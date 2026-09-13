@@ -19,6 +19,33 @@
 
 **2026-09-13 对标基准**：组合回测新增 `--benchmark`（默认上证，输出各档超额年化）；深证成指/创业板指已入库（各 1100 根）。第一步「跑赢上证」达成：激进档 + 弱市覆盖（可加 `--weak-skip-entry`）在 val OOS（+14.3% vs +10.3%，Calmar 1.14 vs 0.91）与全样本（Calmar/Sharpe 全面占优）均胜出。详见「对标基准」专节。
 
+---
+
+## 冠军 Baseline（2026-09-13 定版）
+
+**冠军配置**：激进档 + 弱市覆盖（上证 5 日日均收益 < -0.6% 时 ATR 止损 ×0.5 且弱市停开仓）。
+即 `--tier 激进 --weak-tiers 激进 --weak-skip-entry` 的实际口径；全样本更优版本为不停开仓（见下）。
+
+**成绩（vs 上证指数 sh000001）**
+
+| 段 | 激进 + 弱市覆盖 | 上证 | 超额年化 |
+|---|---|---|---|
+| val OOS（2025-03-26 ~ 2026-09-11，含停开仓） | **+14.3% / -12.5%，Calmar 1.14，Sharpe 0.86** | +10.3% / -11.3%，0.91，0.77 | **+4.0pp** |
+| 全样本 1000 日（2022-07-25 ~ 2026-09-04，不停开仓） | +34.2% / -17.0%，Calmar 2.01，Sharpe 1.58 | +4.7% / -20.4%，0.23，0.39 | **+29.5pp** |
+| 全样本 1000 日（含停开仓） | +12.8% / -28.0%，Calmar 0.46，Sharpe 0.76 | 同上 | +8.0pp |
+
+> **约定：以后所有新实验都以「激进 + 弱市覆盖」（冠军）为 baseline**，必须报告超额年化与风险调整指标（Calmar/Sharpe/回撤），并注明段口径（val OOS / 全样本 1000 日）。
+> 第二/三步基准已入库：深证成指 `sz399001`、创业板指 `sz399006`（各 1100 根），`--benchmark` 可直接切换。
+
+**复现命令**
+
+```bash
+# 冠军（val OOS 最优：弱市覆盖 + 停开仓）
+python backtest_strategy_portfolio.py --tier all --segment val --weak-tiers 激进 --weak-skip-entry --benchmark sh000001
+# 全样本 1000 日（不停开仓版本全样本更优）
+python backtest_strategy_portfolio.py --tier all --segment all --min-active 1000 --weak-tiers 激进 --benchmark sh000001
+```
+
 默认运行环境：`numpy=2.4.6  sklearn=1.9.0  lightgbm=4.7.0`
 
 ---
