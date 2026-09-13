@@ -17,14 +17,23 @@
 
 **2026-09-13 进入/退出决策层专项寻优**：v4 三档决策层重搜索——保守叠加 `disp_max=0.5` + `Rot-T10only`（+0.3%→**+12.4%**）、平衡 `exit_p` 0.45→0.50、激进维持默认；修正 `disp_rank` 全样本排名前视（`RotT10+DispHi` 等旧 disp 系变体成绩作废）；每股策略消融组合的弱市覆盖层经三套选参/验证口径检验后按档可选启用（`--weak-tiers`）。脚本：`backtest_v4_entry_exit_opt.py` / `backtest_portfolio_overlay_opt.py`，详见下文对应专节。
 
+**2026-09-13 三档定版**：改称 **稳健 / 均衡 / 激进**（保守废弃；原激进→均衡，激进=均衡+弱市覆盖冠军）。消融生成端已按新键重跑（`mode_candidates` = 稳健/均衡/激进），组合端 `--tier/--select` 使用新名，**激进档默认自动套用冠军覆盖**（`--no-overlay` 可关闭还原裸激进）。文件说明同步更新。
+
 **2026-09-13 对标基准**：组合回测新增 `--benchmark`（默认上证，输出各档超额年化）；深证成指/创业板指已入库（各 1100 根）。第一步「跑赢上证」达成：激进档 + 弱市覆盖（可加 `--weak-skip-entry`）在 val OOS（+14.3% vs +10.3%，Calmar 1.14 vs 0.91）与全样本（Calmar/Sharpe 全面占优）均胜出。详见「对标基准」专节。
 
 ---
 
 ## 冠军 Baseline（2026-09-13 定版）
 
-**冠军配置**：激进档 + 弱市覆盖（上证 5 日日均收益 < -0.6% 时 ATR 止损 ×0.5 且弱市停开仓）。
-即 `--tier 激进 --weak-tiers 激进 --weak-skip-entry` 的实际口径；全样本更优版本为不停开仓（见下）。
+**三档命名（保守废弃）**
+
+| 新档位 | 定义 | 旧档位 |
+|---|---|---|
+| **稳健** | 原稳健选型（Calmar；不启用弱市覆盖） | 稳健（不变） |
+| **均衡** | 原激进选型（裸配置，无覆盖） | 原激进 |
+| **激进** | 原激进选型 + 弱市覆盖（上证 5 日日均收益 < -0.6% 时 ATR 止损 ×0.5 且弱市停开仓）= **上证冠军配置** | 原激进 + 覆盖 |
+
+> 消融数据已按新键重跑（`research/strategy_ablation_*.json`：`mode_candidates` = 稳健/均衡/激进，激进=均衡；保守不再生成）。`backtest_strategy_portfolio.py` 的 `--tier/--weak-tiers/--select` 均使用新档位名，激进档默认自动套用冠军覆盖（`--no-overlay` 可关）。
 
 **成绩（vs 上证指数 sh000001）**
 
@@ -40,10 +49,12 @@
 **复现命令**
 
 ```bash
-# 冠军（val OOS 最优：弱市覆盖 + 停开仓）
-python backtest_strategy_portfolio.py --tier all --segment val --weak-tiers 激进 --weak-skip-entry --benchmark sh000001
-# 全样本 1000 日（不停开仓版本全样本更优）
-python backtest_strategy_portfolio.py --tier all --segment all --min-active 1000 --weak-tiers 激进 --benchmark sh000001
+# 新三档 val OOS（激进档默认即冠军覆盖+停开仓）
+python backtest_strategy_portfolio.py --tier all --segment val --benchmark sh000001
+# 裸激进对照（均衡档，或 --no-overlay）
+python backtest_strategy_portfolio.py --tier 均衡 --segment val --benchmark sh000001
+# 全样本 1000 日
+python backtest_strategy_portfolio.py --tier all --segment all --min-active 1000 --benchmark sh000001
 ```
 
 默认运行环境：`numpy=2.4.6  sklearn=1.9.0  lightgbm=4.7.0`
@@ -306,6 +317,8 @@ gzip -d stock_cache.db.gz
 
 ## 每只股票自动策略消融（全 A 实证 · 2026-09-13 优化重跑）
 
+> ⚠️ **2026-09-13 定版**：本节起三档改称 **稳健 / 均衡 / 激进**（保守废弃；原激进→均衡；激进=均衡+弱市覆盖冠军，见顶部「冠军 Baseline」节）。下文历史表格中出现的「保守」均为旧命名记录，不再生成。
+
 > 脚本：`backtest_strategy_ablation.py`  
 > 运行：全 A 非 ETF 股票 **5518 只**（每股取近 1000 交易日），**约 230 秒**（8 进程并行，i7-1165G7 4 核 8 线程）  
 > 口径：与 GUI「工具 → 多算法消融选策略」一致。
@@ -536,8 +549,8 @@ python stock_gui.py
 | `build_cli.py` | GUI → CLI 打包器，保证算法同步 |
 | `data_clean.py` | 独立数据清洗工具（默认只报告，`--fix` 才改库） |
 | `backfill_full.py` | 旧版独立回填脚本，保留备用 |
-| `backtest_strategy_ablation.py` | **全 A 股每只股票自动策略消融**（MACD/KDJ/RSI/布林/MA/L1/多维评分 × 三档风险，训练选型/验证报告） |
-| `backtest_strategy_portfolio.py` | 每股所选策略 → 组合回测（slot 槽位 / sleeve 袖套；`--weak-tiers` 按档启用弱市覆盖、`--min-active` 裁剪稀疏日历） |
+| `backtest_strategy_ablation.py` | **全 A 股每只股票自动策略消融**（MACD/KDJ/RSI/布林/MA/L1/多维评分 × 三档风险；选型目标：稳健=Calmar、均衡=最大年化，激进=均衡+组合层覆盖；保守废弃） |
+| `backtest_strategy_portfolio.py` | 新三档组合回测（slot 槽位 / sleeve 袖套；`--benchmark` 指数超额、`--min-active` 裁剪稀疏日历；激进档默认冠军弱市覆盖，`--no-overlay` 关闭） |
 | `backtest_v4_entry_exit_opt.py` | v4 三档进入/退出决策层寻优（T12 选参 + S3 留出切片 + 5 折滚动 WF + 平台检查） |
 | `backtest_portfolio_overlay_opt.py` | 每股消融组合的弱市覆盖层寻优（train→val / h1→h2 / h2→h1 三口径 + 平台检查） |
 | `stock_cache.db` | 本地 SQLite 日K缓存（约 808 万根） |

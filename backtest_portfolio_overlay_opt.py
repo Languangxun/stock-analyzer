@@ -26,10 +26,10 @@ import numpy as np
 import stock_gui as sg
 from backtest_strategy_ablation import load_stocks, PER_STOCK_FILE
 from backtest_strategy_portfolio import (
-    TIERS, SLOT_CFG, _worker_slot, build_matrices, market_weak_mask,
-    slot_sim)
+    TIERS, LEGACY_MODE, SLOT_CFG, _worker_slot, build_matrices,
+    market_weak_mask, slot_sim)
 
-OBJECTIVE = {"保守": "calmar", "稳健": "calmar", "激进": "ann"}
+OBJECTIVE = {"稳健": "calmar", "均衡": "ann", "激进": "ann"}
 MIN_TRADES = 20
 FIELDS = ("ann", "mdd", "calmar", "sharpe", "winrate", "pf", "trades")
 
@@ -44,7 +44,14 @@ def load_selections():
     sel = {}
     for d in data:
         if d:
-            sel[d["code"]] = dict(d.get("mode_candidates", {}))
+            mc_old = d.get("mode_candidates", {})
+            if "均衡" in mc_old:
+                sel[d["code"]] = {t: mc_old.get(t) for t in TIERS
+                                  if mc_old.get(t)}
+            else:
+                sel[d["code"]] = {t: mc_old.get(src)
+                                  for t, src in LEGACY_MODE.items()
+                                  if mc_old.get(src)}
     return sel
 
 

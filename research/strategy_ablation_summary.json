@@ -1,68 +1,17 @@
 {
-  "total_stocks": 5518,
-  "timestamp": "2026-09-13T08:39:16.457369",
+  "total_stocks": 5520,
+  "timestamp": "2026-09-13T14:56:28.048384",
   "modes": {
-    "保守": {
-      "count": 5518,
-      "algo_distribution": {
-        "macd": {
-          "count": 918,
-          "pct": 16.64
-        },
-        "l1_pattern": {
-          "count": 507,
-          "pct": 9.19
-        },
-        "kdj": {
-          "count": 844,
-          "pct": 15.3
-        },
-        "rsi": {
-          "count": 1208,
-          "pct": 21.89
-        },
-        "boll": {
-          "count": 918,
-          "pct": 16.64
-        },
-        "composite": {
-          "count": 897,
-          "pct": 16.26
-        },
-        "ma_trend": {
-          "count": 226,
-          "pct": 4.1
-        }
-      },
-      "train": {
-        "ann_median": 0.1575401221183962,
-        "ann_mean": 0.17612999582631858,
-        "mdd_median": -0.13162753765173701,
-        "winrate_median": 0.47058823529411764,
-        "trades_median": 21.0
-      },
-      "val": {
-        "ann_median": -0.007748857485275484,
-        "ann_mean": 0.021803639552825996,
-        "mdd_median": -0.1194035450170442,
-        "winrate_median": 0.3333333333333333,
-        "trades_median": 8.0
-      },
-      "regime": {
-        "bull_ann_median": 0.2171402537768803,
-        "bear_ann_median": 0.10238142919872643
-      }
-    },
     "稳健": {
-      "count": 5518,
+      "count": 5520,
       "algo_distribution": {
         "macd": {
           "count": 889,
           "pct": 16.11
         },
         "composite": {
-          "count": 893,
-          "pct": 16.18
+          "count": 895,
+          "pct": 16.21
         },
         "kdj": {
           "count": 766,
@@ -74,58 +23,58 @@
         },
         "rsi": {
           "count": 1273,
-          "pct": 23.07
+          "pct": 23.06
         },
         "boll": {
           "count": 986,
-          "pct": 17.87
+          "pct": 17.86
         },
         "ma_trend": {
           "count": 189,
-          "pct": 3.43
+          "pct": 3.42
         }
       },
       "train": {
         "ann_median": 0.18809760778550988,
-        "ann_mean": 0.21963254832813758,
+        "ann_mean": 0.21962700482004976,
         "mdd_median": -0.14341948627465767,
         "winrate_median": 0.5,
         "trades_median": 21.0
       },
       "val": {
-        "ann_median": -0.008210406412289928,
-        "ann_mean": 0.025304167880030398,
-        "mdd_median": -0.13840565428275253,
+        "ann_median": -0.008156669065207067,
+        "ann_mean": 0.02533394296025411,
+        "mdd_median": -0.13833661172403067,
         "winrate_median": 0.36363636363636365,
         "trades_median": 8.0
       },
       "regime": {
-        "bull_ann_median": 0.26674428322177574,
-        "bear_ann_median": 0.11749284391715709
+        "bull_ann_median": 0.26683907786306504,
+        "bear_ann_median": 0.11743086807875347
       }
     },
-    "激进": {
-      "count": 5518,
+    "均衡": {
+      "count": 5520,
       "algo_distribution": {
         "composite": {
-          "count": 986,
-          "pct": 17.87
+          "count": 988,
+          "pct": 17.9
         },
         "kdj": {
           "count": 1177,
-          "pct": 21.33
+          "pct": 21.32
         },
         "l1_pattern": {
           "count": 588,
-          "pct": 10.66
+          "pct": 10.65
         },
         "macd": {
           "count": 897,
-          "pct": 16.26
+          "pct": 16.25
         },
         "rsi": {
           "count": 870,
-          "pct": 15.77
+          "pct": 15.76
         },
         "boll": {
           "count": 946,
@@ -137,22 +86,22 @@
         }
       },
       "train": {
-        "ann_median": 0.23049663241677154,
-        "ann_mean": 0.25792564398282064,
-        "mdd_median": -0.21375588034207849,
+        "ann_median": 0.23043288310769894,
+        "ann_mean": 0.25790622616471304,
+        "mdd_median": -0.21372699250301325,
         "winrate_median": 0.48484848484848486,
         "trades_median": 25.0
       },
       "val": {
-        "ann_median": -0.008626775971272704,
-        "ann_mean": 0.03811912686697734,
-        "mdd_median": -0.18810661819681923,
+        "ann_median": -0.008570093373130139,
+        "ann_mean": 0.03814403709570058,
+        "mdd_median": -0.18801177823670567,
         "winrate_median": 0.375,
         "trades_median": 9.0
       },
       "regime": {
-        "bull_ann_median": 0.3663662501538406,
-        "bear_ann_median": 0.1016686013856351
+        "bull_ann_median": 0.3664532312337654,
+        "bear_ann_median": 0.10164863848648734
       }
     }
   }

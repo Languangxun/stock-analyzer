@@ -6,10 +6,12 @@
   1. 取近 1000 交易日；
   2. 生成 6 种基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态）+ 多维评分 × 3 档风险；
   3. 训练集（前 75%）选型，验证集（后 25%）只报告；
-  4. 按保守/稳健/激进三档目标分别选出最优策略；
+  4. 按新三档目标选优（2026-09-13 定版，保守废弃）：稳健=Calmar，
+     均衡=最大年化（原激进）；激进=均衡选型+组合层弱市覆盖（冠军，
+     由 backtest_strategy_portfolio.py 应用）；
   5. 输出每只股票的结果 + 全市场聚合统计。
 
-v2026-09-12
+v2026-09-13
 """
 import json
 import math
@@ -78,7 +80,9 @@ def _trim_rows(rows, max_bars=1000):
 
 
 def _pick_candidates(cands, key):
-    """按保守/稳健/激进目标从候选中选出最优（口径同 GUI run_ablation）。"""
+    """按新三档目标从候选中选最优（保守已废弃，2026-09-13 定版）：
+    稳健=训练集 Calmar；均衡=训练集最大年化（原激进）；激进=均衡选型
+    + 组合层弱市覆盖（本脚本不生成，见 backtest_strategy_portfolio.py）。"""
     MIN_TR = 8
     pool = [c for c in cands if c["train"].get("trades", 0) >= MIN_TR]
     if not pool:
@@ -91,16 +95,9 @@ def _pick_candidates(cands, key):
     def _calmar(m):
         return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
 
-    if key == "保守":
-        # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中按训练集
-        # Calmar 选优；原按 |mdd| 升序的选法 OOS 明显更差。
-        pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
-        if pool2:
-            pool = pool2
-        pool.sort(key=lambda c: -_calmar(c["train"]))
-    elif key == "激进":
+    if key == "均衡":       # 原激进：最大年化
         pool.sort(key=lambda c: -c["train"].get("ann", -1))
-    else:  # 稳健：收益回撤比
+    else:                   # 稳健：收益回撤比
         pool.sort(key=lambda c: -_calmar(c["train"]))
     return dict(pool[0])
 
@@ -183,15 +180,16 @@ def run_ablation_for_stock(args):
     if not cands:
         return None
 
+    _bal = _pick_candidates(cands, "均衡")
     out = {
         "code": code,
         "bars": n,
         "train_n": split,
         "val_n": n - split,
         "mode_candidates": {
-            "保守": _pick_candidates(cands, "保守"),
             "稳健": _pick_candidates(cands, "稳健"),
-            "激进": _pick_candidates(cands, "激进"),
+            "均衡": _bal,
+            "激进": _bal,      # 均衡选型 + 组合层弱市覆盖 = 激进（冠军）
         },
         "all_candidates": cands,
     }
@@ -218,7 +216,7 @@ def build_summary(per_stock):
     if total == 0:
         return {}
 
-    modes = ["保守", "稳健", "激进"]
+    modes = ["稳健", "均衡"]        # 激进=均衡+组合层弱市覆盖，不单独统计
     summary = {
         "total_stocks": total,
         "timestamp": datetime.now().isoformat(),

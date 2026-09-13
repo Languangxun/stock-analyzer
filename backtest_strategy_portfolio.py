@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """backtest_strategy_portfolio.py - 每股自动消融选出的策略 → 组合回测
 
-读取 research/strategy_ablation_per_stock.json（每股三档自动选型结果），
+读取 research/strategy_ablation_per_stock.json（每股自动选型结果），
 把每股选出的策略聚合成组合回测。两种口径：
 
   --mode slot    （默认）v4 式仓位槽位：共享资金、单仓 frac、最多 max_pos 仓，
@@ -11,9 +11,16 @@
 
 验证段（--segment val）为样本外：选型只在训练段完成。
 
+新三档（2026-09-13 定版，保守废弃）：
+  稳健 = 原稳健选型（Calmar；不启用弱市覆盖）
+  均衡 = 原激进选型（裸配置，无覆盖）——所有新实验的对照 baseline 之一
+  激进 = 原激进选型 + 弱市覆盖（ATR×0.5, mkt5<-0.6%，弱市停开仓）= 上证冠军配置
+  冠军数据：val OOS +14.3%/-12.5%（Calmar 1.14）vs 上证 +10.3%/-11.3%；
+            全样本 1000 日 +12.8%/-28.0%（Calmar 0.46）vs 上证 +4.7%/-20.4%。
+
 用法：
-  python backtest_strategy_portfolio.py --tier all --segment val
-  python backtest_strategy_portfolio.py --tier 稳健 --mode sleeve
+  python backtest_strategy_portfolio.py --tier all --segment val --benchmark sh000001
+  python backtest_strategy_portfolio.py --tier 均衡 --mode sleeve
 """
 import argparse
 import datetime as _dt
@@ -29,12 +36,17 @@ import stock_gui as sg
 from backtest_strategy_ablation import (
     load_stocks, _trim_rows, ALGO_LABEL, PER_STOCK_FILE)
 
-TIERS = ("保守", "稳健", "激进")
+# 新三档；消融 JSON 旧档位键（保守/稳健/激进）读入时用 LEGACY_MODE 映射，
+# 以后消融若按新键生成（稳健/均衡/激进）则直接读取。
+TIERS = ("稳健", "均衡", "激进")
+LEGACY_MODE = {"稳健": "稳健", "均衡": "激进", "激进": "激进"}
 SLOT_CFG = {
-    "保守": {"frac": 0.12, "max_pos": 10},
     "稳健": {"frac": 0.20, "max_pos": 6},
+    "均衡": {"frac": 0.33, "max_pos": 4},
     "激进": {"frac": 0.33, "max_pos": 4},
 }
+# 激进档冠军 baseline：弱市覆盖（-0.6% 阈值、ATR×0.5、弱市停开仓）
+BASELINE_WEAK = {"th": -0.006, "scale": 0.5, "skip": True}
 _GEN = {
     "macd": sg._sig_macd, "kdj": sg._sig_kdj, "rsi": sg._sig_rsi,
     "boll": sg._sig_boll, "ma_trend": sg._sig_ma_trend,
@@ -437,7 +449,9 @@ def main():
     ap.add_argument("--select", action="append", default=[],
                     metavar="档位=目标",
                     help="按训练集目标重选（mdd/calmar/ann），"
-                         "如 --select 保守=calmar；可多次")
+                         "如 --select 稳健=calmar；可多次")
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="关闭激进档冠军 baseline 的弱市覆盖（等价裸激进=均衡）")
     ap.add_argument("--tag", default="", help="输出文件后缀标签")
     ap.add_argument("--frac", type=float, default=None,
                     help="覆盖单仓比例（所有档位）")
@@ -477,7 +491,14 @@ def main():
     for d in data:
         if not d:
             continue
-        mc = dict(d.get("mode_candidates", {}))
+        mc_old = dict(d.get("mode_candidates", {}))
+        if "均衡" in mc_old:            # 新键生成的消融结果
+            mc = {t: mc_old.get(t) for t in TIERS if mc_old.get(t)}
+            if not mc.get("激进"):
+                mc["激进"] = mc.get("均衡")
+        else:                            # 旧键（保守/稳健/激进）映射
+            mc = {t: mc_old.get(src) for t, src in LEGACY_MODE.items()
+                  if mc_old.get(src)}
         for t, o in overrides.items():
             obj, _, mf = o.partition("@")
             mset = set(x for x in mf.replace("，", "+").split("+") if x) \
@@ -570,14 +591,18 @@ def main():
         wmask_cache = {}
 
         def _weak_for(tier):
-            """该档的 (mask, scale, skip)：显式参数优先；--weak-tiers 用
-            经过四口径验证的默认覆盖（ATR×0.5, mkt5<-0.6%）。"""
+            """该档的 (mask, scale, skip)：显式参数 > --weak-tiers 预设 >
+            激进档冠军 baseline（弱市覆盖+停开仓）；--no-overlay 关闭。"""
             if args.weak_mkt_th is not None:
                 th, sc, sk = (args.weak_mkt_th, args.weak_atr_scale,
                               getattr(args, "weak_skip_entry", False))
             elif tier in getattr(args, "weak_tiers", []):
                 th, sc, sk = (-0.006, 0.5,
                               getattr(args, "weak_skip_entry", False))
+            elif tier == "激进" and not args.no_overlay:
+                th = BASELINE_WEAK["th"]
+                sc = BASELINE_WEAK["scale"]
+                sk = BASELINE_WEAK["skip"]
             else:
                 return None, 1.0, False
             if th not in wmask_cache:
