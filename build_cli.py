@@ -81,9 +81,9 @@ def extract(src, start_marker, end_marker):
 
 
 def extract_cache_block(gui_src):
-    """缓存层：GUI 内嵌段，从 CACHE_OK = True 后的缓存标记到 数据获取 段前。"""
+    """缓存层：GUI 内嵌段，从 CACHE_OK = True 后的缓存标记到 QT_URL 前。"""
     start = gui_src.index("# ================= 内嵌缓存层")
-    end = gui_src.index("# ================= 数据获取", start)
+    end = gui_src.index("QT_URL = ", start)
     return gui_src[start:end]
 
 
@@ -101,22 +101,40 @@ def extract_cli_tail(old_cli_src):
 
 
 def main():
-    gui_src = open(GUI_PATH, encoding="utf-8").read()
+    with open(GUI_PATH, encoding="utf-8") as f:
+        gui_src = f.read()
+    if not os.path.exists(CLI_PATH):
+        raise SystemExit("缺少 %s：CLI 专属尾部只能从既有生成物提取" % CLI_PATH)
+    with open(CLI_PATH, encoding="utf-8") as f:
+        old_cli = f.read()
+
+    cache_start = gui_src.index("# ================= 内嵌缓存层")
+    cache_end = gui_src.index("QT_URL = ", cache_start)
+    algo_start = gui_src.index("QT_URL = ")
+    if cache_end > algo_start:
+        raise SystemExit("缓存块与算法块区间重叠，拒绝生成")
 
     cache_block = extract_cache_block(gui_src)
     algo_block = extract_algo_block(gui_src)
 
     # 算法块里不应有 tkinter 残留
-    assert "tkinter" not in algo_block, "算法块混入了 tkinter 代码"
+    if "tkinter" in algo_block:
+        raise SystemExit("算法块混入了 tkinter 代码")
 
-    old_cli = open(CLI_PATH, encoding="utf-8").read()
     cli_tail = extract_cli_tail(old_cli)
 
     out = (CLI_HEADER + CLI_IMPORTS + "\n" + cache_block + "\n\n"
            + algo_block.rstrip() + "\n\n"
            + CLI_MAIN_MARKER + "\n\n" + cli_tail)
-    with open(CLI_PATH, "w", encoding="utf-8", newline="\n") as f:
+    # 写入前先做语法校验，避免生成物被写坏
+    try:
+        compile(out, CLI_PATH, "exec")
+    except SyntaxError as e:
+        raise SystemExit("生成结果语法错误，未写入: %s" % e)
+    tmp = CLI_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(out)
+    os.replace(tmp, CLI_PATH)
     print("已生成 %s (%.1f KB, 算法+缓存内嵌, 独立运行)"
           % (CLI_PATH, len(out.encode("utf-8")) / 1024))
 

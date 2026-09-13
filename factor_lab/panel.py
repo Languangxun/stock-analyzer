@@ -91,8 +91,8 @@ def mkt5_map():
     closes = {r["date"]: r["close"] for r in rows}
     dates = sorted(closes)
     out = {}
-    for i in range(4, len(dates)):
-        c0, c1 = closes[dates[i - 4]], closes[dates[i]]
+    for i in range(5, len(dates)):
+        c0, c1 = closes[dates[i - 5]], closes[dates[i]]
         if c0 and c1 and c0 > 0:
             out[dates[i]] = c1 / c0 - 1.0
     return out
@@ -297,11 +297,18 @@ def stage_build(limit=None, workers=None, sample=None, seed=7):
                              initargs=(glob,)) as exe:
         futs = {exe.submit(_l2_worker, g): g for g in tasks}
         done = 0
+        fail = 0
         for fut in as_completed(futs):
-            L2.update(fut.result())
+            try:
+                L2.update(fut.result())
+            except Exception as e:
+                fail += 1
+                print(f"  L2 worker 失败: {e}")
             done += 1
             if done % 40 == 0:
                 print(f"  L2 组 {done}/{len(tasks)} {time.time()-t0:.0f}s")
+    if fail:
+        print(f"L2 失败 {fail}/{len(tasks)} 组（已跳过）")
     print(f"L2 完成：{len(L2)} 只 {time.time()-t0:.0f}s")
 
     groups3 = {}
@@ -316,10 +323,17 @@ def stage_build(limit=None, workers=None, sample=None, seed=7):
                              initargs=(glob,)) as exe:
         futs = {exe.submit(_l3_worker, g): g for g in tasks3}
         done = 0
+        fail3 = 0
         for fut in as_completed(futs):
-            L3.update(fut.result())
+            try:
+                L3.update(fut.result())
+            except Exception as e:
+                fail3 += 1
+                print(f"  L3 worker 失败: {e}")
             done += 1
             print(f"  L3 组 {done}/{len(tasks3)} {time.time()-t0:.0f}s")
+    if fail3:
+        print(f"L3 失败 {fail3}/{len(tasks3)} 组（已跳过）")
     print(f"L3 完成：{len(L3)} 只 {time.time()-t0:.0f}s")
     with open(MATCH_CACHE, "wb") as f:
         pickle.dump({"L2": L2, "L3": L3}, f, protocol=4)

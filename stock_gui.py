@@ -828,7 +828,7 @@ def _fetch_163(full, count=600):
         except (ValueError, IndexError):
             continue
     out.reverse()  # 网易返回倒序，翻转
-    return out[:count]
+    return out[-count:]
 
 
 def _fetch_eastmoney(full, count=600, fqt=2):
@@ -1564,7 +1564,10 @@ def clean_daily_db(fix=True, progress=None):
                         fresh, raw_last = _bf_fetch_one(c)
                         fd = [r for r in fresh
                               if r["date"] < time.strftime("%Y-%m-%d")]
-                        if len(fd) >= 200:
+                        old_n = conn.execute(
+                            "SELECT COUNT(*) FROM daily_bars WHERE code=?",
+                            (c,)).fetchone()[0]
+                        if len(fd) >= 200 and len(fd) >= min(old_n, 400):
                             conn.execute(
                                 "DELETE FROM daily_bars WHERE code=?", (c,))
                             conn.executemany(
@@ -2531,15 +2534,17 @@ def backtest_signals(rows, signals, rp=None):
             typ = sig_map.get(i)
 
             if entry is not None:
+                prev_high = highest
                 highest = max(highest, h) if highest else h
                 atr_stop = entry - rp["atr_mult"] * atrs[i] if atrs[i] > 0 \
                     else entry * 0.95
-                trail_stop = highest * rp["trail_ratio"] \
-                    if highest > entry * rp["trail_trigger"] else atr_stop
+                trail_stop = prev_high * rp["trail_ratio"] \
+                    if prev_high > entry * rp["trail_trigger"] else atr_stop
 
                 # 止损触发（日内最低触及止损价）
                 if l <= trail_stop:
-                    exit_price = trail_stop
+                    exit_price = r["open"] if r["open"] <= trail_stop \
+                        else trail_stop
                     trades.append(exit_price / entry - 1)
                     eq *= exit_price / entry
                     entry = None
@@ -2888,16 +2893,21 @@ def chip_snapshots(rows, nbin=80, tail=120):
             and r["high"] >= r["low"]]
     if len(bars) < 30:
         return {}
-    lo_p = min(r["low"] for r in bars)
-    hi_p = max(r["high"] for r in bars)
+    # 因果网格：bin 边界/换手基准只用评估窗口之前的热身历史，
+    # 不用未来价格极值（否则历史某日的筹码分布含未来信息）
+    rec_from = len(bars) - min(tail, len(bars))
+    base = bars[:rec_from] if rec_from >= 30 else []
+    if not base:
+        return {}
+    lo_p = min(r["low"] for r in base)
+    hi_p = max(r["high"] for r in base)
     if hi_p <= lo_p:
         return {}
     step = (hi_p - lo_p) / nbin
     mids = [lo_p + step * (k + 0.5) for k in range(nbin + 1)]
     chips = [0.0] * (nbin + 1)
-    med_vol = sorted(r["vol"] for r in bars)[len(bars) // 2] or 1.0
+    med_vol = sorted(r["vol"] for r in base)[len(base) // 2] or 1.0
     out = {}
-    rec_from = len(bars) - min(tail, len(bars))
     for idx, r in enumerate(bars):
         t = min(0.20, max(0.002, 0.02 * (r["vol"] / med_vol)))
         chips = [c * (1.0 - t) for c in chips]
@@ -3488,13 +3498,8 @@ def _sig_ma_trend(rows):
     return out
 
 
-def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
-                       use_chips=True):
-    """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
-    rp: 风险参数（buy_th/cooldown）。返回 [(i,date,"BUY"/"SELL",reason)]。"""
-    n = len(rows)
-    if n < 60:
-        return []
+def _composite_precompute(rows, chip_tail=400, use_chips=True):
+    """预计算多维评分所需指标，供同一只股票多档风险复用。"""
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
@@ -3508,6 +3513,22 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
             else {}
     except Exception:
         chip_snaps = {}
+    return (dif, dea, k_, d_, r6, b_up, b_low, pdi_a, mdi_a, adx_a,
+            ma20, vols_d, chip_snaps)
+
+
+def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
+                       use_chips=True, pre=None):
+    """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
+    rp: 风险参数（buy_th/cooldown）。pre 为 _composite_precompute 结果，
+    同一只股票多档复用可避免重复计算指标。返回 [(i,date,"BUY"/"SELL",reason)]。"""
+    n = len(rows)
+    if n < 60:
+        return []
+    if pre is None:
+        pre = _composite_precompute(rows, chip_tail, use_chips)
+    (dif, dea, k_, d_, r6, b_up, b_low, pdi_a, mdi_a, adx_a,
+     ma20, vols_d, chip_snaps) = pre
     weak = idx_chg_by_date or {}
     buy_th = rp["buy_th"]
     out = []
@@ -3644,9 +3665,9 @@ def _sig_l1_pattern(rows, W=None, step=5, up_th=0.6, dn_th=0.4):
 
 # ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
 
-def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None):
+def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
-    atrs 可外部预计算加速。"""
+    atrs 可外部预计算加速。trade_out（可选 list）：追加逐笔收益率。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
@@ -3670,14 +3691,15 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None):
         c, h, l = r["close"], r["high"], r["low"]
         typ = sig_map.get(i)
         if entry is not None:
+            prev_high = highest
             highest = max(highest, h) if highest else h
             atr_stop = (entry - rp["atr_mult"] * atrs[i]) if atrs[i] > 0 \
                 else entry * 0.95
-            trail_stop = (highest * rp["trail_ratio"]
-                          if highest > entry * rp["trail_trigger"]
+            trail_stop = (prev_high * rp["trail_ratio"]
+                          if prev_high > entry * rp["trail_trigger"]
                           else atr_stop)
             if l <= trail_stop:
-                exit_px = min(trail_stop, h)
+                exit_px = r["open"] if r["open"] <= trail_stop else trail_stop
                 trades.append(exit_px / entry - 1)
                 eq *= exit_px / entry
                 entry = None
@@ -3693,6 +3715,8 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None):
         curve.append(eq * (c / entry) if entry else eq)
     if len(trades) < 2:
         return None
+    if trade_out is not None:
+        trade_out.extend(trades)
     wins = len([t for t in trades if t > 0])
     import datetime
     try:
@@ -3755,16 +3779,32 @@ def _bull_bear_score(rows, curve, i0, regime):
 
 
 def _precompute_atr(rows, i0=0, i1=None):
-    """预计算 ATR(14)，供 run_ablation 批量回测复用。"""
+    """预计算 ATR(14)，供 run_ablation 批量回测复用（numpy 向量化）。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
-    atrs = [0.0] * len(rows)
-    for i in range(i0 + 14, i1):
-        s = 0.0
-        for j in range(i - 13, i + 1):
-            h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
-            s += max(h - l, abs(h - pc), abs(l - pc))
-        atrs[i] = s / 14
-    return atrs
+    n = len(rows)
+    start = i0 + 14
+    if i1 <= start:
+        return [0.0] * n
+    if np is None:
+        atrs = [0.0] * n
+        for i in range(start, i1):
+            s = 0.0
+            for j in range(i - 13, i + 1):
+                h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
+                s += max(h - l, abs(h - pc), abs(l - pc))
+            atrs[i] = s / 14
+        return atrs
+    h = np.array([(r.get("high") or 0.0) for r in rows], float)
+    l = np.array([(r.get("low") or 0.0) for r in rows], float)
+    c = np.array([(r.get("close") or 0.0) for r in rows], float)
+    pc = np.empty(n, float)
+    pc[1:] = c[:-1]
+    pc[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    cs = np.insert(np.cumsum(tr), 0, 0.0)
+    atrs = np.zeros(n, float)
+    atrs[start:i1] = (cs[start + 1:i1 + 1] - cs[start - 13:i1 - 13]) / 14.0
+    return atrs.tolist()
 
 
 def _annualized_vol(rows, lookback=250):
@@ -3827,11 +3867,14 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     for mode, rp in CFG.RISK_PARAMS.items():
         tasks.append(("composite", mode, rp, True))
 
+    comp_pre = _composite_precompute(rows)
+
     def _eval_task(task):
         algo, mode, rp, is_comp = task
         if is_comp:
             try:
-                sigs = _composite_signals(rows, rp, idx_chg_by_date=None)
+                sigs = _composite_signals(rows, rp, idx_chg_by_date=None,
+                                          pre=comp_pre)
             except Exception:
                 log.warning("composite信号生成失败 %s", mode, exc_info=True)
                 return None
@@ -3883,10 +3926,12 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
                     "label": f"多维评分·{key}（样本不足，固定回退）",
                     "train": {}, "val": {}}
         if key == "保守":
-            # 修正：旧代码按 mdd 升序（负数）= 选到最大回撤；改为在活跃候选里
-            # 按 |mdd| 升序，回撤最小优先、收益次之。
-            pool.sort(key=lambda c: (abs(c["train"].get("mdd", 0.05)),
-                                     -c["train"].get("ann", -1)))
+            # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中按
+            # 训练集 Calmar 选优；原按 |mdd| 升序的选法 OOS 明显更差。
+            pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
+            if pool2:
+                pool = pool2
+            pool.sort(key=lambda c: -_calmar(c["train"]))
         elif key == "激进":
             pool.sort(key=lambda c: -c["train"].get("ann", -1))
         else:   # 稳健：收益回撤比
@@ -4104,7 +4149,7 @@ def _multi_day_prediction(o_today, levels, max_days=10):
                    for p in PS},
             "lo": {p: l50 + K * (wpct(lo_pairs or cl_pairs, p) - l50)
                    for p in PS},
-            "up_prob": len([p for p, w in cl_pairs if p > 0]) / len(cl_pairs) if cl_pairs else 0.5,
+            "up_prob": sum(w for p, w in cl_pairs if p > 0) if cl_pairs else 0.5,
         }
         
         # 均值回归修正：预测天数越多，向零回归越强
@@ -4868,7 +4913,7 @@ _V4_QTS = (10, 25, 50, 75, 90)
 _V4_COST = {"slip": 0.001, "commission": 0.0, "stamp": 0.0}
 _V4_CAPITAL = 1_000_000.0
 # 预测缓存版本：**改因子/模型/折参数代码后必须 +1**，否则旧缓存被误用
-_V4_CACHE_VER = "1"
+_V4_CACHE_VER = "3"
 
 # 三档风险：同一套 v4 模型输出上的不同决策层参数（不分别训练）
 # a_th 为自适应分数的 σ 阈值（训练段标准化后）
@@ -4887,6 +4932,29 @@ _V4_LGBM = {"objective": "regression", "num_leaves": 15, "max_depth": 4,
             "min_child_samples": 40, "subsample": 0.8, "subsample_freq": 1,
             "colsample_bytree": 0.8, "reg_lambda": 1.0, "reg_alpha": 0.0,
             "random_state": 42, "n_jobs": 1, "verbose": -1}
+
+
+# 分档默认规则补丁（backtest_v4_entry_exit_opt.py 进入/退出专项，2026-09-13）：
+# - 保守：新增低分化入场闸门 disp_max=0.5（行业离散度因果分位≤0.5 才开新仓）。
+#   T12选参 / S3留出切片 / 5折滚动WF / 连续滚动 四口径一致改善，且
+#   disp_max 0.4~0.7 为平台非孤峰（见 research/v4_entry_exit_opt.json）。
+#   另叠加 Rot-T10only（h_only=10+冷却5+最短持有5+行业前30%）：连续滚动
+#   P50 -10.8%→+6.3%、最差窗 -20.5%→-4.6%、逐折 3/5 胜且两处巨亏折修复
+#   （validate：研究脚本 / README 进入退出专节）。
+# - 平衡：p_up 退出阈值 0.45→0.50（各口径一致小幅改善）。
+# - 激进：无稳健胜出候选（weak 止损切片口径好、连续口径差，属口径矛盾），
+#   维持默认；Rot-T10only 对激进削左尾但压上限（逐折中位反而略降），保留
+#   为 _V4_VARIANTS 可选变体，不写死默认。详见 opt 报告与 README。
+# - 同时修正 disp_rank 前视：原全样本 argsort 排名 → 截至当日的扩张窗口
+#   分位（60 个有效日起），旧 disp 系变体（如 RotT10+DispHi）成绩作废。
+# 注：每股「多算法消融选策略」是独立机制（run_ablation /
+# backtest_strategy_ablation.py），本补丁只作用于 v4 组合默认。
+_V4_TIER_EXTRA = {
+    "保守": {"weak_q": 25, "weak_mkt": -0.006, "disp_max": 0.5,
+             "h_only": 10, "cooldown": 5, "min_hold": 5, "rot_top": 0.70},
+    "平衡": {"weak_q": 25, "weak_mkt": -0.006, "exit_p": 0.50},
+    "激进": {},
+}
 
 
 def _v4_deps():
@@ -4918,11 +4986,19 @@ def _v4_rankic(a, b):
 
 
 def _v4_roll_mean(a, w):
+    """滚动均值（NaN 感知：窗口内跳过缺失，不向后续传播）。"""
+    a = np.asarray(a, float)
     n = len(a)
     out = np.full(n, np.nan)
     if n >= w:
-        c = np.cumsum(np.insert(np.asarray(a, float), 0, 0.0))
-        out[w - 1:] = (c[w:] - c[:-w]) / w
+        x = np.nan_to_num(a, nan=0.0)
+        v = np.isfinite(a).astype(float)
+        cx = np.insert(np.cumsum(x), 0, 0.0)
+        cv = np.insert(np.cumsum(v), 0, 0.0)
+        cnt = cv[w:] - cv[:-w]
+        s = cx[w:] - cx[:-w]
+        out[w - 1:] = np.divide(s, cnt,
+                                out=np.full_like(s, np.nan), where=cnt > 0)
     return out
 
 
@@ -5276,18 +5352,10 @@ def _v4_wf_impl(code, bars, industry):
                              "selected": bool(sel[i])}
                             for i, f in enumerate(_V4_FACTORS)]
 
-    # 过拟合守卫：LGBM 训练段 IC 显著高于测试段时，弃用该股 ml 预测
-    if ins_ic and per_stock_ic:
-        ins_med = float(np.median(ins_ic))
-        oos_all = [ic for H in _V4_HORIZONS for ic in per_stock_ic[H]]
-        oos_med = float(np.median(oos_all)) if oos_all else None
-        if oos_med is not None and ins_med - oos_med > 0.20:
-            log.warning("v4 %s LGBM 过拟合 guard 触发："
-                        "train_ic=%.3f oos_ic=%.3f，弃用 ml 预测",
-                        code, ins_med, oos_med)
-            for H in _V4_HORIZONS:
-                ml[H][:] = np.nan
-            ml_dyn[:] = np.nan
+    # 注：此处不再按「测试折 IC」逐股弃用 LightGBM 预测。
+    # 原过拟合 guard 用同一测试折的 OOS IC 决定是否使用该折预测，属于
+    # 测试集泄漏（后视选模型），且会把 train(0.6)/oos(0) 的股票几乎全部误杀。
+    # 模型是否有效交由报告中的 Train/Test IC 与 "Full - LightGBM" 消融如实呈现。
 
     if not np.isfinite(p_up).any() and not any(
             np.isfinite(ml[H]).any() for H in _V4_HORIZONS):
@@ -5386,14 +5454,12 @@ def _v4_metrics(eq_curve, dates, trades, stock_days=0):
 _V4_VARIANTS = {
     "Full v4": {},
     "Full - Adaptive": {"use_adaptive": False},
-    "Full - Horizon": {"adaptive_h": False},
     "Full - Logistic": {"use_logistic": False},
     "Full - LightGBM": {"use_lgbm": False},
     "Full - Quantile": {"use_quantile": False, "use_dist_exit": False},
     "Full - DistributionExit": {"use_dist_exit": False},
     "Adaptive+Horizon": {"use_logistic": False, "use_lgbm": False},
-    "Adaptive+LightGBM": {"use_logistic": False, "adaptive_h": False,
-                          "use_dist_exit": False},
+    "Adaptive+LightGBM": {"use_logistic": False, "use_dist_exit": False},
     "Logistic+LightGBM": {"use_adaptive": False, "use_dist_exit": False},
     "LightGBM+Quantile": {"use_logistic": False, "use_adaptive": False},
     "Adaptive+Horizon+LightGBM": {"use_logistic": False,
@@ -5415,6 +5481,18 @@ _V4_VARIANTS = {
     "Dist+Reentry+Cd5": {"exit_mode": "dist", "reentry_tier": True,
                          "cooldown": 5, "min_hold": 5},
     "Hybrid (v4.0.1)": {"exit_mode": "hybrid"},   # 隔离默认 dist vs hybrid
+    # Exit Ablation 头部候选（2026-09-13，激进档为主；详见
+    # backtest_exit_ablation.py / research/v4_exit_ablation_all.json）：
+    "Exit: Q25+Q90": {"stop_q": 25, "target_q": 90},
+    "Exit: Q25+Q90+NoReentry": {"stop_q": 25, "target_q": 90,
+                                "reentry_tier": False},
+    "Exit: Q25+Q90+MinHold5": {"stop_q": 25, "target_q": 90, "min_hold": 5},
+    "Exit: Q25+Q90+ExitP55": {"stop_q": 25, "target_q": 90, "exit_p": 0.55},
+    "Exit: Q25+Q90+NoPup+Cd10": {"stop_q": 25, "target_q": 90,
+                                 "use_logistic": False, "cooldown": 10},
+    # regime 条件化止损（连续口径复核：平衡档有效、激进档无稳健增益）：
+    "RegimeStop: Q25 mkt<-0.6%": {"weak_q": 25, "weak_mkt": -0.006},
+    "RegimeStop: Q25 mkt<-1.0%": {"weak_q": 25, "weak_mkt": -0.010},
     # 板块轮动（行业5日收益动量门槛）：
     "Rot-Top30": {"rot_top": 0.70},               # 只买行业强度前30%的个股
     "Rot-Top50": {"rot_top": 0.50},
@@ -5423,14 +5501,17 @@ _V4_VARIANTS = {
                     "rot_top": 0.70},             # T10王牌+板块轮动叠加
     "RotT10+DispHi": {"h_only": 10, "cooldown": 5, "min_hold": 5,
                       "rot_top": 0.70,
-                      "disp_min": 0.5},           # regime：仅高分化（轮动富集）环境
+                      "disp_min": 0.5, "disp_max": None},  # regime：仅高分化
+    # （disp_max=None 显式清掉保守档新默认的低分化闸门，否则两闸门互斥 0 交易）
+    # ⚠️ 2026-09-13：disp_rank 全样本排名前视已修（改因果扩张分位），
+    # 本变体原成绩作废、尚未按修正口径重评，仅保留作对照。
 }
 
 
 def _v4_entry_score(mats, rules):
     """与入场逻辑一致的 (score, label) pooled IC/MAE（矩阵向量化）。"""
     cal, M, codes = mats
-    if rules.get("use_lgbm", False):
+    if rules.get("use_lgbm", True):
         x, y = M["ml_dyn"], M["y_dyn"]
     elif rules.get("use_quantile", True):
         x, y = M["q50"], M["y5"]
@@ -5597,7 +5678,7 @@ def _v4_entry_mask(M, rules, tier):
             ok = M["has_bar"].copy()
             if rules.get("use_logistic", True):
                 ok &= (M["p_up"] >= tier["p_th"])
-            if rules.get("use_lgbm", False):
+            if rules.get("use_lgbm", True):
                 ok &= (M["ml_dyn"] >= tier["r_th"])
                 if rules.get("use_quantile", True) \
                         and rules.get("q50_entry", True):
@@ -5635,7 +5716,7 @@ def _v4_entry_ok_cell(M, ks, t, tier, rules):
     if rules.get("use_logistic", True) \
             and not (M["p_up"][ks, t] >= tier["p_th"]):
         return False
-    if rules.get("use_lgbm", False):
+    if rules.get("use_lgbm", True):
         if not (M["ml_dyn"][ks, t] >= tier["r_th"]):
             return False
         if rules.get("use_quantile", True) and rules.get("q50_entry", True) \
@@ -5716,13 +5797,24 @@ def _v4_attach_rotation(M, cal, codes_s, ind_of, mkt, ind):
         if n >= 3:
             v = row[m]
             RANK[k, m] = v.argsort().argsort() / max(n - 1, 1)
-    # 行业动量离散度（轮动富集度）：行业5日收益横截面 std 的窗口内分位（0~1）
+    # 行业动量离散度（轮动富集度）：行业5日收益横截面 std。
+    # 分位必须因果：只与「截至当日」的扩张窗口历史比较（至少 60 个有效日）。
+    # 原全样本 argsort 排名会看到未来，使 disp_min/disp_max/weak_disp 类
+    # regime 闸门产生前视高估（2026-09-13 修正）。
     DISP = np.array([np.nanstd(R5[k]) if np.isfinite(R5[k]).sum() >= 3
                      else np.nan for k in range(R5.shape[0])])
-    dm = np.isfinite(DISP)
     DRANK = np.full(len(DISP), np.nan)
-    if dm.sum() >= 5:
-        DRANK[dm] = DISP[dm].argsort().argsort() / max(dm.sum() - 1, 1)
+    _hist = []
+    _MIN_HIST = 60
+    for _k in range(len(DISP)):
+        _v = DISP[_k]
+        if not np.isfinite(_v):
+            continue
+        _hist.append(_v)
+        _n = len(_hist)
+        if _n >= _MIN_HIST:
+            _a = np.asarray(_hist)
+            DRANK[_k] = ((_a < _v).sum() + 0.5 * (_a == _v).sum()) / _n
     ns, nc = M["close"].shape
     M["ind_rank5"] = np.full((ns, nc), np.nan)
     M["ind5"] = np.full((ns, nc), np.nan)
@@ -5764,8 +5856,34 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     # 以小博大选项：stop_q=止损参考分位(10/25, 越小越宽/越大越紧)；
     # trail_slow=移动止盈用激进参数(触发1.05/回落10%, 让盈利跑更久)；
     # reentry_tier=平仓后 reentry_bars 根内按更高一档阈值再入场（质量门槛替代时间门槛）
-    qstop = M["q25"] if int(rules.get("stop_q", 10)) == 25 else M["q10"]
+    _sq = int(rules.get("stop_q", 10))
+    qstop = M["q%d" % _sq] if _sq in _V4_QTS else M["q10"]
     trp = CFG.RISK_PARAMS["激进"] if rules.get("trail_slow") else rp
+    # 退出参数覆盖（Exit Ablation 用；未指定时保持原行为不变）
+    trail_trigger = float(rules.get("trail_trigger", trp["trail_trigger"]))
+    trail_ratio = float(rules.get("trail_ratio", trp["trail_ratio"]))
+    atr_mult = float(rules.get("atr_mult", rp["atr_mult"]))
+    exit_p = float(rules.get("exit_p", tier["exit_p"]))
+    _tq = int(rules.get("target_q", 75))
+    qkey = "q%d" % _tq if _tq in _V4_QTS else "q75"
+    # ---- regime 条件化止损（默认全关，不影响原有行为）----
+    # weak_q: 弱市时改用更紧的止损分位（如 25/50）
+    # weak_mkt: 弱市判定一：M["mkt5"] < weak_mkt（大盘5日累计收益阈值）
+    # weak_disp: 弱市判定二：M["disp_rank"] >= weak_disp（行业分化度分位）
+    # weak_exit_p: 弱市时提高 p_up 退出阈值（更易退出）
+    weak_q = int(rules.get("weak_q", 0) or 0)
+    weak_qstop = M["q%d" % weak_q] if (weak_q and weak_q in _V4_QTS) \
+        else None
+    weak_mkt = rules.get("weak_mkt")
+    weak_disp = rules.get("weak_disp")
+    weak_exit_p = rules.get("weak_exit_p")
+    weak_mask = None
+    if weak_qstop is not None or weak_exit_p is not None:
+        weak_mask = np.zeros(M["has_bar"].shape, dtype=bool)
+        if weak_mkt is not None and "mkt5" in M:
+            weak_mask |= (M["mkt5"] < float(weak_mkt))
+        if weak_disp is not None and "disp_rank" in M:
+            weak_mask |= (M["disp_rank"] >= float(weak_disp))
     _strict = _V4_TIERS.get({"平衡": "保守", "激进": "平衡"}
                             .get(rules.get("tier_name", "")))
     re_bars = int(rules.get("reentry_bars", 8) or 8)
@@ -5793,15 +5911,17 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
             px_o = float(M["open"][ks, t])
             hi = float(M["high"][ks, t])
             lo = float(M["low"][ks, t])
-            p["highest"] = max(p["highest"], hi)   # 逐日更新最高价（v3.3 同口径；此前缺失→移动止盈失效）
+            # 用昨日最高价判定今日止损，收盘后再更新 highest，
+            # 避免“同日先看 high 再看 low”的日内顺序前视
+            prev_high = p["highest"]
             sold = False
             if not M["limit_dn"][ks, t]:
                 if mode == "baseline" or p["atr_fallback"] or not use_dist:
                     atr_t = float(M["atr"][ks, t])
-                    if p["highest"] > p["entry"] * rp["trail_trigger"]:
-                        stop = p["highest"] * rp["trail_ratio"]
+                    if prev_high > p["entry"] * trail_trigger:
+                        stop = prev_high * trail_ratio
                     else:
-                        stop = p["entry"] - rp["atr_mult"] * max(atr_t, 1e-9)
+                        stop = p["entry"] - atr_mult * max(atr_t, 1e-9)
                     if lo <= stop:
                         px = px_o if px_o <= stop else min(stop, hi)
                         sold = True
@@ -5809,18 +5929,24 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                         px = px_c
                         sold = True
                 else:
-                    # Q 棘轮止损（只收紧不放宽；stop_q 可选 10/25 分位）
+                    # Q 棘轮止损（只收紧不放宽；弱市可切换更紧分位）
+                    qsel, ep = qstop, exit_p
+                    if weak_mask is not None and weak_mask[ks, t]:
+                        if weak_qstop is not None:
+                            qsel = weak_qstop
+                        if weak_exit_p is not None:
+                            ep = float(weak_exit_p)
                     if rules.get("use_q10_stop", True):
-                        qs = qstop[ks, t]
+                        qs = qsel[ks, t]
                         if np.isfinite(qs):
                             p["stop"] = max(p["stop"], p["entry"]
                                             * (1.0 + float(qs)))
                     # 移动止盈棘轮：浮盈触发后随最高价上移（拉长持仓）
                     if exit_mode == "hybrid" \
                             and rules.get("use_trailing", True) \
-                            and p["highest"] > p["entry"] * trp["trail_trigger"]:
+                            and prev_high > p["entry"] * trail_trigger:
                         p["stop"] = max(p["stop"],
-                                        p["highest"] * trp["trail_ratio"])
+                                        prev_high * trail_ratio)
                     if lo <= p["stop"]:
                         px = px_o if px_o <= p["stop"] else min(p["stop"], hi)
                         sold = True
@@ -5830,7 +5956,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                     elif t - p["t_in"] >= mh \
                             and rules.get("use_logistic", True) \
                             and np.isfinite(M["p_up"][ks, t]) \
-                            and float(M["p_up"][ks, t]) < tier["exit_p"]:
+                            and float(M["p_up"][ks, t]) < ep:
                         px = px_c
                         sold = True
             if sold:
@@ -5842,9 +5968,22 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                                "pnl": p["shares"] * (net - p["buy_net"]),
                                "hold": t - p["t_in"]})
                 del pos[ks]
+            else:
+                p["highest"] = max(prev_high, hi)   # 收盘后更新最高价
         # ---- 入场 ----
         if len(pos) < tier["max_pos"]:
-            for ks in np.nonzero(ok_entry[:, t])[0]:
+            cand = np.nonzero(ok_entry[:, t])[0]
+            # 名额不足时按信号强度排序，而非数据库行序（保证可复现）
+            if len(cand) > 1:
+                if rules.get("use_lgbm", True):
+                    sc = M["ml_dyn"][cand, t]
+                elif rules.get("use_quantile", True):
+                    sc = M["q50"][cand, t]
+                else:
+                    sc = M["p_up"][cand, t]
+                sc = np.where(np.isfinite(sc), sc, -np.inf)
+                cand = cand[np.argsort(-sc, kind="stable")]
+            for ks in cand:
                 if len(pos) >= tier["max_pos"]:
                     break
                 if ks in pos:
@@ -5868,13 +6007,17 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                 p = {"t_in": t, "shares": shares, "buy_net": buy_net,
                      "entry": px_c,
                      "highest": max(px_c, float(M["high"][ks, t]))}
-                if use_dist and np.isfinite(qstop[ks, t]) \
-                        and np.isfinite(M["q75"][ks, t]):
+                _qset = qstop
+                if weak_qstop is not None and weak_mask is not None \
+                        and weak_mask[ks, t]:
+                    _qset = weak_qstop
+                if use_dist and np.isfinite(_qset[ks, t]) \
+                        and np.isfinite(M[qkey][ks, t]):
                     if rules.get("use_q10_stop", True):
-                        p["stop"] = p["entry"] * (1.0 + float(qstop[ks, t]))
+                        p["stop"] = p["entry"] * (1.0 + float(_qset[ks, t]))
                     else:
                         p["stop"] = 0.0     # 无初始止损，随棘轮/移动止盈上移
-                    p["target"] = p["entry"] * (1.0 + float(M["q75"][ks, t]))
+                    p["target"] = p["entry"] * (1.0 + float(M[qkey][ks, t]))
                     p["atr_fallback"] = False
                 else:
                     p["stop"] = None
@@ -5899,6 +6042,8 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     stock_days = int(M["has_bar"].sum())
     m = _v4_metrics(eq_curve, cal, trades, stock_days=stock_days)
     m["forced_closes"] = n_forced
+    m["equity"] = eq_curve              # 权益曲线（报告层 _strip 会剔除）
+    m["dates"] = cal
     return m
 
 
@@ -6089,11 +6234,14 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
                  "use_dist_exit": False}
         sims["adaptive:" + tn] = _v4_portfolio_sim(
             mats_bt, _V4_TIERS[tn], rules)
+        full_rules = {"mode": "full", "tier_name": tn}
+        full_rules.update(_V4_TIER_EXTRA.get(tn, {}))
         sims["full:" + tn] = _v4_portfolio_sim(
-            mats_bt, _V4_TIERS[tn], {"mode": "full", "tier_name": tn})
+            mats_bt, _V4_TIERS[tn], full_rules)
     for vname, vr in _V4_VARIANTS.items():
         for tn in ("保守", "平衡", "激进"):
             rules = {"mode": "full", "tier_name": tn}
+            rules.update(_V4_TIER_EXTRA.get(tn, {}))
             rules.update(vr)
             sims["abl:%s:%s" % (vname, tn)] = _v4_portfolio_sim(
                 mats_bt, _V4_TIERS[tn], rules)
@@ -6315,59 +6463,6 @@ def slice_view(res, show_n, pan=0):
     return view
 
 
-# ================= 邮件发送（授权码来自香橙派 ai-quant 日报配置） =================
-
-EMAIL_SMTP_HOST = "smtp.163.com"
-EMAIL_SMTP_PORT = 465
-EMAIL_SENDER = "languangxunlh@163.com"
-EMAIL_AUTH_CODE = "KYVmx5RTa7s4zUcA"
-EMAIL_RECIPIENTS = ("19526719996@163.com", "2180287399@qq.com")
-
-
-def _load_email_cfg():
-    """ini [email] 可覆盖默认值。"""
-    global EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SENDER, EMAIL_AUTH_CODE
-    global EMAIL_RECIPIENTS
-    try:
-        cp = configparser.ConfigParser()
-        cp.read(INI_PATH, encoding="utf-8")
-        if cp.has_section("email"):
-            EMAIL_SMTP_HOST = cp.get("email", "host", fallback=EMAIL_SMTP_HOST)
-            EMAIL_SMTP_PORT = cp.getint("email", "port", fallback=EMAIL_SMTP_PORT)
-            EMAIL_SENDER = cp.get("email", "sender", fallback=EMAIL_SENDER)
-            EMAIL_AUTH_CODE = cp.get("email", "auth_code",
-                                     fallback=EMAIL_AUTH_CODE)
-            rcpt = cp.get("email", "recipients", fallback="")
-            if rcpt:
-                EMAIL_RECIPIENTS = tuple(
-                    r.strip() for r in rcpt.replace("；", ";").split(";")
-                    if r.strip())
-    except Exception:
-        log.exception("读取邮箱配置失败(使用默认)")
-    return (EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SENDER, EMAIL_AUTH_CODE,
-            EMAIL_RECIPIENTS)
-
-
-def send_email_report(subject, body, recipients=None):
-    """发送文本邮件（纯标准库）。返回实际收件人元组。"""
-    import smtplib
-    import ssl
-    from email.header import Header
-    from email.mime.text import MIMEText
-    host, port, sender, auth, rcpts = _load_email_cfg()
-    rcpts = tuple(recipients) if recipients else rcpts
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = Header(subject, "utf-8")
-    msg["From"] = sender
-    msg["To"] = ", ".join(rcpts)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
-        s.login(sender, auth)
-        s.sendmail(sender, rcpts, msg.as_string())
-    log.info("邮件已发送: %s -> %s", subject, rcpts)
-    return rcpts
-
-
 # ================= GUI =================
 
 class Chart(tk.Canvas):
@@ -6425,7 +6520,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("股票形态相似度预测工具 · 增强版")
-        # 窗口尺寸自适应屏幕分辨率（不超出屏幕可用区域）
+        # 窗口尺寸自适应屏幕分辨率；桌面端默认最大化，面板高度按比例分配
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         # 小屏模式：2.4寸等触摸小屏（宽≤700 或 高≤500）自动全屏 + 精简布局
@@ -6436,9 +6531,24 @@ class App:
             self.PANEL_H = {"main": int(sh * 0.44), "vol": int(sh * 0.13),
                             "ind": int(sh * 0.18)}
         else:
-            w = max(900, min(1280, sw - 24))
-            h = max(600, min(810, sh - 60))
-        root.geometry(f"{w}x{h}")
+            w, h = sw, sh
+            body_h = max(520, h - int(h * 0.30))
+            self.PANEL_H = {"main": int(body_h * 0.60),
+                            "vol": int(body_h * 0.15),
+                            "ind": int(body_h * 0.23)}
+            root.minsize(1000, 640)
+            root.geometry(f"{w}x{h}+0+0")
+            try:
+                root.attributes("-zoomed", True)    # 桌面默认最大化
+            except tk.TclError:
+                pass                                # 个别 WM 不支持则用全屏尺寸
+            root.bind("<F11>", self._toggle_fullscreen)
+            root.bind("<Escape>", lambda e: self._exit_fullscreen())
+        # 文本区比例：右侧参考面板宽度 / 自选池宽度 / 底部日志行数随屏幕缩放
+        self._rt_chars = 38 if self.compact else max(32, min(56, sw // 45))
+        self._wf_width = max(160, min(230, sw // 10))
+        self._bottom_lines = (5 if self.compact
+                              else max(6, min(12, sh // 130)))
         self.settings = {"theme": "dark", "updown": "red_up"}
         self.api_key = ""
         self.watchlist = []
@@ -6497,6 +6607,34 @@ class App:
         self._safe_after(30000, self._index_loop)
         self._safe_after(self.REFRESH_MS, self._auto_refresh)   # 15分钟完整重分析
         self._safe_after(self.TICK_MS, self._tick)              # 5秒行情快照
+
+    def _toggle_fullscreen(self, _e=None):
+        """F11：进入/退出全屏；退出后回到最大化。"""
+        try:
+            cur = bool(self.root.attributes("-fullscreen"))
+        except Exception:
+            cur = False
+        try:
+            self.root.attributes("-fullscreen", not cur)
+            if cur:
+                try:
+                    self.root.attributes("-zoomed", True)
+                except tk.TclError:
+                    pass
+        except Exception:
+            log.exception("切换全屏失败")
+
+    def _exit_fullscreen(self, _e=None):
+        """Esc：若处于全屏则退回最大化（非全屏时不拦截）。"""
+        try:
+            if self.root.attributes("-fullscreen"):
+                self.root.attributes("-fullscreen", False)
+                try:
+                    self.root.attributes("-zoomed", True)
+                except tk.TclError:
+                    pass
+        except Exception:
+            pass
 
     def _style_ttk(self):
         style = ttk.Style(self.root)
@@ -6713,7 +6851,7 @@ class App:
             self._rt_content.pack(fill="both", expand=True)
 
             pred = tk.Frame(self._rt_content, bg=DARK_BG)
-            self.side_txt = tk.Text(pred, width=38,
+            self.side_txt = tk.Text(pred, width=self._rt_chars,
                                     font=("Microsoft YaHei", 9),
                                     relief="flat", bg=PANEL_BG, fg=FG_MAIN,
                                     insertbackground=FG_MAIN,
@@ -6734,7 +6872,7 @@ class App:
             wf = ttk.LabelFrame(body, text=" 自选池 ", padding=4)
             wf.pack(side="left", fill="y", padx=(8, 2), pady=2)
             wf.pack_propagate(False)
-            wf.config(width=170)
+            wf.config(width=self._wf_width)
 
             self._wf_content = tk.Frame(wf, bg=DARK_BG)
             self._wf_content.pack(fill="both", expand=True)
@@ -6805,7 +6943,7 @@ class App:
         bottom = tk.Frame(self.root, bg=DARK_BG)
         bottom.pack(fill="both", padx=8, pady=(2, 6))
         self._w_bottom = bottom
-        self.txt = tk.Text(bottom, height=5 if self.compact else 8,
+        self.txt = tk.Text(bottom, height=self._bottom_lines,
                            font=("Consolas", 9),
                            bg="#12171d", fg="#cfd8e0",
                            insertbackground=FG_MAIN, relief="flat",
@@ -6928,7 +7066,6 @@ class App:
                     font=("Microsoft YaHei", 10))
         m.add_command(label="复制报告", command=self.copy_report)
         m.add_command(label="导出报告", command=self.export_report)
-        m.add_command(label="邮件发报告", command=self.mail_report)
         m.add_command(label="样本明细", command=self.show_samples)
         m.add_command(label="五大指数", command=self._open_idx_window)
         if CACHE_OK:
@@ -7256,6 +7393,14 @@ class App:
         win.title(f"策略消融选择 - {full}")
         win.configure(bg=DARK_BG)
         win.transient(self.root)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.minsize(820, 560)
+        win.geometry(f"{min(1100, max(820, int(sw * 0.55)))}x"
+                     f"{min(1000, max(560, int(sh * 0.80)))}")
+        win.resizable(True, True)
+        # 按钮栏先占底部，避免被上方可滚动区挤没
+        btns = ttk.Frame(win)
+        btns.pack(side="bottom", fill="x", pady=10)
         ttk.Label(win, text=(
             f"基于近{abl['bars']}个交易日回测选策略 "
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
@@ -7284,9 +7429,19 @@ class App:
         cv.configure(yscrollcommand=sbar.set)
         cv.pack(side="left", fill="both", expand=True, padx=(12, 0))
         sbar.pack(side="right", fill="y")
+        # 单元格宽度跟随窗口，拉伸后不空/不挤
+        cv.bind("<Configure>",
+                lambda e: cv.itemconfigure("box", width=max(300, e.width)))
 
         sel_var = tk.StringVar(value=rec)
         order = ("保守", "稳健", "激进")
+        try:
+            _st = ttk.Style(win)
+            _st.configure("Strat.TRadiobutton",
+                          font=("Microsoft YaHei", 10),
+                          background=DARK_BG, foreground=FG_MAIN)
+        except Exception:
+            pass
 
         def _fmt(v, pct=True):
             if v is None:
@@ -7314,7 +7469,8 @@ class App:
                             highlightthickness=1)
             cell.pack(fill="x", padx=2, pady=4)
             rbtn = ttk.Radiobutton(cell, text=txt, value=mode,
-                                   variable=sel_var)
+                                   variable=sel_var,
+                                   style="Strat.TRadiobutton")
             rbtn.pack(anchor="w", padx=8, pady=6)
 
         _fitting = [False]
@@ -7326,12 +7482,6 @@ class App:
             try:
                 box.update_idletasks()
                 cv.configure(scrollregion=cv.bbox("all"))
-                h = min(box.winfo_reqheight() + 190,
-                        int(self.root.winfo_screenheight() * 0.85))
-                w = min(max(box.winfo_reqwidth() + 60, 520),
-                        int(self.root.winfo_screenwidth() * 0.95))
-                cv.configure(width=w - 30, height=max(200, h - 170))
-                win.geometry(f"{w}x{h}")
             finally:
                 _fitting[0] = False
         box.bind("<Configure>", _fit)
@@ -7363,9 +7513,8 @@ class App:
             sel_var.set(abl.get("recommend", "稳健"))
             apply()
 
-        btns = ttk.Frame(win)
-        btns.pack(pady=10)
-        ttk.Button(btns, text="应用所选策略", command=apply).pack(
+        btns2 = btns
+        ttk.Button(btns2, text="应用所选策略", command=apply).pack(
             side="left", padx=6)
         ttk.Button(btns, text=f"用推荐档({abl.get('recommend', '稳健')})",
                    command=use_recommend).pack(side="left", padx=6)
@@ -8777,33 +8926,6 @@ class App:
                     f"QQ：{AUTHOR_QQ}\n{DISCLAIMER}\n")
         self.progress_var.set(f"已导出: {fn}")
 
-    def mail_report(self):
-        """把当前预测报告邮件发送到配置的收件箱。"""
-        if not self.res:
-            messagebox.showinfo("提示", "请先【分析预测】一只股票")
-            return
-        self.progress_var.set("正在发送邮件...")
-        code = self.res["full_code"]
-
-        def fn():
-            body = self._report_text() + "\n\n-- 相似样本明细 --\n"
-            for s in self.res["samples"]:
-                body += json.dumps(s, ensure_ascii=False) + "\n"
-            body += (f"\n作者：{AUTHOR}  邮箱：{AUTHOR_EMAIL}  "
-                     f"QQ：{AUTHOR_QQ}\n{DISCLAIMER}\n")
-            return send_email_report(
-                f"股票预测报告 {code} {time.strftime('%Y-%m-%d %H:%M')}",
-                body)
-
-        def done(ok, err):
-            if err:
-                self.progress_var.set(f"邮件发送失败: {err}")
-                messagebox.showerror("邮件发送失败", str(err))
-            else:
-                self.progress_var.set(
-                    f"报告已发送: {code} -> {', '.join(ok)}")
-        self._run_bg(fn, done)
-
     def show_samples(self):
         if not self.res:
             return
@@ -8906,7 +9028,10 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("工具")
         win.configure(bg=DARK_BG)
-        win.geometry("620x520")
+        _sh = self.root.winfo_screenheight()
+        win.geometry(f"680x{min(780, max(560, int(_sh * 0.62)))}")
+        win.minsize(560, 480)
+        win.resizable(True, True)
         win.transient(self.root)
         win.grab_set()
 
@@ -8917,9 +9042,11 @@ class App:
         f_bt = ttk.Frame(nb, padding=10)
         nb.add(f_bt, text=" 信号胜率 ")
 
-        bt_result = tk.Text(f_bt, height=18, bg=PANEL_BG, fg=FG_MAIN,
+        bt_result = tk.Text(f_bt, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
                             wrap="word", state="disabled")
+        bt_bar = ttk.Frame(f_bt)
+        bt_bar.pack(side="bottom", fill="x")     # 先占底部，避免被 Text 挤没
         bt_scroll = ttk.Scrollbar(f_bt, command=bt_result.yview)
         bt_result.configure(yscrollcommand=bt_scroll.set)
         bt_scroll.pack(side="right", fill="y")
@@ -8951,24 +9078,26 @@ class App:
                     f"  每日最多一个B/S标记，仅供参考。\n")
             bt_result.config(state="disabled")
 
-        btn_bt = tk.Button(f_bt, text="计算胜率", command=run_bt,
+        btn_bt = tk.Button(bt_bar, text="计算胜率", command=run_bt,
                            bg=BTN_BG, fg=BTN_FG,
                            activebackground=BTN_HOVER, activeforeground=BTN_FG,
                            relief="flat", cursor="hand2",
                            font=("Microsoft YaHei", 10, "bold"))
-        btn_bt.pack(pady=6, ipadx=16, ipady=4)
-        tk.Button(f_bt, text="重选策略(消融回测)", command=self._rerun_strategy,
+        btn_bt.pack(pady=(6, 2), ipadx=16, ipady=4)
+        tk.Button(bt_bar, text="重选策略(消融回测)", command=self._rerun_strategy,
                   bg=BTN_BG, fg=BTN_FG,
                   activebackground=BTN_HOVER, activeforeground=BTN_FG,
                   relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 10, "bold")).pack(
-                      pady=2, ipadx=10, ipady=4)
+                      pady=(2, 6), ipadx=10, ipady=4)
 
         # ── AI 分析（多轮对话，共享同一份数据上下文） ──
         f_ai = ttk.Frame(nb, padding=10)
         nb.add(f_ai, text=" AI 分析 ")
 
-        ai_result = tk.Text(f_ai, height=16, bg=PANEL_BG, fg=FG_MAIN,
+        bar = ttk.Frame(f_ai)
+        bar.pack(side="bottom", fill="x", pady=6)   # 先占底部，避免被 Text 挤没
+        ai_result = tk.Text(f_ai, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
                             wrap="word", state="disabled")
         ai_scroll = ttk.Scrollbar(f_ai, command=ai_result.yview)
@@ -9052,8 +9181,6 @@ class App:
                 return
             _call(q)
 
-        bar = ttk.Frame(f_ai)
-        bar.pack(fill="x", pady=6)
         tk.Button(bar, text="开始分析", command=run_ai,
                   bg=BTN_BG, fg=BTN_FG,
                   activebackground=BTN_HOVER, activeforeground=BTN_FG,

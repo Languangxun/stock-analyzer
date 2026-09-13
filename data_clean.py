@@ -275,12 +275,21 @@ def migrate_one(conn, full, name, log=None, force=False, min_bars=100):
     ok, viol, why = _validate(rows, full, name)
     if not ok:
         return f"reject({why or 'viol=%d' % viol})"
-    raw = fetch_raw_last(full)
-    k = (raw / rows[-1][4]) if (raw and rows[-1][4] > 0) else None
     today = time.strftime("%Y-%m-%d")
     bars = [r for r in rows if r[0] < today]
     if not bars:
         return "nodata"
+    raw = fetch_raw_last(full)
+    k = (raw / bars[-1][4]) if (raw and bars[-1][4] > 0) else None
+    # 防止上游截断把长历史覆盖成短历史（对齐 stock_gui 的 min(len,400) 保护）
+    old_n, old_last = conn.execute(
+        "SELECT COUNT(*), MAX(date) FROM daily_bars WHERE code=?",
+        (full,)).fetchone()
+    if not force:
+        if old_n and len(bars) < min(old_n, 400):
+            return f"shrink({len(bars)}<{old_n})"
+        if old_last and bars[-1][0] < old_last:
+            return f"stale({bars[-1][0]}<{old_last})"
     conn.execute("DELETE FROM daily_bars WHERE code=?", (full,))
     conn.executemany(
         "INSERT OR REPLACE INTO daily_bars"

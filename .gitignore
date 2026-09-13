@@ -33,3 +33,13 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# --- 2026-09-13 上证冠军配置入库时的排除项 ---
+# ai-quant 独立子项目（含 .env 密钥，禁止误提交）
+ai-quant/
+# 插件运行数据（交易记录/设置）
+_data/
+# 编辑器配置
+.obsidian/
+# 历史运行日志（保留 oneoff_results 结果）
+research/legacy/logs/

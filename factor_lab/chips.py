@@ -38,14 +38,20 @@ def chip_features_stock(bars, start_idx, params=None):
     valid = np.zeros(n_all, dtype=bool)
     if n < 30:
         return out, valid
-    lo = min(b["low"] for b in bars)
-    hi = max(b["high"] for b in bars)
+    # 因果网格：只用输出窗口(index>=start_idx)之前的热身历史确定 bin 边界
+    # 与换手基准 med_vol，避免历史日筹码分布用到未来价格/成交量
+    base = ([b for i, b in zip(keep, bars) if i < start_idx]
+            if start_idx >= 30 else [])
+    if not base:
+        return out, valid
+    lo = min(b["low"] for b in base)
+    hi = max(b["high"] for b in base)
     if hi <= lo:
         return out, valid
     step = (hi - lo) / nbin
     mids = lo + step * (np.arange(nbin + 1) + 0.5)
     chips = np.zeros(nbin + 1)
-    med_vol = sorted(b["vol"] for b in bars)[n // 2] or 1.0
+    med_vol = sorted(b["vol"] for b in base)[len(base) // 2] or 1.0
     a, cap, floor = p["decay_a"], p["cap"], p["floor"]
     prom = p["prom"]
 

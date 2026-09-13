@@ -67,6 +67,8 @@ def load_all_bars(tail=None):
             "SELECT code, date, open, high, low, close, vol "
             "FROM daily_bars ORDER BY code, date")
         for code, d, o, h, l, c, v in cur:
+            if not c or c <= 0:
+                continue
             by.setdefault(code, []).append(
                 {"date": d, "open": o, "high": h, "low": l, "close": c,
                  "vol": v or 0.0})

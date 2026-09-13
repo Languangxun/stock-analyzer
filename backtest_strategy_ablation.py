@@ -26,8 +26,8 @@ import stock_gui as sg
 from stock_gui import (
     db_conn, _is_etf,
     _sig_macd, _sig_kdj, _sig_rsi, _sig_boll, _sig_ma_trend, _sig_l1_pattern,
-    _composite_signals,
-    _bt_events, _bull_bear_score, _regime_map,
+    _composite_signals, _composite_precompute,
+    _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
     ALGO_LABEL, CFG, get_daily
 )
 
@@ -78,31 +78,46 @@ def _trim_rows(rows, max_bars=1000):
 
 
 def _pick_candidates(cands, key):
-    """按保守/稳健/激进目标从候选中选出最优。"""
-    pool = [c for c in cands if c["train"]["trades"] >= 3]
+    """按保守/稳健/激进目标从候选中选出最优（口径同 GUI run_ablation）。"""
+    MIN_TR = 8
+    pool = [c for c in cands if c["train"].get("trades", 0) >= MIN_TR]
     if not pool:
-        pool = cands
+        pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
+    if not pool:
+        pool = list(cands)
     if not pool:
         return None
+
+    def _calmar(m):
+        return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
+
     if key == "保守":
-        pool.sort(key=lambda c: (c["train"]["mdd"], -c["train"]["winrate"]))
+        # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中按训练集
+        # Calmar 选优；原按 |mdd| 升序的选法 OOS 明显更差。
+        pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
+        if pool2:
+            pool = pool2
+        pool.sort(key=lambda c: -_calmar(c["train"]))
     elif key == "激进":
-        pool.sort(key=lambda c: -c["train"]["ann"])
+        pool.sort(key=lambda c: -c["train"].get("ann", -1))
     else:  # 稳健：收益回撤比
-        pool.sort(key=lambda c: -(c["train"]["ann"] /
-                                   max(abs(c["train"]["mdd"]), 0.05)))
+        pool.sort(key=lambda c: -_calmar(c["train"]))
     return dict(pool[0])
 
 
 def run_ablation_for_stock(args):
     """对单只股票跑完整消融。多进程 worker。"""
-    code, rows, regime = args
+    code, rows = args
+    regime = _load_index_regime()      # 进程内缓存，避免随任务反复 pickle
     rows = _trim_rows(rows)
     n = len(rows)
     if n < 200:
         return None
     val_n = max(200, n // 4)
     split = n - val_n
+
+    # 预计算 ATR(14) 与多维评分指标，所有候选/档位复用（关键提速）
+    atrs = _precompute_atr(rows, 0, n)
 
     # 各基础算法信号发生器
     gens = {
@@ -123,8 +138,8 @@ def run_ablation_for_stock(args):
         if not sigs:
             continue
         for mode, rp in CFG.RISK_PARAMS.items():
-            tr = _bt_events(rows, sigs, rp, 0, split)
-            va = _bt_events(rows, sigs, rp, split, n)
+            tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs)
+            va = _bt_events(rows, sigs, rp, split, n, atrs=atrs)
             if not tr:
                 continue
             bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
@@ -139,16 +154,18 @@ def run_ablation_for_stock(args):
                 "bear": bear,
             })
 
-    # 多维评分 × 3 档风险
+    # 多维评分 × 3 档风险（指标只算一次）
+    comp_pre = _composite_precompute(rows)
     for mode, rp in CFG.RISK_PARAMS.items():
         try:
-            sigs = _composite_signals(rows, rp, idx_chg_by_date=None)
+            sigs = _composite_signals(rows, rp, idx_chg_by_date=None,
+                                      pre=comp_pre)
         except Exception:
             continue
         if not sigs:
             continue
-        tr = _bt_events(rows, sigs, rp, 0, split)
-        va = _bt_events(rows, sigs, rp, split, n)
+        tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs)
+        va = _bt_events(rows, sigs, rp, split, n, atrs=atrs)
         if not tr:
             continue
         bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
@@ -280,7 +297,7 @@ def main(limit=None, max_workers=None):
     done = 0
     skipped = 0
 
-    args_list = [(code, rows, regime) for code, rows in stocks]
+    args_list = [(code, rows) for code, rows in stocks]
     with ProcessPoolExecutor(max_workers=max_workers) as exe:
         futures = {exe.submit(run_ablation_for_stock, a): a[0] for a in args_list}
         for fut in as_completed(futures):

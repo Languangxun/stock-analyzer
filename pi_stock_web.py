@@ -8,8 +8,10 @@
   python3 stock_web.py [--port 8010]
 """
 import argparse
+import html
 import math
 import json
+import re
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +52,19 @@ def normalize_code(code):
     if d[0] in "48":
         return "bj" + d
     raise ValueError(f"不支持的代码: {code}")
+
+
+def _valid_code(full):
+    """校验标准化后的代码：sh/sz/bj + 6 位数字。"""
+    return bool(full) and re.fullmatch(r"(sh|sz|bj)\d{6}", full)
+
+
+def norm_full(code):
+    """标准化并严格校验，防止前缀绕过/参数注入。"""
+    full = normalize_code(code)
+    if not _valid_code(full):
+        raise ValueError(f"代码格式不对: {code}")
+    return full
 
 
 def api_data(full):
@@ -1075,7 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api":
             qs = parse_qs(parsed.query)
             try:
-                full = normalize_code(qs.get("code", [""])[0])
+                full = norm_full(qs.get("code", [""])[0])
                 res = api_data(full)
                 self._send(200, json.dumps(res, ensure_ascii=False),
                            "application/json; charset=utf-8")
@@ -1092,8 +1107,11 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             try:
-                res = analyze_server(normalize_code(code))
-                img_tag = ('<img src="/svg?code=' + code +
+                full = norm_full(code)
+                res = analyze_server(full)
+                cq = html.escape(full, quote=True)
+                txt = html.escape(str(res["text"]))
+                img_tag = ('<img src="/svg?code=' + cq +
                            '" style="max-width:100%" alt="K线图">')
                 body = ("<html><head><meta charset='utf-8'>"
                         "<meta name='viewport' content='width=device-width,"
@@ -1101,21 +1119,22 @@ class Handler(BaseHTTPRequestHandler):
                         "<body style='font-family:Arial;font-size:15px;'>"
                         "<div>" + img_tag + "</div>"
                         "<pre style='white-space:pre-wrap;font-size:15px;"
-                        "line-height:1.6'>" + res +
-                        "</pre><p><a href='/lite?code=" + code + "'>图形版</a>"
+                        "line-height:1.6'>" + txt +
+                        "</pre><p><a href='/lite?code=" + cq + "'>图形版</a>"
                         " | <a href='/'>完整版</a> | "
                         "<a href='/text?code=000725'>京东方A</a></p></body>"
                         "</html>")
                 self._send(200, body)
             except Exception as e:
-                self._send(200, "加载失败: " + str(e), "text/plain")
+                self._send(200, "加载失败: " + html.escape(str(e)),
+                           "text/plain; charset=utf-8")
         elif parsed.path == "/lite" or parsed.path == "/l":
             self._send(200, PAGE_LITE)
         elif parsed.path == "/svg":
             qs = parse_qs(parsed.query)
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             try:
-                res = analyze_server(normalize_code(code))
+                res = analyze_server(norm_full(code))
                 self._send(200, build_svg(res), "image/svg+xml")
             except Exception as e:
                 self._send(404, str(e), "text/plain")
@@ -1125,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             want_bars = qs.get("bars", ["0"])[0] == "1"
             try:
-                res = analyze_server(normalize_code(code))
+                res = analyze_server(norm_full(code))
                 body = res["text"]
                 if want_bars:
                     bl = ["BARS"]
@@ -1148,9 +1167,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8010)
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="监听地址，默认仅本机；对外暴露需显式指定 0.0.0.0")
     args = ap.parse_args()
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"stock_web v2 listening on 127.0.0.1:{args.port}")
+    srv = ThreadingHTTPServer((args.bind, args.port), Handler)
+    print(f"stock_web v2 listening on {args.bind}:{args.port}")
     srv.serve_forever()
 
 

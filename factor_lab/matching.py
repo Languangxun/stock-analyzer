@@ -206,7 +206,7 @@ def _gram_dist(a, b, dim):
     dd += nb[None, :]
     np.maximum(dd, 0.0, out=dd)
     np.sqrt(dd, out=dd)
-    dd /= np.float32(dim)
+    dd /= np.float32(np.sqrt(dim))
     return dd
 
 

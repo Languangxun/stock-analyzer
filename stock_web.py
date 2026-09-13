@@ -8,6 +8,7 @@
   python3 stock_web.py [--port 8010]
 """
 import argparse
+import html
 import math
 import json
 import re
@@ -24,6 +25,29 @@ KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 STATUS_HTML = "/var/www/status/index.html"
 W_WINDOW, TOPK = 10, 10
 DEFAULT_CODE = "000725"
+
+# 简单频率限制：每 IP 每分钟最多 60 次（保护上游行情源）
+_RL_LOCK = threading.Lock()
+_RL_WINDOW = 60.0
+_RL_LIMIT = 60
+_RL = {}
+
+
+def _rate_limited(addr):
+    now = time.time()
+    with _RL_LOCK:
+        bucket = _RL.setdefault(addr, [])
+        # 清窗口外记录
+        bucket[:] = [t for t in bucket if now - t < _RL_WINDOW]
+        if len(bucket) >= _RL_LIMIT:
+            return True
+        bucket.append(now)
+        return False
+
+
+def _valid_code(full):
+    """校验标准化后的代码：sh/sz/bj + 6 位数字。"""
+    return bool(full) and re.fullmatch(r"(sh|sz|bj)\d{6}", full)
 
 
 def http_get(url, retries=3, timeout=15):
@@ -1263,6 +1287,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(time.strftime("%H:%M:%S"), self.address_string(), fmt % args)
 
+    def _client_addr(self):
+        return self.client_address[0]
+
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         data = body.encode("utf-8")
         self.send_response(code)
@@ -1277,6 +1304,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if _rate_limited(self._client_addr()):
+            self._send(429, "请求过于频繁，请稍后再试", "text/plain; charset=utf-8")
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send(200, PAGE)
@@ -1284,11 +1314,13 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             try:
                 full = normalize_code(qs.get("code", [""])[0])
+                if not _valid_code(full):
+                    raise ValueError("非法股票代码")
                 res = api_data(full)
                 self._send(200, json.dumps(res, ensure_ascii=False),
                            "application/json; charset=utf-8")
             except Exception as e:
-                self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False),
+                self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False),
                            "application/json; charset=utf-8")
         elif parsed.path == "/quant/" or parsed.path == "/quant":
             try:
@@ -1300,9 +1332,13 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             try:
-                res = analyze_server(normalize_code(code))
+                full = normalize_code(code)
+                if not _valid_code(full):
+                    raise ValueError("非法股票代码")
+                res = analyze_server(full)
                 text = res["text"] if isinstance(res, dict) else str(res)
-                img_tag = ('<img src="/svg?code=' + code +
+                safe = html.escape(full)
+                img_tag = ('<img src="/svg?code=' + safe +
                            '" style="max-width:100%" alt="K线图">')
                 body = ("<html><head><meta charset='utf-8'>"
                         "<meta name='viewport' content='width=device-width,"
@@ -1310,31 +1346,37 @@ class Handler(BaseHTTPRequestHandler):
                         "<body style='font-family:Arial;font-size:15px;'>"
                         "<div>" + img_tag + "</div>"
                         "<pre style='white-space:pre-wrap;font-size:15px;"
-                        "line-height:1.6'>" + text +
-                        "</pre><p><a href='/lite?code=" + code + "'>图形版</a>"
+                        "line-height:1.6'>" + html.escape(text) +
+                        "</pre><p><a href='/lite?code=" + safe + "'>图形版</a>"
                         " | <a href='/'>完整版</a> | "
                         "<a href='/text?code=000725'>京东方A</a></p></body>"
                         "</html>")
                 self._send(200, body)
             except Exception as e:
-                self._send(200, "加载失败: " + str(e), "text/plain")
+                self._send(400, "加载失败: " + str(e), "text/plain")
         elif parsed.path == "/lite" or parsed.path == "/l":
             self._send(200, PAGE_LITE)
         elif parsed.path == "/svg":
             qs = parse_qs(parsed.query)
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             try:
-                res = analyze_server(normalize_code(code))
+                full = normalize_code(code)
+                if not _valid_code(full):
+                    raise ValueError("非法股票代码")
+                res = analyze_server(full)
                 self._send(200, build_svg(res), "image/svg+xml")
             except Exception as e:
-                self._send(404, str(e), "text/plain")
+                self._send(400, str(e), "text/plain")
         elif parsed.path == "/e63":
             # E63/PyS60 转接端点：纯文本报告（+可选紧凑K线数据）
             qs = parse_qs(parsed.query)
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             want_bars = qs.get("bars", ["0"])[0] == "1"
             try:
-                res = analyze_server(normalize_code(code))
+                full = normalize_code(code)
+                if not _valid_code(full):
+                    raise ValueError("非法股票代码")
+                res = analyze_server(full)
                 body = res["text"]
                 if want_bars:
                     bl = ["BARS"]
@@ -1347,7 +1389,7 @@ class Handler(BaseHTTPRequestHandler):
                     body += "\n@@" + "\n".join(bl)
                 self._send(200, body, "text/plain; charset=utf-8")
             except Exception as e:
-                self._send(200, "ERR " + str(e), "text/plain; charset=utf-8")
+                self._send(400, "ERR " + str(e), "text/plain; charset=utf-8")
         elif parsed.path == "/healthz":
             self._send(200, "ok", "text/plain")
         else:
@@ -1357,9 +1399,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8010)
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="监听地址，默认仅本机；公网部署请显式指定 0.0.0.0")
     args = ap.parse_args()
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"stock_web v2 listening on 127.0.0.1:{args.port}")
+    srv = ThreadingHTTPServer((args.bind, args.port), Handler)
+    print(f"stock_web v2 listening on {args.bind}:{args.port}")
     srv.serve_forever()
 
 

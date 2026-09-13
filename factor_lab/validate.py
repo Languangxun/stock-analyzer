@@ -83,13 +83,16 @@ def stability_selection(base_w, S, G, YY, train_days, b=30, prefix=8,
     return counts / b, pos_freq / b
 
 
-def lasso_select(X, Y1, train_rows, seed=3, alpha_max=1e-1):
+def lasso_select(X, Y1, train_rows, seed=3, alpha_max=1e-1, date_ord=None):
     from sklearn.linear_model import LassoCV
     from sklearn.model_selection import TimeSeriesSplit
     rng = np.random.RandomState(seed)
     n = min(300000, train_rows.sum())
     idx = np.nonzero(train_rows)[0]
     idx = rng.choice(idx, size=n, replace=False)
+    if date_ord is not None:
+        # 抽样会打乱时间顺序；按日期重排后再做 TimeSeriesSplit，避免时序CV泄漏
+        idx = idx[np.argsort(date_ord[idx], kind="stable")]
     m = LassoCV(cv=TimeSeriesSplit(5),
                 alphas=np.logspace(-4, np.log10(alpha_max), 16),
                 max_iter=3000, n_jobs=-1)
@@ -151,12 +154,13 @@ def portfolio(score, y, rd, day_idx, q=0.1, cost=0.001, mode="long"):
         order = np.argsort(-s)
         top = set(idx[order[:k]].tolist())
         bot = set(idx[order[-k:]].tolist())
-        t = (len(top - prev_top) + len(bot - prev_bot)) / (2 * k)
-        turn.append(t)
         if mode == "long":
+            t = len(top - prev_top) / k
             r = y[list(top)].mean() - cost * t
         else:
+            t = (len(top - prev_top) + len(bot - prev_bot)) / (2 * k)
             r = (y[list(top)].mean() - y[list(bot)].mean()) - cost * t
+        turn.append(t)
         rets.append(r)
         prev_top, prev_bot = top, bot
     rets = np.array(rets)
@@ -339,7 +343,7 @@ def run():
                   f"{'+'.join(f['factors'][:5])}...")
 
     print("\n=== LASSO 选因子（训练段, TimeSeriesSplit）===")
-    las = lasso_select(Xo, p["Y1"], np.isin(rd, tr_days))
+    las = lasso_select(Xo, p["Y1"], np.isin(rd, tr_days), date_ord=rd)
     lasso_mask = 0
     for i in range(K):
         if FACTOR_NAMES[i] in las["factors"]:
@@ -431,9 +435,13 @@ def run():
     n_pass, thr = bh_fdr(pvals, 0.05)
     print(f"\n多重检验：训练Top{n_top}组合在验证段 BH-FDR q<0.05 通过 "
           f"{n_pass} 个（阈值 p≤{thr:.2e}）")
-    tm = z["train_mean"][z["train_n"] >= 30]
-    vmv = z["val_mean"][z["val_n"] >= 30]
-    corr_tv = float(np.corrcoef(tm, vmv)[0, 1])
+    m_tv = (z["train_n"] >= 30) & (z["val_n"] >= 30)
+    if int(m_tv.sum()) >= 2:
+        tm = z["train_mean"][m_tv]
+        vmv = z["val_mean"][m_tv]
+        corr_tv = float(np.corrcoef(tm, vmv)[0, 1])
+    else:
+        corr_tv = None
 
     print("\n=== 逐股时序交叉验证（验证段）===")
     psc = per_stock_check(Xo, p["Y1"], rd, p["code"],
