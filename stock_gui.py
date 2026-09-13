@@ -7001,21 +7001,44 @@ class App:
         if not picks:
             lb.insert("end", "今日缓存中无入围股票（无买入阈值以上评分）")
             return
+        # 账户上下文（插件未装/未填本金 → None，自动降级为纯分析）
+        ctx = self._plugin_account()
+        cash = None
+        self._picks_rows = {}
+        if ctx:
+            cash = float(ctx.get("cash") or 0.0)
+            lb.insert("end", f"账户：本金 ¥{ctx.get('capital', 0):,.0f} | "
+                             f"可用现金 ¥{cash:,.0f} | 持仓 "
+                             f"{len(ctx.get('positions') or {})} 只 "
+                             "（买不起的仅正常分析，不做账户联动）")
         lb.insert("end", f"{'代码':<10}{'名称':<8}{'收盘':>8}{'涨跌':>7}"
                          f"{'评分':>5}  理由")
         self._picks_codes = []
         for code, name, close, chg, score, reasons, band in picks:
+            note = ""
+            if ctx:
+                held = (ctx.get("positions") or {}).get(code)
+                if held and held.get("volume"):
+                    note += f" 持{held['volume']}股"
+                lot_cost = float(close or 0) * 100.0
+                if lot_cost > 0:
+                    if lot_cost <= cash:
+                        note += f" 可买{int(cash // lot_cost)}手"
+                    else:
+                        note += " 买不起"
+            idx = lb.size()
             lb.insert("end", f"{code:<10}{name[:6]:<8}{close:>8.2f}"
                              f"{chg:>+6.1f}%{score:>4}  {reasons[:30]}"
-                             f"  波段{band:.0f}")
+                             f"  波段{band:.0f}{note}")
+            self._picks_rows[idx] = code
             self._picks_codes.append(code)
         lb.insert("end", "")
         lb.insert("end", "双击某行 → 直接分析该股")
 
         def pick(_e=None):
             sel = lb.curselection()
-            if sel and sel[0] < len(self._picks_codes):
-                code = self._picks_codes[sel[0]]
+            if sel and sel[0] in self._picks_rows:
+                code = self._picks_rows[sel[0]]
                 win.destroy()
                 self.code_var.set(code)
                 self.run()
@@ -7142,6 +7165,25 @@ class App:
                 fn(*args)
             except Exception:
                 log.exception("插件 %s.%s 失败", getattr(p, "name", "?"), hook)
+
+    def _plugin_account(self):
+        """读取插件账户上下文（约定：插件实现 ``account_context()``）。
+
+        无插件 / 插件未填本金（available=False）/ 读取异常 → 返回 None，
+        调用方按普通分析处理（自动降级）。"""
+        for p in getattr(self, "_plugins", []) or []:
+            fn = getattr(p, "account_context", None)
+            if not callable(fn):
+                continue
+            try:
+                ctx = fn()
+            except Exception:
+                log.exception("插件 %s.account_context 失败",
+                              getattr(p, "name", "?"))
+                continue
+            if ctx and ctx.get("available"):
+                return ctx
+        return None
 
     def _on_close(self):
         """窗口关闭：先让插件保存，再销毁。"""

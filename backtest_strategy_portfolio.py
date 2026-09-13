@@ -13,14 +13,15 @@
 
 新三档（2026-09-13 定版，保守废弃）：
   稳健 = 原稳健选型（Calmar；不启用弱市覆盖）
-  均衡 = 原激进选型（裸配置，无覆盖）——所有新实验的对照 baseline 之一
-  激进 = 原激进选型 + 弱市覆盖（ATR×0.5, mkt5<-0.6%，弱市停开仓）= 上证冠军配置
-  冠军数据：val OOS +14.3%/-12.5%（Calmar 1.14）vs 上证 +10.3%/-11.3%；
-            全样本 1000 日 +12.8%/-28.0%（Calmar 0.46）vs 上证 +4.7%/-20.4%。
+  均衡 = 原激进选型 + 弱市覆盖（弱市收紧止损 + 停开仓）= 上证冠军配置
+  激进 = 冠军逻辑的「不停开仓」版（最大参与，弱市只收紧止损）+ 放开涨停买入；
+         全样本 1000 日 +34.2%/-17.0%/Calmar 2.01（已验证配置最优），val +11.3%
+  冠军数据：均衡 val OOS +14.3%/-12.5%（Calmar 1.14）vs 上证 +10.3%/-11.3%；
+            全样本 1000 日 激进 +34.2%/-17.0%（Calmar 2.01）vs 上证 +4.7%/-20.4%。
 
 用法：
   python backtest_strategy_portfolio.py --tier all --segment val --benchmark sh000001
-  python backtest_strategy_portfolio.py --tier 均衡 --mode sleeve
+  python backtest_strategy_portfolio.py --tier 稳健 --mode sleeve
 """
 import argparse
 import datetime as _dt
@@ -45,8 +46,13 @@ SLOT_CFG = {
     "均衡": {"frac": 0.33, "max_pos": 4},
     "激进": {"frac": 0.33, "max_pos": 4},
 }
-# 激进档冠军 baseline：弱市覆盖（-0.6% 阈值、ATR×0.5、弱市停开仓）
+# 均衡档冠军 baseline：弱市覆盖（-0.6% 阈值、ATR×0.5、弱市停开仓）
 BASELINE_WEAK = {"th": -0.006, "scale": 0.5, "skip": True}
+# 激进档（2026-09-13 效果优先定版）：同冠军逻辑但不停开仓（最大参与），
+# 全样本 1000 日 +34.2%/-17.0%/Calmar 2.01 为已验证配置最优。
+BASELINE_WEAK_AGGR = {"th": -0.006, "scale": 0.5, "skip": False}
+# 冠军覆盖默认挂在哪一档（2026-09-13：原激进→均衡）
+OVERLAY_TIER = "均衡"
 _GEN = {
     "macd": sg._sig_macd, "kdj": sg._sig_kdj, "rsi": sg._sig_rsi,
     "boll": sg._sig_boll, "ma_trend": sg._sig_ma_trend,
@@ -184,13 +190,13 @@ def build_matrices(results, keep_idx, cal):
     return M, buy, sell, rps
 
 
-def market_weak_mask(cal, thr):
-    """按上证指数近5日日均收益 < thr 生成弱市日历掩码。thr=None 全 False。"""
+def market_weak_mask(cal, thr, index="sh000001"):
+    """按指数近5日日均收益 < thr 生成弱市日历掩码。thr=None 全 False。"""
     mask = np.zeros(len(cal), bool)
     if thr is None:
         return mask
     try:
-        rows = sg.get_daily("sh000001")
+        rows = sg.get_daily(index)
     except Exception:
         return mask
     ret = {}
@@ -246,8 +252,41 @@ def benchmark_metrics(code, cal):
             if sd > 1e-12 else None, "days": len(cal)}
 
 
+def index_timing_mask(cal, code, ma_w=60):
+    """指数趋势闸门（防前视）：第 t 日是否在场 = 截至 t-1 收盘 > MA(ma_w)。
+    返回 bool 数组（True=在场可持仓/开仓）。"""
+    try:
+        rows = sg.get_daily(code)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    cl = {r["date"]: (r.get("close") or 0.0) for r in rows}
+    vals, last = [], None
+    for d in cal:
+        v = cl.get(d)
+        if v:
+            last = v
+        vals.append(last)
+    if not vals or not vals[0]:
+        return None
+    n = len(vals)
+    mask = np.zeros(n, bool)
+    for t in range(n):
+        # 用 t-1 及以前的数据判断第 t 日是否在场
+        if t < ma_w + 1:
+            continue
+        prev = vals[t - 1]
+        seg = [v for v in vals[:t] if v][-ma_w:]
+        if len(seg) < ma_w or not prev:
+            continue
+        mask[t] = prev > sum(seg) / len(seg)
+    return mask
+
+
 def slot_sim(cal, codes, M, buy, sell, rps, cfg,
-             weak_mask=None, weak_atr_scale=1.0, weak_skip_entry=False):
+             weak_mask=None, weak_atr_scale=1.0, weak_skip_entry=False,
+             invest_mask=None, invest_exit=True, allow_limit_up=False):
     nc, ns = len(cal), len(codes)
     buy_mult, sell_mult = 1.001, 0.999
     cash, pos = 1e6, {}
@@ -258,6 +297,21 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
         upd = np.isfinite(col)
         last_px[upd] = col[upd].astype(np.float64)
         weak = bool(weak_mask[t]) if weak_mask is not None else False
+        risk_off = (invest_mask is not None and not invest_mask[t])
+        if risk_off and invest_exit:
+            # 趋势闸门关闭：全部按收盘平仓（跌停顺延），当日不再开仓
+            for ks in sorted(pos):
+                if not M["has_bar"][ks, t] or not col[ks]:
+                    continue
+                if M["limit_dn"][ks, t]:
+                    continue
+                net = float(col[ks]) * sell_mult
+                cash += pos[ks]["shares"] * net
+                trades.append({"ret": net / pos[ks]["buy_net"] - 1.0,
+                               "pnl": pos[ks]["shares"]
+                               * (net - pos[ks]["buy_net"]),
+                               "hold": t - pos[ks]["t_in"]})
+                del pos[ks]
         for ks in sorted(pos):
             if not M["has_bar"][ks, t]:
                 continue                # 停牌顺延
@@ -294,9 +348,13 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
             else:
                 p["highest"] = max(prev_high, hi)
         if len(pos) < cfg["max_pos"]:
-            cand = np.nonzero(buy[:, t] & M["has_bar"][:, t]
-                              & ~M["limit_up"][:, t])[0]
-            if weak and weak_skip_entry:
+            ok = buy[:, t] & M["has_bar"][:, t]
+            if not allow_limit_up:
+                ok = ok & ~M["limit_up"][:, t]
+            cand = np.nonzero(ok)[0]
+            if risk_off:
+                cand = cand[:0]         # 趋势闸门关闭：当日不开新仓
+            elif weak and weak_skip_entry:
                 cand = cand[:0]         # 弱市只平不开（进场闸门，非仓位缩放）
             if len(cand) > 1:           # 名额不足：低波动优先，保证可复现
                 atrp = np.where(col[cand] > 0,
@@ -434,7 +492,7 @@ def _sleeve_metrics(eq, years, trade_rets, n_stocks):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", default="all",
-                    choices=("保守", "稳健", "激进", "all"))
+                    choices=tuple(TIERS) + ("all",))
     ap.add_argument("--segment", default="val",
                     choices=("train", "val", "all"))
     ap.add_argument("--mode", default="slot",
@@ -451,7 +509,24 @@ def main():
                     help="按训练集目标重选（mdd/calmar/ann），"
                          "如 --select 稳健=calmar；可多次")
     ap.add_argument("--no-overlay", action="store_true",
-                    help="关闭激进档冠军 baseline 的弱市覆盖（等价裸激进=均衡）")
+                    help="关闭均衡档冠军 baseline 的弱市覆盖")
+    ap.add_argument("--universe", default="all",
+                    choices=("all", "chinext", "main"),
+                    help="股票池：all=全A，chinext=创业板(sz30*)，main=主板(sh60/sz00)")
+    ap.add_argument("--weak-index", default="sh000001",
+                    help="弱市判定所用指数（默认上证；创业板策略用 sz399006）")
+    ap.add_argument("--timing-index", default=None,
+                    help="指数趋势闸门（防前视）：如 sz399006；关闭=不启用")
+    ap.add_argument("--timing-ma", type=int, default=60,
+                    help="趋势闸门均线周期（默认 60）")
+    ap.add_argument("--timing-tiers", nargs="*", default=[],
+                    choices=list(TIERS),
+                    help="只对这些档启用趋势闸门（默认全部）")
+    ap.add_argument("--timing-no-exit", action="store_true",
+                    help="闸门关闭时只禁开仓、不平仓（默认清仓）")
+    ap.add_argument("--allow-limit-up-tiers", nargs="*", default=["激进"],
+                    choices=list(TIERS),
+                    help="允许涨停价买入（打板）的档位，默认仅激进")
     ap.add_argument("--tag", default="", help="输出文件后缀标签")
     ap.add_argument("--frac", type=float, default=None,
                     help="覆盖单仓比例（所有档位）")
@@ -512,6 +587,13 @@ def main():
     print(f"  股票 {len(selections)} 只")
     print("加载日K ...")
     stocks = load_stocks(min_bars=400)
+    if args.universe == "chinext":
+        stocks = [(c, r) for c, r in stocks if c.startswith("sz30")]
+        print(f"  创业板股票池: {len(stocks)} 只")
+    elif args.universe == "main":
+        stocks = [(c, r) for c, r in stocks
+                  if c.startswith("sh60") or c.startswith("sz00")]
+        print(f"  主板股票池: {len(stocks)} 只")
     if args.limit:
         stocks = stocks[:args.limit]
     tiers = TIERS if args.tier == "all" else (args.tier,)
@@ -592,22 +674,38 @@ def main():
 
         def _weak_for(tier):
             """该档的 (mask, scale, skip)：显式参数 > --weak-tiers 预设 >
-            激进档冠军 baseline（弱市覆盖+停开仓）；--no-overlay 关闭。"""
+            均衡档冠军 baseline（弱市覆盖+停开仓）；--no-overlay 关闭。"""
             if args.weak_mkt_th is not None:
                 th, sc, sk = (args.weak_mkt_th, args.weak_atr_scale,
                               getattr(args, "weak_skip_entry", False))
             elif tier in getattr(args, "weak_tiers", []):
                 th, sc, sk = (-0.006, 0.5,
                               getattr(args, "weak_skip_entry", False))
-            elif tier == "激进" and not args.no_overlay:
+            elif tier == OVERLAY_TIER and not args.no_overlay:
                 th = BASELINE_WEAK["th"]
                 sc = BASELINE_WEAK["scale"]
                 sk = BASELINE_WEAK["skip"]
+            elif tier == "激进" and not args.no_overlay:
+                th = BASELINE_WEAK_AGGR["th"]
+                sc = BASELINE_WEAK_AGGR["scale"]
+                sk = BASELINE_WEAK_AGGR["skip"]
             else:
                 return None, 1.0, False
             if th not in wmask_cache:
-                wmask_cache[th] = market_weak_mask(cal, th)
+                wmask_cache[th] = market_weak_mask(cal, th,
+                                                   args.weak_index)
             return wmask_cache[th], sc, sk
+
+        timing_mask = None
+        if args.timing_index:
+            timing_mask = index_timing_mask(cal, args.timing_index,
+                                            args.timing_ma)
+            if timing_mask is None:
+                print(f"  趋势闸门 {args.timing_index} 加载失败")
+            else:
+                print(f"  趋势闸门 {args.timing_index} MA{args.timing_ma}: "
+                      f"在场日 {int(timing_mask.sum())}/{len(cal)}"
+                      f"{'（只禁开仓）' if args.timing_no_exit else '（关闭日清仓）'}")
 
         for tier in tiers:
             rp_tier = {k: (rps.get((k, tier))
@@ -615,10 +713,16 @@ def main():
                        for k in range(len(codes_kept))}
             wm, sc, sk = _weak_for(tier)
             if wm is not None:
-                print(f"  [{tier}] 弱市覆盖 ATR×{sc} "
+                print(f"  [{tier}] 弱市覆盖 {args.weak_index} ATR×{sc}"
+                      f"{' 停开仓' if sk else ''} "
                       f"弱市日 {int(wm.sum())}/{len(cal)}")
+            tm = timing_mask if (timing_mask is not None
+                                 and (not args.timing_tiers
+                                      or tier in args.timing_tiers)) else None
             m = slot_sim(cal, codes_kept, M, buy[tier], sell[tier],
-                         rp_tier, slot_cfg[tier], wm, sc, sk)
+                         rp_tier, slot_cfg[tier], wm, sc, sk,
+                         tm, not args.timing_no_exit,
+                         tier in args.allow_limit_up_tiers)
             dist = {}
             for c in codes_kept:
                 sel = selections.get(c, {}).get(tier)

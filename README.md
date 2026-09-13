@@ -1,13 +1,22 @@
-# stock-analyzer
+# stock-analyzer · v5.0
 
 基于**历史形态相似度匹配 + 多维融合 + Walk-Forward 自适应 ML + 量化回测**的 A 股短线统计研究工具。
 
+> **v5.0（2026-09-13）**：新三档（稳健/均衡/激进）+ 激进双引擎（核心+低价彩票）+ 小资金方案（ETF核心/整手/费用建模）+ 基准对标（上证/深证/创业板）+ 插件账户联动（总资产/持仓接入信号）。
 > **个人研究项目，输出仅供历史统计参考，不构成投资建议。**
 > 欢迎交流（联系方式见网站底部）。
 
 ---
 
 ## 重要版本说明
+
+**v5.0 发布（2026-09-13）**
+1. **三档定版**：稳健 / 均衡 / 激进（保守废弃）；均衡 = 上证冠军（原激进 + 弱市覆盖）。
+2. **激进双引擎（新）**：市值核心（top20 等权，低换手）+ 低价彩票袖套（放量急跌右尾），`backtest_aggr_lottery.py`。
+3. **小资金方案（新）**：创业板ETF（sz159915）作可负担核心（可选 MA60 趋势闸门）+ 彩票 ≤10~20%；回测按整数手 / 最低佣金 5 元 / 印花税建模。
+4. **基准对标（新）**：`--benchmark` 输出超额；深证成指/创业板指入库。
+5. **插件账户联动（新）**：交易记录插件可填总资产，荐股列表显示可买手数/持仓，未填自动降级。
+6. **v4 决策层寻优**：保守 `disp_max=0.5`+`Rot-T10only`（+12.4%）、平衡 `exit_p=0.50`；修正 `disp_rank` 全样本排名前视。
 
 **v4.0.2 重大修正（2026-09-11）**：旧版组合级回测存在 `highest` 未逐日更新 bug，导致移动止盈/棘轮止损自 v4.0 起从未真正生效。v3.3 baseline 此前报告的 **+8.4% 年化系 bug 假象**；修正后真实口径为 **-16.0% / -39.0%**（该数字为当时口径；2026-09-13 进一步修复后组合数字已重算，见下文）。
 
@@ -56,6 +65,39 @@ python backtest_strategy_portfolio.py --tier 均衡 --segment val --benchmark sh
 # 全样本 1000 日
 python backtest_strategy_portfolio.py --tier all --segment all --min-active 1000 --benchmark sh000001
 ```
+
+### v5.0 激进双引擎（创业板 · 2026-09-13）
+
+> 脚本：`backtest_aggr_lottery.py`；结果：`research/aggr_lottery_chinext_{val,all}_{final,final_small}.json`。
+> 结构：**核心袖套**（市值 topN 等权、低换手；小资金可用 ETF `sz159915` + MA60 闸门）+
+> **低价彩票袖套**（低价 30% 内、放量 vr>2.0、5 日急跌 < -6%，持有 5~10 日，吃右尾）。
+> 费用口径：滑点 0.1%/边 + 佣金万 2.5（最低 5 元）+ 印花税千 1（卖出）+ 过户费；**整数手约束**（买不起自动跳过）。
+
+| 配置 | val（2025-03-18 ~ 2026-09-04） | 全史（2020-02 ~ 2026-09） |
+|---|---|---|
+| 创业板指基准 | +47.5% / -25.8% | +19.6% / -46.3% |
+| **大资金激进**（100 万：股票核心 top20/每 40 日 + 彩票 10%） | **+48.7% / -22.2%，Calmar 1.40** | **+73.3% / -57.5%，Calmar 0.15** |
+| **小资金激进**（5 万：ETF 核心 MA60 + 彩票 20%） | **+69.6% / -14.0%，Calmar 3.10** | **+98.2% / -28.1%** |
+| 激进档彩票右尾（>20% 单笔概率） | 10~17% | 6~11% |
+
+```bash
+# 大资金：股票核心 + 彩票袖套（创业板）
+python backtest_aggr_lottery.py --universe chinext --segment val \
+  --core-top 20 --core-reb 40 --lot-frac 0.10 --lot-k 10 --lot-hold 10 \
+  --vr 2.0 --drop -0.06 --capital 1000000
+# 小资金：ETF 核心（MA60）+ 彩票（1 万起可用，一手约 334 元）
+python backtest_aggr_lottery.py --universe chinext --segment val \
+  --core-etf sz159915 --core-etf-ma 60 --lot-frac 0.20 --lot-k 2 --lot-hold 5 \
+  --vr 2.0 --drop -0.06 --capital 50000
+```
+
+> **诚实提示**：① 低价彩票单独使用全史为负（只能小比例增强右尾）；② 小资金做股票核心受整手粒度限制（1 万难复制 top20，实测 val +20% 仍输指数），ETF 核心是小资金可行解；③ 强单边趋势段 MA60 择时会跑输买入持有（2025-08 起窗口 ETF MA60 -0.9% vs 持有 +43.8%）。
+
+### 插件账户联动（v5.0）
+
+- 交易记录插件（`plugins/trade_log.py`）面板「本金」填写总资产 → 每日荐股自动标注 `可买N手` / `持X股`，顶部显示账户摘要；
+- 未装插件 / 未填本金 / 读取异常 → **自动降级为纯分析**；买不起（100 股一手 > 可用现金）的标的照常展示、不做账户联动；
+- 接口约定见 `PLUGIN_API.md` 4.5（插件实现 `account_context()`，宿主探测读取）。
 
 默认运行环境：`numpy=2.4.6  sklearn=1.9.0  lightgbm=4.7.0`
 
@@ -553,6 +595,8 @@ python stock_gui.py
 | `backtest_strategy_portfolio.py` | 新三档组合回测（slot 槽位 / sleeve 袖套；`--benchmark` 指数超额、`--min-active` 裁剪稀疏日历；激进档默认冠军弱市覆盖，`--no-overlay` 关闭） |
 | `backtest_v4_entry_exit_opt.py` | v4 三档进入/退出决策层寻优（T12 选参 + S3 留出切片 + 5 折滚动 WF + 平台检查） |
 | `backtest_portfolio_overlay_opt.py` | 每股消融组合的弱市覆盖层寻优（train→val / h1→h2 / h2→h1 三口径 + 平台检查） |
+| `backtest_aggr_lottery.py` | **v5.0 激进双引擎**：核心（股票市值 topN 等权 / ETF+MA60）+ 低价彩票袖套；支持本金化、整数手、最低佣金、`--core-max-price` |
+| `plugins/trade_log.py` | 交易记录插件（v5.0：总资产填写 + `account_context()` 账户联动） |
 | `stock_cache.db` | 本地 SQLite 日K缓存（约 808 万根） |
 | `research/v4_report.json` | **最新全A研究报告**（全指标） |
 | `research/v4_factors.json` | 每股因子表 |

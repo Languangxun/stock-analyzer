@@ -32,6 +32,7 @@ class TradeLogPlugin(StockPlugin):
             "min_commission": 5.0,  # 最低佣金（元）
             "stamp_tax": 0.001,     # 印花税（千1，仅卖出）
             "transfer_fee": 0.00001,  # 过户费（十万1）
+            "capital": 0.0,         # 总资产/本金（0=未填写 → 宿主自动降级）
         }
         self._ai_msgs = []  # AI对话历史
         self.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -110,6 +111,39 @@ class TradeLogPlugin(StockPlugin):
         # 过滤掉已清仓的
         return {k: v for k, v in position.items() if v["volume"] > 0}
 
+    # ------------------------------------------------------------------
+    # 账户上下文（宿主可读；无本金时 available=False，宿主自动降级）
+    # ------------------------------------------------------------------
+    def account_context(self):
+        """返回账户快照给宿主结合信号使用。
+
+        可用现金 = 本金 + 累计卖出 - 累计买入 - 累计费用（不复权、不含市值浮动，
+        持仓市值按宿主提供的现价另算）。未填写本金（<=0）时 available=False。
+        """
+        capital = float(self._settings.get("capital", 0.0) or 0.0)
+        buy = sum(r.get("volume", 0) * r.get("price", 0)
+                  for r in self._records if r.get("type") == "BUY")
+        sell = sum(r.get("volume", 0) * r.get("price", 0)
+                   for r in self._records if r.get("type") == "SELL")
+        fees = sum(r.get("fee", 0) for r in self._records)
+        cash = capital + sell - buy - fees
+        positions = {}
+        for code, pos in self._calc_position().items():
+            positions[code] = {
+                "name": pos.get("name", ""),
+                "volume": int(pos.get("volume", 0)),
+                "avg_cost": (pos["cost"] / pos["volume"]
+                             if pos.get("volume") else 0.0),
+            }
+        return {
+            "available": capital > 0,
+            "capital": capital,
+            "cash": cash,
+            "market_value": None,        # 需要现价，宿主展示层计算
+            "positions": positions,
+            "source": "交易记录插件",
+        }
+
     def build_panel(self, parent):
         """创建面板。"""
         c = self.api.colors()
@@ -141,7 +175,15 @@ class TradeLogPlugin(StockPlugin):
             activebackground=c["BTN_HOVER"], activeforeground=c["BTN_FG"],
             relief="flat", cursor="hand2",
             font=("Microsoft YaHei", 9))
-        self._btn_settings.pack(side="left")
+        self._btn_settings.pack(side="left", padx=(0, 4))
+
+        self._btn_capital = tk.Button(
+            btn_frame, text="本金", command=self._set_capital,
+            bg=c["BTN_BG"], fg=c["BTN_FG"],
+            activebackground=c["BTN_HOVER"], activeforeground=c["BTN_FG"],
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei", 9))
+        self._btn_capital.pack(side="left", padx=(0, 4))
 
         self._btn_ai = tk.Button(
             btn_frame, text="AI分析", command=self._show_ai_dialog,
@@ -157,6 +199,14 @@ class TradeLogPlugin(StockPlugin):
             bg=c["DARK_BG"], fg=c["FG_MAIN"],
             font=("Microsoft YaHei", 9))
         self._pos_label.pack(fill="x", padx=6, pady=2)
+
+        # 本金/可用现金标签
+        self._cap_label = tk.Label(
+            self._frame, text="本金：未设置（点“本金”填写）",
+            justify="left", anchor="nw",
+            bg=c["DARK_BG"], fg=c["FG_MAIN"],
+            font=("Microsoft YaHei", 9))
+        self._cap_label.pack(fill="x", padx=6, pady=2)
 
         # 交易记录列表
         list_frame = tk.Frame(self._frame, bg=c["DARK_BG"])
@@ -217,6 +267,7 @@ class TradeLogPlugin(StockPlugin):
 
         self._update_position_label()
         self._update_summary()
+        self._update_capital_label()
 
     def _update_position_label(self):
         """更新持仓显示。"""
@@ -248,6 +299,35 @@ class TradeLogPlugin(StockPlugin):
             self._summary_label.config(text=text)
         except Exception:
             pass
+
+    def _update_capital_label(self):
+        """更新本金/可用现金显示。"""
+        ctx = self.account_context()
+        try:
+            if not ctx["available"]:
+                self._cap_label.config(text="本金：未设置（点“本金”填写，"
+                                            "未填则不参与信号联动）")
+            else:
+                pos_val = sum(p["volume"] * p["avg_cost"]
+                              for p in ctx["positions"].values())
+                self._cap_label.config(
+                    text=f"本金：¥{ctx['capital']:,.0f} | 可用现金："
+                         f"¥{ctx['cash']:,.0f} | 持仓成本：¥{pos_val:,.0f}")
+        except Exception:
+            pass
+
+    def _set_capital(self):
+        """快速设置总资产（本金）。"""
+        cur = self._settings.get("capital", 0.0) or 0.0
+        val = simpledialog.askfloat(
+            "总资产（本金）",
+            "输入账户总资产（元）\n（0 或留空 = 不启用账户联动，仅正常分析）",
+            initialvalue=cur, minvalue=0.0, parent=self._frame)
+        if val is None:
+            return
+        self._settings["capital"] = float(val)
+        self._save_data()
+        self._update_capital_label()
 
     def _show_add_dialog(self):
         """显示添加交易记录对话框。"""
@@ -466,20 +546,32 @@ class TradeLogPlugin(StockPlugin):
         tk.Label(form, text="（如0.00001为十万1）", bg=c["DARK_BG"], fg=c["FG_MAIN"],
                  font=("Microsoft YaHei", 8)).grid(row=7, column=1, sticky="w")
 
+        # 总资产（本金）
+        tk.Label(form, text="总资产(本金)：", bg=c["DARK_BG"], fg=c["FG_MAIN"],
+                 font=("Microsoft YaHei", 9)).grid(row=8, column=0, sticky="e", pady=4)
+        cap_var = tk.StringVar(value=str(self._settings.get("capital", 0.0)))
+        tk.Entry(form, textvariable=cap_var, width=20,
+                 font=("Microsoft YaHei", 9)).grid(row=8, column=1, pady=4)
+        tk.Label(form, text="（元；0=不启用账户联动，仅正常分析）",
+                 bg=c["DARK_BG"], fg=c["FG_MAIN"],
+                 font=("Microsoft YaHei", 8)).grid(row=9, column=1, sticky="w")
+
         def on_save():
             try:
                 self._settings["commission"] = float(comm_var.get())
                 self._settings["min_commission"] = float(min_comm_var.get())
                 self._settings["stamp_tax"] = float(stamp_var.get())
                 self._settings["transfer_fee"] = float(transfer_var.get())
+                self._settings["capital"] = max(0.0, float(cap_var.get() or 0))
                 self._save_data()
+                self._update_capital_label()
                 messagebox.showinfo("提示", "设置已保存", parent=win)
                 win.destroy()
             except ValueError:
                 messagebox.showwarning("提示", "请输入有效的数值", parent=win)
 
         btn_frame = tk.Frame(form, bg=c["DARK_BG"])
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=(12, 0))
+        btn_frame.grid(row=10, column=0, columnspan=2, pady=(12, 0))
 
         tk.Button(btn_frame, text="保存", command=on_save,
                   bg=c["BTN_BG"], fg=c["BTN_FG"],
@@ -636,6 +728,7 @@ class TradeLogPlugin(StockPlugin):
         try:
             self._frame.config(bg=c["DARK_BG"])
             self._pos_label.config(bg=c["DARK_BG"], fg=c["FG_MAIN"])
+            self._cap_label.config(bg=c["DARK_BG"], fg=c["FG_MAIN"])
             self._summary_label.config(bg=c["DARK_BG"], fg=c["FG_MAIN"])
             self._btn_add.config(bg=c["BTN_BG"], fg=c["BTN_FG"],
                                  activebackground=c["BTN_HOVER"])
