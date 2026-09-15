@@ -13,7 +13,10 @@ backtest_roll_cont.py（连续权益曲线滚动）为准，本脚本仅作补�
   3. Walk-forward 选型：窗口 k 内选最优变体（按 --select 指标），
      看它在窗口 k+1 的样本外表现，与固定默认/事后最优对比。
 
-用法：python backtest_exit_roll.py [--tier 激进] [--win 250] [--step 60]
+口径与 stock_gui.run_v4_research 一致：统一近端 252 日窗口
+（不再按"结束日距最新日 ≤45 天"剔除退市/长停股）。
+
+用法：python backtest_exit_roll.py [--tier 激进] [--win 120] [--step 60]
 """
 import argparse
 import json
@@ -38,6 +41,12 @@ VARIANTS = [
 
 
 def load_mats():
+    """加载预测缓存并重建堆叠矩阵（统一近端 252 日窗口 + 轮动上下文）。
+
+    与 stock_gui.run_v4_research 同口径：不再按"结束日距最新日 ≤45 天"
+    剔除退市/长停股，改为统一近端窗口；窗口内退市持仓按 _V4_STALE_BARS
+    规则由组合模拟自动了结。
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "research", "v4_preds.pkl"), "rb") as f:
         preds = pickle.load(f)["preds"]
@@ -47,13 +56,17 @@ def load_mats():
     mkt, ind = sg._v4_mkt_ind_ctx(ind_of)
     mats = sg._v4_stack(preds)
     sg._v4_attach_rotation(mats[1], mats[0], mats[2], ind_of, mkt, ind)
-    import datetime as _dt
-    last_d = max(r["dates"][-1] for r in preds)
-    _ld = _dt.date.fromisoformat(last_d)
+    all_cal_bt = sorted({d for r in preds for d in r["dates"]})
+    bt_start = all_cal_bt[-252] if len(all_cal_bt) > 252 else all_cal_bt[0]
     rows_bt = [k for k, r in enumerate(preds)
-               if (_ld - _dt.date.fromisoformat(r["dates"][-1])).days <= 45]
+               if r["dates"] and r["dates"][-1] >= bt_start]
     mats_bt = sg._v4_stack_subset([preds[k] for k in rows_bt])
     sg._v4_attach_rotation(mats_bt[1], mats_bt[0], mats_bt[2], ind_of, mkt, ind)
+    _j0 = next((i for i, d in enumerate(mats_bt[0]) if d >= bt_start), 0)
+    if _j0:
+        mats_bt = (mats_bt[0][_j0:],
+                   {k: v[:, _j0:] for k, v in mats_bt[1].items()},
+                   mats_bt[2])
     return mats_bt
 
 
@@ -100,7 +113,8 @@ def med(vals):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", default="激进", choices=("保守", "平衡", "激进"))
-    ap.add_argument("--win", type=int, default=250)
+    ap.add_argument("--win", type=int, default=120,
+                    help="滚动窗口日数（统一近端窗口仅 252 日，默认 120）")
     ap.add_argument("--step", type=int, default=60)
     args = ap.parse_args()
     t0 = time.time()
@@ -109,7 +123,8 @@ def main():
     mats = load_mats()
     cal = mats[0]
     nc = len(cal)
-    print(f"日历 {cal[0]} ~ {cal[-1]}，{nc} 个交易日；候选 {len(VARIANTS)} 个")
+    print(f"统一窗口日历 {cal[0]} ~ {cal[-1]}，{nc} 个交易日；"
+          f"候选 {len(VARIANTS)} 个")
 
     # ---- 1) 全窗 + 分年度 ----
     full = run_variants(mats, args.tier)
@@ -157,34 +172,40 @@ def main():
               f"{s['mdd_min']*100:>+8.1f}%")
 
     # ---- 3) Walk-forward 选型 ----
-    print(f"\n=== Walk-forward 选型（窗口k内选最优 → 看窗口k+1）===")
     wf_out = {}
-    for metric in ("ann", "calmar"):
-        oos_anns, picks = [], []
-        for k in range(K - 1):
-            cur, nxt = win_res[k], win_res[k + 1]
-            best = max(VARIANTS, key=lambda kv: cur["res"][kv[0]][metric]
-                       if cur["res"][kv[0]][metric] is not None else -9e9)[0]
-            picks.append((best, cur["start"], nxt["start"],
-                          nxt["res"][best]["ann"]))
-            oos_anns.append(nxt["res"][best]["ann"])
-        dflt = [win_res[k + 1]["res"]["Full(默认)"]["ann"]
-                for k in range(K - 1)]
-        best_fixed = max(
-            VARIANTS,
-            key=lambda kv: summary[kv[0]]["ann_med"])[0]
-        fixed_oos = [win_res[k + 1]["res"][best_fixed]["ann"]
-                     for k in range(K - 1)]
-        print(f"[按 {metric} 选] OOS年化中位={med(oos_anns)*100:+.1f}% "
-              f"均值={np.mean(oos_anns)*100:+.1f}% | "
-              f"默认Full OOS中位={med(dflt)*100:+.1f}% | "
-              f"事后最优固定({best_fixed}) OOS中位={med(fixed_oos)*100:+.1f}%")
-        for b, s0, s1, a in picks:
-            print(f"   {s0} 选 {b:<22} → {s1} 年化 {a*100:+.1f}%")
-        wf_out[metric] = {"oos_ann_med": med(oos_anns),
-                          "oos_ann_mean": float(np.mean(oos_anns)),
-                          "default_med": med(dflt),
-                          "picks": picks}
+    if K < 2:
+        # 统一窗口仅 252 日：窗口数不足时跳过，避免空统计崩溃
+        print(f"\n=== Walk-forward 选型：滚动窗口仅 {K} 个，跳过"
+              f"（请减小 --win 或 --step）===")
+    else:
+        print(f"\n=== Walk-forward 选型（窗口k内选最优 → 看窗口k+1）===")
+        for metric in ("ann", "calmar"):
+            oos_anns, picks = [], []
+            for k in range(K - 1):
+                cur, nxt = win_res[k], win_res[k + 1]
+                best = max(VARIANTS, key=lambda kv: cur["res"][kv[0]][metric]
+                           if cur["res"][kv[0]][metric] is not None
+                           else -9e9)[0]
+                picks.append((best, cur["start"], nxt["start"],
+                              nxt["res"][best]["ann"]))
+                oos_anns.append(nxt["res"][best]["ann"])
+            dflt = [win_res[k + 1]["res"]["Full(默认)"]["ann"]
+                    for k in range(K - 1)]
+            best_fixed = max(
+                VARIANTS,
+                key=lambda kv: summary[kv[0]]["ann_med"])[0]
+            fixed_oos = [win_res[k + 1]["res"][best_fixed]["ann"]
+                         for k in range(K - 1)]
+            print(f"[按 {metric} 选] OOS年化中位={med(oos_anns)*100:+.1f}% "
+                  f"均值={np.mean(oos_anns)*100:+.1f}% | "
+                  f"默认Full OOS中位={med(dflt)*100:+.1f}% | "
+                  f"事后最优固定({best_fixed}) OOS中位={med(fixed_oos)*100:+.1f}%")
+            for b, s0, s1, a in picks:
+                print(f"   {s0} 选 {b:<22} → {s1} 年化 {a*100:+.1f}%")
+            wf_out[metric] = {"oos_ann_med": med(oos_anns),
+                              "oos_ann_mean": float(np.mean(oos_anns)),
+                              "default_med": med(dflt),
+                              "picks": picks}
 
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, "research", f"v4_exit_roll_{args.tier}.json")

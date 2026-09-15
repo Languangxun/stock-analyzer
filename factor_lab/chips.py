@@ -59,8 +59,10 @@ def chip_features_stock(bars, start_idx, params=None):
         i = keep[k]
         t = min(cap, max(floor, a * (b["vol"] / med_vol)))
         chips *= (1.0 - t)
-        b_lo = max(0, int((b["low"] - lo) / step))
-        b_hi = min(nbin, int((b["high"] - lo) / step))
+        # 网格边界钳制：当前 bar 可能完全低于/高于热身段价格区间
+        # （后复权序列的长历史下的极端情形），避免负索引越界
+        b_lo = min(nbin, max(0, int((b["low"] - lo) / step)))
+        b_hi = min(nbin, max(0, int((b["high"] - lo) / step)))
         if b_hi <= b_lo:
             chips[b_hi] += b["vol"]
         else:

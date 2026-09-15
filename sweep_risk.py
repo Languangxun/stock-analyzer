@@ -75,13 +75,16 @@ for mode, g in GRIDS.items():
         med, bt, atr, tt, tr, info = results[0]
         best_all[mode] = (bt, g["cooldown"], atr, tt, tr)
         print(f"  ★最优: th{bt} cd{g['cooldown']} atr{atr} "
-              f"trail({tt},{tr}) → 年化中位{med*100:+.1f}%\n")
+              f"trail({tt},{tr}) → 年化中位{med*100:+.1f}%")
+        print("    注：★最优为样本内选择，未经独立样本验证\n")
 
 print("=== 最终三档参数 ===")
 for mode, p in best_all.items():
     print(mode, p)
 import json
 with open("risk_sweep_results.json", "w", encoding="utf-8") as f:
-    json.dump({m: {"buy_th": p[0], "cooldown": p[1], "atr_mult": p[2],
-                   "trail_trigger": p[3], "trail_ratio": p[4]}
-               for m, p in best_all.items()}, f, ensure_ascii=False, indent=1)
+    json.dump({"_note": "★最优为样本内选择，未经独立样本验证",
+               **{m: {"buy_th": p[0], "cooldown": p[1], "atr_mult": p[2],
+                      "trail_trigger": p[3], "trail_ratio": p[4]}
+                  for m, p in best_all.items()}},
+              f, ensure_ascii=False, indent=1)

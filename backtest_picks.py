@@ -24,7 +24,11 @@ import stock_gui as sg
 
 
 def load_universe(min_bars=120):
-    """股票池（含名称用于 ST 过滤），只取尾部 600 根。"""
+    """股票池：只剔除 ETF/北交所/历史不足，不按"当前名称/末日价格"预筛。
+
+    注意：ST 历史状态与行业历史分类在库中不可得，这里不再用当前名称过滤
+    （用当前名称剔除 ST 会把"当年非 ST"的股票也提前剔除，属未来信息），
+    行业上下文使用当前分类的近似口径。价格≥2 的仙股过滤改在评估日当天判断。"""
     with sg.db_conn() as conn:
         names = {r[0]: (r[1] or "") for r in
                  conn.execute("SELECT code, name FROM stocks").fetchall()}
@@ -45,10 +49,6 @@ def load_universe(min_bars=120):
     out = []
     for c, r in by.items():
         if len(r) < min_bars or sg._is_etf(c) or c.startswith("bj"):
-            continue
-        if "ST" in names.get(c, "").upper():
-            continue
-        if not r[-1]["close"] or r[-1]["close"] < 2:
             continue
         out.append((c, r, names.get(c, c), ind_of.get(c, "")))
     return out
@@ -80,6 +80,9 @@ def _worker(args):
     for d in evals:
         k = didx.get(d)
         if k is None or k < 60:
+            continue
+        # 仙股过滤用评估日当天收盘价（时点可见），不用回测末日价格
+        if not rows[k]["close"] or rows[k]["close"] < 2:
             continue
         sub = rows[max(0, k - 399):k + 1]
         try:
@@ -197,7 +200,7 @@ def main():
     uni = load_universe()
     if args.limit:
         uni = uni[:args.limit]
-    print(f"  {len(uni)} 只（已剔除 ST/ETF/北交/仙股）")
+    print(f"  {len(uni)} 只（剔除 ETF/北交/历史不足；仙股按评估日当天价格过滤）")
     if not uni:
         raise SystemExit("股票池为空")
     all_dates = sorted({r["date"] for _, rows, _, _ in uni for r in rows})

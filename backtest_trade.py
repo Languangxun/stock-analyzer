@@ -164,6 +164,7 @@ def main():
                        f"胜率{win*100:5.1f}% 组合年化{ann*100:+6.1f}%")
         out.append(f"   ★最优: th>{best[2]*100:.1f}% 胜率{best[1]*100:.1f}% "
                    f"年化{best[0]*100:+.1f}% ({best[3]}笔)")
+        out.append("   （注：★最优为样本内选择，未经独立样本验证）")
         print("\n".join(out))
 
     for name in ("trad_L1", "trad_L1L2行业", "trad_L1L2行业+ETF",

@@ -11,13 +11,19 @@
 
 验证段（--segment val）为样本外：选型只在训练段完成。
 
+口径（2026-09-13 修正，旧成绩作废需重跑）：
+  - 早盘信号：T 日决策只用 T-1 信息（信号映射到执行日+1、ATR 取前一日），
+    T 日收盘执行；止损为前一日挂单、T 日盘中触发合法；
+  - 生存者偏差修复：val 用统一近端 252 日窗口，不再按结束日剔除退市股，
+    窗口内退市/长停持仓按最后收盘价了结（stale_days=20）；
+  - 默认不允许涨停价买入（旧口径可用 --allow-limit-up-tiers 显式恢复）。
+  旧文档中的 +34.2% / val +14.3% 等数字产生于上述修正之前的同根 K 线成交
+  与结束日对齐口径，不可再引用。
+
 新三档（2026-09-13 定版，保守废弃）：
   稳健 = 原稳健选型（Calmar；不启用弱市覆盖）
   均衡 = 原激进选型 + 弱市覆盖（弱市收紧止损 + 停开仓）= 上证冠军配置
-  激进 = 冠军逻辑的「不停开仓」版（最大参与，弱市只收紧止损）+ 放开涨停买入；
-         全样本 1000 日 +34.2%/-17.0%/Calmar 2.01（已验证配置最优），val +11.3%
-  冠军数据：均衡 val OOS +14.3%/-12.5%（Calmar 1.14）vs 上证 +10.3%/-11.3%；
-            全样本 1000 日 激进 +34.2%/-17.0%（Calmar 2.01）vs 上证 +4.7%/-20.4%。
+  激进 = 冠军逻辑的「不停开仓」版（最大参与，弱市只收紧止损）
 
 用法：
   python backtest_strategy_portfolio.py --tier all --segment val --benchmark sh000001
@@ -46,10 +52,11 @@ SLOT_CFG = {
     "均衡": {"frac": 0.33, "max_pos": 4},
     "激进": {"frac": 0.33, "max_pos": 4},
 }
-# 均衡档冠军 baseline：弱市覆盖（-0.6% 阈值、ATR×0.5、弱市停开仓）
+# 均衡档弱市覆盖：-0.6% 阈值、ATR×0.5、弱市停开仓
+# 注意：(ATR×0.5, -0.6%) 是旧口径下用 val/h2 人工选出的参数，统一窗口+
+# 早盘信号修正后需要重新做 train→val 复核，勿把旧 val 数字当 OOS。
 BASELINE_WEAK = {"th": -0.006, "scale": 0.5, "skip": True}
-# 激进档（2026-09-13 效果优先定版）：同冠军逻辑但不停开仓（最大参与），
-# 全样本 1000 日 +34.2%/-17.0%/Calmar 2.01 为已验证配置最优。
+# 激进档（2026-09-13 定版）：同逻辑但不停开仓（最大参与）
 BASELINE_WEAK_AGGR = {"th": -0.006, "scale": 0.5, "skip": False}
 # 冠军覆盖默认挂在哪一档（2026-09-13：原激进→均衡）
 OVERLAY_TIER = "均衡"
@@ -110,7 +117,8 @@ def _seg_range(n, seg):
 # ---------------- slot 模式（v4 式组合） ----------------
 
 def _worker_slot(args):
-    code, rows, sels, seg = args
+    code, rows, sels, seg = args[:4]
+    lo, hi = (args[4] if len(args) > 4 and args[4] else (None, None))
     rows = _trim_rows(rows)
     n = len(rows)
     out = {"code": code, "dates": None, "buy": {}, "sell": {}, "rp": {},
@@ -118,13 +126,24 @@ def _worker_slot(args):
     if n < 200:
         return out
     i0, i1 = _seg_range(n, seg)
+    # 统一近端窗口：按日期把评估段裁到公共窗口（生存者偏差修复）
+    while i0 < i1 and lo and rows[i0]["date"] < lo:
+        i0 += 1
+    while i1 > i0 and hi and rows[i1 - 1]["date"] > hi:
+        i1 -= 1
+    if i1 - i0 < 20:
+        return out
     seg_rows = rows[i0:i1]
     out["dates"] = [r["date"] for r in seg_rows]
     out["o"] = np.array([r["open"] or 0.0 for r in seg_rows], np.float32)
     out["h"] = np.array([r["high"] or 0.0 for r in seg_rows], np.float32)
     out["l"] = np.array([r["low"] or 0.0 for r in seg_rows], np.float32)
     out["c"] = np.array([r["close"] or 0.0 for r in seg_rows], np.float32)
-    out["atr"] = np.array(sg._precompute_atr(rows, 0, n)[i0:i1], np.float32)
+    # 早盘信号：决策在 T 日早盘（只能用 T-1 信息），T 日收盘执行；
+    # 止损单在前一日收盘后设定，故执行日用 T-1 的 ATR
+    atr_full = sg._precompute_atr(rows, 0, n)
+    out["atr"] = np.array([atr_full[j - 1] if j > 0 else 0.0
+                           for j in range(i0, i1)], np.float32)
     dset = {r["date"]: k for k, r in enumerate(seg_rows)}
     for tier in TIERS:
         sel = (sels or {}).get(tier)
@@ -138,9 +157,10 @@ def _worker_slot(args):
             continue
         buys, sells = set(), set()
         for s in sigs:
-            if s[0] < i0 or s[0] >= i1:
+            j = s[0] + 1                 # 执行日 = 信号日 + 1
+            if j < i0 or j >= i1:
                 continue
-            k = dset.get(s[1])
+            k = dset.get(rows[j]["date"])
             if k is None:
                 continue
             (buys if s[2] == "BUY" else sells).add(k)
@@ -286,9 +306,13 @@ def index_timing_mask(cal, code, ma_w=60):
 
 def slot_sim(cal, codes, M, buy, sell, rps, cfg,
              weak_mask=None, weak_atr_scale=1.0, weak_skip_entry=False,
-             invest_mask=None, invest_exit=True, allow_limit_up=False):
+             invest_mask=None, invest_exit=True, allow_limit_up=False,
+             stale_days=20, exec_mode=None):
     nc, ns = len(cal), len(codes)
     buy_mult, sell_mult = 1.001, 0.999
+    # 成交价口径：close=信号次日收盘（默认）；open=信号次日开盘
+    exec_open = ((exec_mode or os.environ.get("EXEC_PX", "close"))
+                 == "open")
     cash, pos = 1e6, {}
     last_px = np.zeros(ns, np.float64)
     eq_curve, trades = [], []
@@ -296,16 +320,21 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
         col = M["close"][:, t]
         upd = np.isfinite(col)
         last_px[upd] = col[upd].astype(np.float64)
-        weak = bool(weak_mask[t]) if weak_mask is not None else False
+        # 早盘信号：T 日执行时，弱市判定只能用 T-1 收盘前信息
+        weak = (bool(weak_mask[t - 1])
+                if (weak_mask is not None and t > 0) else False)
         risk_off = (invest_mask is not None and not invest_mask[t])
         if risk_off and invest_exit:
-            # 趋势闸门关闭：全部按收盘平仓（跌停顺延），当日不再开仓
+            # 趋势闸门关闭：全部平仓（跌停顺延），当日不再开仓
             for ks in sorted(pos):
                 if not M["has_bar"][ks, t] or not col[ks]:
                     continue
                 if M["limit_dn"][ks, t]:
                     continue
-                net = float(col[ks]) * sell_mult
+                px = (float(M["open"][ks, t]) if exec_open else float(col[ks]))
+                if not (px and px > 0):
+                    px = float(col[ks])
+                net = px * sell_mult
                 cash += pos[ks]["shares"] * net
                 trades.append({"ret": net / pos[ks]["buy_net"] - 1.0,
                                "pnl": pos[ks]["shares"]
@@ -314,6 +343,18 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
                 del pos[ks]
         for ks in sorted(pos):
             if not M["has_bar"][ks, t]:
+                p = pos[ks]
+                p["miss"] = p.get("miss", 0) + 1
+                if p["miss"] >= stale_days:
+                    # 退市/长期停牌：按最后已知收盘价了结
+                    px = last_px[ks] if last_px[ks] > 0 else p["entry"]
+                    net = px * sell_mult
+                    cash += p["shares"] * net
+                    trades.append({"ret": net / p["buy_net"] - 1.0,
+                                   "pnl": p["shares"]
+                                   * (net - p["buy_net"]),
+                                   "hold": t - p["t_in"]})
+                    del pos[ks]
                 continue                # 停牌顺延
             p = pos[ks]
             px_c = float(col[ks])
@@ -336,7 +377,7 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
                     px = px_o if px_o <= stop else min(stop, hi)
                     sold = True
                 elif sell[ks, t]:
-                    px = px_c
+                    px = px_o if exec_open else px_c
                     sold = True
             if sold:
                 net = px * sell_mult
@@ -366,7 +407,10 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
                 px_c = float(col[ks])
                 if not px_c:
                     continue
-                buy_net = px_c * buy_mult
+                px_fill = (float(M["open"][ks, t]) if exec_open else px_c)
+                if not (px_fill and px_fill > 0):
+                    px_fill = px_c
+                buy_net = px_fill * buy_mult
                 eq0 = cash + sum(pp["shares"] * last_px[k2]
                                  for k2, pp in pos.items())
                 shares = int(eq0 * cfg["frac"] / buy_net / 100.0) * 100
@@ -374,8 +418,8 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
                     continue
                 cash -= shares * buy_net
                 pos[ks] = {"t_in": t, "shares": shares, "buy_net": buy_net,
-                           "entry": px_c,
-                           "highest": max(px_c, float(M["high"][ks, t]))}
+                           "entry": px_fill,
+                           "highest": px_fill}  # 成交前的盘中高点不计入
         eq_curve.append(cash + sum(pp["shares"] * last_px[k2]
                                    for k2, pp in pos.items()))
     for ks in sorted(pos):
@@ -395,7 +439,8 @@ def slot_sim(cal, codes, M, buy, sell, rps, cfg,
 # ---------------- sleeve 模式（等权独立袖套） ----------------
 
 def _worker_sleeve(args):
-    code, rows, sel, seg = args
+    code, rows, sel, seg = args[:4]
+    lo, hi = (args[4] if len(args) > 4 and args[4] else (None, None))
     if not sel:
         return {"code": code, "curve": None, "trade_rets": [], "sel": None}
     rows = _trim_rows(rows)
@@ -403,6 +448,12 @@ def _worker_sleeve(args):
     if n < 200:
         return {"code": code, "curve": None, "trade_rets": [], "sel": sel}
     i0, i1 = _seg_range(n, seg)
+    while i0 < i1 and lo and rows[i0]["date"] < lo:
+        i0 += 1
+    while i1 > i0 and hi and rows[i1 - 1]["date"] > hi:
+        i1 -= 1
+    if i1 - i0 < 20:
+        return {"code": code, "curve": None, "trade_rets": [], "sel": sel}
     try:
         sigs, rp = _gen_signals(rows, sel)
         if not sigs:
@@ -420,8 +471,8 @@ def _worker_sleeve(args):
             "sel": sel, "d0": rows[i0]["date"], "d1": rows[i1 - 1]["date"]}
 
 
-def run_sleeve(tier, selections, stocks, seg, workers):
-    args = [(c, r, (selections.get(c) or {}).get(tier), seg)
+def run_sleeve(tier, selections, stocks, seg, workers, bounds=(None, None)):
+    args = [(c, r, (selections.get(c) or {}).get(tier), seg, bounds)
             for c, r in stocks]
     curves, trets, d0s, d1s, dist = [], [], [], [], {}
     with ProcessPoolExecutor(max_workers=workers) as exe:
@@ -500,7 +551,10 @@ def main():
     ap.add_argument("--workers", type=int,
                     default=max(1, min(8, os.cpu_count() or 4)))
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--align-days", type=int, default=45)
+    ap.add_argument("--align-days", type=int, default=-1,
+                    help="≥0=旧口径（按测试段结束日对齐，隐含幸存者偏差）；"
+                         "<0=统一近端窗口（默认，窗口内退市股保留、"
+                         "持仓按最后收盘价了结）")
     ap.add_argument("--min-active", type=int, default=0,
                     help="组合日历裁剪：只保留当日有K线股票数≥N 的日期"
                          "（去掉少数长停牌股撑出的稀疏早期日历）")
@@ -524,9 +578,16 @@ def main():
                     help="只对这些档启用趋势闸门（默认全部）")
     ap.add_argument("--timing-no-exit", action="store_true",
                     help="闸门关闭时只禁开仓、不平仓（默认清仓）")
-    ap.add_argument("--allow-limit-up-tiers", nargs="*", default=["激进"],
+    ap.add_argument("--allow-limit-up-tiers", nargs="*", default=[],
                     choices=list(TIERS),
-                    help="允许涨停价买入（打板）的档位，默认仅激进")
+                    help="允许涨停价买入（打板）的档位；默认全不允许"
+                         "（早盘信号+收盘成交下涨停无法保证成交，"
+                         "显式指定可复现旧口径）")
+    ap.add_argument("--exec", dest="exec_px",
+                    default=os.environ.get("EXEC_PX", "close"),
+                    choices=("close", "open"),
+                    help="成交价：close=信号次日收盘（默认）；"
+                         "open=信号次日开盘")
     ap.add_argument("--tag", default="", help="输出文件后缀标签")
     ap.add_argument("--frac", type=float, default=None,
                     help="覆盖单仓比例（所有档位）")
@@ -548,6 +609,8 @@ def main():
                     help="基准指数代码（默认上证 sh000001；传空串禁用），"
                          "输出各档超额年化")
     args = ap.parse_args()
+    os.environ["EXEC_PX"] = args.exec_px     # 供 slot_sim/_bt_events 读取
+    print(f"  成交价口径: {args.exec_px}")
     overrides = {}
     for s in args.select:
         if "=" not in s:
@@ -607,20 +670,45 @@ def main():
         print(f"  槽位覆盖: frac={args.frac} max_pos={args.max_pos}")
     print(f"  股票 {len(stocks)} 只，segment={args.segment}, mode={args.mode}")
 
+    # 生存者偏差修复（默认 align_days<0）：统一近端窗口 252 个交易日，
+    # 窗口内退市/长停股票保留，持仓由 stale_days 规则了结。
+    bounds = (None, None)
+    if args.align_days < 0:
+        idx_dates = [r["date"] for r in sg.get_daily("sh000001")
+                     if r.get("close")]
+        if len(idx_dates) <= 252:
+            raise SystemExit("指数日历不足，无法构建统一窗口")
+        win_i = len(idx_dates) - 252
+        win_start = idx_dates[win_i]
+        prev_start = idx_dates[win_i - 1] if win_i > 0 else None
+        if args.segment == "val":
+            bounds = (win_start, None)
+            print(f"  统一窗口 {win_start} ~ {idx_dates[-1]}")
+        elif args.segment == "train":
+            bounds = (None, prev_start)
+            print(f"  训练段截至统一窗口前一日 ≤{prev_start}")
+        elif args.segment == "all":
+            # 全样本：统一到近端 1000 个交易日，避免退市股的远古片段
+            # （1990s）混入组合日历
+            n_win = min(1000, len(idx_dates) - 1)
+            bounds = (idx_dates[-n_win], None)
+            print(f"  统一窗口（全样本近端{n_win}日） "
+                  f"{idx_dates[-n_win]} ~ {idx_dates[-1]}")
+
     out = {}
     cal = [""]
     if args.mode == "sleeve":
         for tier in tiers:
             print(f"  [{tier}] 等权袖套回测 ...")
             m = run_sleeve(tier, selections, stocks, args.segment,
-                           args.workers)
+                           args.workers, bounds)
             m["selection_dist"] = {ALGO_LABEL.get(k, k): v
                                    for k, v in m["selection_dist"].items()}
             m["tier"] = tier
             out[tier] = m
     else:
         print("生成每股所选策略信号 ...")
-        argl = [(c, r, selections.get(c), args.segment)
+        argl = [(c, r, selections.get(c), args.segment, bounds)
                 for c, r in stocks]
         results = [None] * len(argl)
         with ProcessPoolExecutor(max_workers=args.workers) as exe:
@@ -640,14 +728,19 @@ def main():
         ends = [r["dates"][-1] for r in results if r.get("dates")]
         if not ends:
             raise SystemExit("无有效股票")
-        last_d = max(ends)
-        ld = _dt.date.fromisoformat(last_d)
-        keep_idx = [i for i, r in enumerate(results)
-                    if r.get("dates")
-                    and (ld - _dt.date.fromisoformat(
-                        r["dates"][-1])).days <= args.align_days]
-        print(f"  时间对齐保留 {len(keep_idx)}/{len(results)} 只"
-              f"（测试段结束距 {last_d} ≤{args.align_days} 天）")
+        if args.align_days >= 0:
+            last_d = max(ends)
+            ld = _dt.date.fromisoformat(last_d)
+            keep_idx = [i for i, r in enumerate(results)
+                        if r.get("dates")
+                        and (ld - _dt.date.fromisoformat(
+                            r["dates"][-1])).days <= args.align_days]
+            print(f"  时间对齐保留 {len(keep_idx)}/{len(results)} 只"
+                  f"（测试段结束距 {last_d} ≤{args.align_days} 天）")
+        else:
+            keep_idx = [i for i, r in enumerate(results) if r.get("dates")]
+            print(f"  窗口内有效 {len(keep_idx)}/{len(results)} 只"
+                  f"（窗口内退市股保留，持仓按最后收盘价了结）")
         cal = sorted({d for i in keep_idx for d in results[i]["dates"]})
         if args.half in (1, 2):
             half = len(cal) // 2

@@ -5,6 +5,10 @@
 复用 research/v4_preds.pkl（Walk-Forward 预测与退出规则无关），
 只重跑决策层组合回测，分钟级完成。
 
+口径与 stock_gui.run_v4_research 一致：统一近端 252 日窗口，
+不再按"结束日距最新日 ≤45 天"剔除退市/长停股（生存者偏差修复），
+窗口内退市持仓由 _V4_STALE_BARS 规则按最后收盘价了结。
+
 用法：
   python backtest_exit_ablation.py                 # 激进档
   python backtest_exit_ablation.py --tier 平衡
@@ -20,7 +24,12 @@ import stock_gui as sg
 
 
 def load_mats():
-    """加载预测缓存并重建堆叠矩阵（对齐子样本 + 轮动上下文）。"""
+    """加载预测缓存并重建堆叠矩阵（统一近端 252 日窗口 + 轮动上下文）。
+
+    生存者偏差修复：不再按"测试段结束日距最新日 ≤45 天"剔除退市/长停股，
+    改为统一近端窗口（252 个交易日）；窗口内退市/长停的持仓由
+    stock_gui._v4_portfolio_sim 的 _V4_STALE_BARS 规则按最后收盘价了结。
+    """
     cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "research", "v4_preds.pkl")
     with open(cache, "rb") as f:
@@ -32,13 +41,17 @@ def load_mats():
     mkt, ind = sg._v4_mkt_ind_ctx(ind_of)
     mats = sg._v4_stack(preds)
     sg._v4_attach_rotation(mats[1], mats[0], mats[2], ind_of, mkt, ind)
-    import datetime as _dt
-    last_d = max(r["dates"][-1] for r in preds)
-    _ld = _dt.date.fromisoformat(last_d)
+    all_cal_bt = sorted({d for r in preds for d in r["dates"]})
+    bt_start = all_cal_bt[-252] if len(all_cal_bt) > 252 else all_cal_bt[0]
     rows_bt = [k for k, r in enumerate(preds)
-               if (_ld - _dt.date.fromisoformat(r["dates"][-1])).days <= 45]
+               if r["dates"] and r["dates"][-1] >= bt_start]
     mats_bt = sg._v4_stack_subset([preds[k] for k in rows_bt])
     sg._v4_attach_rotation(mats_bt[1], mats_bt[0], mats_bt[2], ind_of, mkt, ind)
+    _j0 = next((i for i, d in enumerate(mats_bt[0]) if d >= bt_start), 0)
+    if _j0:
+        mats_bt = (mats_bt[0][_j0:],
+                   {k: v[:, _j0:] for k, v in mats_bt[1].items()},
+                   mats_bt[2])
     return mats, mats_bt, len(rows_bt), len(preds)
 
 
@@ -211,7 +224,9 @@ def main():
     t0 = time.time()
     print("加载 v4 预测缓存并重建矩阵 ...")
     _mats, mats_bt, n_bt, n_all = load_mats()
-    print(f"对齐 {n_bt}/{n_all} 只，开始 {len(variants)} 个退出变体 ...")
+    print(f"统一窗口 {mats_bt[0][0]}~{mats_bt[0][-1]} 纳入 {n_bt}/{n_all} 只"
+          f"（窗口内退市/长停持仓按最后收盘价了结），"
+          f"开始 {len(variants)} 个退出变体 ...")
     res = run_variants(mats_bt, args.tier, variants)
     print_table(args.tier, res)
 

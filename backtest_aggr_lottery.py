@@ -9,7 +9,9 @@
             固定持有 N 日，小比例、多仓分散，吃右尾。
 
 规则（防前视，日频权益）：
-  - 信号只用截止当日数据；买入/卖出按当日收盘（含滑点/成本）；
+  - 信号取 T-1（VR/DROP/低价分位），T 日收盘成交（含滑点/成本）；
+  - 旧版「同日信号+同日收盘成交」为前视 bug，已于 2026-09-15 修复，
+    修复后 val 双引擎不再显著跑赢创业板指（见 README v6.0）；
   - 停牌顺延（用最后可得收盘盯市）；ST 与上市不足 min_bars 的票剔除；
   - 无杠杆；空仓允许（现金）。
 
@@ -34,6 +36,13 @@ FIELDS = ("total", "ann", "mdd", "calmar", "sharpe", "trades",
 
 
 def load_universe(prefixes, min_bars=250):
+    """加载股票池并按显示缩放系数把 hfq 价转成乘法前复权（≈现价）口径。
+
+    库内价格为后复权(hfq)，含累计分红因子，跨股票比价会失真；这里给每只
+    乘上 sg._get_adjust 的缩放系数（收益率不变，价格水平≈现价）。缺失
+    系数的股票保持 hfq 原值并计数（低价分位/价格上限可能失真）。
+    本脚本只用 close（比价/收益/股本反推），故仅缩放 close。
+    """
     with sg.db_conn() as conn:
         cap = {c: (m or 0.0) for c, m in
                conn.execute("SELECT code, mktcap FROM stocks")}
@@ -54,15 +63,20 @@ def load_universe(prefixes, min_bars=250):
     C = np.full((n, nc), np.nan)
     V = np.zeros((n, nc))
     shares = np.zeros(n)
+    n_missing_adj = 0
     for r, c in enumerate(codes):
         seq = data[c]
+        adj = sg._get_adjust(c)              # hfq → 乘法前复权（≈现价）
+        if not (adj and adj > 0):
+            n_missing_adj += 1
+            adj = 1.0
         cols = np.array([didx[d] for d, _, _ in seq], np.int64)
-        C[r, cols] = [x[1] for x in seq]
+        C[r, cols] = [x[1] * adj for x in seq]
         V[r, cols] = [x[2] for x in seq]
-        last = seq[-1][1]
+        last = seq[-1][1] * adj              # 缩放后收盘价，与当前市值同口径
         if cap.get(c, 0.0) > 0 and last > 0:
             shares[r] = cap[c] / last
-    return cal, codes, C, V, shares
+    return cal, codes, C, V, shares, n_missing_adj
 
 
 def _roll_mean(A, w):
@@ -241,7 +255,7 @@ def run(cal, C, V, VR, DROP, cap_shares, i0, i1, *, capital=1e6,
                 else:
                     cash += p["cost"]           # 停牌：近似按成本退出
             core = {}
-            cap_now = col * cap_shares
+            cap_now = C[:, d - 1 if d > 0 else d] * cap_shares
             ok = np.isfinite(cap_now) & (cap_now > 0)
             if core_max_price:
                 ok &= (col > 0) & (col <= float(core_max_price))
@@ -273,21 +287,22 @@ def run(cal, C, V, VR, DROP, cap_shares, i0, i1, *, capital=1e6,
                                "cost": amount + fee,
                                "buy": px * (1 + slip)}
                     filled += 1
-        # --- 彩票入场 ---
-        if lot_frac > 0 and lot_k and t % lot_step == 0:
+        # --- 彩票入场（信号取 T-1，T 日收盘成交）---
+        if lot_frac > 0 and lot_k and t % lot_step == 0 and d > 0:
             per = _pos_value() * lot_frac / max(1, lot_k)
             px = col
-            ok = np.isfinite(px) & (px > 0)
-            m = ok & (VR[:, d] >= vr_th) & (DROP[:, d] <= drop_th)
+            prev = C[:, d - 1]
+            ok = np.isfinite(px) & (px > 0) & np.isfinite(prev) & (prev > 0)
+            m = ok & (VR[:, d - 1] >= vr_th) & (DROP[:, d - 1] <= drop_th)
             cand = np.nonzero(m)[0]
             if len(cand) > 1:
-                prices = np.sort(px[ok])
+                prices = np.sort(prev[ok])
                 cut = prices[int(len(prices) * price_q)]
-                cand = np.array([k for k in cand if px[k] <= cut
+                cand = np.array([k for k in cand if prev[k] <= cut
                                  and k not in core
                                  and not any(p["k"] == k for p in lots)])
             if len(cand):
-                cand = cand[np.argsort(DROP[cand, d])]
+                cand = cand[np.argsort(DROP[cand, d - 1])]
                 for k in cand:
                     if len(lots) >= lot_k:
                         break
@@ -357,7 +372,9 @@ def main():
                                "all": "sh000001"}[args.universe]
     t0 = time.time()
     print(f"加载 {args.universe} 股票池 ...")
-    cal, codes, C, V, shares = load_universe(PREFIX)
+    cal, codes, C, V, shares, n_missing_adj = load_universe(PREFIX)
+    print(f"  adjust 缩放：{len(codes)-n_missing_adj}/{len(codes)} 只有系数；"
+          f"{n_missing_adj} 只缺失（用 hfq 原值，低价筛选/价格上限可能失真）")
     VR, DROP = precompute(C, V)
     active = np.isfinite(C).sum(axis=0)
     good = np.nonzero(active >= args.min_active)[0]
@@ -386,6 +403,7 @@ def main():
     print(f"  段 {args.segment}: {dates[0]} ~ {dates[-1]}（{len(dates)} 日）")
 
     grid = [dict()]
+    holdout_split = False
     if args.grid:
         grid = [dict(lot_frac=lf, lot_k=lk, lot_hold=hd,
                      vr_th=vr, drop_th=dp)
@@ -394,28 +412,48 @@ def main():
                 for hd in (5, 10)
                 for vr in (1.5, 2.0)
                 for dp in (-0.06, -0.08, -0.10)]
+        # 参数网格留出：前 2/3 段选参、后 1/3 段仅报告（不参与选参），
+        # 避免 48 组参数在同一段内选优带来的选择偏差。
+        holdout_split = (i1 - i0) >= 90
+    if holdout_split:
+        cut = i0 + (i1 - i0) * 2 // 3
+        sel_i0, sel_i1 = i0, cut
+        ho_i0, ho_i1 = cut, i1
+        print(f"  网格留出：selection {cal[sel_i0]} ~ {cal[sel_i1-1]}"
+              f"（前 2/3）选参；holdout {cal[ho_i0]} ~ {cal[ho_i1-1]}"
+              f"（后 1/3，未参与选参）")
+    else:
+        sel_i0, sel_i1 = i0, i1
+        ho_i0, ho_i1 = i0, i1
+        if args.grid:
+            print("  ⚠ 段太短，网格未做留出切分（selection=holdout）")
+    base_kw = dict(capital=args.capital,
+                   core_top=args.core_top, core_frac=args.core_frac,
+                   core_reb=args.core_reb,
+                   core_max_price=args.core_max_price,
+                   etf_close=etf_close, etf_ma=args.core_etf_ma,
+                   lot_step=args.lot_step, price_q=args.price_q,
+                   slip=args.cost, commission=args.commission,
+                   min_commission=args.min_commission,
+                   stamp=args.stamp, transfer=args.transfer,
+                   hand=args.hand)
     out = []
     for kw in grid:
-        m, _, _ = run(cal, C, V, VR, DROP, shares, i0, i1,
-                      capital=args.capital,
-                      core_top=args.core_top, core_frac=args.core_frac,
-                      core_reb=args.core_reb,
-                      core_max_price=args.core_max_price,
-                      etf_close=etf_close, etf_ma=args.core_etf_ma,
+        kw_run = dict(base_kw,
                       lot_frac=kw.get("lot_frac", args.lot_frac),
                       lot_k=kw.get("lot_k", args.lot_k),
-                      lot_step=args.lot_step,
                       lot_hold=kw.get("lot_hold", args.lot_hold),
-                      price_q=args.price_q,
                       vr_th=kw.get("vr_th", args.vr),
-                      drop_th=kw.get("drop_th", args.drop),
-                      slip=args.cost, commission=args.commission,
-                      min_commission=args.min_commission,
-                      stamp=args.stamp, transfer=args.transfer,
-                      hand=args.hand)
+                      drop_th=kw.get("drop_th", args.drop))
+        m, _, _ = run(cal, C, V, VR, DROP, shares, sel_i0, sel_i1, **kw_run)
         rec = {"kw": kw, **{k: m[k] for k in FIELDS}}
+        if holdout_split:
+            mh, _, _ = run(cal, C, V, VR, DROP, shares, ho_i0, ho_i1,
+                           **kw_run)
+            rec["holdout"] = {k: mh[k] for k in FIELDS}
         out.append(rec)
-        print(f"  本金{args.capital:.0f} frac={rec['kw'].get('lot_frac', args.lot_frac)} "
+        print(f"  [selection] 本金{args.capital:.0f} "
+              f"frac={rec['kw'].get('lot_frac', args.lot_frac)} "
               f"k={rec['kw'].get('lot_k', args.lot_k)} "
               f"hold={rec['kw'].get('lot_hold', args.lot_hold)} "
               f"vr={rec['kw'].get('vr_th', args.vr)} "
@@ -424,6 +462,13 @@ def main():
               f"回撤{m['mdd']*100:+.1f}% Calmar{(m['calmar'] or 0):+.2f} "
               f"交易{m['trades']} 胜率{(m['winrate'] or 0)*100:.0f}% "
               f">20%{(m['tail20'] or 0)*100:.1f}% >50%{(m['tail50'] or 0)*100:.1f}%")
+        if holdout_split:
+            print(f"      holdout（未参与选参）: 总{mh['total']*100:+.1f}% "
+                  f"年化{mh['ann']*100:+.1f}% 回撤{mh['mdd']*100:+.1f}% "
+                  f"Calmar{(mh['calmar'] or 0):+.2f} 交易{mh['trades']} "
+                  f"胜率{(mh['winrate'] or 0)*100:.0f}% "
+                  f">20%{(mh['tail20'] or 0)*100:.1f}% "
+                  f">50%{(mh['tail50'] or 0)*100:.1f}%")
     bench = benchmark_stats(BENCH, cal, i0, i1)
     if bench:
         print(f"  基准 {BENCH}: 总{bench['total']*100:+.1f}% "
@@ -436,6 +481,10 @@ def main():
                "universe": args.universe, "segment": args.segment,
                "capital": args.capital,
                "range": [dates[0], dates[-1]], "benchmark": bench,
+               "holdout_split": holdout_split,
+               "selection_range": [cal[sel_i0], cal[sel_i1-1]],
+               "holdout_range": ([cal[ho_i0], cal[ho_i1-1]]
+                                 if holdout_split else None),
                "results": out}, open(path, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print(f"写入 {path}，耗时 {time.time()-t0:.0f}s")

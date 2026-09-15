@@ -1,0 +1,24 @@
+{
+ "_note": "★最优为样本内选择，未经独立样本验证",
+ "保守(信号严+止损紧)": {
+  "buy_th": 3,
+  "cooldown": 8,
+  "atr_mult": 1.5,
+  "trail_trigger": 1.01,
+  "trail_ratio": 0.96
+ },
+ "稳健(居中)": {
+  "buy_th": 2,
+  "cooldown": 5,
+  "atr_mult": 1.5,
+  "trail_trigger": 1.02,
+  "trail_ratio": 0.94
+ },
+ "激进(捕捉机会+止损松)": {
+  "buy_th": 1,
+  "cooldown": 3,
+  "atr_mult": 3.0,
+  "trail_trigger": 1.05,
+  "trail_ratio": 0.9
+ }
+}

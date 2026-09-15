@@ -1,0 +1,57 @@
+START v4_full 2026-09-13_20:00:10 :: .venv/bin/python stock_predict.py --v4
+END v4_full rc=0 dur=8316s 2026-09-13_22:18:46
+START ablation 2026-09-13_22:18:46 :: .venv/bin/python backtest_strategy_ablation.py
+END ablation rc=0 dur=184s 2026-09-13_22:21:50
+START portfolio_val 2026-09-13_22:21:50 :: .venv/bin/python backtest_strategy_portfolio.py --tier all --segment val
+END portfolio_val rc=0 dur=75s 2026-09-13_22:23:05
+START portfolio_all 2026-09-13_22:23:05 :: .venv/bin/python backtest_strategy_portfolio.py --tier all --segment all
+END portfolio_all rc=0 dur=87s 2026-09-13_22:24:32
+START exit_ablation_aggr 2026-09-13_22:24:32 :: .venv/bin/python backtest_exit_ablation.py --tier 激进
+END exit_ablation_aggr rc=0 dur=49s 2026-09-13_22:25:21
+START exit_ablation_bal 2026-09-13_22:25:21 :: .venv/bin/python backtest_exit_ablation.py --tier 平衡
+END exit_ablation_bal rc=0 dur=42s 2026-09-13_22:26:03
+START exit_roll 2026-09-13_22:26:03 :: .venv/bin/python backtest_exit_roll.py
+END exit_roll rc=0 dur=25s 2026-09-13_22:26:28
+START v4_entry_exit_opt 2026-09-13_22:26:28 :: .venv/bin/python backtest_v4_entry_exit_opt.py
+END v4_entry_exit_opt rc=0 dur=142s 2026-09-13_22:28:50
+START overlay_opt 2026-09-13_22:28:50 :: .venv/bin/python backtest_portfolio_overlay_opt.py
+END overlay_opt rc=0 dur=195s 2026-09-13_22:32:05
+START picks 2026-09-13_22:32:05 :: .venv/bin/python backtest_picks.py --days 250 --step 5 --scores-out research/picks_scores_rerun.pkl
+END picks rc=0 dur=360s 2026-09-13_22:38:05
+START lottery_val_big 2026-09-13_22:38:05 :: .venv/bin/python backtest_aggr_lottery.py --universe chinext --segment val --core-top 20 --core-reb 40 --lot-frac 0.10 --lot-k 10 --lot-hold 10 --vr 2.0 --drop -0.06 --capital 1000000
+END lottery_val_big rc=0 dur=11s 2026-09-13_22:38:16
+START lottery_val_small 2026-09-13_22:38:16 :: .venv/bin/python backtest_aggr_lottery.py --universe chinext --segment val --core-etf sz159915 --core-etf-ma 60 --lot-frac 0.20 --lot-k 2 --lot-hold 5 --vr 2.0 --drop -0.06 --capital 50000
+END lottery_val_small rc=0 dur=11s 2026-09-13_22:38:27
+START lottery_grid 2026-09-13_22:38:27 :: .venv/bin/python backtest_aggr_lottery.py --universe chinext --segment val --grid
+END lottery_grid rc=0 dur=12s 2026-09-13_22:38:39
+START bsmatrix 2026-09-13_22:38:39 :: .venv/bin/python backtest_bsmatrix.py
+END bsmatrix rc=0 dur=19s 2026-09-13_22:38:58
+START sweep_risk 2026-09-13_22:38:58 :: .venv/bin/python sweep_risk.py
+END sweep_risk rc=0 dur=69s 2026-09-13_22:40:07
+START trade 2026-09-13_22:40:07 :: .venv/bin/python backtest_trade.py
+END trade rc=0 dur=111s 2026-09-13_22:41:58
+START t5 2026-09-13_22:41:58 :: .venv/bin/python backtest_t5.py
+END t5 rc=0 dur=63s 2026-09-13_22:43:01
+START swing 2026-09-13_22:43:01 :: .venv/bin/python backtest_swing.py
+END swing rc=0 dur=247s 2026-09-13_22:47:08
+START roll_cont 2026-09-13_22:47:08 :: .venv/bin/python backtest_roll_cont.py
+END roll_cont rc=0 dur=23s 2026-09-13_22:47:31
+START factor_ablation 2026-09-13_22:47:31 :: .venv/bin/python backtest_factor_ablation.py
+END factor_ablation rc=124 dur=1200s 2026-09-13_23:07:31
+START calib3 2026-09-13_23:07:31 :: .venv/bin/python backtest_calib3.py
+END calib3 rc=0 dur=63s 2026-09-13_23:08:34
+START confirm 2026-09-13_23:08:34 :: .venv/bin/python backtest_confirm.py
+END confirm rc=0 dur=38s 2026-09-13_23:09:12
+START mega 2026-09-13_23:09:12 :: .venv/bin/python backtest_mega.py
+END mega rc=0 dur=60s 2026-09-13_23:10:12
+START l2hybrid 2026-09-13_23:10:12 :: .venv/bin/python backtest_l2hybrid.py
+END l2hybrid rc=0 dur=81s 2026-09-13_23:11:34
+START l2type 2026-09-13_23:11:34 :: .venv/bin/python backtest_l2type.py
+END l2type rc=0 dur=85s 2026-09-13_23:12:59
+START l3risk 2026-09-13_23:12:59 :: .venv/bin/python backtest_l3risk.py
+END l3risk rc=0 dur=201s 2026-09-13_23:16:20
+START levels 2026-09-13_23:16:20 :: .venv/bin/python backtest_levels.py
+END levels rc=0 dur=135s 2026-09-13_23:18:35
+START rot_t10 2026-09-13_23:18:35 :: .venv/bin/python research/check_rot_t10.py
+END rot_t10 rc=0 dur=19s 2026-09-13_23:18:54
+ALL_DONE 2026-09-13_23:18:54

@@ -7,7 +7,9 @@
   弱市 ATR 止损缩放 scale × 弱市阈值 th × 弱市停开仓 skip。
 
 防过拟合协议（三套选参/验证口径，任一通过才算稳健）：
-  A. train→val：train 段（各股前 75%，放宽对齐）选参，val 段（样本外）验证；
+  A. train→val：train 段（各股前 75%，放宽对齐）选参；val 段为统一近端
+     252 日窗口（样本外，不再按结束日距最新日剔除退市/长停股，
+     窗口内退市持仓按最后收盘价了结）；
   B. h1→h2：val 前半段选参、后半段验证；
   C. h2→h1：反向对照（检验 regime 依赖，不作采纳依据）。
 另做参数平台检查：选中点的邻域不能是孤峰。
@@ -55,9 +57,14 @@ def load_selections():
     return sel
 
 
-def build_segment(stocks, selections, seg, workers, align_days):
-    """跑指定段（train/val）的每股信号 → 时间对齐 → 矩阵。"""
-    argl = [(c, r, selections.get(c), seg) for c, r in stocks]
+def build_segment(stocks, selections, seg, workers, align_days, bounds=None):
+    """跑指定段（train/val）的每股信号 → 时间对齐 → 矩阵。
+
+    bounds=(lo, hi) 为统一窗口日期边界（_worker_slot 第 5 参数，None 不限）；
+    val 段传 (win_start, None)，窗口内退市/长停股保留，不再按"结束日距
+    最新日 ≤N 天"剔除（生存者偏差修复）。align_days 仅在无 bounds 时生效。
+    """
+    argl = [(c, r, selections.get(c), seg, bounds) for c, r in stocks]
     results = [None] * len(argl)
     with ProcessPoolExecutor(max_workers=workers) as exe:
         futs = {exe.submit(_worker_slot, a): i for i, a in enumerate(argl)}
@@ -75,12 +82,20 @@ def build_segment(stocks, selections, seg, workers, align_days):
     ends = [r["dates"][-1] for r in results if r.get("dates")]
     if not ends:
         raise SystemExit("无有效股票")
-    last_d = max(ends)
-    ld = _dt.date.fromisoformat(last_d)
-    keep_idx = [i for i, r in enumerate(results)
-                if r.get("dates")
-                and (ld - _dt.date.fromisoformat(
-                    r["dates"][-1])).days <= align_days]
+    if bounds and bounds[0]:
+        keep_idx = [i for i, r in enumerate(results) if r.get("dates")]
+        print(f"  统一窗口 {bounds[0]} ~ 不限：窗口内有效 "
+              f"{len(keep_idx)}/{len(results)} 只（退市/长停股保留，"
+              f"持仓按最后收盘价了结）")
+    else:
+        last_d = max(ends)
+        ld = _dt.date.fromisoformat(last_d)
+        keep_idx = [i for i, r in enumerate(results)
+                    if r.get("dates")
+                    and (ld - _dt.date.fromisoformat(
+                        r["dates"][-1])).days <= align_days]
+        print(f"  时间对齐保留 {len(keep_idx)}/{len(results)} 只"
+              f"（结束日距 {last_d} ≤{align_days} 天）")
     cal = sorted({d for i in keep_idx for d in results[i]["dates"]})
     M, buy, sell, rps = build_matrices(results, keep_idx, cal)
     codes = [results[i]["code"] for i in keep_idx]
@@ -141,7 +156,9 @@ def main():
     ap.add_argument("--workers", type=int,
                     default=max(1, min(8, os.cpu_count() or 4)))
     ap.add_argument("--align-train", type=int, default=800)
-    ap.add_argument("--align-val", type=int, default=45)
+    ap.add_argument("--align-val", type=int, default=-1,
+                    help="val 段对齐：-1=统一近端 252 日窗口（默认，"
+                         "不再剔除退市/长停股）；≥0=旧的结束日距对齐天数")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
     t0 = time.time()
@@ -150,10 +167,23 @@ def main():
     stocks = load_stocks(min_bars=400)
     print(f"  股票 {len(stocks)} 只")
 
+    # val 段统一近端 252 日窗口（生存者偏差修复）：给 _worker_slot 传
+    # (win_start, None)，窗口内退市/长停股保留，持仓按最后收盘价了结。
+    val_bounds = None
+    if args.align_val < 0:
+        idx_dates = [r["date"] for r in sg.get_daily("sh000001")
+                     if r.get("close")]
+        if len(idx_dates) <= 252:
+            raise SystemExit("指数日历不足，无法构建统一窗口")
+        val_bounds = (idx_dates[-252], None)
+        print(f"  val 统一窗口 {val_bounds[0]} ~ 最新（252 个交易日）")
     seg_data = {}
-    for seg, al in (("train", args.align_train), ("val", args.align_val)):
-        print(f"构建 {seg} 段矩阵（align {al} 天）...")
-        seg_data[seg] = build_segment(stocks, selections, seg, args.workers, al)
+    for seg, al, bd in (("train", args.align_train, None),
+                        ("val", args.align_val, val_bounds)):
+        label = "统一窗口" if bd else f"align {al} 天"
+        print(f"构建 {seg} 段矩阵（{label}）...")
+        seg_data[seg] = build_segment(stocks, selections, seg, args.workers,
+                                      al, bd)
         cal = seg_data[seg][0]
         print(f"  {seg}: {cal[0]} ~ {cal[-1]}，{len(cal)} 日，"
               f"{len(seg_data[seg][1])} 只")

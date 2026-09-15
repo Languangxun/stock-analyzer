@@ -2505,14 +2505,22 @@ def _trend_track_signals(disp_rows, mas, idx_chg_by_date, idx_chg_today):
     return signals
 
 
+def _exec_mode():
+    """成交价口径（环境变量 EXEC_PX，默认 close）：
+    close = 信号次日收盘成交（早盘信号，默认）；open = 信号次日开盘成交。"""
+    return os.environ.get("EXEC_PX", "close").lower()
+
+
 def backtest_signals(rows, signals, rp=None):
-    """按买卖点信号模拟交易（信号日收盘价成交，无手续费）。
-    BUY开仓/SELL平仓，带ATR动态止损+移动止盈。
+    """按买卖点信号模拟交易（早盘信号：信号在 T 日收盘生成，T+1 日收盘成交）。
+    BUY开仓/SELL平仓，带ATR动态止损+移动止盈；止损单用 T-1 日 ATR 设定，
+    T 日盘中止损触发才是可执行的挂单，避免用当日收盘信息判当日盘中。
     返回 胜率、区间收益、年化收益、最大回撤。"""
     try:
         if not signals or len(rows) < 30:
             return None
-        sig_map = {s[0]: s[2] for s in signals}
+        # 早盘信号：T 日收盘生成的信号，T+1 日开盘前可决策 → T+1 日收盘执行
+        sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < len(rows)}
         
         # 计算ATR(14)用于止损
         atrs = [0.0] * len(rows)
@@ -2525,6 +2533,7 @@ def backtest_signals(rows, signals, rp=None):
                       for j in range(i-13, i+1)) / 14
         
         rp = rp or CFG.risk_params()
+        exec_open = _exec_mode() == "open"
         eq = 1.0
         entry = None
         highest = None  # 持仓期间最高价
@@ -2540,8 +2549,10 @@ def backtest_signals(rows, signals, rp=None):
             if entry is not None:
                 prev_high = highest
                 highest = max(highest, h) if highest else h
-                atr_stop = entry - rp["atr_mult"] * atrs[i] if atrs[i] > 0 \
-                    else entry * 0.95
+                # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
+                atr_prev = atrs[i - 1] if i > 0 else 0.0
+                atr_stop = entry - rp["atr_mult"] * atr_prev \
+                    if atr_prev > 0 else entry * 0.95
                 trail_stop = prev_high * rp["trail_ratio"] \
                     if prev_high > entry * rp["trail_trigger"] else atr_stop
 
@@ -2557,11 +2568,13 @@ def backtest_signals(rows, signals, rp=None):
                     continue
             
             if typ == "BUY" and entry is None and c:
-                entry = c
-                highest = h
+                px_fill = ((r.get("open") or c) if exec_open else c)
+                entry = px_fill
+                highest = px_fill     # 成交时点之前的盘中高点不计入
             elif typ == "SELL" and entry:
-                trades.append(c / entry - 1)
-                eq *= c / entry
+                px_fill = ((r.get("open") or c) if exec_open else c)
+                trades.append(px_fill / entry - 1)
+                eq *= px_fill / entry
                 entry = None
                 highest = None
             curve.append(eq * (c / entry) if entry else eq)
@@ -2828,7 +2841,14 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
                   conn.execute("SELECT code, industry FROM stocks")}
         codes = [r[0] for r in conn.execute(
             "SELECT code FROM daily_bars GROUP BY code "
-            "HAVING COUNT(*) >= ?", (min_bars,)).fetchall()]
+            "HAVING COUNT(*) >= ? AND MAX(date) >= "
+            "(SELECT date(MAX(date), '-10 day') FROM daily_bars)",
+            (min_bars,)).fetchall()]
+        try:
+            delisted = {r[0] for r in conn.execute(
+                "SELECT code FROM delisted").fetchall()}
+        except sqlite3.OperationalError:
+            delisted = set()
     ind5_map, ind5_med, ind5_lead = _picks_ind_ctx()
     CH = 500
     cands = []
@@ -2851,6 +2871,7 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
         cands += [(c, r) for c, r in by.items()
                   if len(r) >= min_bars and not _is_etf(c)
                   and not c.startswith('bj')          # 北交所K线源不支持
+                  and c not in delisted               # 退市登记
                   and r[-1]['close'] and r[-1]['close'] >= 2]   # 剔除仙股
         if progress:
             progress(f"荐股载入 {min(i + CH, len(codes))}/{len(codes)}")
@@ -3671,11 +3692,13 @@ def _sig_l1_pattern(rows, W=None, step=5, up_th=0.6, dn_th=0.4):
 
 def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
+    早盘信号：信号在 T 日收盘生成，T+1 日收盘执行；止损单用 T-1 日 ATR 设定。
     atrs 可外部预计算加速。trade_out（可选 list）：追加逐笔收益率。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
-    sig_map = {s[0]: s[2] for s in signals if i0 <= s[0] < i1}
+    # 早盘信号：执行日 = 信号日 + 1（信号日+1 须落在评估区间内）
+    sig_map = {s[0] + 1: s[2] for s in signals if i0 <= s[0] + 1 < i1}
     # ATR(14) 预计算（若未传入）
     if atrs is None:
         atrs = [0.0] * len(rows)
@@ -3686,6 +3709,7 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
                 s += max(h - l, abs(h - pc), abs(l - pc))
             atrs[i] = s / 14
     eq = 1.0
+    exec_open = _exec_mode() == "open"
     entry = None
     highest = None
     trades = []
@@ -3693,11 +3717,13 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
     for i in range(i0, i1):
         r = rows[i]
         c, h, l = r["close"], r["high"], r["low"]
+        px_fill = (r.get("open") or c) if exec_open else c
         typ = sig_map.get(i)
         if entry is not None:
             prev_high = highest
             highest = max(highest, h) if highest else h
-            atr_stop = (entry - rp["atr_mult"] * atrs[i]) if atrs[i] > 0 \
+            atr_prev = atrs[i - 1] if i > 0 else 0.0
+            atr_stop = (entry - rp["atr_mult"] * atr_prev) if atr_prev > 0 \
                 else entry * 0.95
             trail_stop = (prev_high * rp["trail_ratio"]
                           if prev_high > entry * rp["trail_trigger"]
@@ -3709,11 +3735,11 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
                 entry = None
                 highest = None
         if typ == "BUY" and entry is None and c:
-            entry = c
-            highest = h
+            entry = px_fill
+            highest = px_fill         # 成交时点之前的盘中高点不计入
         elif typ == "SELL" and entry:
-            trades.append(c / entry - 1)
-            eq *= c / entry
+            trades.append(px_fill / entry - 1)
+            eq *= px_fill / entry
             entry = None
             highest = None
         curve.append(eq * (c / entry) if entry else eq)
@@ -3945,13 +3971,13 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
                        "激进": _pick("激进")}
 
-    # ---- 风险档推荐：验证集 Calmar 最优者；高波动股标注保守易被扫损 ----
-    def _vc(t):
-        v = (mode_candidates.get(t) or {}).get("val") or {}
-        if not v or v.get("trades", 0) < 3:
+    # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
+    def _tc(t):
+        tr = (mode_candidates.get(t) or {}).get("train") or {}
+        if not tr or tr.get("trades", 0) < 3:
             return None
-        return _calmar(v)
-    scored = [(t, _vc(t)) for t in ("保守", "稳健", "激进")]
+        return _calmar(tr)
+    scored = [(t, _tc(t)) for t in ("保守", "稳健", "激进")]
     scored = [(t, s) for t, s in scored if s is not None]
     recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
     vol = _annualized_vol(rows)
@@ -4229,7 +4255,8 @@ def analyze(full, progress=None, quick=False):
         hhmm = int(snap_full[8:12])
     except ValueError:
         hhmm = 0
-    if (snap_d == today_compact and q["price"] > 0 and hhmm >= 925):
+    # 盘中 live 仅限交易时段（9:25~15:00）；盘后不再伪装盘中
+    if (snap_d == today_compact and q["price"] > 0 and 925 <= hhmm < 1500):
         pc0 = q["prev_close"] or (rows[-1]["close"] if rows else 0)
         lo0 = q["low"] if q["low"] > 0 else min(q["price"], q["open"] or q["price"])
         live = {"date": today_str, "open": q["open"] or pc0,
@@ -4237,6 +4264,8 @@ def analyze(full, progress=None, quick=False):
                 "high": max(q["high"], q["price"]),
                 "low": min(lo0, q["price"]), "vol": 0.0}
     had_today_bar = live is not None
+    post_close = bool(snap_d == today_compact and q["price"] > 0
+                      and hhmm >= 1500)      # 已收盘：快照为今日最终价
     if len(rows) < 30:
         raise ValueError(
             f"该股上市不足30个交易日(现仅{len(rows)}根日K)，"
@@ -4335,9 +4364,12 @@ def analyze(full, progress=None, quick=False):
     # 无今开可锚，改锚昨收（否则会把上一交易日的开价误当"今开"）
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
-    pre_open = (not had_today_bar
+    pre_open = (not had_today_bar and not post_close
                 and snap_d >= today_compact)
-    if pre_open:
+    if post_close:
+        o_today = q["price"] or prev_close
+        anchor = "今收"
+    elif pre_open:
         o_today = prev_close
         anchor = "昨收(未开盘)"
     elif live is not None:
@@ -4350,7 +4382,7 @@ def analyze(full, progress=None, quick=False):
 
     # 市场阶段（按行情快照时间）
     phase = market_phase_text(q.get("time"))
-    next_label = "今日(T)" if pre_open else "次日(T+1)"
+    next_label = "今日(T)" if (pre_open and not post_close) else "次日(T+1)"
 
     samples = []
     max_pred_days = 10  # 最多预测10天
@@ -5831,18 +5863,54 @@ def _v4_attach_rotation(M, cal, codes_s, ind_of, mkt, ind):
             M["ind5"][k] = R5[:, j]
 
 
+def _v4_morning_view(M):
+    """早盘视图：决策/模型列整体后移一日。
+
+    T 日早盘只能看到 T-1 收盘及以前的因子与预测，故 p_up/q*/ml_dyn/adaptive/
+    base_buy/base_sell/atr/regime 等决策列取 T-1 值；价格、涨跌停、停牌等
+    执行日字段保持当日不变，供 T 日收盘执行。"""
+    keys = ["p_up", "adaptive", "ml_dyn", "l1_up", "l1_ret",
+            "base_buy", "base_sell", "atr", "h_choice",
+            "ind_rank5", "ind5", "mkt5", "disp_rank"]
+    keys += ["q%d" % q for q in _V4_QTS]
+    out = dict(M)
+    for k in keys:
+        A = M.get(k)
+        if A is None:
+            continue
+        if A.dtype == bool:
+            B = np.zeros_like(A)
+        elif np.issubdtype(A.dtype, np.integer):
+            B = np.full_like(A, -1)
+        else:
+            B = np.full_like(A, np.nan)
+        B[:, 1:] = A[:, :-1]
+        out[k] = B
+    return out
+
+
+# 退市/长期停牌持仓：连续 N 根无 bar 后按最后已知收盘价了结
+_V4_STALE_BARS = 20
+
+
 def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     """组合级事件回测（矩阵版，唯一实现）。
 
-    - 信号日收盘成交；买入=收盘×(1+滑点)(1+佣金)；卖出=×(1-滑点)(1-佣金-印花税)
+    早盘信号：因子/预测只用 T-1 收盘信息（_v4_morning_view），T 日收盘执行；
+    止损单在前一日收盘后设定（T-1 的 q/ATR），T 日盘中触发才是可执行的挂单。
+    - 买入=收盘×(1+滑点)(1+佣金)；卖出=×(1-滑点)(1-佣金-印花税)
       （v4.0.1 起佣金/印花税记 0，仅保留滑点）
-    - 涨停禁买、跌停顺延；停牌持仓顺延；期末强平
+    - 涨停禁买、跌停顺延；停牌持仓顺延；期末强平；退市/长停超 _V4_STALE_BARS
+      根按最后收盘价了结
     - dist 分布退出（默认）：Q10棘轮止损（只收紧）+ Q75目标 + p_up 信号退出
     - hybrid 混合退出（消融对照）：Q10棘轮 + 移动止盈棘轮 + p_up（修正 bug 后实证劣于 dist）
     - 对照退出：ATR止损/移动止盈（v3.3 稳健参数，highest 逐日更新）
     - baseline：v3.3 多维评分信号进出
     """
     cal, M, codes = mats
+    M = _v4_morning_view(M)             # 早盘信号：决策列只到 T-1
+    # 成交价口径：close=信号次日收盘（默认）；open=信号次日开盘
+    exec_open = (rules.get("exec") or _exec_mode()) == "open"
     rp = CFG.RISK_PARAMS["稳健"]
     mode = rules.get("mode", "full")
     use_dist = rules.get("use_dist_exit", True) \
@@ -5909,6 +5977,18 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
         # ---- 退出 ----
         for ks in sorted(pos):
             if not M["has_bar"][ks, t]:
+                p = pos[ks]
+                p["miss"] = p.get("miss", 0) + 1
+                if p["miss"] >= _V4_STALE_BARS:
+                    # 退市/长期停牌：按最后已知收盘价了结（不再等复牌）
+                    px = last_px[ks] if last_px[ks] > 0 else p["entry"]
+                    net = px * sell_mult
+                    cash += p["shares"] * net
+                    trades.append({"code": codes[ks],
+                                   "ret": net / p["buy_net"] - 1.0,
+                                   "pnl": p["shares"] * (net - p["buy_net"]),
+                                   "hold": t - p["t_in"]})
+                    del pos[ks]
                 continue                # 停牌顺延
             p = pos[ks]
             px_c = float(col[ks])
@@ -5930,7 +6010,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                         px = px_o if px_o <= stop else min(stop, hi)
                         sold = True
                     elif mode == "baseline" and M["base_sell"][ks, t]:
-                        px = px_c
+                        px = px_o if exec_open else px_c
                         sold = True
                 else:
                     # Q 棘轮止损（只收紧不放宽；弱市可切换更紧分位）
@@ -5961,7 +6041,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                             and rules.get("use_logistic", True) \
                             and np.isfinite(M["p_up"][ks, t]) \
                             and float(M["p_up"][ks, t]) < ep:
-                        px = px_c
+                        px = px_o if exec_open else px_c
                         sold = True
             if sold:
                 cool[ks] = t
@@ -6001,7 +6081,11 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                         and not _v4_entry_ok_cell(M, ks, t, _strict, rules):
                     continue             # 交易后再入场：按更高一档信号要求
                 px_c = float(M["close"][ks, t])
-                buy_net = px_c * buy_mult
+                # 开盘成交口径：信号次日开盘价买入（open 缺失时退回收盘）
+                px_fill = (float(M["open"][ks, t]) if exec_open else px_c)
+                if not (px_fill and px_fill > 0):
+                    px_fill = px_c
+                buy_net = px_fill * buy_mult
                 eq0 = cash + sum(pp["shares"] * last_px[k2]
                                  for k2, pp in pos.items())
                 shares = int(eq0 * tier["frac"] / buy_net / 100.0) * 100
@@ -6009,8 +6093,8 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                     continue
                 cash -= shares * buy_net
                 p = {"t_in": t, "shares": shares, "buy_net": buy_net,
-                     "entry": px_c,
-                     "highest": max(px_c, float(M["high"][ks, t]))}
+                     "entry": px_fill,
+                     "highest": px_fill}   # 成交时点之前的盘中高点不计入
                 _qset = qstop
                 if weak_qstop is not None and weak_mask is not None \
                         and weak_mask[ks, t]:
@@ -6213,17 +6297,22 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
     factors = _v4_factor_agg(preds)
 
     # ---- 组合回测：Baseline / Adaptive / Full 三档 + 消融 ----
-    # 时间对齐子样本：测试段结束距全局最新日 ≤45 自然日；
-    # 退市股旧窗口只参与 IC/模型统计（对齐隐含幸存者偏差，如实记录）
-    import datetime as _dt4
-    last_d = max(r["dates"][-1] for r in preds)
-    _ld = _dt4.date.fromisoformat(last_d)
+    # 生存者偏差修复：不再按"测试段结束日距最新日 ≤45 天"剔除退市股，
+    # 改为统一近端窗口（252 个交易日），窗口内仍存续的股票全部纳入；
+    # 窗口内退市/长停的持仓由 _V4_STALE_BARS 规则按最后收盘价了结。
+    all_cal_bt = sorted({d for r in preds for d in r["dates"]})
+    bt_start = all_cal_bt[-252] if len(all_cal_bt) > 252 else all_cal_bt[0]
     rows_bt = [k for k, r in enumerate(preds)
-               if (_ld - _dt4.date.fromisoformat(r["dates"][-1])).days <= 45]
+               if r["dates"] and r["dates"][-1] >= bt_start]
     mats_bt = _v4_stack_subset([preds[k] for k in rows_bt])
     _v4_attach_rotation(mats_bt[1], mats_bt[0], mats_bt[2], ind_of, mkt, ind)
+    _j0 = next((i for i, d in enumerate(mats_bt[0]) if d >= bt_start), 0)
+    if _j0:
+        mats_bt = (mats_bt[0][_j0:],
+                   {k: v[:, _j0:] for k, v in mats_bt[1].items()},
+                   mats_bt[2])
     p("v4.0：组合级回测（三档风险 × 策略 × 消融，"
-      f"{len(rows_bt)}/{len(preds)} 只时间对齐）...")
+      f"{len(rows_bt)}/{len(preds)} 只，窗口 {mats_bt[0][0]}~{mats_bt[0][-1]}）...")
     sims = {}
     tier_of_mode = {"保守": "保守", "稳健": "平衡", "激进": "激进"}
     for mode in ("保守", "稳健", "激进"):
@@ -6278,8 +6367,8 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
             "n_codes_pool": len(codes),
             "n_valid": len(preds),
             "n_valid_bt": len(rows_bt),
-            "bt_align_note": "组合回测使用测试段结束距最新日≤45自然日的"
-                             "时间对齐子样本（隐含幸存者偏差，如实记录）",
+            "bt_align_note": "组合回测使用统一近端窗口（最后252个交易日），"
+                             "窗口内退市/长停持仓按最后收盘价了结",
             "min_bars": min_bars,
             "date_min": min(all_dates),
             "date_max": max(all_dates),
@@ -6308,7 +6397,10 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
             "Walk-Forward 扩展窗：每折仅用折前数据训练，折间不重叠",
             "LightGBM 超参先验固定，未用 Test 调参",
             "三档风险为同一模型输出上的决策层参数，未分别训练",
+            "组合回测为早盘信号：p_up/q*/ml_dyn/ATR 等决策列取 T-1，"
+            "T 日收盘执行；止损由前一日设定、T 日盘中触发",
             "组合回测统一初始资金/手续费/滑点/成交时点/涨跌停/停牌规则",
+            "组合回测使用统一近端窗口，窗口内退市/长停持仓按最后收盘价了结",
         ],
     }
 
