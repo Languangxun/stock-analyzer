@@ -6513,6 +6513,481 @@ def _v4_print_report(r):
     print("注：全部为历史统计研究，不构成投资建议。")
 
 
+# ================= v6.0 三档组合策略引擎（稳健/均衡/激进） =================
+#
+# 原理（详见 README 第二节）：
+#   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
+#          上证 MA20 闸门（T-1 收盘在均线上才持仓）
+#   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
+#   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
+#          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）
+# 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
+#         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
+# 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
+#         消除单一调仓日的运气；tier_backtest 报告相位年化区间。
+
+TIER_CFG = {
+    "稳健": dict(universe="all", score="blend", top=20, reb=20,
+                 gate="sh000001", ma=20),
+    "均衡": dict(universe="all", score="blend", top=20, reb=10,
+                 gate="sh000001", ma=20),
+    "激进": dict(universe="chinext", score="beta", top=5, reb=10,
+                 gate="sz399006", ma=60),
+}
+TIER_BENCH = {"稳健": "sh000001", "均衡": "sh000001", "激进": "sz399006"}
+_TIER_PREFIXES = ("sh60", "sh68", "sz00", "sz30")
+_TIER_MIN_PRICE = 1.0
+_TIER_MIN_BARS = 250
+_TIER_MIN_AMOUNT = 3e5            # V(手)×价 = 成交额/100，3e5 → 3000万元
+_TIER_STALE_DAYS = 20
+_TIER_SLIP = 0.001
+_TIER_COMMISSION = 0.00025
+_TIER_MIN_COMMISSION = 5.0
+_TIER_STAMP = 0.001
+_TIER_TRANSFER = 0.00001
+_TIER_LOT = 100
+_TIER_CACHE = {}
+
+
+def tier_segments(cal):
+    """回测段定义（tranche 起点由各档 reb 决定，见 tier_eval）。"""
+    return {
+        "full": ("2022-09-01", cal[-1]),
+        "train": (cal[0], "2024-12-31"),
+        "val": ("2025-08-29", cal[-1]),
+        "val2025": ("2025-01-02", "2025-08-28"),
+        "bull": ("2025-03-18", "2026-09-04"),
+    }
+
+
+def tier_load_panel():
+    """全A日K面板（hfq × adjust = 乘法前复权≈现价）。结果缓存。"""
+    if np is None:
+        raise RuntimeError("三档引擎需要 numpy")
+    if _TIER_CACHE.get("panel") is not None:
+        return _TIER_CACHE["panel"]
+    t0 = time.time()
+    with db_conn() as conn:
+        adj = {c: (k or 1.0) for c, k in
+               conn.execute("select code,k from adjust")}
+        rows = conn.execute(
+            "select code,date,close,vol from daily_bars "
+            "where date>=? order by code,date", ("2020-01-01",)).fetchall()
+    data, dates = {}, set()
+    for c, d, cl, v in rows:
+        if not c.startswith(_TIER_PREFIXES):
+            continue
+        data.setdefault(c, []).append((d, cl, v or 0.0))
+        dates.add(d)
+    codes = sorted(data)
+    cal = sorted(dates)
+    didx = {d: i for i, d in enumerate(cal)}
+    n, nc = len(codes), len(cal)
+    C = np.full((n, nc), np.nan, np.float32)
+    V = np.zeros((n, nc), np.float32)
+    for r, c in enumerate(codes):
+        seq = data[c]
+        k = adj.get(c, 1.0)
+        cols = np.fromiter((didx[x[0]] for x in seq), np.int64, len(seq))
+        C[r, cols] = [(x[1] * k) if x[1] else np.nan for x in seq]
+        V[r, cols] = [x[2] for x in seq]
+    log.info("tier panel %d 只 × %d 日 (%.0fs)", n, nc, time.time() - t0)
+    _TIER_CACHE["panel"] = (codes, cal, C, V)
+    return codes, cal, C, V
+
+
+def tier_idx_series(cal, code):
+    """指数收盘序列（按面板日历对齐、前向填充）与日收益。"""
+    with db_conn() as conn:
+        rows = conn.execute("select date,close from daily_bars where code=? "
+                            "order by date", (code,)).fetchall()
+    m = {d: c for d, c in rows if c}
+    cl = np.full(len(cal), np.nan)
+    last = np.nan
+    for i, d in enumerate(cal):
+        v = m.get(d)
+        if v:
+            last = v
+        cl[i] = last
+    r = np.full(len(cal), np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r[1:] = np.where(cl[:-1] > 0, cl[1:] / cl[:-1] - 1.0, np.nan)
+    return cl, r
+
+
+def tier_build_features(cal, C, V):
+    """因果特征：20日波动 / 20日均额 / 上市根数 / 60日β（对创业板指）。"""
+    NST, NDT = C.shape
+    ret1 = np.full_like(C, np.nan)
+    ret1[:, 1:] = C[:, 1:] / C[:, :-1] - 1.0
+    ret20 = np.full_like(C, np.nan)
+    ret20[:, 20:] = C[:, 20:] / C[:, :-20] - 1.0
+    x = np.nan_to_num(ret1, nan=0.0)
+    v = np.isfinite(ret1).astype(float)
+    cx = np.cumsum(np.insert(x, 0, 0, 1), axis=1)
+    cv = np.cumsum(np.insert(v, 0, 0, 1), axis=1)
+    cxx = np.cumsum(np.insert(x * x, 0, 0, 1), axis=1)
+    n20 = cv[:, 20:] - cv[:, :-20]
+    s20 = cx[:, 20:] - cx[:, :-20]
+    s220 = cxx[:, 20:] - cxx[:, :-20]
+    vol20 = np.full_like(C, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        m20 = s20 / np.maximum(n20, 1)
+        var = np.where(n20 > 1, s220 / np.maximum(n20, 1) - m20 * m20, np.nan)
+        vol20[:, 19:] = np.sqrt(np.maximum(var, 0))
+    amt = V * C
+    ca = np.cumsum(np.insert(np.nan_to_num(amt), 0, 0, 1), axis=1)
+    cva = np.cumsum(np.insert(np.isfinite(amt).astype(float), 0, 0, 1), axis=1)
+    amt20 = np.full_like(amt, np.nan)
+    amt20[:, 19:] = ((ca[:, 20:] - ca[:, :-20])
+                     / np.maximum(cva[:, 20:] - cva[:, :-20], 1))
+    barcount = np.cumsum(np.isfinite(C), axis=1)
+    _, idx_ret = tier_idx_series(cal, "sz399006")
+    beta60 = np.full_like(C, np.nan)
+    for t in range(60, NDT):
+        y = idx_ret[t - 59:t + 1]
+        vv = np.isfinite(y)
+        if int(vv.sum()) < 48:
+            continue
+        xs = x[:, t - 59:t + 1]
+        m = np.isfinite(ret1[:, t - 59:t + 1]) & vv[None, :]
+        nn = np.maximum(m.sum(axis=1), 1)
+        ym = np.where(vv, y, 0.0)
+        sx = (xs * m).sum(axis=1)
+        sy = (ym[None, :] * m).sum(axis=1)
+        sxy = (xs * m * ym[None, :]).sum(axis=1)
+        syy = (ym[None, :] ** 2 * m).sum(axis=1)
+        cov = sxy / nn - (sx / nn) * (sy / nn)
+        vr = syy / nn - (sy / nn) ** 2
+        ok = (m.sum(axis=1) >= 48) & (vr > 1e-12)
+        beta60[ok, t] = cov[ok] / vr[ok]
+    return dict(ret20=ret20, vol20=vol20, amt20=amt20, barcount=barcount,
+                beta60=beta60)
+
+
+def _tier_rank01(x):
+    m = np.isfinite(x)
+    out = np.full(len(x), np.nan)
+    n = int(m.sum())
+    if n > 5:
+        out[m] = x[m].argsort().argsort() / max(1, n - 1)
+    return out
+
+
+def tier_make_score(feat, kind):
+    """合成打分：blend=动量20与低波20百分位等权；beta=60日β。"""
+    NST, NDT = feat["vol20"].shape
+    if kind == "beta":
+        return feat["beta60"]
+    if kind == "blend":
+        r1 = np.zeros_like(feat["vol20"])
+        r2 = np.zeros_like(feat["vol20"])
+        for t in range(NDT):
+            r1[:, t] = _tier_rank01(feat["ret20"][:, t])
+            r2[:, t] = _tier_rank01(feat["vol20"][:, t])
+        return r1 + (1.0 - r2)
+    raise ValueError("未知评分: " + kind)
+
+
+def tier_make_gate(cal, code, ma_w):
+    """指数趋势闸门：第 t 日可持仓 = T-1 收盘 > MA(ma_w)（截至 T-1）。"""
+    cl, _ = tier_idx_series(cal, code)
+    ma = np.full(len(cal), np.nan)
+    ma[ma_w - 1:] = np.convolve(cl, np.ones(ma_w) / ma_w, "valid")
+    gate = np.zeros(len(cal), bool)
+    with np.errstate(invalid="ignore"):
+        gate[1:] = (cl[:-1] > ma[:-1]) & np.isfinite(ma[:-1])
+    return gate
+
+
+def _tier_limit_pct(code):
+    return 0.20 if (code.startswith("sz30") or code.startswith("sh68")) else 0.10
+
+
+def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
+                   capital=1e6):
+    """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。"""
+    NST = C.shape[0]
+    top, reb = cfg["top"], cfg["reb"]
+    if cfg["universe"] == "chinext":
+        uni = np.array([c.startswith("sz30") for c in codes])
+    else:
+        uni = np.ones(NST, bool)
+    elig = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
+            & (feat["barcount"] >= _TIER_MIN_BARS)
+            & (feat["amt20"] >= _TIER_MIN_AMOUNT) & uni[:, None])
+    lim = np.array([_tier_limit_pct(c) for c in codes])[:, None]
+    r1 = np.full_like(C, np.nan)
+    r1[:, 1:] = C[:, 1:] / C[:, :-1] - 1.0
+    limit_up = r1 >= lim - 0.005
+    limit_dn = r1 <= -(lim - 0.005)
+    cash = float(capital)
+    shares = np.zeros(NST)
+    entry = np.zeros(NST)
+    last = np.full(NST, np.nan)
+    miss = np.zeros(NST, int)
+    holding = np.zeros(NST, bool)
+    target = set()
+    trades = []
+    eq, eq_cal = [], []
+
+    def sell_fee(amount):
+        return (max(amount * _TIER_COMMISSION, _TIER_MIN_COMMISSION)
+                + amount * _TIER_STAMP + amount * _TIER_TRANSFER)
+
+    def close_pos(k, t, px):
+        nonlocal cash
+        amount = shares[k] * px
+        net = amount - sell_fee(amount)
+        cash += net
+        trades.append({"code": str(codes[k]),
+                       "ret": net / (shares[k] * entry[k]) - 1.0, "hold": t})
+        holding[k] = False
+        shares[k] = 0.0
+        target.discard(int(k))
+
+    start = i0 + phase
+    for j in range(max(0, start - 40), start + 1):
+        f = np.isfinite(C[:, j])
+        last[f] = C[f, j]
+    for t in range(start, i1):
+        col = C[:, t]
+        fin = np.isfinite(col)
+        last[fin] = col[fin]
+        miss = np.where(holding & ~fin, miss + 1, 0)
+        for k in np.nonzero(holding & (miss >= _TIER_STALE_DAYS))[0]:
+            close_pos(k, t, last[k] if last[k] > 0 else entry[k])
+        on = bool(gate[t]) if gate is not None else True
+        if (t - start) % reb == 0 and t > start:
+            d = t - 1
+            cand = np.nonzero(elig[:, d])[0]
+            s = score[cand, d]
+            m = np.isfinite(s)
+            cand, s = cand[m], s[m]
+            order = cand[np.argsort(-s, kind="stable")]
+            target = set(order[:top].tolist()) if on else set()
+        for k in np.nonzero(holding)[0]:
+            if int(k) in target or not fin[k] or limit_dn[k, t]:
+                continue
+            close_pos(k, t, col[k] * (1 - _TIER_SLIP))
+        if (t - start) % reb == 0 and t > start and on:
+            equity = cash + float(np.nansum(np.where(holding,
+                                                     shares * last, 0.0)))
+            for k in order:
+                if int(holding.sum()) >= top:
+                    break
+                if holding[k] or not fin[k] or limit_up[k, t]:
+                    continue
+                px = col[k] * (1 + _TIER_SLIP)
+                budget = min(equity / top, cash)
+                n_lot = int(budget / (px * _TIER_LOT))
+                if n_lot <= 0:
+                    continue
+                amount = n_lot * _TIER_LOT * px
+                fee = max(amount * _TIER_COMMISSION, _TIER_MIN_COMMISSION) \
+                    + amount * _TIER_TRANSFER
+                if amount + fee > cash:
+                    continue
+                cash -= amount + fee
+                shares[k] = n_lot * _TIER_LOT
+                entry[k] = (amount + fee) / shares[k]
+                holding[k] = True
+        eq.append(cash + float(np.nansum(np.where(holding,
+                                                  shares * last, 0.0))))
+        eq_cal.append(cal[t])
+    return np.array(eq), eq_cal, trades
+
+
+def _tier_metrics(eq, dates, trades=None):
+    eq = np.asarray(eq, float)
+    out = {"total": None, "ann": None, "mdd": None, "sharpe": None,
+           "trades": 0, "winrate": None, "pf": None, "days": len(eq)}
+    if len(eq) < 2 or eq[0] <= 0:
+        return out
+    import datetime as _d
+    out["total"] = float(eq[-1] / eq[0] - 1.0)
+    years = max((_d.date.fromisoformat(dates[-1])
+                 - _d.date.fromisoformat(dates[0])).days / 365.25, 0.05)
+    mult = eq[-1] / eq[0]
+    out["ann"] = float(mult ** (1 / years) - 1.0) if mult > 0 else -1.0
+    peak = np.maximum.accumulate(eq)
+    out["mdd"] = float((eq / peak - 1.0).min())
+    dr = np.diff(eq) / eq[:-1]
+    sd = float(dr.std())
+    out["sharpe"] = float(dr.mean() / sd * math.sqrt(252.0)) \
+        if sd > 1e-12 else None
+    if trades:
+        rr = np.array([t["ret"] for t in trades])
+        out["trades"] = len(rr)
+        out["winrate"] = float((rr > 0).mean())
+        gp = rr[rr > 0].sum()
+        gl = -rr[rr <= 0].sum()
+        out["pf"] = float(gp / gl) if gl > 1e-9 else None
+    return out
+
+
+def tier_eval(segment="full", tiers=None, phases=None, progress=None,
+              overrides=None):
+    """三档回测（相位平均主口径）。overrides 可覆盖 cfg（研究用）。
+    返回 {tier: metrics}。"""
+    codes, cal, C, V = tier_load_panel()
+    if progress:
+        progress("三档引擎：构建特征 ...")
+    key = "feat"
+    if _TIER_CACHE.get(key) is None:
+        _TIER_CACHE[key] = tier_build_features(cal, C, V)
+    feat = _TIER_CACHE[key]
+    segs = tier_segments(cal)
+    if segment in ("2022", "2023", "2024", "2025", "2026"):
+        a = f"{segment}-01-01" if segment != "2022" else "2022-09-01"
+        b = f"{segment}-12-31" if segment != "2026" else cal[-1]
+    elif segment in segs:
+        a, b = segs[segment]
+    else:
+        raise ValueError("未知区间: " + segment)
+    i0 = int(np.searchsorted(cal, a))
+    i1 = int(np.searchsorted(cal, b, side="right"))
+    tiers = list(TIER_CFG) if not tiers else [t for t in tiers if t in TIER_CFG]
+    out = {}
+    for tier in tiers:
+        cfg = dict(TIER_CFG[tier])
+        if overrides:
+            cfg.update(overrides)
+        score = tier_make_score(feat, cfg["score"])
+        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
+            if cfg.get("gate") else None
+        n_ph = min(phases or cfg["reb"], cfg["reb"])
+        norms, dates, all_trades = [], None, []
+        for p in range(n_ph):
+            eq, ec, tr = tier_sim_phase(codes, cal, C, feat, score, gate,
+                                        i0, i1, cfg, phase=p, capital=1e6)
+            j0 = cfg["reb"] - 1 - p
+            if j0 >= len(eq) or eq[j0] <= 0:
+                continue
+            norms.append(eq[j0:] / eq[j0])
+            dates = ec[j0:]
+            all_trades.extend(tr)
+            if progress and p == 0:
+                progress(f"[{tier}] {ec[j0]} ~ {ec[-1]} 相位计算中 ...")
+        if not norms:
+            continue
+        L = min(len(e) for e in norms)
+        E = np.mean([e[:L] for e in norms], axis=0) * 1e6
+        dates = dates[:L]
+        m = _tier_metrics(E, dates, all_trades)
+        anns = [_tier_metrics(e[:L], dates)["ann"] for e in norms]
+        m["phase_ann_min"] = min(anns)
+        m["phase_ann_max"] = max(anns)
+        try:
+            bcl, _ = tier_idx_series(cal, TIER_BENCH[tier])
+            bmap = {d: v for d, v in zip(cal, bcl)}
+            bseg = np.array([bmap.get(d, np.nan) for d in dates], float)
+            bm = _tier_metrics(bseg, dates)
+        except Exception:
+            bm = None
+        m["benchmark"] = TIER_BENCH[tier]
+        m["bench"] = bm
+        m["excess_total"] = (m["total"] - bm["total"]) \
+            if bm and bm["total"] is not None else None
+        m["range"] = [dates[0], dates[-1]]
+        out[tier] = m
+    return out
+
+
+def tier_latest_picks(capital=100000.0, min_active=300):
+    """生产端：按最新可用交易日给出三档目标持仓（含闸门状态）。"""
+    codes, cal, C, V = tier_load_panel()
+    if _TIER_CACHE.get("feat") is None:
+        _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
+    feat = _TIER_CACHE["feat"]
+    NST, NDT = C.shape
+    # 最后一个「足够多股票有数据」的交易日作为信号日
+    elig_n = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
+              & (feat["barcount"] >= _TIER_MIN_BARS)
+              & (feat["amt20"] >= _TIER_MIN_AMOUNT)).sum(axis=0)
+    good = np.nonzero(elig_n >= min_active)[0]
+    if not len(good):
+        raise RuntimeError("没有可用交易日")
+    d = int(good[-1])
+    signal_date = cal[d]
+    uni = {c: i for i, c in enumerate(codes)}
+    with db_conn() as conn:
+        names = {c: (n or c) for c, n in
+                 conn.execute("select code,name from stocks")}
+    risky = np.array([("ST" in names.get(c, "").upper()
+                       or "退" in names.get(c, "")) for c in codes])
+    out = {"signal_date": signal_date, "capital": capital, "tiers": {}}
+    for tier, cfg in TIER_CFG.items():
+        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
+            if cfg.get("gate") else None
+        on = bool(gate[d]) if gate is not None else True
+        score = tier_make_score(feat, cfg["score"])
+        if cfg["universe"] == "chinext":
+            m = np.array([c.startswith("sz30") for c in codes])
+        else:
+            m = np.ones(NST, bool)
+        ok = (np.isfinite(C[:, d]) & (C[:, d] > _TIER_MIN_PRICE)
+              & (feat["barcount"][:, d] >= _TIER_MIN_BARS)
+              & (feat["amt20"][:, d] >= _TIER_MIN_AMOUNT) & m
+              & np.isfinite(score[:, d]) & ~risky)
+        cand = np.nonzero(ok)[0]
+        order = cand[np.argsort(-score[cand, d], kind="stable")]
+        picks = []
+        per = capital / cfg["top"] if on else 0.0
+        for k in order:
+            if len(picks) >= cfg["top"]:
+                break
+            px = float(C[k, d])
+            lots = int(per / (px * 100)) if per > 0 and px > 0 else 0
+            picks.append({
+                "code": str(codes[k]), "name": names.get(codes[k], ""),
+                "price": px, "score": float(score[k, d]),
+                "vol20": float(feat["vol20"][k, d])
+                if np.isfinite(feat["vol20"][k, d]) else None,
+                "beta60": float(feat["beta60"][k, d])
+                if np.isfinite(feat["beta60"][k, d]) else None,
+                "lots": lots, "cost": lots * 100 * px,
+            })
+        out["tiers"][tier] = {"gate_on": on, "cfg": cfg, "picks": picks}
+        if on and picks and picks[0]["cost"] > 0:
+            total = sum(p["cost"] for p in picks)
+            out["tiers"][tier]["suggested_cost"] = total
+    return out
+
+
+def tier_report_text(capital=100000.0):
+    """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
+    p = tier_latest_picks(capital=capital)
+    lines = [f"v6.0 三档组合 · 信号日 {p['signal_date']} · "
+             f"建议资金 {capital:,.0f}",
+             "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
+             ""]
+    for tier, d in p["tiers"].items():
+        cfg = d["cfg"]
+        flag = "在场" if d["gate_on"] else "空仓（闸门关闭→持现金）"
+        lines.append(f"【{tier}】{cfg['score']} · top{cfg['top']} · "
+                     f"{cfg['reb']}日调仓 · 闸门 {cfg['gate']} MA{cfg['ma']}"
+                     f" → {flag}")
+        if not d["gate_on"]:
+            lines.append("")
+            continue
+        lines.append(f"  {'代码':<9}{'名称':<10}{'现价':>8}{'手数':>6}"
+                     f"{'金额':>10}{'分数':>8}{'20日波动':>9}{'β60':>7}")
+        for x in d["picks"]:
+            lines.append(
+                f"  {x['code']:<9}{x['name'][:8]:<10}{x['price']:>8.2f}"
+                f"{x['lots']:>6}{x['cost']:>10.0f}{x['score']:>8.3f}"
+                f"{(x['vol20']*100 if x['vol20'] is not None else 0):>8.1f}%"
+                f"{(x['beta60'] if x['beta60'] is not None else 0):>7.2f}")
+        if d.get("suggested_cost"):
+            lines.append(f"  合计约 {d['suggested_cost']:,.0f} 元"
+                         f"（{d['suggested_cost']/capital*100:.0f}% 仓位，"
+                         f"买不起的票自动跳过）")
+        lines.append("")
+    lines.append("注：历史统计研究，不构成投资建议。")
+    return "\n".join(lines)
+
+
 def slice_view(res, show_n, pan=0):
     n_total = len(res["disp_rows"])
     off = max(0, n_total - show_n - pan)
@@ -7188,6 +7663,11 @@ class App:
             m.add_command(label="更新缓存", command=self.refresh_cache)
             m.add_command(label="v4.0 全A研究（三档风险+消融）",
                           command=self.run_v4_research_bg)
+            m.add_separator()
+            m.add_command(label="v6.0 三档组合（当前目标持仓）",
+                          command=self.run_tiers_bg)
+            m.add_command(label="v6.0 三档回测（全期，相位平均）",
+                          command=self.run_tiers_backtest_bg)
         m.add_separator()
         m.add_command(label="⚙ 设置", command=self.open_settings)
         x = anchor_widget.winfo_rootx()
@@ -7360,6 +7840,79 @@ class App:
         lines.append("完整结果见 research/v4_report.json 与 README")
         messagebox.showinfo("v4.0 全A研究完成", "\n".join(lines))
         self.progress_var.set("v4.0 全A研究完成（research/v4_report.json）")
+
+    def _show_text_window(self, title, text):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        txt = tk.Text(win, width=132, font=("Consolas", 9), wrap="none")
+        txt.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(txt, command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.config(yscrollcommand=sb.set)
+        txt.insert("end", text)
+        txt.see("end")
+
+    def run_tiers_bg(self):
+        """工具菜单：v6.0 三档组合——最新目标持仓（后台计算）。"""
+        if getattr(self, "_tiers_running", False):
+            messagebox.showinfo("v6.0 三档", "已在后台运行中，请稍候")
+            return
+        self._tiers_running = True
+        self.progress_var.set("v6.0 三档：加载面板并计算最新目标持仓 ...")
+
+        def _job():
+            return tier_report_text()
+
+        self._run_bg(_job, self._tiers_done)
+
+    def _tiers_done(self, res, err):
+        self._tiers_running = False
+        if err:
+            self.progress_var.set(f"v6.0 三档失败: {err}")
+            messagebox.showerror("v6.0 三档", str(err))
+            return
+        self._show_text_window("v6.0 三档组合 · 当前目标持仓", res)
+        self.progress_var.set("v6.0 三档：完成")
+
+    def run_tiers_backtest_bg(self):
+        """工具菜单：v6.0 三档回测（全期，相位平均，后台）。"""
+        if getattr(self, "_tiersbt_running", False):
+            messagebox.showinfo("v6.0 三档回测", "已在后台运行中，请稍候")
+            return
+        self._tiersbt_running = True
+        self.progress_var.set("v6.0 三档回测：加载面板（约1分钟）...")
+
+        def _job():
+            return tier_eval(segment="full", progress=self._progress)
+
+        self._run_bg(_job, self._tiersbt_done)
+
+    def _tiersbt_done(self, res, err):
+        self._tiersbt_running = False
+        if err:
+            self.progress_var.set(f"v6.0 三档回测失败: {err}")
+            messagebox.showerror("v6.0 三档回测", str(err))
+            return
+        lines = ["v6.0 三档回测（全期 2022-09 ~ 最新，相位平均，含全部费用）",
+                 "指标口径见 README；年化/回撤均为相位平均组合", ""]
+        for tier, m in res.items():
+            b = m.get("bench") or {}
+            lines.append(
+                f"[{tier}] {m['range'][0]} ~ {m['range'][1]}")
+            lines.append(
+                f"  策略 年化 {m['ann']*100:+.1f}%  回撤 {m['mdd']*100:+.1f}%  "
+                f"Sharpe {m['sharpe'] if m['sharpe'] is not None else 0:+.2f}")
+            if b.get("ann") is not None:
+                lines.append(
+                    f"  基准 {m['benchmark']} 年化 {b['ann']*100:+.1f}%  "
+                    f"超额 {(m['excess_total'] or 0)*100:+.1f}pp  "
+                    f"（相位区间 {m['phase_ann_min']*100:+.1f}% ~ "
+                    f"{m['phase_ann_max']*100:+.1f}%）")
+            lines.append("")
+        lines.append("详情：python backtest_tiers.py --tier all --segment full")
+        lines.append("注：历史统计研究，不构成投资建议。")
+        self._show_text_window("v6.0 三档回测 · 全期", "\n".join(lines))
+        self.progress_var.set("v6.0 三档回测完成")
 
     def _run_bg(self, fn, done):
         """后台线程执行 fn，完成后经 future 回调在主线程调用
