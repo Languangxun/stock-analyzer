@@ -153,7 +153,7 @@ def _fetch_tx_kline(full, fq="hfq", pages=3, page=800):
     for _ in range(pages):
         param = (f"?param={full},day,,{end},{page},{fq}" if (end and fq)
                  else f"?param={full},day,,,{page},{fq}" if fq
-                 else f"?param={full},day,,,{page}")
+                 else f"?param={full},day,,,{page},")
         got = None
         for host in TX_HOSTS:
             try:
@@ -227,18 +227,25 @@ def _bar_valid(b):
 
 
 def _validate(rows, code, name):
-    """hfq 序列健康检查：结构合法 + 除前5根新股外无涨跌停越界。"""
+    """hfq 序列健康检查：结构合法 + 除前5根新股外无涨跌停越界。
+
+    涨跌停越界只统计 2020-01-01 起（本项目研究与交易窗口；更早历史存在
+    涨跌停制度差异/ST 更名，无法用当前规则校验）。"""
     if len(rows) < 100:
         return False, len(rows), "历史不足100根"
     viol = 0
     for i in range(max(5, 1), len(rows)):
         prev = rows[i - 1]
         cur = rows[i]
-        lim = _limit_pct(code, name, cur[0])
-        if lim is None or not prev[4] or not cur[4]:
-            continue
         if not _bar_valid(cur):
             viol += 1
+            continue
+        if cur[0] < "2020-01-01":
+            continue
+        # 用板块涨跌停校验（不按当前名称判 ST：ST 是时点状态，历史 ST 段
+        # 无法从当前名称还原，按 5% 校验会把大量正常历史误判为越界）
+        lim = _limit_pct(code, "", cur[0])
+        if lim is None or not prev[4] or not cur[4]:
             continue
         if abs(cur[4] / prev[4] - 1) * 100 > lim + 3.0:
             viol += 1
@@ -264,23 +271,45 @@ def migrate_one(conn, full, name, log=None, force=False, min_bars=100):
                        (full,)).fetchone()
     if row and not force:
         return "skip"
-    rows = _fetch_em_kline(full, fqt=2)
-    src = "em"
+    rows = _fetch_tx_kline(full, fq="hfq", pages=2)
+    src = "tx"
     if len(rows) < min_bars:
-        tx = _fetch_tx_kline(full, fq="hfq", pages=6)
-        if len(tx) > len(rows):
-            rows, src = tx, "tx"
+        em = _fetch_em_kline(full, fqt=2)
+        if len(em) > len(rows):
+            rows, src = em, "em"
     if len(rows) < min_bars:
         return "nodata"
     ok, viol, why = _validate(rows, full, name)
     if not ok:
         return f"reject({why or 'viol=%d' % viol})"
     today = time.strftime("%Y-%m-%d")
-    bars = [r for r in rows if r[0] < today]
+    after_close = (date.today().weekday() < 5
+                   and time.strftime("%H:%M") >= "15:05")
+    bars = [r for r in rows
+            if r[0] < today or (after_close and r[0] == today)]
     if not bars:
         return "nodata"
-    raw = fetch_raw_last(full)
-    k = (raw / bars[-1][4]) if (raw and bars[-1][4] > 0) else None
+    # 显示缩放 K 必须用「同一交易日」的 raw/hfq 收盘配对（2026-09-16 修复）：
+    # 旧实现用实时价配最后一根历史 bar，若当天有涨跌会把 K 算错当日涨跌幅，
+    # 导致整段历史价格显示偏移（如京东方A昨收=今日价）。
+    k = None
+    raw_map = {}
+    for _fetch_raw in (lambda: _fetch_tx_kline(full, fq="", pages=1,
+                                               page=20),
+                       lambda: _fetch_em_kline(full, fqt=0, count=20)):
+        try:
+            for r in _fetch_raw():
+                if r[4] > 0:
+                    raw_map[r[0]] = r[4]
+        except Exception:
+            pass
+        if raw_map:
+            break
+    for r in reversed(bars[-8:]):
+        rc = raw_map.get(r[0])
+        if rc and r[4] and r[4] > 0:
+            k = rc / r[4]
+            break
     # 防止上游截断把长历史覆盖成短历史（对齐 stock_gui 的 min(len,400) 保护）
     old_n, old_last = conn.execute(
         "SELECT COUNT(*), MAX(date) FROM daily_bars WHERE code=?",

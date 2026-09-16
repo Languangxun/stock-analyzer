@@ -522,11 +522,19 @@ def _prev_weekday(d):
 
 
 def last_completed_td():
-    """库中最后一天日K应为的日期 = 今天之前的最近工作日。
-    注意：今日bar永远不入库（盘中未收盘，由实时快照在analyze里合成），
-    所以即使已收盘，新鲜度基准也是上一个工作日。"""
+    """库中最后一天日K应为的日期：收盘后（≥15:05）为今天，否则上一工作日。
+    2026-09-16 起：收盘后允许把今日已收盘的日K入库（此前永远等次日）。"""
     import datetime
+    if _allow_today_bar():
+        return _dstr(datetime.date.today())
     return _dstr(_prev_weekday(datetime.date.today()))
+
+
+def _allow_today_bar():
+    """是否允许今日日K入库：工作日且已过 15:05（数据已收盘定型）。"""
+    import datetime
+    return (datetime.date.today().weekday() < 5
+            and time.strftime("%H:%M") >= "15:05")
 
 
 # ================= 日K增量缓存 =================
@@ -693,7 +701,7 @@ def _fetch_tencent(full, count=600, host=None, fq="hfq"):
     """
     host = host or KLINE_URL
     param = (f"?param={full},day,,,{count},{fq}" if fq
-             else f"?param={full},day,,,{count}")
+             else f"?param={full},day,,,{count},")
     txt = _http_get(host + param, decode="utf-8", retries=1, timeout=8)
     kd = json.loads(txt)
     d = (kd.get("data") or {}).get(full) or {}
@@ -782,14 +790,36 @@ def _get_adjust(full):
 
 
 def _sync_adjust(full, rows):
-    """按最新原始价刷新显示缩放系数（后复权→乘法前复权）。"""
+    """按「同一交易日」配对刷新显示缩放系数 k=raw_close/hfq_close。
+
+    修复 2026-09-16：旧实现用实时价配库内最后 hfq bar，若日K落后数日
+    （盘中/未回填），会把整段历史价格按「最新价/落后日价」缩放错
+    （如京东方A显示昨收=今日价）。现在优先用远端不复权日K与 hfq 日K
+    的同一日期配对；仅当 hfq 末 bar 就是今天时才允许用实时价兜底。"""
     if not rows:
         return
     try:
-        last = rows[-1]["close"]
-        raw = _raw_last_price(full)
-        if raw and last and last > 0:
-            _set_adjust(full, raw / last)
+        raw_map = {}
+        try:
+            for r in (_fetch_tencent(full, count=6, fq="") or []):
+                if r.get("close") and r.get("date"):
+                    raw_map[r["date"]] = r["close"]
+        except Exception:
+            pass
+        k = None
+        for r in reversed(rows[-8:]):
+            rc = raw_map.get(r["date"])
+            if rc and r.get("close") and r["close"] > 0:
+                k = rc / r["close"]
+                break
+        if k is None:
+            raw = _raw_last_price(full)
+            last = rows[-1]["close"]
+            if (raw and last and last > 0
+                    and rows[-1]["date"] == time.strftime("%Y-%m-%d")):
+                k = raw / last
+        if k and k > 0:
+            _set_adjust(full, k)
     except Exception:
         log.debug("sync_adjust 失败 %s", full, exc_info=True)
 
@@ -1093,6 +1123,7 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     库内一律存后复权(hfq)；返回前按 adjust 缩放为乘法前复权显示。"""
     today = time.strftime("%Y-%m-%d")
     fresh = last_completed_td()
+    allow_today = _allow_today_bar()
     with db_conn() as conn:
         rows = _db_rows(conn, full)
         nrow = conn.execute("SELECT name FROM stocks WHERE code=?",
@@ -1106,7 +1137,9 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     if rows:
         try:
             remote = [r for r in _fetch_remote_rows(full, count=1100)
-                      if r["date"] < today and _bar_ok(r)]
+                      if (r["date"] < today
+                          or (allow_today and r["date"] == today))
+                      and _bar_ok(r)]
             # 基期一致性校验：前复权序列每次分红整体重定基，增量合并会在
             # 缓存接缝处留下人造跳空。重叠日期收盘价偏差>0.5% → 全量替换。
             rebase = False
@@ -1196,7 +1229,9 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
             "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
             [(full, r["date"], r["open"], r["high"], r["low"],
               r["close"], r["vol"]) for r in remote
-             if r["date"] < today and _bar_ok(r)])
+             if (r["date"] < today or (_allow_today_bar()
+                                       and r["date"] == today))
+             and _bar_ok(r)])
         rows = [r for r in _db_rows(conn, full)]
     _sync_adjust(full, rows)
     return _display_rows(full, rows, tail)
@@ -1363,7 +1398,9 @@ def backfill_full_market(progress=None, force=False, limit=0,
             try:
                 fetched, raw_last = _bf_fetch_one(c)
                 rows = [r for r in fetched
-                        if r["date"] < today and _bar_ok(r)]
+                        if (r["date"] < today
+                            or (_allow_today_bar() and r["date"] == today))
+                        and _bar_ok(r)]
                 if not rows:
                     raise RuntimeError("过滤后无有效数据")
                 # 基期一致性：与库内重叠收盘偏差>0.5% 说明旧数据是别的
