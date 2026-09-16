@@ -6724,6 +6724,7 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
     cash = float(capital)
     shares = np.zeros(NST)
     entry = np.zeros(NST)
+    t_in = np.zeros(NST, int)
     last = np.full(NST, np.nan)
     miss = np.zeros(NST, int)
     holding = np.zeros(NST, bool)
@@ -6735,13 +6736,16 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
         return (max(amount * _TIER_COMMISSION, _TIER_MIN_COMMISSION)
                 + amount * _TIER_STAMP + amount * _TIER_TRANSFER)
 
-    def close_pos(k, t, px):
+    def close_pos(k, t, px, reason):
         nonlocal cash
         amount = shares[k] * px
         net = amount - sell_fee(amount)
         cash += net
         trades.append({"code": str(codes[k]),
-                       "ret": net / (shares[k] * entry[k]) - 1.0, "hold": t})
+                       "ret": net / (shares[k] * entry[k]) - 1.0,
+                       "hold": int(t - t_in[k]), "t_in": int(t_in[k]),
+                       "t_out": int(t), "entry_px": float(entry[k]),
+                       "exit_px": float(px), "reason": reason})
         holding[k] = False
         shares[k] = 0.0
         target.discard(int(k))
@@ -6756,7 +6760,7 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
         last[fin] = col[fin]
         miss = np.where(holding & ~fin, miss + 1, 0)
         for k in np.nonzero(holding & (miss >= _TIER_STALE_DAYS))[0]:
-            close_pos(k, t, last[k] if last[k] > 0 else entry[k])
+            close_pos(k, t, last[k] if last[k] > 0 else entry[k], "delist")
         on = bool(gate[t]) if gate is not None else True
         if (t - start) % reb == 0 and t > start:
             d = t - 1
@@ -6769,7 +6773,8 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
         for k in np.nonzero(holding)[0]:
             if int(k) in target or not fin[k] or limit_dn[k, t]:
                 continue
-            close_pos(k, t, col[k] * (1 - _TIER_SLIP))
+            close_pos(k, t, col[k] * (1 - _TIER_SLIP),
+                      "target" if on else "gate")
         if (t - start) % reb == 0 and t > start and on:
             equity = cash + float(np.nansum(np.where(holding,
                                                      shares * last, 0.0)))
@@ -6791,6 +6796,7 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
                 cash -= amount + fee
                 shares[k] = n_lot * _TIER_LOT
                 entry[k] = (amount + fee) / shares[k]
+                t_in[k] = t
                 holding[k] = True
         eq.append(cash + float(np.nansum(np.where(holding,
                                                   shares * last, 0.0))))
@@ -6894,7 +6900,106 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
     return out
 
 
-def tier_latest_picks(capital=100000.0, min_active=300):
+def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None):
+    """荐股收益回测：把三档策略的每一次「推荐→平仓」当一笔交易统计。
+
+    与 tier_eval 同引擎（相位平均），区别是输出逐笔荐股口径：
+    推荐次数/平均收益/胜率/盈亏比/持有期/右尾占比/退出原因分布。"""
+    codes, cal, C, V = tier_load_panel()
+    if _TIER_CACHE.get("feat") is None:
+        _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
+    feat = _TIER_CACHE["feat"]
+    segs = tier_segments(cal)
+    if segment in ("2022", "2023", "2024", "2025", "2026"):
+        a = f"{segment}-01-01" if segment != "2022" else "2022-09-01"
+        b = f"{segment}-12-31" if segment != "2026" else cal[-1]
+    elif segment in segs:
+        a, b = segs[segment]
+    else:
+        raise ValueError("未知区间: " + segment)
+    i0 = int(np.searchsorted(cal, a))
+    i1 = int(np.searchsorted(cal, b, side="right"))
+    tiers = list(TIER_CFG) if not tiers else [t for t in tiers if t in TIER_CFG]
+    out = {}
+    for tier in tiers:
+        cfg = TIER_CFG[tier]
+        score = tier_make_score(feat, cfg["score"])
+        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
+            if cfg.get("gate") else None
+        n_ph = min(phases or cfg["reb"], cfg["reb"])
+        trades = []
+        for p in range(n_ph):
+            _, _, tr = tier_sim_phase(codes, cal, C, feat, score, gate,
+                                      i0, i1, cfg, phase=p, capital=1e6)
+            trades.extend(tr)
+            if progress and p == 0:
+                progress(f"[{tier}] 荐股回测 {cal[i0 + p]} ~ {cal[i1 - 1]} ...")
+        if not trades:
+            out[tier] = {"n": 0, "range": [cal[i0], cal[i1 - 1]]}
+            continue
+        rr = np.array([t["ret"] for t in trades], float)
+        holds = np.array([t["hold"] for t in trades], float)
+        wins = rr[rr > 0]
+        losses = rr[rr <= 0]
+        reasons = {}
+        for t in trades:
+            reasons[t.get("reason", "?")] = reasons.get(t.get("reason", "?"), 0) + 1
+        out[tier] = {
+            "n": len(rr), "range": [cal[i0], cal[i1 - 1]],
+            "avg_ret": float(rr.mean()), "med_ret": float(np.median(rr)),
+            "winrate": float((rr > 0).mean()),
+            "avg_win": float(wins.mean()) if len(wins) else None,
+            "avg_loss": float(losses.mean()) if len(losses) else None,
+            "payoff": float(wins.mean() / abs(losses.mean()))
+            if len(wins) and len(losses) else None,
+            "pf": float(wins.sum() / -losses.sum())
+            if len(losses) and losses.sum() < 0 else None,
+            "avg_hold": float(holds.mean()), "med_hold": float(np.median(holds)),
+            "best": float(rr.max()), "worst": float(rr.min()),
+            "tail20": float((rr > 0.20).mean()),
+            "tail50": float((rr > 0.50).mean()),
+            "by_reason": reasons,
+        }
+    return out
+
+
+def tier_picks_report_text(segment="full", tiers=None, capital=0.0):
+    """GUI/CLI 共用：按风险偏好的荐股收益回测文本表。"""
+    st = tier_picks_stats(segment=segment, tiers=tiers)
+    lines = [f"v6.0 荐股收益回测 · {segment} · 按风险偏好（逐笔口径）",
+             "口径：T-1 打分 → T 日收盘买入 → 调仓/闸门/退市平仓；"
+             "含滑点/佣金/印花税/整手；每档分 reb 个相位并行，"
+             "笔数为全部相位交易合计、单笔等权",
+             ""]
+    hdr = (f"{'档位':<5}{'推荐笔数':>8}{'平均收益':>9}{'中位':>8}"
+           f"{'胜率':>7}{'盈亏比':>8}{'PF':>6}{'均持有':>7}"
+           f"{'最好':>8}{'最差':>8}{'>20%':>7}{'>50%':>7}")
+    lines.append(hdr)
+    for tier, s in st.items():
+        if not s.get("n"):
+            lines.append(f"{tier:<5}{'0（闸门长期关闭/无信号）':>40}")
+            continue
+        lines.append(
+            f"{tier:<5}{s['n']:>8}{s['avg_ret']*100:>+8.2f}%"
+            f"{s['med_ret']*100:>+7.2f}%{s['winrate']*100:>6.1f}%"
+            f"{(s['payoff'] or 0):>8.2f}{(s['pf'] or 0):>6.2f}"
+            f"{s['avg_hold']:>7.1f}{s['best']*100:>+7.1f}%"
+            f"{s['worst']*100:>+7.1f}%{s['tail20']*100:>6.1f}%"
+            f"{s['tail50']*100:>6.1f}%")
+    lines.append("")
+    for tier, s in st.items():
+        if s.get("n"):
+            r = s["by_reason"]
+            lines.append(f"[{tier}] 退出原因: 调仓 {r.get('target', 0)} / "
+                         f"闸门 {r.get('gate', 0)} / 退市 {r.get('delist', 0)}"
+                         f"    区间 {s['range'][0]} ~ {s['range'][1]}")
+    lines.append("")
+    lines.append("组合收益（等权跟买）见 `backtest_tiers.py --segment " +
+                 segment + "`；注：历史统计研究，不构成投资建议。")
+    return "\n".join(lines)
+
+
+def tier_latest_picks(capital=100000.0, min_active=300, tiers=None):
     """生产端：按最新可用交易日给出三档目标持仓（含闸门状态）。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
@@ -6917,7 +7022,10 @@ def tier_latest_picks(capital=100000.0, min_active=300):
     risky = np.array([("ST" in names.get(c, "").upper()
                        or "退" in names.get(c, "")) for c in codes])
     out = {"signal_date": signal_date, "capital": capital, "tiers": {}}
-    for tier, cfg in TIER_CFG.items():
+    for tier in (tiers or list(TIER_CFG)):
+        if tier not in TIER_CFG:
+            continue
+        cfg = TIER_CFG[tier]
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         on = bool(gate[d]) if gate is not None else True
@@ -6939,11 +7047,13 @@ def tier_latest_picks(capital=100000.0, min_active=300):
                 break
             px = float(C[k, d])
             lots = int(per / (px * 100)) if per > 0 and px > 0 else 0
+            v20 = float(feat["vol20"][k, d]) \
+                if np.isfinite(feat["vol20"][k, d]) else None
             picks.append({
                 "code": str(codes[k]), "name": names.get(codes[k], ""),
                 "price": px, "score": float(score[k, d]),
-                "vol20": float(feat["vol20"][k, d])
-                if np.isfinite(feat["vol20"][k, d]) else None,
+                "vol20": v20,
+                "stop_ref": (px * (1 - 2.0 * v20)) if v20 else None,
                 "beta60": float(feat["beta60"][k, d])
                 if np.isfinite(feat["beta60"][k, d]) else None,
                 "lots": lots, "cost": lots * 100 * px,
@@ -6955,9 +7065,9 @@ def tier_latest_picks(capital=100000.0, min_active=300):
     return out
 
 
-def tier_report_text(capital=100000.0):
+def tier_report_text(capital=100000.0, tiers=None):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
-    p = tier_latest_picks(capital=capital)
+    p = tier_latest_picks(capital=capital, tiers=tiers)
     lines = [f"v6.0 三档组合 · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
@@ -6972,17 +7082,22 @@ def tier_report_text(capital=100000.0):
             lines.append("")
             continue
         lines.append(f"  {'代码':<9}{'名称':<10}{'现价':>8}{'手数':>6}"
-                     f"{'金额':>10}{'分数':>8}{'20日波动':>9}{'β60':>7}")
+                     f"{'金额':>10}{'分数':>8}{'20日波动':>9}{'β60':>7}"
+                     f"{'参考止损':>9}")
         for x in d["picks"]:
             lines.append(
                 f"  {x['code']:<9}{x['name'][:8]:<10}{x['price']:>8.2f}"
                 f"{x['lots']:>6}{x['cost']:>10.0f}{x['score']:>8.3f}"
                 f"{(x['vol20']*100 if x['vol20'] is not None else 0):>8.1f}%"
-                f"{(x['beta60'] if x['beta60'] is not None else 0):>7.2f}")
+                f"{(x['beta60'] if x['beta60'] is not None else 0):>7.2f}"
+                f"{(x['stop_ref'] if x['stop_ref'] else 0):>9.2f}")
         if d.get("suggested_cost"):
             lines.append(f"  合计约 {d['suggested_cost']:,.0f} 元"
                          f"（{d['suggested_cost']/capital*100:.0f}% 仓位，"
                          f"买不起的票自动跳过）")
+        lines.append(f"  出局规则（回测同口径）：跌出 Top{cfg['top']} / "
+                     f"闸门关闭 / 退市；预计持有 ~{cfg['reb']} 个交易日；"
+                     f"参考止损=现价−2×20日波动（仅风险提示，回测未用）")
         lines.append("")
     lines.append("注：历史统计研究，不构成投资建议。")
     return "\n".join(lines)
@@ -7537,31 +7652,122 @@ class App:
     # ---------- 折叠 ----------
 
     def _open_picks(self):
-        """每日荐股：扫本地缓存多维打分，Top-N 入围。"""
+        """每日荐股：v6.0 按风险偏好（稳健/均衡/激进）或旧多维评分。"""
         win = tk.Toplevel(self.root)
-        win.title(f"每日荐股 · 风险偏好{CFG.RISK_MODE} · 纯本地缓存")
+        win.title("每日荐股 · 按风险偏好（v6.0 三档引擎）")
         win.configure(bg=DARK_BG)
-        win.geometry("520x460" if not self.compact else
+        win.geometry("720x520" if not self.compact else
                      f"{self.root.winfo_screenwidth()}x"
                      f"{self.root.winfo_screenheight()}+0+0")
         if self.compact:
             win.attributes("-fullscreen", True)
             win.bind("<Escape>", lambda e: win.destroy())
+        top = tk.Frame(win, bg=DARK_BG)
+        top.pack(fill="x", padx=6, pady=(6, 0))
+        tk.Label(top, text="风险偏好：", bg=DARK_BG, fg=FG_MAIN,
+                 font=("Microsoft YaHei", 10)).pack(side="left")
+        mode = tk.StringVar(value="稳健")
         lb = tk.Listbox(win, font=("Consolas", 9), bg="#12171d",
                         fg="#cfd8e0", selectbackground="#2b3540")
         lb.pack(fill="both", expand=True, padx=6, pady=6)
-        lb.insert("end", "扫描本地缓存中…")
 
-        def worker():
-            try:
-                picks = daily_picks(progress=lambda s: self._safe_after(
-                    0, lambda: self.progress_var.set(s)))
-            except Exception as e:
-                picks = []
-                self._safe_after(0, lambda: lb.delete(0, "end") or
-                                 lb.insert("end", f"失败: {e}"))
-            self._safe_after(0, lambda: self._picks_fill(win, lb, picks))
-        threading.Thread(target=worker, daemon=True).start()
+        MODES = ("稳健", "均衡", "激进", "综合(旧评分)")
+
+        def reload(*_a):
+            m = mode.get()
+            lb.delete(0, "end")
+            if m == "综合(旧评分)":
+                lb.insert("end", "扫描本地缓存中…")
+
+                def worker():
+                    try:
+                        picks = daily_picks(progress=lambda s: self._safe_after(
+                            0, lambda: self.progress_var.set(s)))
+                    except Exception as e:
+                        picks = []
+                        self._safe_after(0, lambda: lb.delete(0, "end") or
+                                         lb.insert("end", f"失败: {e}"))
+                    self._safe_after(0, lambda: self._picks_fill(win, lb, picks))
+                threading.Thread(target=worker, daemon=True).start()
+            else:
+                lb.insert("end", f"{m}：加载 v6.0 三档引擎（首次约1分钟）…")
+
+                def worker2():
+                    try:
+                        data = tier_latest_picks(capital=self._picks_capital())
+                    except Exception as e:
+                        self._safe_after(0, lambda: lb.delete(0, "end") or
+                                         lb.insert("end", f"失败: {e}"))
+                        return
+                    self._safe_after(0, lambda: self._picks_fill_tier(
+                        win, lb, m, data))
+                threading.Thread(target=worker2, daemon=True).start()
+
+        om = tk.OptionMenu(top, mode, *MODES, command=reload)
+        om.config(bg=BTN_BG if "BTN_BG" in globals() else PANEL_BG,
+                  fg=FG_MAIN, activebackground=BTN_HOVER,
+                  font=("Microsoft YaHei", 10), highlightthickness=0)
+        om.pack(side="left")
+        tk.Label(top, text="（三档=组合策略目标持仓；双击某行分析该股）",
+                 bg=DARK_BG, fg="#8a97a5",
+                 font=("Microsoft YaHei", 9)).pack(side="left", padx=8)
+        reload()
+
+    def _picks_capital(self):
+        """账户本金优先（插件），否则默认 10 万。"""
+        try:
+            ctx = self._plugin_account() or {}
+            cap = float(ctx.get("capital") or 0.0)
+            if cap <= 0:
+                cap = float(ctx.get("cash") or 0.0)
+            return cap if cap > 0 else 100000.0
+        except Exception:
+            return 100000.0
+
+    def _picks_fill_tier(self, win, lb, mode, data):
+        """把 tier_latest_picks 的结果按所选档格式化进列表。"""
+        lb.delete(0, "end")
+        self._picks_rows = {}
+        self._picks_codes = []
+        d = (data or {}).get("tiers", {}).get(mode)
+        if not d:
+            lb.insert("end", "无数据")
+            return
+        cfg = d["cfg"]
+        lb.insert("end", f"信号日 {data['signal_date']} · 建议资金 "
+                         f"¥{data['capital']:,.0f} · {mode}：{cfg['score']} "
+                         f"top{cfg['top']} / {cfg['reb']}日调仓 / "
+                         f"闸门 {cfg['gate']} MA{cfg['ma']} → "
+                         + ("在场" if d["gate_on"] else "空仓（闸门关闭）"))
+        if not d["gate_on"]:
+            lb.insert("end", "闸门关闭：本期不建仓，持有现金等待信号恢复。")
+            lb.insert("end", "双击此处无操作；可切换其它风险档查看。")
+            return
+        lb.insert("end", f"{'代码':<10}{'名称':<9}{'现价':>8}{'手数':>5}"
+                         f"{'金额':>8}{'分数':>7}{'波动':>7}{'参考止损':>9}")
+        row0 = lb.size()
+        for i, x in enumerate(d["picks"]):
+            lb.insert("end",
+                      f"{x['code']:<10}{x['name'][:7]:<9}{x['price']:>8.2f}"
+                      f"{x['lots']:>5}{x['cost']:>8.0f}{x['score']:>7.3f}"
+                      f"{(x['vol20']*100 if x['vol20'] is not None else 0):>6.1f}%"
+                      f"{(x['stop_ref'] or 0):>9.2f}")
+            self._picks_rows[row0 + i] = x["code"]
+            self._picks_codes.append(x["code"])
+        lb.insert("end", "")
+        lb.insert("end", f"合计约 {d.get('suggested_cost', 0):,.0f} 元；"
+                         "出局规则：跌出 Top / 闸门关闭 / 退市；"
+                         "参考止损仅风险提示（回测未用）")
+        lb.insert("end", "双击某行 → 直接分析该股")
+
+        def pick(_e=None):
+            sel = lb.curselection()
+            if sel and sel[0] in self._picks_rows:
+                code = self._picks_rows[sel[0]]
+                win.destroy()
+                self.code_var.set(code)
+                self.run()
+        lb.bind("<Double-Button-1>", pick)
 
     def _picks_fill(self, win, lb, picks):
         lb.delete(0, "end")
@@ -7668,6 +7874,8 @@ class App:
                           command=self.run_tiers_bg)
             m.add_command(label="v6.0 三档回测（全期，相位平均）",
                           command=self.run_tiers_backtest_bg)
+            m.add_command(label="v6.0 荐股收益回测（按风险偏好）",
+                          command=self.run_picks_bt_bg)
         m.add_separator()
         m.add_command(label="⚙ 设置", command=self.open_settings)
         x = anchor_widget.winfo_rootx()
@@ -7913,6 +8121,28 @@ class App:
         lines.append("注：历史统计研究，不构成投资建议。")
         self._show_text_window("v6.0 三档回测 · 全期", "\n".join(lines))
         self.progress_var.set("v6.0 三档回测完成")
+
+    def run_picks_bt_bg(self):
+        """工具菜单：v6.0 荐股收益回测（逐笔口径，按风险偏好）。"""
+        if getattr(self, "_picksbt_running", False):
+            messagebox.showinfo("v6.0 荐股回测", "已在后台运行中，请稍候")
+            return
+        self._picksbt_running = True
+        self.progress_var.set("v6.0 荐股收益回测：加载面板（约1分钟）...")
+
+        def _job():
+            return tier_picks_report_text(segment="full")
+
+        self._run_bg(_job, self._picksbt_done)
+
+    def _picksbt_done(self, res, err):
+        self._picksbt_running = False
+        if err:
+            self.progress_var.set(f"v6.0 荐股回测失败: {err}")
+            messagebox.showerror("v6.0 荐股回测", str(err))
+            return
+        self._show_text_window("v6.0 荐股收益回测（按风险偏好）", res)
+        self.progress_var.set("v6.0 荐股收益回测完成")
 
     def _run_bg(self, fn, done):
         """后台线程执行 fn，完成后经 future 回调在主线程调用
