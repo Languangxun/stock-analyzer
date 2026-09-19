@@ -82,7 +82,7 @@ print("=== 最终三档参数 ===")
 for mode, p in best_all.items():
     print(mode, p)
 import json
-with open("risk_sweep_results.json", "w", encoding="utf-8") as f:
+with open(_os_boot.path.join(_RESULTS_DIR, "risk_sweep_results.json"), "w", encoding="utf-8") as f:
     json.dump({"_note": "★最优为样本内选择，未经独立样本验证",
                **{m: {"buy_th": p[0], "cooldown": p[1], "atr_mult": p[2],
                       "trail_trigger": p[3], "trail_ratio": p[4]}

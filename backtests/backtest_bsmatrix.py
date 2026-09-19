@@ -18,6 +18,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import statistics
 import time
 
@@ -256,7 +260,7 @@ def main():
     import json
     out = [{k2: (round(v2, 4) if isinstance(v2, float) else v2)
             for k2, v2 in s.items()} for s in per]
-    with open("bs_matrix_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "bs_matrix_results.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False)
     print(f"\n完成 {time.time()-t0:.0f}s → bs_matrix_results.json")
 

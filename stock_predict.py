@@ -6830,6 +6830,9 @@ def _v4_print_report(r):
 #   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
 #   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
 #          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）
+# 激进档基准（v6.1.1）：两个口径统一对标科创50（sh000688），
+#         不再按是否具备科创板权限区分（多数账户无科创板权限，但仍以科创50
+#         作为「高弹性成长」这一风格的统一参照）。
 # 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
 #         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
 # 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
@@ -6843,22 +6846,36 @@ TIER_CFG = {
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
 }
-# 主板口径（v6.1）：同一套策略在沪主板+深主板内运行；激进档 β/闸门改用上证
+# 主板口径（v6.1.1）：稳健/均衡在沪主板+深主板内运行；
+# 激进档改用 blend_mom（动量0.7/低波0.3）偏弹性 + 高换手（reb10/top20/上证MA20）。
+# 依据（2026-09-19 过拟合诊断，全量缓存）：
+#   · β 选股（对上证/对创业板指）在主板池全面失效：年化 -6.7%、回撤 -47.2%、
+#     参数邻域 top3/5/10/20 与 MA20/60/120 全为负、随机安慰剂不比真实打分差
+#     → 判定为口径设计缺陷（主板与上证同源，高β≈上证自身高波动成分，无独立 alpha）；
+#   · 改为 blend_mom 后：全期 +6.6%、样本外 +13.0%（超额 +12.3pp）、
+#     强势段 +14.1%、交易 9564 笔（原 1746 笔，提升 5.5 倍）、回撤 -12.3%；
+#   · 动量权重邻域 0.6/0.7 稳健（+7.0%/+6.6%），0.9/1.0 崩坏（-10.5%/-28.2%）
+#     → 取 0.7 并保留低波 0.3 作为防守项。
 TIER_CFG_MAIN = {
     "稳健": dict(universe="main", score="blend", top=20, reb=20,
                  gate="sh000001", ma=20),
     "均衡": dict(universe="main", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
-    "激进": dict(universe="main", score="beta_sh", top=5, reb=10,
+    "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
                  gate="sh000001", ma=20),
 }
 TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN}
+# 激进档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
+# 主板激进用 blend_mom 弹性档，两者都以科创50 作为超额对比基准。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
-    ("all", "激进"): "sz399006",
+    ("all", "激进"): "sh000688",
     ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
-    ("main", "激进"): "sh000001",
+    ("main", "激进"): "sh000688",
 }
+# 基准指数中文名（报告/对照用）
+BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
+              "sh000688": "科创50", "sz399001": "深证成指"}
 
 
 def tier_cfg(tier, universe="all"):
@@ -7019,21 +7036,29 @@ def _tier_rank01(x):
     return out
 
 
-def tier_make_score(feat, kind):
-    """合成打分：blend=动量20与低波20百分位等权；
-    beta=60日β（对创业板指）；beta_sh=60日β（对上证，主板口径）。"""
+def tier_make_score(feat, kind, mom_w=None):
+    """合成打分：
+      blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
+      blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
+      beta       = 60日β（对创业板指）
+      beta_sh    = 60日β（对上证，主板口径）
+    注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
     if kind == "beta":
         return feat["beta60"]
     if kind == "beta_sh":
         return feat.get("beta60_sh", feat["beta60"])
-    if kind == "blend":
+    if kind in ("blend", "blend_mom"):
+        if kind == "blend_mom":
+            mw = 0.7 if mom_w is None else float(mom_w)
+        else:
+            mw = 0.5
         r1 = np.zeros_like(feat["vol20"])
         r2 = np.zeros_like(feat["vol20"])
         for t in range(NDT):
             r1[:, t] = _tier_rank01(feat["ret20"][:, t])
             r2[:, t] = _tier_rank01(feat["vol20"][:, t])
-        return r1 + (1.0 - r2)
+        return mw * r1 + (1.0 - mw) * (1.0 - r2)
     raise ValueError("未知评分: " + kind)
 
 
@@ -7205,7 +7230,7 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
-        score = tier_make_score(feat, cfg["score"])
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         n_ph = min(phases or cfg["reb"], cfg["reb"])
@@ -7232,15 +7257,22 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         m["phase_ann_max"] = max(anns)
         bench_code = (TIER_BENCH.get((universe, tier))
                       or TIER_BENCH[("all", tier)])
-        try:
-            bcl, _ = tier_idx_series(cal, bench_code)
-            bmap = {d: v for d, v in zip(cal, bcl)}
-            bseg = np.array([bmap.get(d, np.nan) for d in dates], float)
-            bm = _tier_metrics(bseg, dates)
-        except Exception:
-            bm = None
+        # 多基准对照（v6.1.1）：主基准 + 其余指数，避免单一强基准让超额恒负
+        extra = [c for c in ("sh000001", "sz399006", "sh000688")
+                 if c != bench_code]
+        benches = {}
+        for code in [bench_code] + extra:
+            try:
+                bcl, _ = tier_idx_series(cal, code)
+                bmap = {d: v for d, v in zip(cal, bcl)}
+                bseg = np.array([bmap.get(d, np.nan) for d in dates], float)
+                benches[code] = _tier_metrics(bseg, dates)
+            except Exception:
+                continue
+        bm = benches.get(bench_code)
         m["benchmark"] = bench_code
         m["bench"] = bm
+        m["benches"] = benches
         m["excess_total"] = (m["total"] - bm["total"]) \
             if bm and bm["total"] is not None else None
         m["range"] = [dates[0], dates[-1]]
@@ -7275,7 +7307,7 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
-        score = tier_make_score(feat, cfg["score"])
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         n_ph = min(phases or cfg["reb"], cfg["reb"])
@@ -7390,7 +7422,7 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         on = bool(gate[d]) if gate is not None else True
-        score = tier_make_score(feat, cfg["score"])
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
         m = tier_universe_mask(codes, cfg.get("universe", "all"))
         if apply_perms:
             m = m & np.array([pick_allowed(c, info.get(c, ("", ""))[1])

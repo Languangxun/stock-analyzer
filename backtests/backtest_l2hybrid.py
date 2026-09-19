@@ -9,6 +9,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import math
 import time
 from backtest_l2type import load_all, precompute, match_pool, match_l1, \
@@ -96,7 +100,7 @@ def main():
         mae = sum(abs(p - a) for p, a in zip(preds, acts)) / len(preds)
         out[name] = {"n": len(preds), "dir_hit": hit, "ic": ic, "mae": mae}
         print(f"{name:<26}{len(preds):>5}{hit*100:>8.1f}%{ic:>+9.4f}{mae*100:>8.3f}%")
-    with open("l2hybrid_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "l2hybrid_results.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
     print(f"完成 {time.time()-t0:.0f}s")
 

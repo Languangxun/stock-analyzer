@@ -17,6 +17,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import math
 import time
 
@@ -180,7 +184,7 @@ def main():
                  "theme_L1", "etf_L1"):
         report(name, R[name], TAIL)
     import json
-    with open("trade_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "trade_results.json"), "w", encoding="utf-8") as f:
         json.dump({n: [(round(p,5) if p else None, round(a,5), d)
                        for p, a, d in v] for n, v in R.items()},
                   f, ensure_ascii=False)

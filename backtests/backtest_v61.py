@@ -51,11 +51,20 @@ def _tier_table(rep, tier):
     if not tv:
         return None
     b = tv.get("bench") or {}
+    benches = {}
+    for c, v in (tv.get("benches") or {}).items():
+        if v and v.get("ann") is not None:
+            benches[c] = {
+                "ann": v.get("ann"),
+                "excess": (tv["total"] - (v.get("total") or 0))
+                if tv.get("total") is not None else None,
+            }
     return {
         "range": tv["range"], "total": tv["total"], "ann": tv["ann"],
         "mdd": tv["mdd"], "sharpe": tv["sharpe"], "trades": tv["trades"],
         "winrate": tv["winrate"], "benchmark": tv["benchmark"],
         "bench_ann": b.get("ann"), "bench_mdd": b.get("mdd"),
+        "benches": benches,
         "excess_total": tv.get("excess_total"),
         "phase_ann_min": tv.get("phase_ann_min"),
         "phase_ann_max": tv.get("phase_ann_max"),
@@ -72,7 +81,7 @@ def build_md(report):
         lines.append(f"#### {UNI_NAME[uni]} · 组合（相位平均，含全部费用）")
         lines.append("")
         lines.append("| 档位 | 区间 | 总收益 | 年化 | 最大回撤 | Sharpe | "
-                     "交易 | 基准 | 基准年化 | 超额(总) | 相位年化区间 |")
+                     "交易 | 主基准 | 基准年化 | 超额(总) | 相位年化区间 |")
         lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for tier in TIERS:
             t = _tier_table(rep, tier)
@@ -87,6 +96,30 @@ def build_md(report):
                 f"{(t['excess_total'] or 0)*100:+.1f}pp | "
                 f"{(t['phase_ann_min'] or 0)*100:+.1f}% ~ "
                 f"{(t['phase_ann_max'] or 0)*100:+.1f}% |")
+        lines.append("")
+        # 多基准对照（激进档主基准为科创50，另附创业板指/上证）
+        lines.append(f"#### {UNI_NAME[uni]} · 三基准对照（年化 / 超额pp）")
+        lines.append("")
+        lines.append("| 档位 | 策略年化 | 科创50 | 超额 | 创业板指 | 超额 | "
+                     "上证指数 | 超额 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for tier in TIERS:
+            t = _tier_table(rep, tier)
+            if not t:
+                continue
+            bs = t.get("benches") or {}
+            def cell(code):
+                v = bs.get(code)
+                if not v or v.get("ann") is None:
+                    return "-", "-"
+                return (f"{(v['ann'] or 0)*100:+.1f}%",
+                        f"{(v['excess'] or 0)*100:+.1f}pp")
+            a1, e1 = cell("sh000688")
+            a2, e2 = cell("sz399006")
+            a3, e3 = cell("sh000001")
+            lines.append(
+                f"| {tier} | {(t['ann'] or 0)*100:+.1f}% | {a1} | {e1} | "
+                f"{a2} | {e2} | {a3} | {e3} |")
         lines.append("")
         lines.append(f"#### {UNI_NAME[uni]} · 荐股（逐笔口径）")
         lines.append("")
@@ -109,7 +142,12 @@ def build_md(report):
                 f"退市{r.get('delist', 0)} |")
         lines.append("")
     lines.append("- 口径：T-1 信号 → T 日收盘成交；含滑点/佣金/印花税/整手/"
-                 "涨跌停/退市了结；主板激进档 β 与闸门改用上证 MA20。")
+                 "涨跌停/退市了结。")
+    lines.append("- 基准（v6.1.1）：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
+                 "（不分是否具备科创板权限），另附创业板指/上证对照，"
+                 "避免单一强基准使超额恒负。")
+    lines.append("- 主板激进档（v6.1.1）：改用 blend_mom（动量0.7/低波0.3）"
+                 "高换手配置（reb10/top20/上证MA20）——原 β 口径经诊断证伪。")
     lines.append("- 注：全部为历史统计研究，不构成投资建议。")
     return "\n".join(lines)
 

@@ -18,6 +18,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import json
 import math
 import time
@@ -253,7 +257,7 @@ def main():
     else:
         print("  (无京东方数据)")
 
-    with open("swing_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "swing_results.json"), "w", encoding="utf-8") as f:
         json.dump(R, f, ensure_ascii=False)
     print(f"\n完成 {time.time()-t0:.0f}s -> swing_results.json")
 

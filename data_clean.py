@@ -32,7 +32,9 @@ from datetime import date, datetime
 
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                   "stock_cache.db")
+# 清洗报告统一写入 reports/（避免污染仓库根目录）
 REPORT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "reports",
                            "清洗报告_" + time.strftime("%Y%m%d") + ".md")
 EM_HOSTS = ("push2his.eastmoney.com", "92.push2his.eastmoney.com",
             "93.push2his.eastmoney.com", "97.push2his.eastmoney.com")
@@ -503,6 +505,7 @@ def main():
     if args.all_adj:
         bad = migrate_all(args.db, workers=args.workers, limit=args.limit,
                           force=args.force, log=log)
+        os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
         with open(REPORT_PATH, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         print(f"\n报告已保存: {REPORT_PATH}")
@@ -556,6 +559,7 @@ def main():
         conn.commit()
         log(f"修复完成：成功 {fixed} 只")
     conn.close()
+    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\n报告已保存: {REPORT_PATH}")

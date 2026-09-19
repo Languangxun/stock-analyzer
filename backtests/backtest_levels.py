@@ -19,6 +19,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import bisect
 import math
 import time
@@ -312,7 +316,7 @@ def main():
         summary[name] = {"n": len(preds), "dir_hit": hit, "ic": ic, "mae": mae}
         print(f"{name:<14}{len(preds):>5}{hit*100:>8.1f}%{ic:>+9.4f}{mae*100:>8.3f}%")
     import json
-    with open("level_ablation_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "level_ablation_results.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(f"\n完成 {time.time()-t0:.0f}s → level_ablation_results.json")
 

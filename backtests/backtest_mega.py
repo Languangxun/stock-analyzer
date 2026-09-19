@@ -17,6 +17,10 @@ ROOT = _os_boot.path.dirname(_os_boot.path.dirname(
 if ROOT not in _sys_boot.path:
     _sys_boot.path.insert(0, ROOT)
 # --- 目录引导结束 ---
+# 历史结果统一归档到 research/legacy/results/（不污染仓库根目录）
+_RESULTS_DIR = _os_boot.path.join(ROOT, "research", "legacy", "results")
+_os_boot.makedirs(_RESULTS_DIR, exist_ok=True)
+
 import math
 import time
 
@@ -96,7 +100,7 @@ def main():
         print(f"{name:<20}{st['n']:>6}{st['hit']*100:>8.1f}%{st['z']:>+8.2f}{sig}"
               f"{st['ic']:>+9.4f}{st['t_ic']:>+8.2f}{st['mae']*100:>7.3f}%")
     print("\n(z>1.96≈95%置信；t(IC)>2≈显著)")
-    with open("mega_results.json", "w", encoding="utf-8") as f:
+    with open(_os_boot.path.join(_RESULTS_DIR, "mega_results.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
     print(f"完成 {time.time()-t0:.0f}s → mega_results.json")
 
