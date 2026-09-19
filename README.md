@@ -689,15 +689,15 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
   452 只 ≥1000 根**，合计 **90.7 万根**；未达 200 根的 289 只（新上市/迷你）留在代码表但不入回测。
   入库口径与个股一致（hfq + `adjust` 缩放）；`refresh_all_codes` 已改为**只清 A 股行**，
   不会在刷新代码表时抹掉 ETF。
-- **客户端数据包与研究产物**（Release **v6.1.2**）：
-  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.2>
-  - `stock-analyzer-client-20260919.zip`（292 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
+- **客户端数据包与研究产物**（Release **v6.1.3**）：
+  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.3>
+  - `stock-analyzer-client-v6.1.3-20260919.zip`（292 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
     （含 `adjust` 修复、复权口径迁移、科创50 指数、**1202 只 ETF 历史**），解压即用；
     **配置为空 Key 模板**（不含任何私有凭据，打包后自动全包扫描 Key 模式），
     首次运行请在设置内填自己的 API Key；
-  - `research_v6.1.2.zip`（25.6 MB）：全部回测 JSON 与报告产物
+  - `research_v6.1.3.zip`（27.8 MB）：全部回测 JSON 与报告产物
     （含单文件 >100MB 的逐对象消融明细，故不入仓，随研究包分发）。
-  - 上一版：v6.1 <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1>；
+  - 上一版：v6.1.2 <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.2>；
     全部版本：<https://github.com/monologue-github/stock-analyzer/releases>
 
 ---
@@ -708,19 +708,20 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 |---|---|
 | `stock_gui.py` | 本地 GUI + **三档引擎/信号源权威实现**（`tier_*`、`_sig_*`、`pick_ablation_multi`）+ AI 客户端 |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 从 GUI 自动抽取）：`--tiers` / `--tiers-backtest` / `--picks-backtest` / `--ai-tier` / `--universe` |
-| `backtests/backtest_v61.py` | **v6.1 标准回测**（两口径 × 四类产品，产物 `research/v61_report.*`） |
+| `backtests/backtest_v61.py` | **标准回测**（**四口径** × 四类产品，产物 `research/v61_report.*`） |
 | `backtests/backtest_tiers.py` | 三档分段回测封装（`--segment full/val/bull/yearly`、`--universe`、参数敏感性） |
 | `backtests/backtest_picks_v6.py` | 荐股逐笔收益回测（按风险偏好/口径/逐年） |
-| `backtests/backtest_strategy_ablation.py` | 全对象多算法消融（**逐个对象覆盖**，9 类算法 × 3 档，多指标结合，AI 不参与，输出覆盖率清单） |
+| `backtests/backtest_strategy_ablation.py` | 全对象多算法消融（**逐个对象覆盖**，**10 类算法**含 L2 同行业+行业ETF，× 3 档，多指标结合，numpy 加速，AI 不参与，输出覆盖率清单） |
 | `backtests/`（其余） | 历史研究回测脚本（因子消融、退出消融、横截面实验、激进双引擎等），保留作研究记录 |
 | `build_cli.py` | GUI → CLI 打包器，保证算法同步 |
 | `build_client_zip.py` | 生成客户端发布包 `dist/stock-analyzer-client-<日期>.zip` |
 | `sync_adjust.py` | 批量刷新 `adjust` 现价缩放系数（hfq → 乘法前复权） |
 | `stock_gui.py` → `refresh_etf_codes()` | 东财 ETF/LOF 代码表刷新（剔除货币类），写入 `stocks`（`industry='ETF'`） |
 | `stock_gui.py` → `backfill_etf_history()` | ETF 历史回填（hfq 口径、断点续传、6 线程、同步 `adjust`） |
+| `stock_gui.py` → `sector_l2_series()` / `_sig_l2_industry()` | L2 行业参照序列（优先同名行业ETF，否则同行业等权合成）与 L2 信号（v6.1.3） |
 | `data_clean.py` | 数据清洗（结构异常/除权残留/退市/停牌），`--fix` 才改库 |
 | `factor_lab/` | 因子穷举/验证框架（BH-FDR 全组合 pass=0，负面证据）+ 筹码特征 |
-| `research/v61_report.json` / `.md` | **本次 v6.1/v6.1.1 标准回测产物（权威，含三基准对照）** |
+| `research/v61_report.json` / `.md` | **本次标准回测产物（权威，四口径 + 三基准对照）** |
 | `research/v61_report_{val,bull}.json` / `.md` | 样本外 / 强势段标准回测产物 |
 | `research/tiers_*.json` | 三档分段/逐年回测产物 |
 | `research/strategy_ablation_*.json` | 全A消融两层产物（逐股 + 聚合） |
