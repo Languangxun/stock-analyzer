@@ -175,7 +175,8 @@ def portfolio(score, y, rd, day_idx, q=0.1, cost=0.001, mode="long"):
         if rets.std(ddof=1) > 0 else None
     return {"n_days": len(rets), "ann": ann, "mdd": mdd, "sharpe": sharpe,
             "vol": vol, "win": float((rets > 0).mean()),
-            "avg_turnover": float(np.mean(turn))}
+            "avg_turnover": float(np.mean(turn)),
+            "calmar": float(ann / abs(mdd)) if mdd < -1e-9 else None}
 
 
 def eval_candidate(name, mask, w, Xo, Y1, rd, tr_days, va_days):
@@ -420,6 +421,48 @@ def run():
             print(f"  {name:<18} 验证 {v['ann']*100:+7.1f}% / "
                   f"{v['mdd']*100:+6.1f}% / {v['sharpe'] or 0:+.2f}   "
                   f"训练 {t['ann']*100:+7.1f}%")
+
+    # ---- 多指标结合综合分（仅训练集指标，防前视）：横截面 rank 加权 ----
+    def _metric(r, *path):
+        d = r
+        for k in path:
+            d = (d or {}).get(k)
+            if d is None:
+                return None
+        return float(d)
+
+    def _rank_map(vals):
+        m = sum(1 for v in vals if v is not None)
+        out = [0.0] * len(vals)
+        order = sorted(range(len(vals)),
+                       key=lambda i: (vals[i] is not None, vals[i]))
+        pos = 0
+        for i in order:
+            if vals[i] is not None:
+                pos += 1
+                out[i] = pos / max(1, m)
+        return out
+
+    names = list(results)
+    weights = [("train_ic", "mean", 0.25), ("train_ic", "icir", 0.15),
+               ("train_long", "calmar", 0.25), ("train_long", "sharpe", 0.15),
+               ("train_long", "win", 0.10), ("train_long", "ann", 0.10)]
+    comp = [0.0] * len(names)
+    for a, b, w in weights:
+        rm = _rank_map([_metric(results[n], a, b) for n in names])
+        for i in range(len(names)):
+            comp[i] += w * rm[i]
+    for n, s in zip(names, comp):
+        results[n]["composite_train"] = s
+    print("\n多指标综合分（训练集 rank 加权；选型只看训练段，验证段仅报告）:")
+    for n in sorted(names, key=lambda x: -results[x]["composite_train"]):
+        r = results[n]
+        tl = r.get("train_long") or {}
+        vl = r.get("val_long") or {}
+        print(f"  {n:<18} 综合={r['composite_train']:.3f}  "
+              f"训练Calmar={(tl.get('calmar') or 0):+.2f}  "
+              f"验证Calmar={(vl.get('calmar') or 0):+.2f}  "
+              f"验证年化={(vl.get('ann') or 0)*100:+.1f}%")
 
     # 多重检验：对训练Top 10k组合做验证段 BH-FDR
     n_top = 10000

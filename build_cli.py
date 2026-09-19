@@ -28,18 +28,21 @@ K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪�
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--backfill]
                              [--clean] [--research] [--v4 [--v4-limit N]]
-                             [--tiers [--tier 稳健|均衡|激进]]
-                             [--tiers-backtest] [股票代码]
+                             [--tiers [--tier 稳健|均衡|激进] [--ai-tier]]
+                             [--tiers-backtest] [--universe all|main]
+                             [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
   --refresh-cache  刷新全市场代码表/市值分层（约1分钟，7天有效）
   --backfill       全市场1000交易日日K回填（断点续传，配额内自动分晚完成）
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
   --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
-  --tiers          v6.0 三档组合：输出最新目标持仓/闸门状态（可配 --tier）
-  --tiers-backtest v6.0 三档组合：全期回测摘要（相位平均，含全部费用）
-  --picks-backtest v6.0 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
-  --picks-seg     荐股回测区间：full(默认)/val/bull/2024/2025...
+  --tiers          v6.1 三档组合：输出最新目标持仓/闸门状态（可配 --tier）
+  --ai-tier        荐股前由AI在三档内选一档（按设置里的风险偏好锚定）
+  --universe       股票池：all(全A，默认)/main(沪深主板)
+  --tiers-backtest v6.1 三档组合：全期回测摘要（相位平均，含全部费用）
+  --picks-backtest v6.1 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
+  --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 """
 
 '''
@@ -93,8 +96,11 @@ def extract_cache_block(gui_src):
 
 
 def extract_algo_block(gui_src):
-    """算法主体：QT_URL 起，slice_view 前止。"""
-    return extract(gui_src, "QT_URL = ", "def slice_view")
+    """算法主体：QT_URL 起，slice_view 前止；并入 AI 客户端块
+    （deepseek_chat 起，class App 前止，供 CLI --ai 急救与模型列表使用）。"""
+    block = extract(gui_src, "QT_URL = ", "def slice_view")
+    ai = extract(gui_src, "# ================= AI 客户端", "class App:")
+    return block + "\n\n" + ai
 
 
 def extract_cli_tail(old_cli_src):

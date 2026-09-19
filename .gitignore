@@ -1,4 +1,4 @@
-﻿# 本地配置（含 API Key，勿提交）
+# 本地配置（含 API Key，勿提交）
 stock_gui.ini
 # 本地缓存数据库
 stock_cache.db
@@ -16,6 +16,9 @@ plugins/_data/
 # factor_lab 中间缓存/结果（由 backtest_factor_ablation.py 生成，可重跑）
 research/factor_lab/
 *.npz
+
+# 全A消融逐股明细（>100MB，超出 GitHub 单文件上限；随 Release 资产 research_v6.1.zip 分发）
+research/strategy_ablation_per_stock*.json
 
 # --- 标准 Python 忽略项 ---
 .env

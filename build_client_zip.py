@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """build_client_zip.py - 生成客户端压缩包（dist/stock-analyzer-client-<日期>.zip）
 
-客户端包 = 运行所需最小集合：GUI/CLI（含 v6.0 三档引擎）+ 插件 + 配置模板 +
-说明/许可 + 本地日K缓存 stock_cache.db。
+客户端包 = 运行所需最小集合：GUI/CLI（含 v6.1 三档引擎与 AI 客户端）+ 插件 +
+配置模板 + 说明/许可 + 本地日K缓存 stock_cache.db。
 
 默认先 VACUUM 压缩数据库（1GB+ 库可显著减小包体，需约 2 倍空闲磁盘），
 用 --no-vacuum 跳过。
