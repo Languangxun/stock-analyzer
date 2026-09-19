@@ -3903,6 +3903,7 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
 
 ALGO_LABEL = {
     "l1_pattern": "L1形态上行概率",
+    "l2_ind": "L2同行业+行业ETF",
     "macd": "MACD金叉/死叉",
     "kdj": "KDJ金叉/死叉",
     "rsi": "RSI超买超卖",
@@ -3976,6 +3977,137 @@ def _sig_l1_pattern(rows, W=None, step=5, up_th=0.6, dn_th=0.4):
 
 # 注意：与上面的 _SECTOR_CACHE（个股板块上下文缓存）区分，勿重名
 _SECTOR_MOM_CACHE = {"ts": 0.0, "data": None}
+
+
+_SECTOR_L2_CACHE = {"ts": 0.0, "data": None}
+
+# 行业名与 ETF 简称匹配时要去掉的发行商后缀/噪声词
+_ETF_VENDOR = ("ETF", "基金", "国泰", "华夏", "华宝", "易方达", "南方", "广发",
+               "嘉实", "富国", "汇添富", "银华", "工银", "博时", "天弘", "华安",
+               "招商", "鹏华", "建信", "景顺", "中欧", "万家", "摩根", "国联安",
+               "中证", "上证", "深证", "指数", "LOF", "联接")
+
+
+def _match_industry_etf(ind_names, etf_names):
+    """行业 → 行业ETF 代码的启发式匹配（v6.1.3）。
+
+    规则：ETF 名称去掉发行商/指数噪声词后，与行业名（去掉 Ⅱ/Ⅲ 后缀）互相包含，
+    取名称最长的匹配（更具体）。返回 {industry: etf_code}。"""
+    def norm(s):
+        t = s or ""
+        for w in _ETF_VENDOR:
+            t = t.replace(w, "")
+        return t.replace("Ⅱ", "").replace("Ⅲ", "").strip()
+    out = {}
+    for ind in ind_names:
+        ni = norm(ind)
+        if len(ni) < 2:
+            continue
+        best, best_len = None, -1
+        for code, name in etf_names.items():
+            ne = norm(name)
+            if len(ne) < 2:
+                continue
+            if (ni in ne or ne in ni) and len(ne) > best_len:
+                best, best_len = code, len(ne)
+        if best:
+            out[ind] = best
+    return out
+
+
+def sector_l2_series(max_age=1800):
+    """L2 参照序列（同行业 + 行业ETF）（v6.1.3）。
+
+    每个行业构造一条「行业指数」日收盘序列，优先用**同名行业ETF**（可直接交易、
+    无成分股停牌噪声）；找不到匹配 ETF 时用**同行业个股等权收益累乘**合成。
+    返回 (cal, {industry: close数组(归一化到首个有效值)}, {industry: etf_code或''})，
+    仅用截至当日数据（因果）。"""
+    now = time.time()
+    if (_SECTOR_L2_CACHE["data"] is not None
+            and now - _SECTOR_L2_CACHE["ts"] < max_age):
+        return _SECTOR_L2_CACHE["data"]
+    codes, cal, C, V = tier_load_panel()
+    with db_conn() as conn:
+        info = {c2: ((n or ""), (i or "")) for c2, n, i in
+                conn.execute("select code,name,industry from stocks")}
+    idx_of = {c: k for k, c in enumerate(codes)}
+    groups, etf_names = {}, {}
+    for k, code in enumerate(codes):
+        nm, ind = info.get(code, ("", ""))
+        if _is_etf(code):
+            if nm:
+                etf_names[code] = nm
+            continue
+        if ind:
+            groups.setdefault(ind, []).append(k)
+    ind_etfs = _match_industry_etf(list(groups), etf_names)
+    series, used_etf = {}, {}
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for ind, ks in groups.items():
+            if len(ks) < 3:
+                continue
+            etf = ind_etfs.get(ind)
+            if etf is not None:
+                ei = idx_of.get(etf)
+                if ei is not None:
+                    arr = C[ei, :].astype(float)
+                    fin = np.isfinite(arr) & (arr > 0)
+                    if int(fin.sum()) >= 60:
+                        base = arr[fin][0]
+                        series[ind] = arr / base
+                        used_etf[ind] = etf
+                        continue
+            # 回退：同行业个股等权收益累乘合成
+            sub = C[ks, :].astype(float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                r = np.where(sub[:, :-1] > 0, sub[:, 1:] / sub[:, :-1] - 1.0,
+                             np.nan)
+            r = np.hstack([np.full((len(ks), 1), np.nan), r])
+            m = np.nanmean(r, axis=0)
+            m = np.where(np.isfinite(m), m, 0.0)
+            series[ind] = np.cumprod(1.0 + m)
+            used_etf[ind] = ""
+    _SECTOR_L2_CACHE["data"] = (cal, series, used_etf)
+    _SECTOR_L2_CACHE["ts"] = now
+    return _SECTOR_L2_CACHE["data"]
+
+
+def _sig_l2_industry(rows, industry="", step=3, **_kw):
+    """L2 信号（同行业 + 行业ETF，v6.1.3）：
+
+    用行业的「行业指数」（优先同名行业ETF）做择时——
+    · BUY：行业指数在 MA20 上方 **且** 行业 5 日动量 > 0（行业走强）；
+    · SELL：行业指数在 MA20 下方 **且** 行业 5 日动量 < 0（行业转弱）。
+    即「同行业/行业ETF 先转强，再买该行业个股」，与 `sector_rot`（行业之间比强弱）
+    互补：L2 看**行业自身的时序趋势**，sector_rot 看**横截面排名**。"""
+    if not industry:
+        return []
+    try:
+        cal, series, _used = sector_l2_series()
+    except Exception:
+        return []
+    arr = series.get(industry)
+    if arr is None or len(arr) < 25:
+        return []
+    ma20 = np.full(len(arr), np.nan)
+    ma20[19:] = np.convolve(arr, np.ones(20) / 20.0, "valid")
+    r5 = np.full(len(arr), np.nan)
+    r5[5:] = arr[5:] / arr[:-5] - 1.0
+    didx = {d: i for i, d in enumerate(cal)}
+    out = []
+    for i in range(5, len(rows), step):
+        j = didx.get(rows[i].get("date"))
+        if j is None or j < 20:
+            continue
+        up = np.isfinite(ma20[j]) and arr[j] > ma20[j]
+        dn = np.isfinite(ma20[j]) and arr[j] < ma20[j]
+        if up and np.isfinite(r5[j]) and r5[j] > 0:
+            out.append((i, rows[i]["date"], "BUY", "行业(ETF)走强"))
+        elif dn and np.isfinite(r5[j]) and r5[j] < 0:
+            out.append((i, rows[i]["date"], "SELL", "行业(ETF)转弱"))
+    return out
 
 
 def sector_mom_series(max_age=1800):
@@ -4130,10 +4262,14 @@ def _ablation_pf(trades):
 
 # ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
 
-def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
+def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
+               arrays=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
     早盘信号：信号在 T 日收盘生成，T+1 日收盘执行；止损单用 T-1 日 ATR 设定。
-    atrs 可外部预计算加速。trade_out（可选 list）：追加逐笔收益率。"""
+    atrs 可外部预计算加速。
+    arrays（v6.1.3，numpy 加速）：(o,h,l,c) 平行列表，已由调用方从 rows 抽出，
+      供批量回测复用，避免每次回测重复做 4×N 次字典取值。
+    trade_out（可选 list）：追加逐笔收益率。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
@@ -4141,35 +4277,43 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
     sig_map = {s[0] + 1: s[2] for s in signals if i0 <= s[0] + 1 < i1}
     # ATR(14) 预计算（若未传入）
     if atrs is None:
-        atrs = [0.0] * len(rows)
-        for i in range(i0 + 14, i1):
-            s = 0.0
-            for j in range(i - 13, i + 1):
-                h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
-                s += max(h - l, abs(h - pc), abs(l - pc))
-            atrs[i] = s / 14
+        atrs = _precompute_atr(rows, i0, i1)
+    # OHLC 平行数组（numpy 加速路径：调用方传入；否则就地抽取一次）
+    if arrays is not None:
+        o_a, h_a, l_a, c_a = arrays
+    else:
+        o_a = [(r.get("open") or 0.0) for r in rows]
+        h_a = [(r.get("high") or 0.0) for r in rows]
+        l_a = [(r.get("low") or 0.0) for r in rows]
+        c_a = [(r.get("close") or 0.0) for r in rows]
     eq = 1.0
     exec_open = _exec_mode() == "open"
+    atr_mult = rp["atr_mult"]
+    trail_ratio = rp["trail_ratio"]
+    trail_trig = rp["trail_trigger"]
     entry = None
     highest = None
     trades = []
     curve = []
+    sig_get = sig_map.get
     for i in range(i0, i1):
-        r = rows[i]
-        c, h, l = r["close"], r["high"], r["low"]
-        px_fill = (r.get("open") or c) if exec_open else c
-        typ = sig_map.get(i)
+        c = c_a[i]
+        h = h_a[i]
+        l = l_a[i]
+        px_fill = (o_a[i] or c) if exec_open else c
+        typ = sig_get(i)
         if entry is not None:
             prev_high = highest
             highest = max(highest, h) if highest else h
             atr_prev = atrs[i - 1] if i > 0 else 0.0
-            atr_stop = (entry - rp["atr_mult"] * atr_prev) if atr_prev > 0 \
+            atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
                 else entry * 0.95
-            trail_stop = (prev_high * rp["trail_ratio"]
-                          if prev_high > entry * rp["trail_trigger"]
+            trail_stop = (prev_high * trail_ratio
+                          if prev_high > entry * trail_trig
                           else atr_stop)
             if l <= trail_stop:
-                exit_px = r["open"] if r["open"] <= trail_stop else trail_stop
+                o_i = o_a[i]
+                exit_px = o_i if (o_i and o_i <= trail_stop) else trail_stop
                 trades.append(exit_px / entry - 1)
                 eq *= exit_px / entry
                 entry = None
@@ -4187,7 +4331,6 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
         return None
     if trade_out is not None:
         trade_out.extend(trades)
-    wins = len([t for t in trades if t > 0])
     import datetime
     try:
         d0 = datetime.date.fromisoformat(rows[i0]["date"])
@@ -4195,13 +4338,23 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None):
         years = max((d1 - d0).days / 365.25, 0.25)
     except Exception:
         years = max((i1 - i0) / 250.0, 0.25)
-    total = curve[-1] if curve else 1.0
+    if np is not None:
+        # numpy 加速：累计峰值/回撤/胜率一次算完
+        cur = np.asarray(curve, float)
+        tr = np.asarray(trades, float)
+        total = float(cur[-1]) if cur.size else 1.0
+        wins = int((tr > 0).sum())
+        peak = np.maximum.accumulate(cur)
+        mdd = float(np.min(cur / peak - 1.0)) if cur.size else 0.0
+    else:
+        total = curve[-1] if curve else 1.0
+        wins = len([t for t in trades if t > 0])
+        peak, mdd = 0.0, 0.0
+        for v in curve:
+            peak = max(peak, v)
+            if peak > 0:
+                mdd = min(mdd, v / peak - 1)
     ann = total ** (1 / years) - 1 if total > 0 else -1.0
-    peak, mdd = 0.0, 0.0
-    for v in curve:
-        peak = max(peak, v)
-        if peak > 0:
-            mdd = min(mdd, v / peak - 1)
     return {"trades": len(trades), "wins": wins,
             "winrate": wins / len(trades),
             "total": total - 1, "ann": ann, "mdd": mdd,
@@ -4221,31 +4374,60 @@ def _regime_map(idx_rows, n):
     return out
 
 
-def _bull_bear_score(rows, curve, i0, regime):
-    """分段年化收益：牛市段/熊市段（无数据段返回 None）。"""
+def _bull_bear_score(rows, curve, i0, regime, dates=None):
+    """分段年化收益：牛市段/熊市段（无数据段返回 None）。
+
+    v6.1.3：改为 numpy 向量化（逐日收益、区间掩码、对数求和一次性算完）；
+    dates 可选传入日期列表（与 curve 前 len 项对齐），避免重复做 rows[i] 取值。"""
     if not regime or not curve:
         return None, None
-    bull_r, bear_r = [], []
-    prev = None
-    for k, i in enumerate(range(i0, min(i0 + len(curve), len(rows)))):
-        day = rows[i]["date"]
-        reg = regime.get(day)
-        if prev is not None and prev[1] > 0:
-            r = curve[k] / prev[1] - 1
-            if reg is True:
-                bull_r.append(r)
-            elif reg is False:
-                bear_r.append(r)
-        prev = (day, curve[k])
-    def _ann(rets):
-        if len(rets) < 20:
+    m = min(i0 + len(curve), len(rows))
+    n_idx = m - i0
+    if n_idx < 21:
+        return None, None
+    if dates is None:
+        dates = [rows[i]["date"] for i in range(i0, m)]
+    else:
+        dates = dates[i0:m]        # 只取本区间（train/val 曲线可能短于全量）
+    if len(dates) != n_idx:
+        return None, None
+    cur = np.asarray(curve[:n_idx], float) if np is not None else None
+    if cur is None:                       # 无 numpy 的纯 Python 回退
+        bull_r, bear_r, prev = [], [], None
+        for k, i in enumerate(range(i0, m)):
+            reg = regime.get(rows[i]["date"])
+            if prev is not None and prev[1] > 0:
+                r = curve[k] / prev[1] - 1
+                if reg is True:
+                    bull_r.append(r)
+                elif reg is False:
+                    bear_r.append(r)
+            prev = (rows[i]["date"], curve[k])
+        def _ann0(rets):
+            if len(rets) < 20:
+                return None
+            s = 0.0
+            for r in rets:
+                s += math.log1p(max(-0.95, min(r, 0.95)))
+            return math.expm1(s * 252.0 / len(rets))
+        return _ann0(bull_r), _ann0(bear_r)
+    prev = cur[:-1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ret = np.where(prev > 0, cur[1:] / np.where(prev > 0, prev, 1.0) - 1.0,
+                       np.nan)
+    regs = [regime.get(d) for d in dates[1:]]
+    is_bull = np.fromiter((r is True for r in regs), bool, len(regs))
+    is_bear = np.fromiter((r is False for r in regs), bool, len(regs))
+    valid = np.isfinite(ret)
+
+    def _ann(mask):
+        x = ret[valid & mask]
+        if x.size < 20:
             return None
-        s = 0.0
-        for r in rets:
-            s += math.log1p(max(-0.95, min(r, 0.95)))
-        n = len(rets)
-        return math.expm1(s * 252.0 / n)
-    return _ann(bull_r), _ann(bear_r)
+        s = float(np.log1p(np.clip(x, -0.95, 0.95)).sum())
+        return math.expm1(s * 252.0 / x.size)
+
+    return _ann(is_bull), _ann(is_bear)
 
 
 def _precompute_atr(rows, i0=0, i1=None):
@@ -6972,7 +7154,7 @@ def _v4_print_report(r):
     print("注：全部为历史统计研究，不构成投资建议。")
 
 
-# ============ v6.1.2 三档组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
+# ============ v6.1.3 三档组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
 #
 # 原理（详见 README 第二节）：
 #   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
@@ -11648,7 +11830,7 @@ class App:
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=29, column=0, columnspan=3, sticky="we")
-        about.insert("end", "版本：v6.1.2（2026-09）\n")
+        about.insert("end", "版本：v6.1.3（2026-09）\n")
         about.insert("end", "作者：獨白\n")
         about.insert("end", "邮箱：kingrux106@gmail.com\n")
         about.insert("end", "QQ：2180287399\n")

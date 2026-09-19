@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""backtest_strategy_ablation.py - 全 A 股多算法策略自动消融选股（v6.1）
+"""backtest_strategy_ablation.py - 全市场对象（个股+ETF）多算法策略自动消融（v6.1.3）
 
-对每只股票：
-  1. 取近 1000 交易日；
-  2. 生成 8 种基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态/
-     筹码峰/板块轮动）+ 多维评分 × 3 档风险；消融全程本地计算，AI 不参与；
+对每个对象（个股 + ETF）逐个独立消融：
+  1. 取近 1000 交易日（≥200 根才纳入，覆盖率清单写入 summary.coverage）；
+  2. 生成 10 类基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态/
+     **L2同行业+行业ETF**/筹码峰/板块轮动）+ 多维评分 × 3 档风险；
+     消融全程本地计算，AI 不参与；
   3. 训练集（前 75%）选型，验证集（后 25%）只报告；
-  4. 多指标结合选优（v6.1）：训练集 Calmar/盈亏比/胜率/年化 横截面 rank 加权，
-     稳健偏 Calmar+PF，均衡/激进偏年化+Calmar；激进=均衡选型+组合层弱市覆盖；
-  5. 输出每只股票的结果 + 全市场聚合统计。
+  4. 多指标结合选优：训练集 Calmar/盈亏比/胜率/年化 横截面 rank 加权，
+     稳健偏 Calmar+PF，均衡/激进偏年化+Calmar；
+  5. numpy 加速：OHLC 平行数组复用、ATR cumsum 滑窗、净值/牛熊分段向量化；
+  6. 输出每个对象的结果 + 全市场聚合统计。
 
-v2026-09-19（板块轮动序列经 initializer 注入子进程，避免重复构建）
+v2026-09-19（板块轮动 + L2 行业序列经 initializer 注入子进程，避免重复构建）
 """
 # --- 目录引导：backtests/ 下运行也能导入 stock_gui/factor_lab，产物写项目根 ---
 import os as _os_boot
@@ -37,7 +39,7 @@ import stock_gui as sg
 from stock_gui import (
     db_conn, _is_etf,
     _sig_macd, _sig_kdj, _sig_rsi, _sig_boll, _sig_ma_trend, _sig_l1_pattern,
-    _sig_chip_peak, _sig_sector_rot,
+    _sig_chip_peak, _sig_sector_rot, _sig_l2_industry,
     _composite_signals, _composite_precompute,
     _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
     _ablation_pf, pick_ablation_multi,
@@ -52,11 +54,13 @@ SUMMARY_FILE = os.path.join(OUTPUT_DIR, "strategy_ablation_summary.json")
 _IDX_REGIME_CACHE = None
 
 
-def _init_sector(cal, series, med5):
-    """子进程初始化：把主进程构建的板块动量序列注入 stock_gui 缓存，
+def _init_sector(cal, series, med5, l2cal, l2series, l2used):
+    """子进程初始化：把主进程构建的板块动量序列与 L2 行业序列注入 stock_gui 缓存，
     避免每个 worker 重复加载全A面板。"""
     sg._SECTOR_MOM_CACHE["data"] = (cal, series, med5)
     sg._SECTOR_MOM_CACHE["ts"] = time.time()
+    sg._SECTOR_L2_CACHE["data"] = (l2cal, l2series, l2used)
+    sg._SECTOR_L2_CACHE["ts"] = time.time()
 
 
 def _load_index_regime():
@@ -129,8 +133,15 @@ def run_ablation_for_stock(args):
 
     # 预计算 ATR(14) 与多维评分指标，所有候选/档位复用（关键提速）
     atrs = _precompute_atr(rows, 0, n)
+    # numpy 加速（v6.1.3）：OHLC 平行数组与日期列表只抽一次，
+    # 供本对象全部候选（10 算法 × 3 档）回测复用，避免重复字典取值
+    arrays = ([r.get("open") or 0.0 for r in rows],
+              [r["high"] for r in rows],
+              [r["low"] for r in rows],
+              [r["close"] for r in rows])
+    dates = [r["date"] for r in rows]
 
-    # 各基础算法信号发生器（v6.1 增：筹码峰 / 板块轮动；AI 不参与）
+    # 各基础算法信号发生器（v6.1 增：筹码峰 / 板块轮动；v6.1.3 增：L2 同行业+行业ETF）
     gens = {
         "macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
@@ -138,6 +149,7 @@ def run_ablation_for_stock(args):
         "boll": lambda: _sig_boll(rows),
         "ma_trend": lambda: _sig_ma_trend(rows),
         "l1_pattern": lambda: _sig_l1_pattern(rows),
+        "l2_ind": lambda: _sig_l2_industry(rows, industry=industry),
         "chip_peak": lambda: _sig_chip_peak(rows),
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
     }
@@ -153,12 +165,13 @@ def run_ablation_for_stock(args):
         for mode, rp in CFG.RISK_PARAMS.items():
             tr_tr, va_tr = [], []
             tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs,
-                            trade_out=tr_tr)
+                            trade_out=tr_tr, arrays=arrays)
             va = _bt_events(rows, sigs, rp, split, n, atrs=atrs,
-                            trade_out=va_tr)
+                            trade_out=va_tr, arrays=arrays)
             if not tr:
                 continue
-            bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
+            bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime,
+                                         dates=dates)
             train = {k: v for k, v in tr.items() if k != "curve"}
             val = ({k: v for k, v in va.items() if k != "curve"} if va else None)
             if tr_tr:
@@ -187,11 +200,14 @@ def run_ablation_for_stock(args):
         if not sigs:
             continue
         tr_tr, va_tr = [], []
-        tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs, trade_out=tr_tr)
-        va = _bt_events(rows, sigs, rp, split, n, atrs=atrs, trade_out=va_tr)
+        tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs, trade_out=tr_tr,
+                        arrays=arrays)
+        va = _bt_events(rows, sigs, rp, split, n, atrs=atrs, trade_out=va_tr,
+                        arrays=arrays)
         if not tr:
             continue
-        bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
+        bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime,
+                                      dates=dates)
         train = {k: v for k, v in tr.items() if k != "curve"}
         val = ({k: v for k, v in va.items() if k != "curve"} if va else None)
         if tr_tr:
@@ -349,11 +365,21 @@ def main(limit=None, max_workers=None, tag=""):
         print(f"  板块轮动序列构建失败，sector_rot 将跳过: {e}")
         cal_mom, series_mom, med_mom = [], {}, None
 
+    print("构建 L2 行业序列（同行业 + 行业ETF，一次构建注入子进程）...")
+    try:
+        l2cal, l2series, l2used = sg.sector_l2_series()
+        n_ind_etf = sum(1 for v in (l2used or {}).values() if v)
+        print(f"  行业数: {len(l2series)}（其中 {n_ind_etf} 个行业用同名 ETF 作参照，"
+              f"其余用同行业等权合成）")
+    except Exception as e:
+        print(f"  L2 行业序列构建失败，l2_ind 将跳过: {e}")
+        l2cal, l2series, l2used = [], {}, {}
+
     if max_workers is None:
         max_workers = max(1, min(os.cpu_count() or 4, 8))
 
-    print(f"开始消融（workers={max_workers}，多指标结合：筹码峰/板块轮动），"
-          f"每只股票自动产生三档策略...")
+    print(f"开始消融（workers={max_workers}，多指标结合：L2同行业+行业ETF/筹码峰/板块轮动，"
+          f"numpy 加速回测），每个对象逐个产生三档策略...")
     per_stock = []
     done = 0
     skipped = 0
@@ -362,7 +388,8 @@ def main(limit=None, max_workers=None, tag=""):
     args_list = [(code, rows, ind) for code, rows, ind in stocks]
     with ProcessPoolExecutor(
             max_workers=max_workers, initializer=_init_sector,
-            initargs=(cal_mom, series_mom, med_mom)) as exe:
+            initargs=(cal_mom, series_mom, med_mom, l2cal, l2series,
+                      l2used)) as exe:
         futures = {exe.submit(run_ablation_for_stock, a): a[0] for a in args_list}
         for fut in as_completed(futures):
             code = futures[fut]
