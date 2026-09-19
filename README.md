@@ -429,9 +429,14 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 - **指数数据（v6.1.1 新增）**：拉入 **科创50（`sh000688`）** 1100 根（2022-03-11 ~ 2026-09-18），
   与上证（`sh000001`）、创业板指（`sz399006`）同区间，供激进档基准与三基准对照使用。
   指数不参与股票池（`tier_load_panel` 只取 `sh60/sh68/sz00/sz30` 前缀）。
-- 客户端数据包（含修复后的 `stock_cache.db`）与研究产物见 Release：
-  `stock-analyzer-client-<日期>.zip`（程序 + 数据库）、`research_v6.1.zip`（回测 JSON 与报告）；
-  历史版本：<https://github.com/monologue-github/stock-analyzer/releases>
+- **客户端数据包与研究产物**（Release **v6.1**）：
+  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1>
+  - `stock-analyzer-client-20260919.zip`（252 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
+    （含 `adjust` 修复、复权口径迁移、科创50 指数），解压即用；
+    **配置为空 Key 模板**（不含任何私有凭据），首次运行请在设置内填自己的 API Key；
+  - `research_v6.1.zip`（22 MB）：全部回测 JSON 与报告产物
+    （含单文件 >100MB 的全A消融逐股明细，故不入仓，随研究包分发）。
+  - 历史版本：<https://github.com/monologue-github/stock-analyzer/releases>
 
 ---
 
