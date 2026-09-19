@@ -572,14 +572,16 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
   452 只 ≥1000 根**，合计 **90.7 万根**；未达 200 根的 289 只（新上市/迷你）留在代码表但不入回测。
   入库口径与个股一致（hfq + `adjust` 缩放）；`refresh_all_codes` 已改为**只清 A 股行**，
   不会在刷新代码表时抹掉 ETF。
-- **客户端数据包与研究产物**（Release **v6.1**）：
-  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1>
-  - `stock-analyzer-client-20260919.zip`（252 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
-    （含 `adjust` 修复、复权口径迁移、科创50 指数），解压即用；
-    **配置为空 Key 模板**（不含任何私有凭据），首次运行请在设置内填自己的 API Key；
-  - `research_v6.1.zip`（22 MB）：全部回测 JSON 与报告产物
-    （含单文件 >100MB 的全A消融逐股明细，故不入仓，随研究包分发）。
-  - 历史版本：<https://github.com/monologue-github/stock-analyzer/releases>
+- **客户端数据包与研究产物**（Release **v6.1.2**）：
+  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.2>
+  - `stock-analyzer-client-20260919.zip`（292 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
+    （含 `adjust` 修复、复权口径迁移、科创50 指数、**1202 只 ETF 历史**），解压即用；
+    **配置为空 Key 模板**（不含任何私有凭据，打包后自动全包扫描 Key 模式），
+    首次运行请在设置内填自己的 API Key；
+  - `research_v6.1.2.zip`（25.6 MB）：全部回测 JSON 与报告产物
+    （含单文件 >100MB 的逐对象消融明细，故不入仓，随研究包分发）。
+  - 上一版：v6.1 <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1>；
+    全部版本：<https://github.com/monologue-github/stock-analyzer/releases>
 
 ---
 
