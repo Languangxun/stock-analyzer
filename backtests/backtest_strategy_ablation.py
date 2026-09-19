@@ -74,8 +74,11 @@ def _load_index_regime():
     return _IDX_REGIME_CACHE
 
 
-def load_stocks(min_bars=400):
-    """加载缓存中所有非 ETF、满足最低 bar 数的股票（含行业）。"""
+def load_stocks(min_bars=200, with_etf=True):
+    """加载缓存中**所有对象**（个股 + ETF）逐个消融，只按最低 bar 数过滤。
+
+    v6.1.2：不再排除 ETF；min_bars 默认 200（低于此值无法做训练/验证切分）。
+    返回 [(code, rows, industry)]，industry 对 ETF 为 "ETF"（stocks 表内标注）。"""
     with db_conn() as conn:
         rows = conn.execute(
             "SELECT code, date, open, high, low, close, vol "
@@ -88,8 +91,14 @@ def load_stocks(min_bars=400):
         by.setdefault(c, []).append(
             {"date": d, "open": o, "high": h, "low": l, "close": cl, "vol": v or 0.0}
         )
-    return [(c, r, ind_of.get(c, "")) for c, r in by.items()
-            if len(r) >= min_bars and not _is_etf(c)]
+    out = []
+    for c, r in by.items():
+        if len(r) < min_bars:
+            continue
+        if not with_etf and _is_etf(c):
+            continue
+        out.append((c, r, ind_of.get(c, "ETF" if _is_etf(c) else "")))
+    return out
 
 
 def _trim_rows(rows, max_bars=1000):
@@ -207,6 +216,7 @@ def run_ablation_for_stock(args):
     out = {
         "code": code,
         "bars": n,
+        "is_etf": bool(_is_etf(code)),
         "train_n": split,
         "val_n": n - split,
         "mode_candidates": {
@@ -233,18 +243,24 @@ def _pct_or_none(count, total):
     return round(count / total * 100, 2) if total else None
 
 
-def build_summary(per_stock):
-    """由每只股票结果构建聚合统计。"""
+def build_summary(per_stock, coverage=None):
+    """由每个对象（个股/ETF）结果构建聚合统计。"""
     total = len(per_stock)
     if total == 0:
         return {}
 
     modes = ["稳健", "均衡"]        # 激进=均衡+组合层弱市覆盖，不单独统计
+    n_etf = sum(1 for s in per_stock if s.get("is_etf"))
     summary = {
         "total_stocks": total,
+        "total_objects": total,
+        "etf_count": n_etf,
+        "stock_count": total - n_etf,
         "timestamp": datetime.now().isoformat(),
         "modes": {},
     }
+    if coverage:
+        summary["coverage"] = coverage
 
     for mode in modes:
         selections = [s["mode_candidates"][mode] for s in per_stock
@@ -309,11 +325,21 @@ def main(limit=None, max_workers=None, tag=""):
     regime = _load_index_regime()
     print(f"  regime 日期数: {len(regime)}")
 
-    print("加载全缓存股票...")
-    stocks = load_stocks(min_bars=400)
+    print("加载全缓存对象（个股 + ETF，逐个消融）...")
+    stocks = load_stocks(min_bars=200, with_etf=True)
+    # 覆盖率统计：缓存内全部对象 vs 本次纳入消融的对象
+    with db_conn() as conn:
+        all_objs = {c: n for c, n in conn.execute(
+            "select code, count(*) from daily_bars group by code")}
+    covered = {c for c, _, _ in stocks}
+    miss = sorted((c, n) for c, n in all_objs.items() if c not in covered)
     if limit:
         stocks = stocks[:limit]
-    print(f"  股票数: {len(stocks)}")
+    n_etf = sum(1 for c, _, _ in stocks if _is_etf(c))
+    print(f"  缓存对象总数 {len(all_objs)}，纳入消融 {len(stocks)}"
+          f"（其中 ETF {n_etf}）；因 K线<200 未纳入 {len(miss)}")
+    if miss:
+        print(f"  未纳入清单（前20）: {miss[:20]}")
 
     print("构建板块轮动序列（行业5日动量，一次构建注入子进程）...")
     try:
@@ -331,6 +357,7 @@ def main(limit=None, max_workers=None, tag=""):
     per_stock = []
     done = 0
     skipped = 0
+    skipped_codes = []          # (code, 原因)，确保「所有对象逐个消融」可核验
 
     args_list = [(code, rows, ind) for code, rows, ind in stocks]
     with ProcessPoolExecutor(
@@ -345,9 +372,11 @@ def main(limit=None, max_workers=None, tag=""):
             except Exception as e:
                 print(f"[{done}/{len(stocks)}] {code} 异常: {e}")
                 skipped += 1
+                skipped_codes.append((code, f"异常: {e}"))
                 continue
             if res is None:
                 skipped += 1
+                skipped_codes.append((code, "无有效候选(样本/信号不足)"))
                 if done % 500 == 0:
                     print(f"[{done}/{len(stocks)}] {code} 无有效候选...")
                 continue
@@ -355,7 +384,20 @@ def main(limit=None, max_workers=None, tag=""):
             if done % 500 == 0:
                 print(f"[{done}/{len(stocks)}] {code} 完成，累计有效 {len(per_stock)}")
 
-    print(f"\n消融完成: 总股票 {done}, 有效 {len(per_stock)}, 跳过 {skipped}, 耗时 {time.time()-t0:.0f}s")
+    n_etf_done = sum(1 for s in per_stock if s.get("is_etf"))
+    print(f"\n消融完成: 总对象 {done}, 有效 {len(per_stock)}"
+          f"（ETF {n_etf_done}）, 跳过 {skipped}, 耗时 {time.time()-t0:.0f}s")
+    coverage = {
+        "cache_objects": len(all_objs),
+        "included": len(args_list),
+        "ablated": len(per_stock),
+        "skipped": len(skipped_codes),
+        "skipped_detail": skipped_codes,
+        "etf_cache": sum(1 for c in all_objs if _is_etf(c)),
+        "etf_included": n_etf,
+        "etf_ablated": n_etf_done,
+        "excluded_by_bars": miss,
+    }
 
     # 第一层输出：每只股票
     print(f"写入 {per_stock_file} ...")
@@ -364,11 +406,17 @@ def main(limit=None, max_workers=None, tag=""):
 
     # 第二层输出：聚合统计
     print(f"构建并写入 {summary_file} ...")
-    summary = build_summary(per_stock)
+    summary = build_summary(per_stock, coverage=coverage)
     with open(summary_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     # 控制台摘要
+    print("\n=== 覆盖率 ===")
+    print(f"  缓存对象 {coverage['cache_objects']}（ETF {coverage['etf_cache']}）"
+          f" → 纳入 {coverage['included']}（ETF {coverage['etf_included']}）"
+          f" → 有效消融 {coverage['ablated']}（ETF {coverage['etf_ablated']}）"
+          f"，跳过 {coverage['skipped']}"
+          f"，K线不足排除 {len(coverage['excluded_by_bars'])}")
     print("\n=== 聚合摘要 ===")
     for mode, data in summary.get("modes", {}).items():
         print(f"\n【{mode}】选中 {data['count']} 只")

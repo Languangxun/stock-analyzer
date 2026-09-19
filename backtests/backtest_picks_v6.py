@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--tier", default="all", choices=list(TIERS) + ["all"])
     ap.add_argument("--yearly", action="store_true")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--universe", default="all", choices=["all", "main"])
+    ap.add_argument("--universe", default="all", choices=["all", "main", "etf", "all_etf"])
     args = ap.parse_args()
     tiers = list(TIERS) if args.tier == "all" else [args.tier]
     t0 = time.time()

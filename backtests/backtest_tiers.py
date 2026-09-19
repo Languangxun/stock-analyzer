@@ -50,7 +50,7 @@ def main():
     ap.add_argument("--reb", type=int, default=None)
     ap.add_argument("--gate-ma", type=int, default=None)
     ap.add_argument("--no-gate", action="store_true")
-    ap.add_argument("--universe", default="all", choices=["all", "main"])
+    ap.add_argument("--universe", default="all", choices=["all", "main", "etf", "all_etf"])
     args = ap.parse_args()
 
     overrides = {}

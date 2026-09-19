@@ -12,7 +12,7 @@
   research/v61_report.md    （可直接嵌入 README 的表格）
 
 用法：
-  python backtest_v61.py                     # 两口径全期
+  python backtest_v61.py                     # 四口径全期(all/main/etf/all_etf)
   python backtest_v61.py --universe main
   python backtest_v61.py --segment val
 """
@@ -34,7 +34,8 @@ import stock_gui as sg
 
 HERE = ROOT
 TIERS = tuple(sg.TIER_CFG)
-UNI_NAME = {"all": "全A", "main": "沪深主板"}
+UNI_NAME = dict(sg.UNIVERSE_NAME)          # all/main/etf/all_etf
+UNIS = ("all", "main", "etf", "all_etf")   # 报告依次输出四个口径
 
 
 def _run_universe(universe, segment, progress):
@@ -74,7 +75,7 @@ def _tier_table(rep, tier):
 def build_md(report):
     lines = [f"### v6.1 标准回测（{report['segment']}，"
              f"数据截至 {report['data_end']}）", ""]
-    for uni in ("all", "main"):
+    for uni in UNIS:
         rep = report["results"].get(uni)
         if not rep:
             continue
@@ -143,7 +144,13 @@ def build_md(report):
         lines.append("")
     lines.append("- 口径：T-1 信号 → T 日收盘成交；含滑点/佣金/印花税/整手/"
                  "涨跌停/退市了结。")
-    lines.append("- 基准（v6.1.1）：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
+    lines.append("- **四口径（v6.1.2）**：`all`=全A个股（不含 ETF，历史口径不变）/ "
+                 "`main`=沪深主板 / `etf`=仅 ETF/LOF / `all_etf`=全A个股+ETF。"
+                 "各口径**在自己的基数池内做横截面排名**，互不污染。")
+    lines.append("- ETF 池：东财 ETF/LOF 代码表（1491 只，剔除货币/现金类），"
+                 "回填历史后 1202 只有 K 线、1145 只 ≥250 根；"
+                 "ETF 三档用 blend/blend_mom + 上证 MA20 闸门（ETF 无创业板语义）。")
+    lines.append("- 基准：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
                  "（不分是否具备科创板权限），另附创业板指/上证对照，"
                  "避免单一强基准使超额恒负。")
     lines.append("- 主板激进档（v6.1.1）：改用 blend_mom（动量0.7/低波0.3）"
@@ -154,14 +161,17 @@ def build_md(report):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--universe", default="both",
-                    choices=["both", "all", "main"])
+    ap.add_argument("--universe", default="all4",
+                    choices=["all4", "both", "all", "main", "etf", "all_etf"])
     ap.add_argument("--segment", default="full",
                     choices=["full", "train", "val", "val2025", "bull"])
     ap.add_argument("--out", default=os.path.join(HERE, "research"))
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
-    unis = ["all", "main"] if args.universe == "both" else [args.universe]
+    if args.universe in ("all4", "both"):
+        unis = list(UNIS)
+    else:
+        unis = [args.universe]
     t0 = time.time()
     codes, cal, C, V = sg.tier_load_panel()
     report = {"ts": time.strftime("%Y-%m-%d %H:%M"),

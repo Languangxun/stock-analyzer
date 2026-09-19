@@ -24,7 +24,7 @@ import sqlite3
 import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -464,7 +464,8 @@ def picks_conf() -> dict:
         "ai_auto_tier": _ai_ini_get("picks", "ai_auto_tier", "0") == "1",
         "risk_pref": _ai_ini_get("picks", "risk_pref", "稳健") or "稳健",
         "universe": (_ai_ini_get("picks", "universe", "all") or "all")
-        if _ai_ini_get("picks", "universe", "all") in ("all", "main")
+        if _ai_ini_get("picks", "universe", "all")
+        in ("all", "main", "etf", "all_etf")
         else "all",
     }
 
@@ -473,7 +474,9 @@ def pick_allowed(code: str, industry: str = "") -> bool:
     """荐股权限判断：板块集合/行业集合为空表示不限制该项。"""
     boards = PICK_PERMS.get("boards") or set()
     if boards:
-        if code.startswith(("sh60", "sz00")):
+        if _is_etf(code):
+            b = "ETF"
+        elif code.startswith(("sh60", "sz00")):
             b = "主板"
         elif code.startswith("sz30"):
             b = "创业板"
@@ -1800,7 +1803,10 @@ def refresh_all_codes(progress=None):
 
         today = time.strftime("%Y-%m-%d")
         with db_conn(commit=True) as conn:
-            conn.execute("DELETE FROM stocks")
+            # 只清 A 股行，保留 ETF/LOF 行（v6.1.2：ETF 宇宙独立维护）
+            conn.execute(
+                "DELETE FROM stocks WHERE substr(code,3,2) "
+                "NOT IN ('51','56','58','15','16','18')")
             conn.executemany(
                 "INSERT OR REPLACE INTO stocks"
                 "(code,name,industry,mktcap,tier,updated) "
@@ -1823,6 +1829,160 @@ def ensure_codes(progress=None) -> None:
             log.exception("ensure_codes 刷新失败")
             if stocks_age() >= STOCKS_TTL * 4:
                 raise           # 完全没有可用代码表时才向上抛
+
+
+# ---- ETF 宇宙（v6.1.2）：东财 ETF 代码表 + 历史回填 ----
+
+ETF_BOARD_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024"   # 沪深 ETF/LOF 板块
+_MMF_KW = ("货币", "快线", "快钱", "添益", "日利", "现金", "理财", "短融")
+_MMF_PRE = ("5116", "5117", "5118", "5119", "159001", "159003", "159005")
+
+
+def _is_money_etf(code, name=""):
+    """货币/现金类（场内货基）：价格近乎不动、会污染低波因子，必须剔除。"""
+    if any(k in (name or "") for k in _MMF_KW):
+        return True
+    return any(code.startswith(p) for p in _MMF_PRE)
+
+
+def refresh_etf_codes(progress=None, exclude_mmf=True):
+    """拉取东财 ETF/LOF 代码表写入 stocks（industry='ETF'），保留原有 A 股行。
+
+    返回 (写入条数, 货币类剔除数)。"""
+    hosts = ("https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
+             "http://push2.eastmoney.com")
+    UT = "fa5fd1943c7b386f172d6893dbfba10b"
+    items, pn, total = [], 1, None
+    while pn <= 25:
+        got, data = False, {}
+        for host in hosts:
+            u = (f"{host}/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1"
+                 f"&fltt=2&invt=2&fields=f12,f13,f14,f20&fs={ETF_BOARD_FS}"
+                 f"&ut={UT}")
+            try:
+                data = json.loads(_http_get(
+                    u, retries=2, timeout=20,
+                    headers={"Referer": "https://quote.eastmoney.com/"}
+                )).get("data") or {}
+                got = True
+                break
+            except Exception:
+                time.sleep(1.0)
+        if not got:
+            break
+        if total is None:
+            total = data.get("total")
+            log.info("ETF 代码表 total=%s", total)
+        diff = data.get("diff") or {}
+        batch = list(diff.values()) if isinstance(diff, dict) else diff
+        if not batch:
+            break
+        for it in batch:
+            code, name = it.get("f12"), it.get("f14") or ""
+            if not code or len(code) != 6:
+                continue
+            full = ("sh" if code[0] == "5" else "sz") + code
+            if not _is_etf(full):
+                continue
+            if exclude_mmf and _is_money_etf(full, name):
+                continue
+            cap = it.get("f20")
+            items.append((full, name, float(cap) if isinstance(cap, (int, float))
+                          else None))
+        if progress and pn % 3 == 0:
+            progress(f"ETF 代码表 {len(items)} 只 (第{pn}页)")
+        pn += 1
+        time.sleep(0.4)
+    if not items:
+        raise RuntimeError("ETF 代码表拉取失败")
+
+    # 去重（同代码只留一条）
+    uniq = {}
+    for full, name, cap in items:
+        uniq[full] = (full, name, "ETF", cap, None, time.strftime("%Y-%m-%d"))
+    with db_conn(commit=True) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO stocks(code,name,industry,mktcap,tier,updated) "
+            "VALUES(?,?,?,?,?,?)", list(uniq.values()))
+    if progress:
+        progress(f"ETF 代码表完成: {len(uniq)} 只（已排除货币类）")
+    return len(uniq)
+
+
+def backfill_etf_history(codes=None, progress=None, workers=6,
+                         min_rows=200, only_stale=True):
+    """回填 ETF 日K（hfg 口径，与主库一致）。返回统计 dict。
+
+    codes 为空时取 stocks 表内 industry='ETF' 的全部代码。"""
+    if codes is None:
+        with db_conn() as conn:
+            codes = [c for (c,) in conn.execute(
+                "select code from stocks where industry='ETF' order by code")]
+    codes = list(codes)
+    if not codes:
+        return {"total": 0, "ok": 0, "skip": 0, "fail": 0, "bar_ok": 0}
+    have = {}
+    with db_conn() as conn:
+        for c, n, mx in conn.execute(
+                "select code,count(*),max(date) from daily_bars "
+                "group by code"):
+            have[c] = (n, mx)
+    fresh = last_completed_td()
+    todo = []
+    for c in codes:
+        n, mx = have.get(c, (0, ""))
+        if only_stale and n >= 1000 and mx >= fresh:
+            continue
+        todo.append(c)
+    stat = {"total": len(codes), "todo": len(todo), "ok": 0, "fail": 0,
+            "bar_ok": 0, "fail_list": []}
+    if not todo:
+        stat["bar_ok"] = sum(1 for c in codes if have.get(c, (0,))[0] >= min_rows)
+        return stat
+    lock = threading.Lock()
+    done = [0]
+
+    def work(code):
+        try:
+            rows = _fetch_remote_rows(code, count=1100)
+            if not rows:
+                raise RuntimeError("空数据")
+            data = [r for r in rows if _bar_ok(r)]
+            if len(data) < min_rows:
+                raise RuntimeError(f"有效数据仅{len(data)}根")
+            with db_conn(commit=True) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO daily_bars"
+                    "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
+                    [(code, r["date"], r["open"], r["high"], r["low"],
+                      r["close"], r["vol"]) for r in data])
+            with db_conn() as conn:
+                allrows = _db_rows(conn, code)
+            try:
+                _sync_adjust(code, allrows)
+            except Exception:
+                log.debug("ETF adjust 同步失败 %s", code, exc_info=True)
+            return code, len(data), None
+        except Exception as e:
+            return code, 0, str(e)[:80]
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = [ex.submit(work, c) for c in todo]
+        for fut in as_completed(futs):
+            code, n, err = fut.result()
+            with lock:
+                done[0] += 1
+                if err:
+                    stat["fail"] += 1
+                    stat["fail_list"].append((code, err))
+                else:
+                    stat["ok"] += 1
+                    if n >= min_rows:
+                        stat["bar_ok"] += 1
+                if progress and done[0] % 50 == 0:
+                    progress(f"ETF 回填 {done[0]}/{len(todo)}"
+                             f"（成功{stat['ok']} 失败{stat['fail']}）")
+    return stat
 
 
 def get_stock_info(full: str):
@@ -3833,6 +3993,8 @@ def sector_mom_series(max_age=1800):
     r5[:, 5:] = C[:, 5:] / C[:, :-5] - 1.0
     groups = {}
     for k, code in enumerate(codes):
+        if _is_etf(code):
+            continue          # 板块轮动用个股行业，ETF 不参与（避免伪"ETF行业"）
         ind = ind_of.get(code)
         if ind:
             groups.setdefault(ind, []).append(k)
@@ -6810,7 +6972,7 @@ def _v4_print_report(r):
     print("注：全部为历史统计研究，不构成投资建议。")
 
 
-# ================= v6.1 三档组合策略引擎（稳健/均衡/激进；全A/主板） =================
+# ============ v6.1.2 三档组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
 #
 # 原理（详见 README 第二节）：
 #   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
@@ -6852,14 +7014,42 @@ TIER_CFG_MAIN = {
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
                  gate="sh000001", ma=20),
 }
-TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN}
+# ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
+# 故三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
+# 闸门统一上证 MA20（ETF 池跨沪深，用市场总闸门）。
+TIER_CFG_ETF = {
+    "稳健": dict(universe="etf", score="blend", top=10, reb=20,
+                 gate="sh000001", ma=20),
+    "均衡": dict(universe="etf", score="blend", top=10, reb=10,
+                 gate="sh000001", ma=20),
+    "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
+                 gate="sh000001", ma=20),
+}
+# 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
+# （池内混入 ETF 后，创业板高β 不再适用）。
+TIER_CFG_ALLETF = {
+    "稳健": dict(universe="all_etf", score="blend", top=20, reb=20,
+                 gate="sh000001", ma=20),
+    "均衡": dict(universe="all_etf", score="blend", top=20, reb=10,
+                 gate="sh000001", ma=20),
+    "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
+                 reb=10, gate="sh000001", ma=20),
+}
+TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
+                  "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
+UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
+                 "all_etf": "全A含ETF"}
 # 激进档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
-# 主板激进用 blend_mom 弹性档，两者都以科创50 作为超额对比基准。
+# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档，都以科创50 作为主基准。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
     ("all", "激进"): "sh000688",
     ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
     ("main", "激进"): "sh000688",
+    ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000001",
+    ("etf", "激进"): "sh000688",
+    ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000001",
+    ("all_etf", "激进"): "sh000688",
 }
 # 基准指数中文名（报告/对照用）
 BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
@@ -6867,19 +7057,30 @@ BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
 
 
 def tier_cfg(tier, universe="all"):
-    """按口径取某档配置（all=全A / main=主板）。"""
+    """按口径取某档配置（all=全A / main=主板 / etf=ETF / all_etf=全A含ETF）。"""
     return dict(TIER_UNIVERSES.get(universe, TIER_CFG).get(tier) or
                 TIER_CFG.get(tier) or {})
 
 
 def tier_universe_mask(codes, kind):
-    """股票池掩码：all(全A) / main(沪深主板) / chinext(创业板)。"""
+    """标的池掩码（v6.1.2）：
+      all      = 全A个股（**不含** ETF，保持历史口径不变）
+      all_etf  = 全A个股 + ETF
+      main     = 沪深主板个股
+      chinext  = 创业板个股
+      etf      = 仅 ETF/LOF"""
     if kind == "chinext":
         return np.array([c.startswith("sz30") for c in codes])
     if kind == "main":
         return np.array([c.startswith(("sh60", "sz00")) for c in codes])
-    return np.ones(len(codes), bool)
-_TIER_PREFIXES = ("sh60", "sh68", "sz00", "sz30")
+    if kind == "etf":
+        return np.array([_is_etf(c) for c in codes])
+    if kind == "all_etf":
+        return np.ones(len(codes), bool)
+    # all（默认）：显式排除 ETF，保证 2026-09 之前的口径可比
+    return np.array([not _is_etf(c) for c in codes])
+_TIER_PREFIXES = ("sh60", "sh68", "sz00", "sz30",
+                  "sh51", "sh56", "sh58", "sz15", "sz16", "sz18")
 _TIER_MIN_PRICE = 1.0
 _TIER_MIN_BARS = 250
 _TIER_MIN_AMOUNT = 3e5            # V(手)×价 = 成交额/100，3e5 → 3000万元
@@ -7024,12 +7225,31 @@ def _tier_rank01(x):
     return out
 
 
-def tier_make_score(feat, kind, mom_w=None):
+def tier_rank_base(codes, universe):
+    """横截面排名的**基数池**（v6.1.2）。
+
+    历史口径：个股排名在全A个股池内做，再按口径筛持仓。加入 ETF 后若
+    仍按整个面板排名，会污染既有全A/主板数字，故这里显式区分：
+      all / main  → 个股池（保持 2026-09 之前口径不变）
+      etf         → ETF 池
+      all_etf     → 个股 + ETF 合并池
+    """
+    arr = np.array(codes)
+    etf = np.array([_is_etf(c) for c in arr])
+    if universe == "etf":
+        return etf
+    if universe == "all_etf":
+        return np.ones(len(arr), bool)
+    return ~etf
+
+
+def tier_make_score(feat, kind, mom_w=None, base=None):
     """合成打分：
       blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
       beta       = 60日β（对创业板指）
       beta_sh    = 60日β（对上证，主板口径）
+    base：横截面排名基数掩码（None=全面板）；见 tier_rank_base。
     注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
     if kind == "beta":
@@ -7041,11 +7261,17 @@ def tier_make_score(feat, kind, mom_w=None):
             mw = 0.7 if mom_w is None else float(mom_w)
         else:
             mw = 0.5
+        ret = feat["ret20"]
+        vol = feat["vol20"]
+        if base is not None and not bool(base.all()):
+            b2 = base[:, None]
+            ret = np.where(b2, ret, np.nan)
+            vol = np.where(b2, vol, np.nan)
         r1 = np.zeros_like(feat["vol20"])
         r2 = np.zeros_like(feat["vol20"])
         for t in range(NDT):
-            r1[:, t] = _tier_rank01(feat["ret20"][:, t])
-            r2[:, t] = _tier_rank01(feat["vol20"][:, t])
+            r1[:, t] = _tier_rank01(ret[:, t])
+            r2[:, t] = _tier_rank01(vol[:, t])
         return mw * r1 + (1.0 - mw) * (1.0 - r2)
     raise ValueError("未知评分: " + kind)
 
@@ -7218,7 +7444,9 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
-        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
+        _base = tier_rank_base(codes, universe)
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
+                                base=_base)
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         n_ph = min(phases or cfg["reb"], cfg["reb"])
@@ -7295,7 +7523,9 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
-        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
+        _base = tier_rank_base(codes, universe)
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
+                                base=_base)
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         n_ph = min(phases or cfg["reb"], cfg["reb"])
@@ -7340,8 +7570,8 @@ def tier_picks_report_text(segment="full", tiers=None, capital=0.0,
     """GUI/CLI 共用：按风险偏好的荐股收益回测文本表。"""
     st = tier_picks_stats(segment=segment, tiers=tiers, overrides=overrides,
                           universe=universe)
-    uni_name = "全A" if universe == "all" else "主板"
-    lines = [f"v6.1 荐股收益回测 · {segment} · {uni_name} · "
+    uni_name = UNIVERSE_NAME.get(universe, universe)
+    lines = [f"v6.1.2 荐股收益回测 · {segment} · {uni_name} · "
              f"按风险偏好（逐笔口径）",
              "口径：T-1 打分 → T 日收盘买入 → 调仓/闸门/退市平仓；"
              "含滑点/佣金/印花税/整手；每档分 reb 个相位并行，"
@@ -7410,7 +7640,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
         gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
             if cfg.get("gate") else None
         on = bool(gate[d]) if gate is not None else True
-        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"))
+        _base = tier_rank_base(codes, universe)
+        score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
+                                base=_base)
         m = tier_universe_mask(codes, cfg.get("universe", "all"))
         if apply_perms:
             m = m & np.array([pick_allowed(c, info.get(c, ("", ""))[1])
@@ -7451,8 +7683,8 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
 def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
     p = tier_latest_picks(capital=capital, tiers=tiers, universe=universe)
-    uni_name = "全A" if universe == "all" else "沪深主板"
-    lines = [f"v6.1 三档组合 · {uni_name} · 信号日 {p['signal_date']} · "
+    uni_name = UNIVERSE_NAME.get(universe, universe)
+    lines = [f"v6.1.2 三档组合 · {uni_name} · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
              "荐股权限（设置内配置，空=全部）：已按板块/行业过滤",
@@ -8237,9 +8469,9 @@ class App:
     def _open_picks(self):
         """每日荐股：AI自动选档 / 三档风险偏好 / 旧多维评分。"""
         pconf = picks_conf()
-        uni_name = "全A" if pconf["universe"] == "all" else "主板"
+        uni_name = UNIVERSE_NAME.get(pconf["universe"], pconf["universe"])
         win = tk.Toplevel(self.root)
-        win.title(f"每日荐股 · {uni_name} · 按风险偏好（v6.1 三档引擎）")
+        win.title(f"每日荐股 · {uni_name} · 按风险偏好（v6.1.2 三档引擎）")
         win.configure(bg=DARK_BG)
         win.geometry("760x540" if not self.compact else
                      f"{self.root.winfo_screenwidth()}x"
@@ -8334,7 +8566,7 @@ class App:
             lb.insert("end", "无数据")
             return
         cfg = d["cfg"]
-        uni_name = "全A" if data.get("universe", "all") == "all" else "主板"
+        uni_name = UNIVERSE_NAME.get(data.get("universe", "all"), "")
         lb.insert("end", f"信号日 {data['signal_date']} · {uni_name} · "
                          f"建议资金 ¥{data['capital']:,.0f} · {mode}："
                          f"{cfg['score']} top{cfg['top']} / {cfg['reb']}日调仓 / "
@@ -8471,16 +8703,27 @@ class App:
             m.add_command(label="v4.0 全A研究（三档风险+消融）",
                           command=self.run_v4_research_bg)
             m.add_separator()
-            m.add_command(label="v6.1 三档组合（当前目标持仓）",
+            m.add_command(label="v6.1.2 三档组合（当前目标持仓）",
                           command=self.run_tiers_bg)
-            m.add_command(label="v6.1 三档回测（全A，相位平均）",
+            m.add_command(label="v6.1.2 三档回测（全A，相位平均）",
                           command=self.run_tiers_backtest_bg)
-            m.add_command(label="v6.1 三档回测（主板）",
+            m.add_command(label="v6.1.2 三档回测（主板）",
                           command=lambda: self.run_tiers_backtest_bg("main"))
-            m.add_command(label="v6.1 荐股收益回测（全A）",
+            m.add_command(label="v6.1.2 三档回测（ETF）",
+                          command=lambda: self.run_tiers_backtest_bg("etf"))
+            m.add_command(label="v6.1.2 三档回测（全A含ETF）",
+                          command=lambda: self.run_tiers_backtest_bg("all_etf"))
+            m.add_command(label="v6.1.2 荐股收益回测（全A）",
                           command=self.run_picks_bt_bg)
-            m.add_command(label="v6.1 荐股收益回测（主板）",
+            m.add_command(label="v6.1.2 荐股收益回测（主板）",
                           command=lambda: self.run_picks_bt_bg("main"))
+            m.add_command(label="v6.1.2 荐股收益回测（ETF）",
+                          command=lambda: self.run_picks_bt_bg("etf"))
+            m.add_command(label="v6.1.2 荐股收益回测（全A含ETF）",
+                          command=lambda: self.run_picks_bt_bg("all_etf"))
+            m.add_separator()
+            m.add_command(label="ETF：刷新代码表 + 回填历史",
+                          command=self.run_etf_sync_bg)
         m.add_separator()
         m.add_command(label="⚙ 设置", command=self.open_settings)
         x = anchor_widget.winfo_rootx()
@@ -8689,14 +8932,14 @@ class App:
         self.progress_var.set("v6.1 三档：完成")
 
     def run_tiers_backtest_bg(self, universe="all"):
-        """工具菜单：v6.1 三档回测（全期，相位平均，后台；all/main）。"""
+        """工具菜单：三档回测（全期，相位平均，后台；all/main/etf/all_etf）。"""
         if getattr(self, "_tiersbt_running", False):
             messagebox.showinfo("v6.1 三档回测", "已在后台运行中，请稍候")
             return
         self._tiersbt_running = True
         uni = universe
-        uni_name = "全A" if uni == "all" else "主板"
-        self.progress_var.set(f"v6.1 三档回测（{uni_name}）：加载面板（约1分钟）...")
+        uni_name = UNIVERSE_NAME.get(uni, uni)
+        self.progress_var.set(f"v6.1.2 三档回测（{uni_name}）：加载面板（约1分钟）...")
 
         def _job():
             return tier_eval(segment="full", progress=self._progress,
@@ -8706,7 +8949,7 @@ class App:
 
     def _tiersbt_done(self, res, err, universe="all"):
         self._tiersbt_running = False
-        uni_name = "全A" if universe == "all" else "沪深主板"
+        uni_name = UNIVERSE_NAME.get(universe, universe)
         if err:
             self.progress_var.set(f"v6.1 三档回测失败: {err}")
             messagebox.showerror("v6.1 三档回测", str(err))
@@ -8745,6 +8988,50 @@ class App:
         self._show_text_window(f"v6.1 三档回测 · {uni_name}", "\n".join(lines))
         self.progress_var.set("v6.1 三档回测完成")
 
+    def run_etf_sync_bg(self):
+        """工具菜单：ETF 刷新代码表 + 回填历史（v6.1.2）。"""
+        if getattr(self, "_etfsync_running", False):
+            messagebox.showinfo("ETF 同步", "已在后台运行中，请稍候")
+            return
+        if not messagebox.askyesno(
+                "ETF 同步",
+                "将从东财刷新 ETF 代码表并回填历史日K。\n\n"
+                "· 约 1500 只 ETF，首次回填需 10~25 分钟（受节流限制）\n"
+                "· 已入库且新鲜的会自动跳过（断点续传）\n"
+                "· 货币/现金类 ETF 自动剔除（会污染低波因子）\n\n"
+                "确定继续？"):
+            return
+        self._etfsync_running = True
+        self.progress_var.set("ETF 同步：拉取代码表 ...")
+
+        def _prog(msg):
+            self._safe_after(0, lambda: self.progress_var.set(msg))
+
+        def _job():
+            n = refresh_etf_codes(progress=_prog)
+            st = backfill_etf_history(progress=_prog, workers=6)
+            return n, st
+
+        def _done(res, err):
+            self._etfsync_running = False
+            if err:
+                self.progress_var.set(f"ETF 同步失败: {err}")
+                messagebox.showerror("ETF 同步", str(err))
+                return
+            n, st = res
+            self.progress_var.set(f"ETF 同步完成：代码表 {n} 只，"
+                                  f"回填成功 {st.get('ok', 0)}"
+                                  f"/失败 {st.get('fail', 0)}"
+                                  f"（可用 {st.get('bar_ok', 0)} 只）")
+            messagebox.showinfo(
+                "ETF 同步",
+                f"代码表：{n} 只\n"
+                f"本次待回填：{st.get('todo', 0)}，成功 {st.get('ok', 0)}，"
+                f"失败 {st.get('fail', 0)}\n"
+                f"K线充足（≥200根）：{st.get('bar_ok', 0)} 只\n\n"
+                "之后可在工具菜单选择「ETF」或「全A含ETF」口径回测/荐股。")
+        self._run_bg(_job, _done)
+
     def run_picks_bt_bg(self, universe="all"):
         """工具菜单：v6.1 荐股收益回测（逐笔口径，按风险偏好）。"""
         if getattr(self, "_picksbt_running", False):
@@ -8752,8 +9039,8 @@ class App:
             return
         self._picksbt_running = True
         uni = universe
-        uni_name = "全A" if uni == "all" else "主板"
-        self.progress_var.set(f"v6.1 荐股收益回测（{uni_name}）：加载面板（约1分钟）...")
+        uni_name = UNIVERSE_NAME.get(uni, uni)
+        self.progress_var.set(f"v6.1.2 荐股收益回测（{uni_name}）：加载面板（约1分钟）...")
 
         def _job():
             return tier_picks_report_text(segment="full", universe=uni)
@@ -11195,12 +11482,13 @@ class App:
         right = ttk.Frame(pfrm)
         right.pack(side="left", fill="y", padx=10)
         board_vars = {}
-        for b in ("主板", "创业板", "科创板"):
+        for b in ("主板", "创业板", "科创板", "ETF"):
             v = tk.BooleanVar(value=(not PICK_PERMS["boards"]
                                      or b in PICK_PERMS["boards"]))
             board_vars[b] = v
             ttk.Checkbutton(right, text=b, variable=v).pack(anchor="w")
-        ttk.Label(right, text="板块不勾选=全部允许", font=("Microsoft YaHei", 8),
+        ttk.Label(right, text="板块不勾选=全部允许（ETF 为独立板块）",
+                  font=("Microsoft YaHei", 8),
                   foreground=AXIS_TXT).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(frm, text="AI自动选档").grid(row=25, column=0, sticky="w",
@@ -11218,10 +11506,12 @@ class App:
         ttk.Label(frm, text="荐股股票池").grid(row=27, column=0, sticky="w",
                                                pady=4)
         uni_var = tk.StringVar(value=pconf["universe"])
-        ttk.Radiobutton(frm, text="全A", variable=uni_var,
-                        value="all").grid(row=27, column=1, sticky="w")
-        ttk.Radiobutton(frm, text="主板", variable=uni_var,
-                        value="main").grid(row=27, column=2, sticky="w")
+        ttk.Combobox(frm, textvariable=uni_var, width=12, state="readonly",
+                     values=["all", "main", "etf", "all_etf"]).grid(
+                         row=27, column=1, sticky="w", pady=4)
+        ttk.Label(frm, text="all=全A(不含ETF) main=主板 etf=仅ETF "
+                            "all_etf=全A含ETF").grid(
+            row=27, column=2, sticky="w")
 
         def save():
             self.settings["theme"] = theme_var.get()
@@ -11358,7 +11648,7 @@ class App:
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=29, column=0, columnspan=3, sticky="we")
-        about.insert("end", "版本：v6.1（2026-09）\n")
+        about.insert("end", "版本：v6.1.2（2026-09）\n")
         about.insert("end", "作者：獨白\n")
         about.insert("end", "邮箱：kingrux106@gmail.com\n")
         about.insert("end", "QQ：2180287399\n")
