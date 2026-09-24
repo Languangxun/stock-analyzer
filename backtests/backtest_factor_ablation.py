@@ -13,6 +13,11 @@
   python backtest_factor_ablation.py --stage validate  # 过拟合治理+报告
   python backtest_factor_ablation.py --stage all       # 全流程
   python backtest_factor_ablation.py --stage all --limit 200 --workers 4
+
+大样本实验（全A 分层抽样 1500 只；读写独立库与独立产物目录，避免与正在
+运行的程序争用主库 stock_cache.db）：
+  python backtest_factor_ablation.py --stage all --sample 1500 --chip-sample 300 \
+      --workers 8 --db stock_cache_lab.db --out-dir research/factor_lab/sample1500
 """
 # --- 目录引导：backtests/ 下运行也能导入 stock_gui/factor_lab，产物写项目根 ---
 import os as _os_boot
@@ -46,13 +51,26 @@ def main():
     ap.add_argument("--weights", default="both",
                     choices=("equal", "framework", "both"))
     ap.add_argument("--chip-sample", type=int, default=300)
+    ap.add_argument("--db", default=None,
+                    help="数据来源库路径（缺省 stock_cache.db；可指向快照副本，"
+                         "避免与正在运行的程序争用主库）")
+    ap.add_argument("--out-dir", default=None,
+                    help="产物目录（缺省 research/factor_lab；大样本实验建议"
+                         "单独目录，不覆盖既有产物）")
     ap.add_argument("--no-verify", action="store_true")
     args = ap.parse_args()
 
+    if args.out_dir:
+        os.environ["FACTOR_LAB_DIR"] = args.out_dir
+    import stock_gui as sg
+    if args.db:
+        sg.DB_PATH = os.path.abspath(args.db)
     from factor_lab import enumerate as enum_mod
     from factor_lab import panel as panel_mod
     from factor_lab import validate as val_mod
     from factor_lab.factors import K, FRAMEWORK_W
+    print(f"数据库: {sg.DB_PATH}")
+    print(f"产物目录: {panel_mod.CACHE_DIR}")
 
     t0 = time.time()
     if args.stage in ("chip", "all"):
@@ -68,7 +86,7 @@ def main():
         panel_mod.stage_build(limit=args.limit, workers=args.workers,
                               sample=args.sample, seed=args.seed)
 
-    if args.stage in ("panel",):
+    if args.stage in ("panel", "all"):
         panel_mod.assemble_panel()
 
     if args.stage in ("enum", "all"):

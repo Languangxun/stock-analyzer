@@ -1,0 +1,14 @@
+risk:
+
+  max_position: 40
+
+  max_single_buy: 200
+
+  max_daily_loss: 5
+
+  cooldown_days: 7
+
+  allow_trade:
+    - BUY
+    - SELL
+    - HOLD

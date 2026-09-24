@@ -20,7 +20,9 @@ from . import factors as fac_mod
 from . import matching as mat_mod
 from .factors import K
 
-CACHE_DIR = os.path.join("research", "factor_lab")
+# 产物目录：环境变量 FACTOR_LAB_DIR 可指向独立目录（大样本实验不覆盖既有产物）
+CACHE_DIR = (os.environ.get("FACTOR_LAB_DIR") or "").strip() or \
+    os.path.join("research", "factor_lab")
 PANEL_FILE = os.path.join(CACHE_DIR, "panel.npz")
 STOCK_CACHE = os.path.join(CACHE_DIR, "stocks_pass_a.pkl")
 MATCH_CACHE = os.path.join(CACHE_DIR, "match_pass_b.pkl")
@@ -354,6 +356,13 @@ def assemble_panel():
     codes = sorted(res.keys())
     code_idx = {c: i for i, c in enumerate(codes)}
 
+    # 筹码三因子允许缺失（价格长期跑出因果网格时该侧无峰 → NaN，约半数个股
+    # 会中招）：行完整性只要求其余因子与标签有限，缺失筹码在截面标准化后按
+    # 中性 0 处理（等价于当日截面均值），避免整只股票被丢弃
+    CHIP_COLS = {fac_mod.F["筹码支撑"], fac_mod.F["筹码压力"],
+                 fac_mod.F["筹码获利"]}
+    other_cols = [k for k in range(K) if k not in CHIP_COLS]
+
     rd, rc, X, Y1 = [], [], [], []
     have = 0
     for c in codes:
@@ -367,7 +376,7 @@ def assemble_panel():
             continue
         Fm = Fm[keep]
         y1 = d["y1"][keep]
-        ok = np.isfinite(Fm).all(axis=1) & np.isfinite(y1)
+        ok = np.isfinite(Fm[:, other_cols]).all(axis=1) & np.isfinite(y1)
         if ok.sum() < 60:
             continue
         i = len(ok) - 1
@@ -409,13 +418,18 @@ def assemble_panel():
             if b - a < 30:
                 continue
             seg = col[a:b].astype(np.float64)
-            sd = seg.std()
-            if sd <= 1e-12:
-                col[a:b] = 0.0
+            fin = np.isfinite(seg)       # 筹码缺失行不参与均值/方差
+            if fin.sum() < 3:
+                col[a:b] = np.nan_to_num(seg, nan=0.0)
                 continue
-            z = (seg - seg.mean()) / sd
+            mu = seg[fin].mean()
+            sd = seg[fin].std()
+            if sd <= 1e-12:
+                col[a:b] = np.nan_to_num(seg, nan=0.0)
+                continue
+            z = (seg - mu) / sd
             np.clip(z, -3.5, 3.5, out=z)
-            col[a:b] = z
+            col[a:b] = np.nan_to_num(z, nan=0.0)
     X = np.nan_to_num(X, nan=0.0)
 
     train_n = int(len(eval_dates) * TRAIN_FRAC)

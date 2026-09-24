@@ -38,11 +38,11 @@ K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪�
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
   --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
-  --tiers          v6.1.3 三档组合：输出最新目标持仓/闸门状态（可配 --tier）
+  --tiers          v6.1.4 三档组合：输出最新目标持仓/闸门状态（可配 --tier）
   --ai-tier        荐股前由AI在三档内选一档（按设置里的风险偏好锚定）
   --universe       标的池：all(全A不含ETF，默认)/main(沪深主板)/etf(仅ETF)/all_etf(全A含ETF)
-  --tiers-backtest v6.1.3 三档组合：全期回测摘要（相位平均，含全部费用）
-  --picks-backtest v6.1.3 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
+  --tiers-backtest v6.1.4 三档组合：全期回测摘要（相位平均，含全部费用）
+  --picks-backtest v6.1.4 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 """
 

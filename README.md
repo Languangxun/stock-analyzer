@@ -1,7 +1,20 @@
-# stock-analyzer · v6.1.3
+# stock-analyzer · v6.1.4
 
 基于**历史形态相似度匹配 + 多维融合 + 三档组合策略 + 全量回测**的 A 股短线统计研究工具。
 
+> **v6.1.4（2026-09-25）**：
+> ① **AI 网关兼容**：请求带自有 UA `stock-analyzer/<版本>` 与稳定会话头 `x-opencode-session`
+> （opencode zen 必需，缺失报 400），模型列表/多轮对话可用；修复「保存并应用」时
+> ini 被整体覆盖导致 `base_url/model`、`[predict]`、`[picks]`、`[data]` 丢失的问题；
+> ② **单股买卖点修复与激进档增益**：筹码峰/板块轮动信号可在图上回放；连续同向信号压缩
+> （不再成串重复 B/S）；**激进档信号密度兜底**——所选策略近 250 日 <8 个信号时改用
+> 多维评分·激进，震荡区间（如 5~6 元箱体）也能标出足够波段买卖点，面板/报告标注「信号口径」；
+> ③ **后台主动预取未分析股K线**：启动 60s 后首轮、此后每小时一轮，当前股/自选 → 样本池 →
+> 全库滚动补齐（跳过北交所/退市），收盘 15:05 后自动回补当日K线；
+> `stock_gui.ini [predict] auto_prefetch = 0` 可关；
+> ④ **因子实验室支持大样本**：新增 `--db`/`--out-dir`（独立库与产物目录，避免与 GUI 争用主库）、
+> 筹码缺失因子按截面中性填充、修复 `--stage all` 漏组装面板；全A 分层抽样复核产物随研究包分发。
+>
 > **v6.1.3（2026-09-19）**：
 > ① **消融新增 L2 对象（同行业 + 行业ETF）**——每个行业构造一条"行业指数"，
 > **优先取同名行业ETF**（可直接交易、无成分股停牌噪声），无匹配时用同行业个股等权收益累乘合成；
@@ -25,7 +38,7 @@
 
 ---
 
-## 一、v6.1.3 新增能力
+## 一、v6.1.3 新增能力（v6.1.4 更新见上方摘要）
 
 ### 1.1 标准回测（四口径 × 四类产品）
 
@@ -608,6 +621,13 @@ python backtests/backtest_picks_v6.py --segment full --universe all_etf --yearly
 # 5) 全对象多算法消融（9 类算法 × 3 档，逐对象覆盖；AI 不参与）
 python backtests/backtest_strategy_ablation.py            # 产物 research/strategy_ablation_*.json
 python backtests/backtest_strategy_ablation.py --limit 200 --workers 4   # 快速试跑
+
+# 6) 因子实验室（全A 分层抽样；大样本实验建议独立快照库 + 独立产物目录，
+#    不动正在被 GUI 使用的主库 stock_cache.db）
+python -c "import sqlite3; s=sqlite3.connect('stock_cache.db'); d=sqlite3.connect('stock_cache_lab.db'); s.backup(d)"
+python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sample 300 \
+    --workers 8 --db stock_cache_lab.db --out-dir research/factor_lab/sample1500
+# 其他脚本也可用 STOCK_DB=stock_cache_lab.db 指向快照库
 ```
 
 > `backtests/*.py` 顶部已带项目根路径引导，**在仓库根目录直接运行即可**，
@@ -618,6 +638,13 @@ python backtests/backtest_strategy_ablation.py --limit 200 --workers 4   # 快�
 ### 4.2 生产端（GUI：`python stock_gui.py`）
 
 - **搜索**：任意位置按键即聚焦搜索框；输入代码/名称带候选下拉与自动补全（缓存加载）；
+- **后台主动预取（未分析股）**：启动后每小时一轮，优先「当前股 + 自选」及其样本池
+  （同行业 + ETF；L3 开启时含同市值层），再滚动补齐全库缺失K线（跳过北交所/退市）；
+  收盘（15:05）后自动回补当日K线。已缓存只做新鲜度检查、批间限速；
+  `stock_gui.ini [predict] auto_prefetch = 0` 可关闭；
+- **单股策略消融**：分析后弹出三档候选（8 算法 × 3 风险参数，训练选型 / 验证防过拟合）；
+  图上买卖点按所选策略回放，**激进档信号过少时自动兜底为多维波段信号**
+  （面板「信号口径」与报告有标注，不改动消融缓存）；
 - **工具菜单**：`v6.1.2 三档组合（当前目标持仓）`、
   `三档回测（全A / 主板 / ETF / 全A含ETF）`、`荐股收益回测（全A / 主板 / ETF / 全A含ETF）`、
   以及 `ETF：刷新代码表 + 回填历史`；
@@ -689,20 +716,21 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
   452 只 ≥1000 根**，合计 **90.7 万根**；未达 200 根的 289 只（新上市/迷你）留在代码表但不入回测。
   入库口径与个股一致（hfq + `adjust` 缩放）；`refresh_all_codes` 已改为**只清 A 股行**，
   不会在刷新代码表时抹掉 ETF。
-- **客户端数据包与研究产物**（Release **v6.1.3**）：
-  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.3>
-  - `stock-analyzer-client-v6.1.3-20260919.zip`（292 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
-    （含 `adjust` 修复、复权口径迁移、科创50 指数、**1202 只 ETF 历史**），解压即用；
+- **客户端数据包与研究产物**（Release **v6.1.4**）：
+  <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.4>
+  - `stock-analyzer-client-v6.1.4-20260925.zip`（270 MB）：GUI + CLI + 插件 + **全量 `stock_cache.db`**
+    （含 `adjust` 修复、hfq 复权口径、科创50 指数、ETF 历史），解压即用；
     **配置为空 Key 模板**（不含任何私有凭据，打包后自动全包扫描 Key 模式），
     首次运行请在设置内填自己的 API Key；
-  - `research_v6.1.3.zip`（27.8 MB）：全部回测 JSON 与报告产物
-    （含单文件 >100MB 的逐对象消融明细，故不入仓，随研究包分发）。
-  - 上一版：v6.1.2 <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.2>；
+  - `research_v6.1.4.zip`（2.8 MB）：回测 JSON 与报告产物，
+    含新增 `factor_lab/sample1500`（全A 分层抽样严格过滤）与 `sample1500_chipfill`
+    （筹码缺失中性填充，1421 只 × 139.7 万行）复核产物。
+  - 上一版：v6.1.3 <https://github.com/monologue-github/stock-analyzer/releases/tag/v6.1.3>；
     全部版本：<https://github.com/monologue-github/stock-analyzer/releases>
 
 ---
 
-## 七、文件说明（v6.1.3）
+## 七、文件说明（v6.1.4）
 
 | 文件 | 说明 |
 |---|---|
@@ -725,7 +753,7 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 | `research/v61_report_{val,bull}.json` / `.md` | 样本外 / 强势段标准回测产物 |
 | `research/tiers_*.json` | 三档分段/逐年回测产物 |
 | `research/strategy_ablation_*.json` | 逐对象消融两层产物（逐对象 + 聚合，含覆盖率清单） |
-| `ARCHITECTURE.md` | **架构与算法说明（v6.1.3）**：目录职责、数据层、算法层（引擎/消融/AI）、研究与发布流程、已知不一致 |
+| `ARCHITECTURE.md` | **架构与算法说明（v6.1.4）**：目录职责、数据层、算法层（引擎/消融/AI）、研究与发布流程、已知不一致 |
 | `PLUGIN_API.md` | 插件 API 文档（插件开发者用，随客户端包分发） |
 | `research/legacy/results/` | 历史（v3/v4 时代）回测结果归档；对应脚本产出统一写入此处 |
 | `reports/` | 生成类报告归档：数据清洗报告（`data_clean.py` 输出）、回测复核（审计）报告、代码审查 |

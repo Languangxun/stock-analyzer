@@ -3,6 +3,9 @@ stock_gui.ini
 # 本地缓存数据库
 stock_cache.db
 stock_cache.db-*
+# 实验用独立快照库（大样本研究，避免与主库争用；由 STOCK_DB/--db 指定）
+stock_cache_lab.db
+stock_cache_lab.db-*
 # 运行日志 / 备份 / 字节码
 *.log
 *.bak
@@ -38,12 +41,14 @@ htmlcov/
 .vscode/
 
 # --- 2026-09-13 上证冠军配置入库时的排除项 ---
-# ai-quant 独立子项目（含 .env 密钥，禁止误提交）
-ai-quant/
+# ai-quant 子项目：v6.1.4 起随主库入库；.env / 大缓存 / 运行态数据
+# 由 ai-quant/.gitignore 排除（提交前务必核对 git status 无密钥）
 # 插件运行数据（交易记录/设置）
 _data/
 # 编辑器配置
 .obsidian/
 # 历史运行日志（保留 oneoff_results 结果）
 research/legacy/logs/
+# 超跌 GUI（本地私用，不入库/不随发布）
 stock_chaodi.ini
+stock_chaodi_gui.py

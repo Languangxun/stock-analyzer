@@ -1,0 +1,10 @@
+system:
+  name: ai-quant
+  version: "0.7.1"
+
+runtime:
+  mode: backtest
+  timezone: Asia/Shanghai
+
+logging:
+  level: INFO

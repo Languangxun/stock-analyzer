@@ -1,0 +1,43 @@
+# 股票模拟盘 / 回测参数（trading.stock_account + sim.stock_run + backtest.stock_engine）
+stock:
+
+  capital: 100000
+
+  # 组合约束
+  max_positions: 5            # 最大同时持仓数
+  max_position_pct: 20        # 单票上限（占总资产 %）
+  min_order_amount: 5000      # 单笔最小买入金额
+  lot_size: 100               # A股一手
+
+  # 交易费用（A股）
+  fees:
+    commission_rate: 0.00025  # 佣金 万2.5
+    min_commission: 5.0       # 最低 5 元
+    stamp_tax_rate: 0.0005    # 印花税 0.05%（仅卖出）
+    transfer_fee_rate: 0.00001  # 过户费 0.001%
+
+  # 成交口径：信号 T 日收盘生成，T+1 成交（close=收盘价，open=开盘价）
+  exec_px: close
+
+  # 退出：CLI 同款 ATR 跟踪止损
+  stop:
+    atr_mult: 1.5
+    trail_trigger: 1.02
+    trail_ratio: 0.94
+
+  # 信号/选股（复用 CLI 多维评分 + RISK_PARAMS）
+  risk_mode: 稳健             # 保守 / 稳健 / 激进
+
+  universe:
+    min_bars: 400             # 最少K线
+    max_scan: 120             # 实盘每日扫描上限（按市值降序；Pi上约2-3分钟）
+    min_price: 2.0            # 剔除仙股
+    recent_days: 15           # 最新K线需在最近 N 个自然日内（剔除停牌/退市）
+    exclude_etf: true
+    exclude_bj: true
+    boards: all               # all=全市场；main=仅沪深主板
+
+  # 回测
+  backtest:
+    start: ""                 # 空=全缓存；可填 2023-01-01
+    benchmark: ""             # 空=等权全市场；可填 sh000001

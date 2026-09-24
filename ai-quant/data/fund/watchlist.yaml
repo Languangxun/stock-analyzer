@@ -1,0 +1,60 @@
+funds:
+
+  - name: 银行
+    type: etf_linked
+
+    etf:
+      code: 512800
+      market: sh
+
+    fund:
+      code: ""
+      platform: fund
+
+
+  - name: 半导体
+    type: etf_linked
+
+    etf:
+      code: 512480
+      market: sh
+
+    fund:
+      code: ""
+      platform: fund
+
+
+  - name: 通信
+    type: etf_linked
+
+    etf:
+      code: 515880
+      market: sh
+
+    fund:
+      code: ""
+      platform: fund
+
+
+  - name: 人工智能
+    type: etf_linked
+
+    etf:
+      code: 159819
+      market: sz
+
+    fund:
+      code: ""
+      platform: fund
+
+
+  - name: 消费电子
+    type: etf_linked
+
+    etf:
+      code: 159732
+      market: sz
+
+    fund:
+      code: ""
+      platform: fund

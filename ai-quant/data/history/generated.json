@@ -1,0 +1,1802 @@
+[
+  {
+    "date": "2026-01-01",
+    "symbol": "半导体ETF",
+    "price": 1.0069,
+    "change": 0.69
+  },
+  {
+    "date": "2026-01-02",
+    "symbol": "半导体ETF",
+    "price": 1.0401,
+    "change": 3.29
+  },
+  {
+    "date": "2026-01-03",
+    "symbol": "半导体ETF",
+    "price": 1.0797,
+    "change": 3.81
+  },
+  {
+    "date": "2026-01-04",
+    "symbol": "半导体ETF",
+    "price": 1.0966,
+    "change": 1.57
+  },
+  {
+    "date": "2026-01-05",
+    "symbol": "半导体ETF",
+    "price": 1.134,
+    "change": 3.41
+  },
+  {
+    "date": "2026-01-06",
+    "symbol": "半导体ETF",
+    "price": 1.1734,
+    "change": 3.47
+  },
+  {
+    "date": "2026-01-07",
+    "symbol": "半导体ETF",
+    "price": 1.1777,
+    "change": 0.37
+  },
+  {
+    "date": "2026-01-08",
+    "symbol": "半导体ETF",
+    "price": 1.1842,
+    "change": 0.54
+  },
+  {
+    "date": "2026-01-09",
+    "symbol": "半导体ETF",
+    "price": 1.2125,
+    "change": 2.4
+  },
+  {
+    "date": "2026-01-10",
+    "symbol": "半导体ETF",
+    "price": 1.2128,
+    "change": 0.02
+  },
+  {
+    "date": "2026-01-11",
+    "symbol": "半导体ETF",
+    "price": 1.237,
+    "change": 1.99
+  },
+  {
+    "date": "2026-01-12",
+    "symbol": "半导体ETF",
+    "price": 1.2423,
+    "change": 0.44
+  },
+  {
+    "date": "2026-01-13",
+    "symbol": "半导体ETF",
+    "price": 1.2578,
+    "change": 1.24
+  },
+  {
+    "date": "2026-01-14",
+    "symbol": "半导体ETF",
+    "price": 1.2962,
+    "change": 3.05
+  },
+  {
+    "date": "2026-01-15",
+    "symbol": "半导体ETF",
+    "price": 1.3231,
+    "change": 2.07
+  },
+  {
+    "date": "2026-01-16",
+    "symbol": "半导体ETF",
+    "price": 1.3312,
+    "change": 0.61
+  },
+  {
+    "date": "2026-01-17",
+    "symbol": "半导体ETF",
+    "price": 1.3366,
+    "change": 0.41
+  },
+  {
+    "date": "2026-01-18",
+    "symbol": "半导体ETF",
+    "price": 1.3843,
+    "change": 3.56
+  },
+  {
+    "date": "2026-01-19",
+    "symbol": "半导体ETF",
+    "price": 1.4012,
+    "change": 1.22
+  },
+  {
+    "date": "2026-01-20",
+    "symbol": "半导体ETF",
+    "price": 1.4308,
+    "change": 2.11
+  },
+  {
+    "date": "2026-01-21",
+    "symbol": "半导体ETF",
+    "price": 1.4337,
+    "change": 0.2
+  },
+  {
+    "date": "2026-01-22",
+    "symbol": "半导体ETF",
+    "price": 1.4573,
+    "change": 1.65
+  },
+  {
+    "date": "2026-01-23",
+    "symbol": "半导体ETF",
+    "price": 1.4749,
+    "change": 1.21
+  },
+  {
+    "date": "2026-01-24",
+    "symbol": "半导体ETF",
+    "price": 1.5229,
+    "change": 3.25
+  },
+  {
+    "date": "2026-01-25",
+    "symbol": "半导体ETF",
+    "price": 1.5598,
+    "change": 2.43
+  },
+  {
+    "date": "2026-01-26",
+    "symbol": "半导体ETF",
+    "price": 1.5625,
+    "change": 0.17
+  },
+  {
+    "date": "2026-01-27",
+    "symbol": "半导体ETF",
+    "price": 1.5636,
+    "change": 0.07
+  },
+  {
+    "date": "2026-01-28",
+    "symbol": "半导体ETF",
+    "price": 1.5644,
+    "change": 0.05
+  },
+  {
+    "date": "2026-01-29",
+    "symbol": "半导体ETF",
+    "price": 1.5704,
+    "change": 0.38
+  },
+  {
+    "date": "2026-01-30",
+    "symbol": "半导体ETF",
+    "price": 1.594,
+    "change": 1.5
+  },
+  {
+    "date": "2026-01-31",
+    "symbol": "半导体ETF",
+    "price": 1.6467,
+    "change": 3.31
+  },
+  {
+    "date": "2026-02-01",
+    "symbol": "半导体ETF",
+    "price": 1.6965,
+    "change": 3.02
+  },
+  {
+    "date": "2026-02-02",
+    "symbol": "半导体ETF",
+    "price": 1.701,
+    "change": 0.27
+  },
+  {
+    "date": "2026-02-03",
+    "symbol": "半导体ETF",
+    "price": 1.7346,
+    "change": 1.98
+  },
+  {
+    "date": "2026-02-04",
+    "symbol": "半导体ETF",
+    "price": 1.8001,
+    "change": 3.77
+  },
+  {
+    "date": "2026-02-05",
+    "symbol": "半导体ETF",
+    "price": 1.8313,
+    "change": 1.74
+  },
+  {
+    "date": "2026-02-06",
+    "symbol": "半导体ETF",
+    "price": 1.9034,
+    "change": 3.93
+  },
+  {
+    "date": "2026-02-07",
+    "symbol": "半导体ETF",
+    "price": 1.9714,
+    "change": 3.57
+  },
+  {
+    "date": "2026-02-08",
+    "symbol": "半导体ETF",
+    "price": 1.9887,
+    "change": 0.88
+  },
+  {
+    "date": "2026-02-09",
+    "symbol": "半导体ETF",
+    "price": 2.0588,
+    "change": 3.53
+  },
+  {
+    "date": "2026-02-10",
+    "symbol": "半导体ETF",
+    "price": 2.1408,
+    "change": 3.98
+  },
+  {
+    "date": "2026-02-11",
+    "symbol": "半导体ETF",
+    "price": 2.1416,
+    "change": 0.04
+  },
+  {
+    "date": "2026-02-12",
+    "symbol": "半导体ETF",
+    "price": 2.199,
+    "change": 2.68
+  },
+  {
+    "date": "2026-02-13",
+    "symbol": "半导体ETF",
+    "price": 2.2819,
+    "change": 3.77
+  },
+  {
+    "date": "2026-02-14",
+    "symbol": "半导体ETF",
+    "price": 2.321,
+    "change": 1.72
+  },
+  {
+    "date": "2026-02-15",
+    "symbol": "半导体ETF",
+    "price": 2.3984,
+    "change": 3.33
+  },
+  {
+    "date": "2026-02-16",
+    "symbol": "半导体ETF",
+    "price": 2.4268,
+    "change": 1.18
+  },
+  {
+    "date": "2026-02-17",
+    "symbol": "半导体ETF",
+    "price": 2.4863,
+    "change": 2.45
+  },
+  {
+    "date": "2026-02-18",
+    "symbol": "半导体ETF",
+    "price": 2.5779,
+    "change": 3.68
+  },
+  {
+    "date": "2026-02-19",
+    "symbol": "半导体ETF",
+    "price": 2.6801,
+    "change": 3.97
+  },
+  {
+    "date": "2026-02-20",
+    "symbol": "半导体ETF",
+    "price": 2.787,
+    "change": 3.99
+  },
+  {
+    "date": "2026-02-21",
+    "symbol": "半导体ETF",
+    "price": 2.8391,
+    "change": 1.87
+  },
+  {
+    "date": "2026-02-22",
+    "symbol": "半导体ETF",
+    "price": 2.8432,
+    "change": 0.15
+  },
+  {
+    "date": "2026-02-23",
+    "symbol": "半导体ETF",
+    "price": 2.9315,
+    "change": 3.1
+  },
+  {
+    "date": "2026-02-24",
+    "symbol": "半导体ETF",
+    "price": 3.0288,
+    "change": 3.32
+  },
+  {
+    "date": "2026-02-25",
+    "symbol": "半导体ETF",
+    "price": 3.1175,
+    "change": 2.93
+  },
+  {
+    "date": "2026-02-26",
+    "symbol": "半导体ETF",
+    "price": 3.1992,
+    "change": 2.62
+  },
+  {
+    "date": "2026-02-27",
+    "symbol": "半导体ETF",
+    "price": 3.2112,
+    "change": 0.37
+  },
+  {
+    "date": "2026-02-28",
+    "symbol": "半导体ETF",
+    "price": 3.2872,
+    "change": 2.37
+  },
+  {
+    "date": "2026-03-01",
+    "symbol": "半导体ETF",
+    "price": 3.3521,
+    "change": 1.97
+  },
+  {
+    "date": "2026-03-02",
+    "symbol": "半导体ETF",
+    "price": 3.1794,
+    "change": -5.15
+  },
+  {
+    "date": "2026-03-03",
+    "symbol": "半导体ETF",
+    "price": 2.9685,
+    "change": -6.63
+  },
+  {
+    "date": "2026-03-04",
+    "symbol": "半导体ETF",
+    "price": 2.7702,
+    "change": -6.68
+  },
+  {
+    "date": "2026-03-05",
+    "symbol": "半导体ETF",
+    "price": 2.5959,
+    "change": -6.29
+  },
+  {
+    "date": "2026-03-06",
+    "symbol": "半导体ETF",
+    "price": 2.3905,
+    "change": -7.91
+  },
+  {
+    "date": "2026-03-07",
+    "symbol": "半导体ETF",
+    "price": 2.2803,
+    "change": -4.61
+  },
+  {
+    "date": "2026-03-08",
+    "symbol": "半导体ETF",
+    "price": 2.1098,
+    "change": -7.48
+  },
+  {
+    "date": "2026-03-09",
+    "symbol": "半导体ETF",
+    "price": 2.0194,
+    "change": -4.29
+  },
+  {
+    "date": "2026-03-10",
+    "symbol": "半导体ETF",
+    "price": 1.8723,
+    "change": -7.28
+  },
+  {
+    "date": "2026-03-11",
+    "symbol": "半导体ETF",
+    "price": 1.7782,
+    "change": -5.03
+  },
+  {
+    "date": "2026-03-12",
+    "symbol": "半导体ETF",
+    "price": 1.6825,
+    "change": -5.38
+  },
+  {
+    "date": "2026-03-13",
+    "symbol": "半导体ETF",
+    "price": 1.5608,
+    "change": -7.23
+  },
+  {
+    "date": "2026-03-14",
+    "symbol": "半导体ETF",
+    "price": 1.5038,
+    "change": -3.65
+  },
+  {
+    "date": "2026-03-15",
+    "symbol": "半导体ETF",
+    "price": 1.3961,
+    "change": -7.16
+  },
+  {
+    "date": "2026-03-16",
+    "symbol": "半导体ETF",
+    "price": 1.3505,
+    "change": -3.27
+  },
+  {
+    "date": "2026-03-17",
+    "symbol": "半导体ETF",
+    "price": 1.2431,
+    "change": -7.95
+  },
+  {
+    "date": "2026-03-18",
+    "symbol": "半导体ETF",
+    "price": 1.1737,
+    "change": -5.58
+  },
+  {
+    "date": "2026-03-19",
+    "symbol": "半导体ETF",
+    "price": 1.1265,
+    "change": -4.02
+  },
+  {
+    "date": "2026-03-20",
+    "symbol": "半导体ETF",
+    "price": 1.0748,
+    "change": -4.59
+  },
+  {
+    "date": "2026-03-21",
+    "symbol": "半导体ETF",
+    "price": 1.0038,
+    "change": -6.61
+  },
+  {
+    "date": "2026-03-22",
+    "symbol": "半导体ETF",
+    "price": 0.9546,
+    "change": -4.9
+  },
+  {
+    "date": "2026-03-23",
+    "symbol": "半导体ETF",
+    "price": 0.8926,
+    "change": -6.5
+  },
+  {
+    "date": "2026-03-24",
+    "symbol": "半导体ETF",
+    "price": 0.845,
+    "change": -5.33
+  },
+  {
+    "date": "2026-03-25",
+    "symbol": "半导体ETF",
+    "price": 0.7842,
+    "change": -7.19
+  },
+  {
+    "date": "2026-03-26",
+    "symbol": "半导体ETF",
+    "price": 0.7425,
+    "change": -5.31
+  },
+  {
+    "date": "2026-03-27",
+    "symbol": "半导体ETF",
+    "price": 0.7058,
+    "change": -4.94
+  },
+  {
+    "date": "2026-03-28",
+    "symbol": "半导体ETF",
+    "price": 0.6803,
+    "change": -3.61
+  },
+  {
+    "date": "2026-03-29",
+    "symbol": "半导体ETF",
+    "price": 0.6526,
+    "change": -4.08
+  },
+  {
+    "date": "2026-03-30",
+    "symbol": "半导体ETF",
+    "price": 0.6114,
+    "change": -6.31
+  },
+  {
+    "date": "2026-03-31",
+    "symbol": "半导体ETF",
+    "price": 0.5765,
+    "change": -5.72
+  },
+  {
+    "date": "2026-04-01",
+    "symbol": "半导体ETF",
+    "price": 0.5483,
+    "change": -4.88
+  },
+  {
+    "date": "2026-04-02",
+    "symbol": "半导体ETF",
+    "price": 0.5245,
+    "change": -4.34
+  },
+  {
+    "date": "2026-04-03",
+    "symbol": "半导体ETF",
+    "price": 0.4977,
+    "change": -5.1
+  },
+  {
+    "date": "2026-04-04",
+    "symbol": "半导体ETF",
+    "price": 0.48,
+    "change": -3.56
+  },
+  {
+    "date": "2026-04-05",
+    "symbol": "半导体ETF",
+    "price": 0.462,
+    "change": -3.76
+  },
+  {
+    "date": "2026-04-06",
+    "symbol": "半导体ETF",
+    "price": 0.4451,
+    "change": -3.64
+  },
+  {
+    "date": "2026-04-07",
+    "symbol": "半导体ETF",
+    "price": 0.4223,
+    "change": -5.12
+  },
+  {
+    "date": "2026-04-08",
+    "symbol": "半导体ETF",
+    "price": 0.3956,
+    "change": -6.33
+  },
+  {
+    "date": "2026-04-09",
+    "symbol": "半导体ETF",
+    "price": 0.3739,
+    "change": -5.49
+  },
+  {
+    "date": "2026-04-10",
+    "symbol": "半导体ETF",
+    "price": 0.3511,
+    "change": -6.08
+  },
+  {
+    "date": "2026-04-11",
+    "symbol": "半导体ETF",
+    "price": 0.3324,
+    "change": -5.34
+  },
+  {
+    "date": "2026-04-12",
+    "symbol": "半导体ETF",
+    "price": 0.3204,
+    "change": -3.61
+  },
+  {
+    "date": "2026-04-13",
+    "symbol": "半导体ETF",
+    "price": 0.3077,
+    "change": -3.94
+  },
+  {
+    "date": "2026-04-14",
+    "symbol": "半导体ETF",
+    "price": 0.2844,
+    "change": -7.59
+  },
+  {
+    "date": "2026-04-15",
+    "symbol": "半导体ETF",
+    "price": 0.262,
+    "change": -7.87
+  },
+  {
+    "date": "2026-04-16",
+    "symbol": "半导体ETF",
+    "price": 0.2489,
+    "change": -5.01
+  },
+  {
+    "date": "2026-04-17",
+    "symbol": "半导体ETF",
+    "price": 0.2411,
+    "change": -3.1
+  },
+  {
+    "date": "2026-04-18",
+    "symbol": "半导体ETF",
+    "price": 0.223,
+    "change": -7.51
+  },
+  {
+    "date": "2026-04-19",
+    "symbol": "半导体ETF",
+    "price": 0.2056,
+    "change": -7.81
+  },
+  {
+    "date": "2026-04-20",
+    "symbol": "半导体ETF",
+    "price": 0.1987,
+    "change": -3.38
+  },
+  {
+    "date": "2026-04-21",
+    "symbol": "半导体ETF",
+    "price": 0.1892,
+    "change": -4.73
+  },
+  {
+    "date": "2026-04-22",
+    "symbol": "半导体ETF",
+    "price": 0.1748,
+    "change": -7.62
+  },
+  {
+    "date": "2026-04-23",
+    "symbol": "半导体ETF",
+    "price": 0.1628,
+    "change": -6.91
+  },
+  {
+    "date": "2026-04-24",
+    "symbol": "半导体ETF",
+    "price": 0.1577,
+    "change": -3.12
+  },
+  {
+    "date": "2026-04-25",
+    "symbol": "半导体ETF",
+    "price": 0.1459,
+    "change": -7.47
+  },
+  {
+    "date": "2026-04-26",
+    "symbol": "半导体ETF",
+    "price": 0.1415,
+    "change": -3.01
+  },
+  {
+    "date": "2026-04-27",
+    "symbol": "半导体ETF",
+    "price": 0.1341,
+    "change": -5.27
+  },
+  {
+    "date": "2026-04-28",
+    "symbol": "半导体ETF",
+    "price": 0.1256,
+    "change": -6.32
+  },
+  {
+    "date": "2026-04-29",
+    "symbol": "半导体ETF",
+    "price": 0.1175,
+    "change": -6.41
+  },
+  {
+    "date": "2026-04-30",
+    "symbol": "半导体ETF",
+    "price": 0.113,
+    "change": -3.83
+  },
+  {
+    "date": "2026-05-01",
+    "symbol": "半导体ETF",
+    "price": 0.1066,
+    "change": -5.68
+  },
+  {
+    "date": "2026-05-02",
+    "symbol": "半导体ETF",
+    "price": 0.0988,
+    "change": -7.32
+  },
+  {
+    "date": "2026-05-03",
+    "symbol": "半导体ETF",
+    "price": 0.094,
+    "change": -4.91
+  },
+  {
+    "date": "2026-05-04",
+    "symbol": "半导体ETF",
+    "price": 0.0907,
+    "change": -3.46
+  },
+  {
+    "date": "2026-05-05",
+    "symbol": "半导体ETF",
+    "price": 0.0846,
+    "change": -6.75
+  },
+  {
+    "date": "2026-05-06",
+    "symbol": "半导体ETF",
+    "price": 0.0795,
+    "change": -5.98
+  },
+  {
+    "date": "2026-05-07",
+    "symbol": "半导体ETF",
+    "price": 0.0751,
+    "change": -5.5
+  },
+  {
+    "date": "2026-05-08",
+    "symbol": "半导体ETF",
+    "price": 0.0715,
+    "change": -4.83
+  },
+  {
+    "date": "2026-05-09",
+    "symbol": "半导体ETF",
+    "price": 0.0694,
+    "change": -3.0
+  },
+  {
+    "date": "2026-05-10",
+    "symbol": "半导体ETF",
+    "price": 0.0641,
+    "change": -7.64
+  },
+  {
+    "date": "2026-05-11",
+    "symbol": "半导体ETF",
+    "price": 0.0618,
+    "change": -3.55
+  },
+  {
+    "date": "2026-05-12",
+    "symbol": "半导体ETF",
+    "price": 0.0599,
+    "change": -3.1
+  },
+  {
+    "date": "2026-05-13",
+    "symbol": "半导体ETF",
+    "price": 0.058,
+    "change": -3.15
+  },
+  {
+    "date": "2026-05-14",
+    "symbol": "半导体ETF",
+    "price": 0.0535,
+    "change": -7.74
+  },
+  {
+    "date": "2026-05-15",
+    "symbol": "半导体ETF",
+    "price": 0.0509,
+    "change": -4.79
+  },
+  {
+    "date": "2026-05-16",
+    "symbol": "半导体ETF",
+    "price": 0.048,
+    "change": -5.71
+  },
+  {
+    "date": "2026-05-17",
+    "symbol": "半导体ETF",
+    "price": 0.0447,
+    "change": -7.0
+  },
+  {
+    "date": "2026-05-18",
+    "symbol": "半导体ETF",
+    "price": 0.0414,
+    "change": -7.27
+  },
+  {
+    "date": "2026-05-19",
+    "symbol": "半导体ETF",
+    "price": 0.0396,
+    "change": -4.35
+  },
+  {
+    "date": "2026-05-20",
+    "symbol": "半导体ETF",
+    "price": 0.0369,
+    "change": -6.8
+  },
+  {
+    "date": "2026-05-21",
+    "symbol": "半导体ETF",
+    "price": 0.0358,
+    "change": -3.08
+  },
+  {
+    "date": "2026-05-22",
+    "symbol": "半导体ETF",
+    "price": 0.0333,
+    "change": -6.9
+  },
+  {
+    "date": "2026-05-23",
+    "symbol": "半导体ETF",
+    "price": 0.0322,
+    "change": -3.32
+  },
+  {
+    "date": "2026-05-24",
+    "symbol": "半导体ETF",
+    "price": 0.0302,
+    "change": -6.24
+  },
+  {
+    "date": "2026-05-25",
+    "symbol": "半导体ETF",
+    "price": 0.0282,
+    "change": -6.68
+  },
+  {
+    "date": "2026-05-26",
+    "symbol": "半导体ETF",
+    "price": 0.0267,
+    "change": -5.36
+  },
+  {
+    "date": "2026-05-27",
+    "symbol": "半导体ETF",
+    "price": 0.0246,
+    "change": -7.87
+  },
+  {
+    "date": "2026-05-28",
+    "symbol": "半导体ETF",
+    "price": 0.0229,
+    "change": -6.91
+  },
+  {
+    "date": "2026-05-29",
+    "symbol": "半导体ETF",
+    "price": 0.0215,
+    "change": -6.17
+  },
+  {
+    "date": "2026-05-30",
+    "symbol": "半导体ETF",
+    "price": 0.0205,
+    "change": -4.35
+  },
+  {
+    "date": "2026-05-31",
+    "symbol": "半导体ETF",
+    "price": 0.0194,
+    "change": -5.5
+  },
+  {
+    "date": "2026-06-01",
+    "symbol": "半导体ETF",
+    "price": 0.0186,
+    "change": -4.34
+  },
+  {
+    "date": "2026-06-02",
+    "symbol": "半导体ETF",
+    "price": 0.0178,
+    "change": -3.98
+  },
+  {
+    "date": "2026-06-03",
+    "symbol": "半导体ETF",
+    "price": 0.0172,
+    "change": -3.71
+  },
+  {
+    "date": "2026-06-04",
+    "symbol": "半导体ETF",
+    "price": 0.0166,
+    "change": -3.2
+  },
+  {
+    "date": "2026-06-05",
+    "symbol": "半导体ETF",
+    "price": 0.0154,
+    "change": -7.34
+  },
+  {
+    "date": "2026-06-06",
+    "symbol": "半导体ETF",
+    "price": 0.0144,
+    "change": -6.34
+  },
+  {
+    "date": "2026-06-07",
+    "symbol": "半导体ETF",
+    "price": 0.0134,
+    "change": -7.31
+  },
+  {
+    "date": "2026-06-08",
+    "symbol": "半导体ETF",
+    "price": 0.0125,
+    "change": -6.78
+  },
+  {
+    "date": "2026-06-09",
+    "symbol": "半导体ETF",
+    "price": 0.0118,
+    "change": -5.57
+  },
+  {
+    "date": "2026-06-10",
+    "symbol": "半导体ETF",
+    "price": 0.0111,
+    "change": -5.53
+  },
+  {
+    "date": "2026-06-11",
+    "symbol": "半导体ETF",
+    "price": 0.0104,
+    "change": -6.87
+  },
+  {
+    "date": "2026-06-12",
+    "symbol": "半导体ETF",
+    "price": 0.01,
+    "change": -3.63
+  },
+  {
+    "date": "2026-06-13",
+    "symbol": "半导体ETF",
+    "price": 0.0094,
+    "change": -5.3
+  },
+  {
+    "date": "2026-06-14",
+    "symbol": "半导体ETF",
+    "price": 0.0088,
+    "change": -6.51
+  },
+  {
+    "date": "2026-06-15",
+    "symbol": "半导体ETF",
+    "price": 0.0086,
+    "change": -3.15
+  },
+  {
+    "date": "2026-06-16",
+    "symbol": "半导体ETF",
+    "price": 0.0083,
+    "change": -3.32
+  },
+  {
+    "date": "2026-06-17",
+    "symbol": "半导体ETF",
+    "price": 0.0078,
+    "change": -5.98
+  },
+  {
+    "date": "2026-06-18",
+    "symbol": "半导体ETF",
+    "price": 0.0074,
+    "change": -4.9
+  },
+  {
+    "date": "2026-06-19",
+    "symbol": "半导体ETF",
+    "price": 0.0069,
+    "change": -6.77
+  },
+  {
+    "date": "2026-06-20",
+    "symbol": "半导体ETF",
+    "price": 0.0064,
+    "change": -7.49
+  },
+  {
+    "date": "2026-06-21",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": -4.24
+  },
+  {
+    "date": "2026-06-22",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -5.68
+  },
+  {
+    "date": "2026-06-23",
+    "symbol": "半导体ETF",
+    "price": 0.0054,
+    "change": -5.99
+  },
+  {
+    "date": "2026-06-24",
+    "symbol": "半导体ETF",
+    "price": 0.0052,
+    "change": -4.87
+  },
+  {
+    "date": "2026-06-25",
+    "symbol": "半导体ETF",
+    "price": 0.0048,
+    "change": -5.91
+  },
+  {
+    "date": "2026-06-26",
+    "symbol": "半导体ETF",
+    "price": 0.0045,
+    "change": -6.34
+  },
+  {
+    "date": "2026-06-27",
+    "symbol": "半导体ETF",
+    "price": 0.0043,
+    "change": -5.28
+  },
+  {
+    "date": "2026-06-28",
+    "symbol": "半导体ETF",
+    "price": 0.0041,
+    "change": -5.32
+  },
+  {
+    "date": "2026-06-29",
+    "symbol": "半导体ETF",
+    "price": 0.0038,
+    "change": -6.82
+  },
+  {
+    "date": "2026-06-30",
+    "symbol": "半导体ETF",
+    "price": 0.0038,
+    "change": 0.21
+  },
+  {
+    "date": "2026-07-01",
+    "symbol": "半导体ETF",
+    "price": 0.0038,
+    "change": 0.55
+  },
+  {
+    "date": "2026-07-02",
+    "symbol": "半导体ETF",
+    "price": 0.0039,
+    "change": 1.72
+  },
+  {
+    "date": "2026-07-03",
+    "symbol": "半导体ETF",
+    "price": 0.0039,
+    "change": 0.24
+  },
+  {
+    "date": "2026-07-04",
+    "symbol": "半导体ETF",
+    "price": 0.004,
+    "change": 1.4
+  },
+  {
+    "date": "2026-07-05",
+    "symbol": "半导体ETF",
+    "price": 0.004,
+    "change": 1.48
+  },
+  {
+    "date": "2026-07-06",
+    "symbol": "半导体ETF",
+    "price": 0.0041,
+    "change": 1.2
+  },
+  {
+    "date": "2026-07-07",
+    "symbol": "半导体ETF",
+    "price": 0.0041,
+    "change": 0.69
+  },
+  {
+    "date": "2026-07-08",
+    "symbol": "半导体ETF",
+    "price": 0.0041,
+    "change": 0.64
+  },
+  {
+    "date": "2026-07-09",
+    "symbol": "半导体ETF",
+    "price": 0.0042,
+    "change": 1.23
+  },
+  {
+    "date": "2026-07-10",
+    "symbol": "半导体ETF",
+    "price": 0.0042,
+    "change": 0.03
+  },
+  {
+    "date": "2026-07-11",
+    "symbol": "半导体ETF",
+    "price": 0.0042,
+    "change": 1.79
+  },
+  {
+    "date": "2026-07-12",
+    "symbol": "半导体ETF",
+    "price": 0.0043,
+    "change": 0.7
+  },
+  {
+    "date": "2026-07-13",
+    "symbol": "半导体ETF",
+    "price": 0.0043,
+    "change": 0.99
+  },
+  {
+    "date": "2026-07-14",
+    "symbol": "半导体ETF",
+    "price": 0.0043,
+    "change": 0.72
+  },
+  {
+    "date": "2026-07-15",
+    "symbol": "半导体ETF",
+    "price": 0.0044,
+    "change": 1.88
+  },
+  {
+    "date": "2026-07-16",
+    "symbol": "半导体ETF",
+    "price": 0.0045,
+    "change": 1.9
+  },
+  {
+    "date": "2026-07-17",
+    "symbol": "半导体ETF",
+    "price": 0.0046,
+    "change": 1.34
+  },
+  {
+    "date": "2026-07-18",
+    "symbol": "半导体ETF",
+    "price": 0.0046,
+    "change": 1.69
+  },
+  {
+    "date": "2026-07-19",
+    "symbol": "半导体ETF",
+    "price": 0.0047,
+    "change": 0.19
+  },
+  {
+    "date": "2026-07-20",
+    "symbol": "半导体ETF",
+    "price": 0.0047,
+    "change": 1.9
+  },
+  {
+    "date": "2026-07-21",
+    "symbol": "半导体ETF",
+    "price": 0.0048,
+    "change": 1.66
+  },
+  {
+    "date": "2026-07-22",
+    "symbol": "半导体ETF",
+    "price": 0.0049,
+    "change": 0.74
+  },
+  {
+    "date": "2026-07-23",
+    "symbol": "半导体ETF",
+    "price": 0.0049,
+    "change": 0.01
+  },
+  {
+    "date": "2026-07-24",
+    "symbol": "半导体ETF",
+    "price": 0.0049,
+    "change": 1.38
+  },
+  {
+    "date": "2026-07-25",
+    "symbol": "半导体ETF",
+    "price": 0.005,
+    "change": 1.32
+  },
+  {
+    "date": "2026-07-26",
+    "symbol": "半导体ETF",
+    "price": 0.005,
+    "change": 0.92
+  },
+  {
+    "date": "2026-07-27",
+    "symbol": "半导体ETF",
+    "price": 0.0051,
+    "change": 0.38
+  },
+  {
+    "date": "2026-07-28",
+    "symbol": "半导体ETF",
+    "price": 0.0051,
+    "change": 1.47
+  },
+  {
+    "date": "2026-07-29",
+    "symbol": "半导体ETF",
+    "price": 0.0051,
+    "change": 0.23
+  },
+  {
+    "date": "2026-07-30",
+    "symbol": "半导体ETF",
+    "price": 0.0052,
+    "change": 1.85
+  },
+  {
+    "date": "2026-07-31",
+    "symbol": "半导体ETF",
+    "price": 0.0053,
+    "change": 0.36
+  },
+  {
+    "date": "2026-08-01",
+    "symbol": "半导体ETF",
+    "price": 0.0053,
+    "change": 1.22
+  },
+  {
+    "date": "2026-08-02",
+    "symbol": "半导体ETF",
+    "price": 0.0054,
+    "change": 1.27
+  },
+  {
+    "date": "2026-08-03",
+    "symbol": "半导体ETF",
+    "price": 0.0054,
+    "change": 0.07
+  },
+  {
+    "date": "2026-08-04",
+    "symbol": "半导体ETF",
+    "price": 0.0054,
+    "change": 0.2
+  },
+  {
+    "date": "2026-08-05",
+    "symbol": "半导体ETF",
+    "price": 0.0055,
+    "change": 1.22
+  },
+  {
+    "date": "2026-08-06",
+    "symbol": "半导体ETF",
+    "price": 0.0055,
+    "change": 0.58
+  },
+  {
+    "date": "2026-08-07",
+    "symbol": "半导体ETF",
+    "price": 0.0056,
+    "change": 1.22
+  },
+  {
+    "date": "2026-08-08",
+    "symbol": "半导体ETF",
+    "price": 0.0056,
+    "change": 0.24
+  },
+  {
+    "date": "2026-08-09",
+    "symbol": "半导体ETF",
+    "price": 0.0056,
+    "change": 0.0
+  },
+  {
+    "date": "2026-08-10",
+    "symbol": "半导体ETF",
+    "price": 0.0056,
+    "change": 0.85
+  },
+  {
+    "date": "2026-08-11",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": 1.16
+  },
+  {
+    "date": "2026-08-12",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": 1.25
+  },
+  {
+    "date": "2026-08-13",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": 1.01
+  },
+  {
+    "date": "2026-08-14",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.59
+  },
+  {
+    "date": "2026-08-15",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 1.25
+  },
+  {
+    "date": "2026-08-16",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 0.54
+  },
+  {
+    "date": "2026-08-17",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": 1.66
+  },
+  {
+    "date": "2026-08-18",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": 1.08
+  },
+  {
+    "date": "2026-08-19",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": 0.07
+  },
+  {
+    "date": "2026-08-20",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": 0.29
+  },
+  {
+    "date": "2026-08-21",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": 0.4
+  },
+  {
+    "date": "2026-08-22",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": 0.16
+  },
+  {
+    "date": "2026-08-23",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": 1.97
+  },
+  {
+    "date": "2026-08-24",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": 0.64
+  },
+  {
+    "date": "2026-08-25",
+    "symbol": "半导体ETF",
+    "price": 0.0064,
+    "change": 1.39
+  },
+  {
+    "date": "2026-08-26",
+    "symbol": "半导体ETF",
+    "price": 0.0065,
+    "change": 0.53
+  },
+  {
+    "date": "2026-08-27",
+    "symbol": "半导体ETF",
+    "price": 0.0065,
+    "change": 0.03
+  },
+  {
+    "date": "2026-08-28",
+    "symbol": "半导体ETF",
+    "price": 0.0065,
+    "change": 0.96
+  },
+  {
+    "date": "2026-08-29",
+    "symbol": "半导体ETF",
+    "price": 0.0064,
+    "change": -1.39
+  },
+  {
+    "date": "2026-08-30",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": -1.37
+  },
+  {
+    "date": "2026-08-31",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": -0.69
+  },
+  {
+    "date": "2026-09-01",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": -0.43
+  },
+  {
+    "date": "2026-09-02",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": -0.93
+  },
+  {
+    "date": "2026-09-03",
+    "symbol": "半导体ETF",
+    "price": 0.0063,
+    "change": 0.57
+  },
+  {
+    "date": "2026-09-04",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": -0.19
+  },
+  {
+    "date": "2026-09-05",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": -0.86
+  },
+  {
+    "date": "2026-09-06",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": -1.46
+  },
+  {
+    "date": "2026-09-07",
+    "symbol": "半导体ETF",
+    "price": 0.0062,
+    "change": 1.13
+  },
+  {
+    "date": "2026-09-08",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": -0.32
+  },
+  {
+    "date": "2026-09-09",
+    "symbol": "半导体ETF",
+    "price": 0.0061,
+    "change": -0.88
+  },
+  {
+    "date": "2026-09-10",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": -1.37
+  },
+  {
+    "date": "2026-09-11",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 0.14
+  },
+  {
+    "date": "2026-09-12",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": -0.8
+  },
+  {
+    "date": "2026-09-13",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.87
+  },
+  {
+    "date": "2026-09-14",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.58
+  },
+  {
+    "date": "2026-09-15",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -0.62
+  },
+  {
+    "date": "2026-09-16",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.86
+  },
+  {
+    "date": "2026-09-17",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.49
+  },
+  {
+    "date": "2026-09-18",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.36
+  },
+  {
+    "date": "2026-09-19",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.4
+  },
+  {
+    "date": "2026-09-20",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.38
+  },
+  {
+    "date": "2026-09-21",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.74
+  },
+  {
+    "date": "2026-09-22",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.78
+  },
+  {
+    "date": "2026-09-23",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 1.03
+  },
+  {
+    "date": "2026-09-24",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 0.27
+  },
+  {
+    "date": "2026-09-25",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 1.29
+  },
+  {
+    "date": "2026-09-26",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": -1.45
+  },
+  {
+    "date": "2026-09-27",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.23
+  },
+  {
+    "date": "2026-09-28",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.6
+  },
+  {
+    "date": "2026-09-29",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": 0.34
+  },
+  {
+    "date": "2026-09-30",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.01
+  },
+  {
+    "date": "2026-10-01",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 0.41
+  },
+  {
+    "date": "2026-10-02",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.28
+  },
+  {
+    "date": "2026-10-03",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.63
+  },
+  {
+    "date": "2026-10-04",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 1.07
+  },
+  {
+    "date": "2026-10-05",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": -0.13
+  },
+  {
+    "date": "2026-10-06",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -0.31
+  },
+  {
+    "date": "2026-10-07",
+    "symbol": "半导体ETF",
+    "price": 0.006,
+    "change": 0.28
+  },
+  {
+    "date": "2026-10-08",
+    "symbol": "半导体ETF",
+    "price": 0.0059,
+    "change": -1.47
+  },
+  {
+    "date": "2026-10-09",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -1.31
+  },
+  {
+    "date": "2026-10-10",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -1.42
+  },
+  {
+    "date": "2026-10-11",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -0.22
+  },
+  {
+    "date": "2026-10-12",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -0.34
+  },
+  {
+    "date": "2026-10-13",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": 0.77
+  },
+  {
+    "date": "2026-10-14",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -0.25
+  },
+  {
+    "date": "2026-10-15",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": 0.62
+  },
+  {
+    "date": "2026-10-16",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -1.24
+  },
+  {
+    "date": "2026-10-17",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -0.29
+  },
+  {
+    "date": "2026-10-18",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": 1.23
+  },
+  {
+    "date": "2026-10-19",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": 0.7
+  },
+  {
+    "date": "2026-10-20",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": 0.55
+  },
+  {
+    "date": "2026-10-21",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -0.35
+  },
+  {
+    "date": "2026-10-22",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": 1.24
+  },
+  {
+    "date": "2026-10-23",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -0.57
+  },
+  {
+    "date": "2026-10-24",
+    "symbol": "半导体ETF",
+    "price": 0.0058,
+    "change": -0.4
+  },
+  {
+    "date": "2026-10-25",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -0.85
+  },
+  {
+    "date": "2026-10-26",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": 0.08
+  },
+  {
+    "date": "2026-10-27",
+    "symbol": "半导体ETF",
+    "price": 0.0057,
+    "change": -1.09
+  }
+]

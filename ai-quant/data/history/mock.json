@@ -1,0 +1,20 @@
+[
+    {
+        "date":"2026-01-01",
+        "symbol":"半导体ETF",
+        "price":1.00,
+        "change":2.1
+    },
+    {
+        "date":"2026-01-02",
+        "symbol":"半导体ETF",
+        "price":1.03,
+        "change":1.5
+    },
+    {
+        "date":"2026-01-03",
+        "symbol":"半导体ETF",
+        "price":0.99,
+        "change":-3.8
+    }
+]

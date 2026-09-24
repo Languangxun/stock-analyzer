@@ -1,0 +1,18 @@
+models:
+
+  decision:
+    provider: deepseek
+    model: deepseek-flash          # DeepSeek-V4.1-Flash（api.deepseek.com 模型ID）
+    display_name: DeepSeek-V4.1-Flash
+    base_url: https://api.deepseek.com
+
+  embedding:
+    provider: ollama
+    model: qwen3-embedding         # Ollama qwen3-embedding:0.6b
+
+ensemble:
+
+  enabled: false
+
+  models:
+    - deepseek

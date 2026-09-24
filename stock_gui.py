@@ -49,8 +49,10 @@ except Exception:                                   # 插件目录缺失时降�
 
 
 # ================= 内嵌缓存层（原 stock_cache.py，单文件化）
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "stock_cache.db")
+# 库路径：环境变量 STOCK_DB 可指向另一份库（研究/回测隔离用，避免与正在
+# 运行的 GUI 争用主库）；缺省仍是项目目录内 stock_cache.db
+DB_PATH = (os.environ.get("STOCK_DB") or "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "stock_cache.db")
 INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stock_gui.ini")
 
@@ -134,6 +136,8 @@ class CFG:
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
+    # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
+    AUTO_PREFETCH = True
     
     # 样本质量筛选与加权参数
     SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
@@ -249,6 +253,8 @@ def _load_predict_cfg():
             CFG.RISK_MODE = rm
         CFG.ENABLE_L3 = bool(gi("enable_l3", 0 if not CFG.ENABLE_L3 else 1,
                                 0, 1))
+        CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
+                                    1 if CFG.AUTO_PREFETCH else 0, 0, 1))
     except Exception:
         log.exception("读取预测参数失败(使用默认)")
 
@@ -374,6 +380,12 @@ set_proxy(_load_proxy_ini())    # 导入即生效（GUI/CLI通用）
 AI_MODEL_DEFAULT = "deepseek-v4-pro"
 AI_BASE_DEFAULT = "https://api.deepseek.com"
 
+# 未配置 ini Key 时回退主目录 opencode 授权（opencode-go，免配置开箱即用）
+OPENCODE_AUTH_PATH = os.path.expanduser(
+    "~/.local/share/opencode/auth.json")
+OPENCODE_GO_BASE = "https://opencode.ai/zen/go/v1"
+OPENCODE_GO_MODEL = "kimi-k3"
+
 
 def _ai_ini_get(section, key, default=""):
     try:
@@ -384,14 +396,37 @@ def _ai_ini_get(section, key, default=""):
         return default
 
 
+def _opencode_go_key() -> str:
+    """主目录 opencode 授权文件里的 opencode-go Key（读取失败返回空串）。"""
+    try:
+        with open(OPENCODE_AUTH_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return ((d.get("opencode-go") or {}).get("key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _use_opencode_go() -> bool:
+    """ini/环境变量均未提供 Key 时，回退使用主目录 opencode-go 授权。"""
+    return (not ENV_API_KEY
+            and not _ai_ini_get("deepseek", "api_key", "")
+            and bool(_opencode_go_key()))
+
+
 def _load_ai_model() -> str:
-    """从 stock_gui.ini [deepseek] model 读取AI分析模型名。"""
-    return _ai_ini_get("deepseek", "model", AI_MODEL_DEFAULT) or AI_MODEL_DEFAULT
+    """ini [deepseek] model；缺省时若走 opencode-go 回退则用其默认模型。"""
+    m = _ai_ini_get("deepseek", "model", "")
+    if m:
+        return m
+    return OPENCODE_GO_MODEL if _use_opencode_go() else AI_MODEL_DEFAULT
 
 
 def _load_ai_base() -> str:
-    """从 stock_gui.ini [deepseek] base_url 读取接口地址（OpenAI 兼容）。"""
-    return _ai_ini_get("deepseek", "base_url", AI_BASE_DEFAULT) or AI_BASE_DEFAULT
+    """ini [deepseek] base_url；缺省时若走 opencode-go 回退则用 zen/go 接口。"""
+    b = _ai_ini_get("deepseek", "base_url", "")
+    if b:
+        return b
+    return OPENCODE_GO_BASE if _use_opencode_go() else AI_BASE_DEFAULT
 
 
 def _normalize_ai_base(base: str) -> str:
@@ -435,8 +470,9 @@ def set_ai_base(base: str) -> None:
 
 
 def get_ai_key() -> str:
-    """当前可用 Key：环境变量优先，其次 ini。"""
-    return (ENV_API_KEY or _ai_ini_get("deepseek", "api_key", "")).strip()
+    """当前可用 Key：环境变量 > ini > 主目录 opencode-go 授权。"""
+    return (ENV_API_KEY or _ai_ini_get("deepseek", "api_key", "")
+            or _opencode_go_key()).strip()
 
 
 # ================= 荐股权限（板块/行业，供设置与荐股过滤共用） =================
@@ -1152,7 +1188,8 @@ def ai_rescue_kline(api_key, model=None):
         "候选接口完整URL（免费、无需key，返回JSON或CSV均可），"
         "一行一个URL，不要解释，不要markdown代码块，只输出URL列表。")
     try:
-        txt = deepseek_chat(api_key, prompt, model=model, timeout=60)
+        txt = deepseek_chat(api_key, prompt, model=model, timeout=60,
+                            session=_ai_session_id("kline-rescue"))
     except Exception as e:
         return False, f"AI调用失败: {e}"
     urls = []
@@ -1367,6 +1404,33 @@ def prefetch(codes, workers=6, progress=None):
 
     ex = _SHARED_EX                # 全局共享线程池，不再每次新建
     list(ex.map(one, codes))
+
+
+def stale_codes(limit=None, skip_bj=True, skip_delisted=True):
+    """返回库内K线尚未更新到最新应有交易日（last_completed_td）的代码。
+
+    只查 stocks/daily_bars（不联网），供后台主动预取挑选目标：
+    收盘（15:05）后返回全市场，用于当日K线回补；盘中只返回缺昨日数据的。
+    skip_bj：排除北交所（与样本池/研究口径一致）；
+    skip_delisted：已有数据但最后K线早于180天视为退市，不再重试。"""
+    import datetime
+    fresh = last_completed_td()
+    cutoff = _dstr(datetime.date.today() - datetime.timedelta(days=180))
+    with db_conn() as conn:
+        codes = [r[0] for r in conn.execute("SELECT code FROM stocks")]
+        have = dict(conn.execute(
+            "SELECT code, MAX(date) FROM daily_bars "
+            "GROUP BY code").fetchall())
+    out = []
+    for c in codes:
+        if skip_bj and c.startswith("bj"):
+            continue
+        d = have.get(c)
+        if d is None:                   # 无缓存：可能新股，值得拉
+            out.append(c)
+        elif d < fresh and not (skip_delisted and d < cutoff):
+            out.append(c)
+    return out[:limit] if limit else out
 
 
 # ================= 全市场深历史回填（集成版，原 backfill_full.py） =================
@@ -2784,6 +2848,20 @@ def _trend_track_signals(disp_rows, mas, idx_chg_by_date, idx_chg_today):
     return signals
 
 
+def _dedup_signals(signals):
+    """压缩连续同向信号（同一方向只保留首条）。
+
+    回测中持仓期的重复 BUY / 空仓期的重复 SELL 本就会被忽略，
+    压缩后图上标注与「最近买卖信号」不再出现成串重复 B/S。"""
+    out = []
+    prev = None
+    for s in signals:
+        if s[2] != prev:
+            out.append(s)
+            prev = s[2]
+    return out
+
+
 def _exec_mode():
     """成交价口径（环境变量 EXEC_PX，默认 close）：
     close = 信号次日收盘成交（早盘信号，默认）；open = 信号次日开盘成交。"""
@@ -4145,15 +4223,111 @@ def sector_mom_series(max_age=1800):
     return _SECTOR_MOM_CACHE["data"]
 
 
+def _is_finite(x):
+    try:
+        return math.isfinite(x)
+    except (TypeError, ValueError):
+        return False
+
+
+def _chip_feats_py(rows, start_idx, params=None):
+    """内置纯 Python 筹码因子引擎（口径同 factor_lab.chips，因果）。
+
+    价格网格摊分成交量、按换手率衰减演化；局部峰中取筹码最重者作为
+    支撑/压力（无峰退化最密集 bin）。返回 (feats, valid)，feats[i] =
+    (支撑距离, 压力距离, 获利占比)，valid[i] 标记输出窗口内的有效日；
+    不足 30 根或热身段不足返回全空。不依赖 factor_lab / numpy。"""
+    p = {"nbin": 200, "decay_a": 0.02, "cap": 0.20, "floor": 0.002,
+         "prom": 0.0}
+    if params:
+        p.update(params)
+    nbin = int(p["nbin"])
+    nan = float("nan")
+    n_all = len(rows)
+    feats = [(nan, nan, nan)] * n_all
+    valid = [False] * n_all
+    keep = [i for i, b in enumerate(rows)
+            if b.get("vol") and b.get("low") and b["low"] > 0
+            and b.get("high") and b["high"] >= b["low"]]
+    if len(keep) < 30 or start_idx < 30:
+        return feats, valid
+    bars = [rows[i] for i in keep]
+    base = [b for i, b in zip(keep, bars) if i < start_idx]
+    if not base:
+        return feats, valid
+    lo = min(b["low"] for b in base)
+    hi = max(b["high"] for b in base)
+    if hi <= lo:
+        return feats, valid
+    step = (hi - lo) / nbin
+    mids = [lo + step * (j + 0.5) for j in range(nbin + 1)]
+    chips = [0.0] * (nbin + 1)
+    med_vol = sorted(b["vol"] for b in base)[len(base) // 2] or 1.0
+    a, cap, floor, prom = (p["decay_a"], p["cap"], p["floor"], p["prom"])
+    for k, b in enumerate(bars):
+        i = keep[k]
+        t = min(cap, max(floor, a * (b["vol"] / med_vol)))
+        d = 1.0 - t
+        chips = [v * d for v in chips]
+        b_lo = min(nbin, max(0, int((b["low"] - lo) / step)))
+        b_hi = min(nbin, max(0, int((b["high"] - lo) / step)))
+        if b_hi <= b_lo:
+            chips[b_hi] += b["vol"]
+        else:
+            per = b["vol"] / (b_hi - b_lo + 1)
+            for j in range(b_lo, b_hi + 1):
+                chips[j] += per
+        if i < start_idx:
+            continue
+        tot = 0.0
+        for v in chips:
+            tot += v
+        if tot <= 0:
+            continue
+        c = b["close"]
+        valid[i] = True
+        thr = prom * max(chips)
+        pk_mid, pk_mass = [], []
+        prev, cur = chips[0], chips[1]
+        for j in range(1, nbin):
+            nxt = chips[j + 1]
+            if cur > prev and cur >= nxt and cur > thr:
+                pk_mid.append(mids[j])
+                pk_mass.append(cur)
+            prev, cur = cur, nxt
+        sup = res = nan
+        best = -1.0
+        for m, v in zip(pk_mid, pk_mass):
+            if m < c and v > best:
+                best, sup = v, m
+        if best < 0:
+            for m, v in zip(mids, chips):
+                if m < c and v > best:
+                    best, sup = v, m
+        best = -1.0
+        for m, v in zip(pk_mid, pk_mass):
+            if m >= c and v > best:
+                best, res = v, m
+        if best < 0:
+            for m, v in zip(mids, chips):
+                if m >= c and v > best:
+                    best, res = v, m
+        profit = 0.0
+        for m, v in zip(mids, chips):
+            if m <= c:
+                profit += v
+        profit /= tot
+        feats[i] = (-(c - sup) / c if _is_finite(sup) else nan,
+                    -(res - c) / c if _is_finite(res) else nan,
+                    profit)
+    return feats, valid
+
+
 def _sig_chip_peak(rows, **_kw):
     """筹码峰信号：贴近峰支撑企稳（获利盘<35%）→BUY；
-    获利盘过重(>90%)或跌破支撑(>0.5%)→SELL。口径与 factor_lab 一致（因果）。"""
+    获利盘过重(>90%)或跌破支撑(>0.5%)→SELL。内置筹码引擎（因果）。"""
     try:
-        from factor_lab.chips import chip_features_stock
-    except Exception:
-        return []
-    try:
-        feats, valid = chip_features_stock(rows, min(250, len(rows) // 4))
+        feats, valid = _chip_feats_py(rows, min(250, len(rows) // 4))
     except Exception:
         return []
     out = []
@@ -4161,11 +4335,11 @@ def _sig_chip_peak(rows, **_kw):
         if not valid[i]:
             continue
         sup_dist, _res_dist, profit = feats[i]
-        if not np.isfinite(profit):
+        if not _is_finite(profit):
             continue
-        if np.isfinite(sup_dist) and profit < 0.35 and sup_dist > -0.04:
+        if _is_finite(sup_dist) and profit < 0.35 and sup_dist > -0.04:
             out.append((i, r["date"], "BUY", "筹码峰支撑企稳"))
-        elif profit > 0.90 or (np.isfinite(sup_dist) and sup_dist > 0.005):
+        elif profit > 0.90 or (_is_finite(sup_dist) and sup_dist > 0.005):
             out.append((i, r["date"], "SELL", "获利盘过重/跌破筹码峰"))
     return out
 
@@ -5159,14 +5333,22 @@ def analyze(full, progress=None, quick=False):
     sel_algo = (strat or {}).get("algo", "composite")
     if sel_algo not in ALGO_LABEL:
         sel_algo = "composite"
+    sel_mode = (strat or {}).get("mode") or CFG.RISK_MODE
 
     signals = []
     # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
-    if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern"):
+    if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
+                    "chip_peak", "sector_rot"):
         try:
-            raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
-                   "boll": _sig_boll, "ma_trend": _sig_ma_trend,
-                   "l1_pattern": _sig_l1_pattern}[sel_algo](disp_rows)
+            if sel_algo == "chip_peak":
+                raw = _sig_chip_peak(disp_rows)
+            elif sel_algo == "sector_rot":
+                raw = _sig_sector_rot(
+                    disp_rows, industry=(my_info.get("industry") or ""))
+            else:
+                raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
+                       "boll": _sig_boll, "ma_trend": _sig_ma_trend,
+                       "l1_pattern": _sig_l1_pattern}[sel_algo](disp_rows)
             cut = max(1, len(disp_rows) - 250)
             signals = [s for s in raw if s[0] >= cut]
         except Exception:
@@ -5335,6 +5517,26 @@ def analyze(full, progress=None, quick=False):
         else:
             # 趋势跟踪零信号（震荡股无MA金叉）→ 回退多维信号，避免无买卖点
             band_algo = "趋势跟踪·MA20/60（无信号→回退多维）"
+    # 连续同向信号压缩：同一轮机会只保留首个 B/S 标注（回测开平仓语义不变）
+    signals = _dedup_signals(signals)
+    # ---- 激进档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
+    # （沿用该档风险参数：激进=买点门槛1/冷却3），保证震荡区间（如 5~6 元
+    # 箱体）也能标出足够波段买卖点。只影响展示与样本内统计，不改动消融缓存。
+    _win = max(1, len(disp_rows) - 250)
+    _recent_n = len([s for s in signals if s[0] >= _win])
+    _min_need = 8 if sel_mode == "激进" else 2
+    if _recent_n < _min_need:
+        try:
+            _fb = [s for s in _composite_signals(disp_rows, rp)
+                   if s[0] >= max(1, len(disp_rows) - 120)]
+        except Exception:
+            log.exception("信号过少兜底失败")
+            _fb = []
+        if _fb:
+            signals = _dedup_signals(_fb)
+            _why = (f"近250日仅{_recent_n}个信号" if _recent_n
+                    else "近250日无信号")
+            band_algo += f"（{_why} → 兜底改用多维评分·{sel_mode}）"
     band_note = f"波段适合度 {band_score:.0f}/100 → {band_algo}"
 
     vols = [r["vol"] for r in disp_rows]
@@ -7961,6 +8163,18 @@ AI_SYSTEM_PROMPT = (
 
 AI_CACHE_MAX = 24          # 单股缓存对话条数上限（含首条数据上下文）
 
+# 自有客户端标识：opencode zen 等网关要求非通用 HTTP 库 UA（否则 Cloudflare
+# 以 error code 1010 拦截），并推荐以客户端名标识
+AI_UA = "stock-analyzer/6.1.4"
+
+
+def _ai_session_id(*parts) -> str:
+    """稳定会话 ID（请求头 x-opencode-session）：opencode zen 据此做路由与
+    提示词缓存；同股同模型跨请求复用，换股/换模型/换用途自然区分。"""
+    import hashlib
+    raw = "stock-analyzer|" + "|".join(str(p) for p in parts)
+    return "sa-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
 
 def _ai_chat_url(base_url="") -> str:
     base = _normalize_ai_base(base_url or AI_BASE_URL)
@@ -7978,16 +8192,20 @@ def _ai_models_url(base_url="") -> str:
     return base + "/models"
 
 
-def _ai_http_json(url, payload=None, api_key="", timeout=60):
-    """OpenAI 兼容请求：代理失败自动回退直连；429/5xx 重试一次。"""
+def _ai_http_json(url, payload=None, api_key="", timeout=60, session=""):
+    """OpenAI 兼容请求：代理失败自动回退直连；429/5xx 重试一次。
+    session 非空时携带 x-opencode-session（opencode zen 必需，缺省报 400
+    MissingSessionID；其他平台忽略该头）。"""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8") \
         if payload is not None else None
 
     def one(opener):
-        req = urllib.request.Request(
-            url, data=data,
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {api_key}"})
+        hdr = {"Content-Type": "application/json",
+               "User-Agent": AI_UA,
+               "Authorization": f"Bearer {api_key}"}
+        if session:
+            hdr["x-opencode-session"] = session
+        req = urllib.request.Request(url, data=data, headers=hdr)
         with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
 
@@ -8005,7 +8223,8 @@ def _ai_http_json(url, payload=None, api_key="", timeout=60):
                 except Exception:
                     pass
                 if e.code == 401:
-                    raise RuntimeError("API Key 无效 (401)，请在设置中检查")
+                    raise RuntimeError("API Key 无效 (401)，请检查设置中的"
+                                       " Key 与接口地址是否匹配")
                 last = RuntimeError(f"HTTP {e.code}: {detail or e.reason}")
                 if e.code in (429, 500, 502, 503, 504):
                     continue        # 换通道/重试
@@ -8032,23 +8251,26 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
     return sorted(set(out))
 
 
-def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90):
+def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
+                  session=""):
     """单轮调用 OpenAI 兼容 chat 接口（纯标准库）。model 缺省用 AI_MODEL。"""
     return _deepseek_chat(api_key, [{"role": "user", "content": prompt}],
-                          model, timeout)
+                          model, timeout, session=session)
 
 
-def _deepseek_chat(api_key, messages, model=None, timeout=90):
+def _deepseek_chat(api_key, messages, model=None, timeout=90, session=""):
     """多轮调用 OpenAI 兼容 chat 接口。messages 为 [{role,content},...]，
     首条 user 消息应携带完整共享数据上下文，后续追问只追加新问题，
-    从而复用同一份数据（不重复拼装）。model 缺省用 ini 配置的 AI_MODEL。"""
+    从而复用同一份数据（不重复拼装）。model 缺省用 ini 配置的 AI_MODEL。
+    session 见 _ai_session_id（opencode zen 必需）。"""
     payload = {
         "model": model or AI_MODEL,
         "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT}]
                     + list(messages),
         "temperature": 0.3,
     }
-    d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout)
+    d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
+                      session=session)
     try:
         return d["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
@@ -8165,7 +8387,8 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         '{"tier": "稳健|均衡|激进", "reason": "不超过40字"}')
     try:
         text = deepseek_chat(key, prompt, model=model or AI_MODEL,
-                             timeout=timeout)
+                             timeout=timeout,
+                             session=_ai_session_id("tier", model or AI_MODEL))
         m = re.search(r'"tier"\s*:\s*"([^"]+)"', text or "")
         tier = m.group(1).strip() if m else ""
         r = re.search(r'"reason"\s*:\s*"([^"]*)"', text or "")
@@ -8181,6 +8404,9 @@ class App:
     PANEL_H = {"main": 400, "vol": 110, "ind": 160}
     REFRESH_MS = 15 * 60 * 1000     # 完整重分析间隔
     TICK_MS = 60 * 1000             # 行情快照刷新（1分钟）
+    PREFETCH_MS = 60 * 60 * 1000    # 后台主动预取周期（未分析股K线）
+    PREFETCH_START_MS = 60 * 1000   # 启动后首轮延迟（先让当前分析跑完）
+    PREFETCH_CHUNK = 20             # 每批预取代码数（批间 sleep 限速）
 
     def __init__(self, root):
         self.root = root
@@ -8280,6 +8506,10 @@ class App:
         self._safe_after(30000, self._index_loop)
         self._safe_after(self.REFRESH_MS, self._auto_refresh)   # 15分钟完整重分析
         self._safe_after(self.TICK_MS, self._tick)              # 5秒行情快照
+        self._pf_busy = False
+        if CFG.AUTO_PREFETCH:
+            # 后台主动预取未分析个股K线（样本池优先，见 _prefetch_work）
+            self._safe_after(self.PREFETCH_START_MS, self._prefetch_tick)
 
     def _toggle_fullscreen(self, _e=None):
         """F11：进入/退出全屏；退出后回到最大化。"""
@@ -9516,7 +9746,7 @@ class App:
                 f"(策略缓存{5 - (time.time() - st.get('ts', 0)) // 86400:.0f}日内有效)")
             return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
-                              "MA/多维×3风险档, 近1000交易日)...")
+                              "MA/筹码峰/板块轮动/多维×3风险档, 近1000交易日)...")
         full = res["full_code"]
         bars = res["disp_rows"][:-1] if res.get("has_live") \
             else res["disp_rows"]
@@ -9560,7 +9790,7 @@ class App:
             f"基于近{abl['bars']}个交易日回测选策略 "
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
-            f"每档在全部候选（6算法+多维评分 × 3风险参数）上独立选优\n"
+            f"每档在全部候选（8算法+多维评分 × 3风险参数）上独立选优\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
@@ -9570,7 +9800,7 @@ class App:
             _msg = (f"该股近一年年化波动率 {_vol * 100:.0f}%；"
                     f"验证集 Calmar 最优档：{rec}")
             if abl.get("high_vol"):
-                _msg += ("。高波动股保守档的宽止损易被反复触发，"
+                _msg += ("。高波动股保守档的紧止损易被反复触发，"
                          "建议优先 稳健/激进。")
             ttk.Label(win, text=_msg, foreground=AXIS_TXT, wraplength=560,
                       justify="left").pack(anchor="w", padx=12, pady=(0, 4))
@@ -9762,6 +9992,73 @@ class App:
             except ValueError:
                 pass
         self._safe_after(self.REFRESH_MS, self._auto_refresh)
+
+    # ---------- 后台主动预取未分析个股K线（样本池优先 → 全库滚动） ----------
+
+    def _prefetch_tick(self):
+        """周期触发：当前分析/回填/预取都不在跑时，后台预取一轮。"""
+        try:
+            if (not self._pf_busy
+                    and not getattr(self, "_bf_busy", False)
+                    and not getattr(self, "_prog_running", False)):
+                self._pf_busy = True
+                threading.Thread(target=self._prefetch_work,
+                                 daemon=True).start()
+        finally:
+            self._safe_after(self.PREFETCH_MS, self._prefetch_tick)
+
+    def _prefetch_work(self):
+        """主动预取未分析个股K线：① 当前股+自选；② 它们的样本池（同行业+
+        ETF，L3 开启时含同市值层）；③ 全库未更新代码（未分析股）。分批限速，
+        已缓存的只做新鲜度检查，收盘后自动回补当日K线。"""
+        try:
+            targets, seen = [], set()
+
+            def _add(cs):
+                for c in cs or []:
+                    if c and c not in seen:
+                        seen.add(c)
+                        targets.append(c)
+
+            try:
+                cur = normalize_code(self.code_var.get())
+            except ValueError:
+                cur = ""
+            _add([cur] + list(self.watchlist))
+            for c in list(targets):          # 样本池
+                try:
+                    info = pool_codes(c, l2_n=L2_DEFAULT_N, l3_n=0)
+                except Exception:
+                    continue
+                _add(info.get("l2") or [])
+                if CFG.ENABLE_L3:
+                    _add(info.get("l3") or [])
+            try:
+                _add(stale_codes())
+            except Exception:
+                log.exception("后台预取: stale_codes 失败")
+            total = len(targets)
+            if not total:
+                self._progress("后台预取: 全库K线均为最新，无需回补")
+                return
+            self._progress(f"后台预取未分析股K线 0/{total}"
+                           "（样本池优先，首轮补齐可能较久）")
+            done = 0
+            for i in range(0, total, self.PREFETCH_CHUNK):
+                chunk = targets[i:i + self.PREFETCH_CHUNK]
+                try:
+                    prefetch(chunk, workers=4)
+                except Exception:
+                    log.debug("后台预取批次失败", exc_info=True)
+                done += len(chunk)
+                if done % (self.PREFETCH_CHUNK * 5) == 0 or done == total:
+                    self._progress(f"后台预取未分析股K线 {done}/{total}"
+                                   f"（{done * 100 // total}%）")
+                time.sleep(1.0)             # 批间限速，避免挤占分析请求
+        except Exception:
+            log.exception("后台预取失败")
+        finally:
+            self._pf_busy = False
 
     def _refresh_done(self, res, err):
         if err or not res:
@@ -10552,6 +10849,8 @@ class App:
                  + (st.get("label", "?") if st else "多维评分·稳健(默认·未消融)")
                  + (f"（缓存至 {time.strftime('%m-%d %H:%M', time.localtime((st.get('ts') or 0) + STRAT_TTL))}，到期自动重新消融）"
                     if st else "（可在工具→重选策略运行消融回测）"))
+        if res.get("band_algo"):
+            L.append(f"信号口径: {res['band_algo']}")
         L.append("=" * 64)
         L.append(f"{q['name']} ({res['full_code']})  快照 {q['time']}  "
                  f"昨收 {res['prev_close']:.2f}")
@@ -10880,6 +11179,12 @@ class App:
 
     def _save_ini(self):
         cp = configparser.ConfigParser()
+        # 先读旧配置：保留本函数不管理的节/键（[predict]/[picks]/[data]、
+        # deepseek 的 model/base_url 等），避免保存自选/UI 时被整体覆盖丢失
+        try:
+            cp.read(INI_PATH, encoding="utf-8")
+        except Exception:
+            log.exception("读取 ini 失败(按空配置继续)")
         if not cp.has_section("watchlist"):
             cp.add_section("watchlist")
         cp.set("watchlist", "codes", ",".join(self.watchlist))
@@ -11249,7 +11554,11 @@ class App:
         def run_bt():
             if not self.res:
                 return
-            bt = backtest_signals(self.res["disp_rows"], self.res["signals"])
+            rp = ((self.res.get("strategy") or {}).get("params")
+                  or CFG.RISK_PARAMS.get(self.res.get("risk_mode"))
+                  or CFG.risk_params())
+            bt = backtest_signals(self.res["disp_rows"], self.res["signals"],
+                                  rp=rp)
             bt_result.config(state="normal")
             bt_result.delete("1.0", "end")
             if not bt or bt.get("winrate") is None:
@@ -11356,7 +11665,8 @@ class App:
             follow_btn.config(state="disabled")
 
             def bg():
-                return _deepseek_chat(key, msgs)
+                return _deepseek_chat(key, msgs,
+                                      session=_ai_session_id(code, AI_MODEL))
 
             def done(text, err):
                 follow_btn.config(state="normal")
@@ -11574,7 +11884,7 @@ class App:
                                 state="readonly",
                                 values=list(CFG.RISK_PARAMS.keys()))
         cmb_risk.grid(row=8, column=1, sticky="w", pady=2)
-        ttk.Label(frm, text="保守=宽止损少交易 激进=紧止损多交易").grid(
+        ttk.Label(frm, text="保守=紧止损少交易 激进=宽止损多交易").grid(
             row=8, column=2, sticky="w")
 
         def _int_var(attr, lo, hi):
@@ -11830,7 +12140,7 @@ class App:
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=29, column=0, columnspan=3, sticky="we")
-        about.insert("end", "版本：v6.1.3（2026-09）\n")
+        about.insert("end", "版本：v6.1.4（2026-09）\n")
         about.insert("end", "作者：獨白\n")
         about.insert("end", "邮箱：kingrux106@gmail.com\n")
         about.insert("end", "QQ：2180287399\n")
