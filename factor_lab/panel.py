@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""面板构建：全A × 近1000交易日 × 21原子因子。
+"""面板构建：全A × 近2000交易日 × 21原子因子。
 
 阶段：
   chip_opt  先在小样本上用训练段优化筹码参数（防泄漏）
@@ -28,7 +28,7 @@ STOCK_CACHE = os.path.join(CACHE_DIR, "stocks_pass_a.pkl")
 MATCH_CACHE = os.path.join(CACHE_DIR, "match_pass_b.pkl")
 CHIP_PARAMS_FILE = os.path.join(CACHE_DIR, "chip_params.json")
 
-EVAL_DAYS = 1000
+EVAL_DAYS = 2000        # 面板回看窗口（2026-09-25 由 1000 提升到 2000）
 PRE = 300
 MIN_BARS = 400
 TRAIN_FRAC = 0.7

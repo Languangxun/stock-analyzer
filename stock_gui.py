@@ -87,7 +87,8 @@ def setup_logging():
 
 setup_logging()
 
-KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+KLINE_URL = ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
+             "fqkline/get")
 
 # DeepSeek API Key 读取优先级：环境变量 > ini 文件
 # 强烈建议通过环境变量 DEEPSEEK_API_KEY 设置，不要在磁盘留存明文 Key。
@@ -136,6 +137,9 @@ class CFG:
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
+    # 单只股票K线联网拉取根数（默认1000；只限制联网拉取，不限制读库/分析，
+    # 库内已有历史永远全量参与计算；深历史回填 --backfill 另有 950+ 目标）
+    MAX_FETCH_BARS = 1000
     # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
     AUTO_PREFETCH = True
     
@@ -255,6 +259,8 @@ def _load_predict_cfg():
                                 0, 1))
         CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
                                     1 if CFG.AUTO_PREFETCH else 0, 0, 1))
+        CFG.MAX_FETCH_BARS = gi("max_fetch_bars", CFG.MAX_FETCH_BARS,
+                                100, 3000)
     except Exception:
         log.exception("读取预测参数失败(使用默认)")
 
@@ -565,11 +571,18 @@ def _cb_record(name, ok, err=None):
 
 
 def _is_ratelimit_err(e):
-    """识别服务端限流/过载类错误：HTTP 429/502/503/504。"""
+    """识别服务端限流/封禁类错误：HTTP 429/502/503/504 或连接被重置。
+
+    东财反爬/整域故障表现为 RemoteDisconnected / Connection reset
+    （非 HTTP 状态码），同样应触发熔断降级，避免每个源反复撞墙。"""
     code = getattr(e, "code", None)
     if code is not None:
         return code in (429, 502, 503, 504)
     s = str(e)
+    if any(c in s for c in ("RemoteDisconnected", "Remote end closed",
+                            "Connection reset", "Connection aborted",
+                            "连接被重置")):
+        return True
     return any(c in s for c in ("503", "502", "504", "429",
                                 "Service Unavailable"))
 
@@ -579,6 +592,68 @@ def _backoff_delay(attempt, base=0.5, cap=6.0):
     d = min(base * (2 ** attempt), cap)
     import random
     return d * (0.75 + random.random() * 0.5)
+
+
+# ---- 代理路由策略：国内行情直连优先，代理故障自动旁路 ----
+_PROXY_DEAD_UNTIL = [0.0]       # 代理连接失败后的旁路截止时间
+_PROXY_LOCK = threading.Lock()
+
+# 国内行情域名：走本地代理会绕境外节点，易被服务端重置/限流
+_DOMESTIC_SUFFIX = (
+    "eastmoney.com", "gtimg.cn", "qq.com", "sinajs.cn", "sina.com.cn",
+    "sina.com", "163.com", "126.net", "sse.com.cn", "szse.cn",
+    "cninfo.com.cn", "csindex.com.cn",
+)
+
+
+def _is_domestic_url(url):
+    """国内行情域名判断（含子域）。"""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == s or host.endswith("." + s)
+               for s in _DOMESTIC_SUFFIX)
+
+
+def _proxy_dead():
+    with _PROXY_LOCK:
+        return time.time() < _PROXY_DEAD_UNTIL[0]
+
+
+def _mark_proxy_dead(seconds=120):
+    """代理被拒（软件未开/端口关闭）后暂时旁路，避免每次双倍超时。"""
+    with _PROXY_LOCK:
+        _PROXY_DEAD_UNTIL[0] = time.time() + seconds
+
+
+def _open_url(req, url, timeout):
+    """按源类型选通道：国内直连优先，国外代理优先；代理被拒自动旁路。
+
+    返回响应字节；两个通道都失败时抛最后一个异常。"""
+    can_proxy = _PROXY_OPENER is not None and not _proxy_dead()
+    if not can_proxy:
+        order = [None]
+    elif _is_domestic_url(url):
+        order = [None, _PROXY_OPENER]      # 国内：直连失败再试代理
+    else:
+        order = [_PROXY_OPENER, None]      # 国外（AI接口等）：代理优先
+    last = None
+    for opener in order:
+        try:
+            if opener is None:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.read()
+            with opener.open(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            if last is None:
+                last = e      # 保留首选通道的错误（更具代表性）
+            if opener is not None and "refused" in str(e).lower():
+                _mark_proxy_dead()
+                log.debug("代理不可用，改为直连 %s: %s", url[:60], e)
+            continue
+    raise last if last is not None else RuntimeError("无可用网络通道")
 
 
 def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
@@ -603,19 +678,8 @@ def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
                 _LAST_REQ[0] = time.time()
             try:
                 req = urllib.request.Request(url, headers=hdr)
-                txt = None
-                if _PROXY_OPENER is not None:
-                    try:
-                        with _PROXY_OPENER.open(req, timeout=timeout) as r:
-                            txt = r.read().decode(decode, errors="ignore")
-                    except Exception as pe:
-                        # 代理不可用（软件未开/节点故障）时自动回退直连，
-                        # 避免配置代理后一个源都拉不到
-                        log.debug("代理请求失败，回退直连 %s: %s",
-                                  url[:80], pe)
-                if txt is None:
-                    with urllib.request.urlopen(req, timeout=timeout) as r:
-                        txt = r.read().decode(decode, errors="ignore")
+                txt = _open_url(req, url, timeout).decode(
+                    decode, errors="ignore")
                 ok_flag = True
                 return txt
             except Exception as e:
@@ -655,11 +719,39 @@ def last_completed_td():
     return _dstr(_prev_weekday(datetime.date.today()))
 
 
+# 上证指数最近一次行情快照日期（YYYYMMDD）：判定今日是否交易日
+# （节假日/休市时快照日期会停在上一交易日，避免把今天当交易日空拉K线）
+_LAST_INDEX_SNAP_DATE = [""]
+
+
+def _note_index_snap(t):
+    """记录上证指数快照日期（只由指数行情调用，个股停牌不影响休市判定）。"""
+    d = (t or "")[:8].replace("-", "")
+    if len(d) == 8 and d.isdigit() and d > _LAST_INDEX_SNAP_DATE[0]:
+        _LAST_INDEX_SNAP_DATE[0] = d
+
+
+def _today_is_session():
+    """今日是否交易日：有今日指数快照→是；快照落后且已过开盘→否；未知→None。"""
+    d = _LAST_INDEX_SNAP_DATE[0]
+    today = time.strftime("%Y%m%d")
+    if not d:
+        return None
+    if d >= today:
+        return True
+    if time.strftime("%H%M") >= "0915":
+        return False
+    return None
+
+
 def _allow_today_bar():
-    """是否允许今日日K入库：工作日且已过 15:05（数据已收盘定型）。"""
+    """是否允许今日日K入库：工作日且已过 15:05（数据已收盘定型），
+    且指数快照未表明今日休市（节假日/周末调休）。"""
     import datetime
-    return (datetime.date.today().weekday() < 5
-            and time.strftime("%H:%M") >= "15:05")
+    if not (datetime.date.today().weekday() < 5
+            and time.strftime("%H:%M") >= "15:05"):
+        return False
+    return _today_is_session() is not False
 
 
 # ================= 日K增量缓存 =================
@@ -765,23 +857,44 @@ def _bars_anomalous(rows, code, name=""):
       只有**连续**出现超阈值大跳变（≥2次相邻）才判为数据错误；
       单次孤立大跳变视为合法除权/折算。
     - 历史不足30根的新股跳过检查。
+    - 2026-09-25 误报豁免（曾把深历史整只误替换为短数据）：退市整理期整体跳过；
+      序列前10根（注册制新股前5日不设限）；相邻两根日历间隔>30天（长期停牌复牌/
+      退市整理首日不设限）；主板ST旧规5%按现名回溯会误伤非ST历史段，放宽到10%。
     """
     if len(rows) < 30:
         return False
+    if code.startswith(("sh000", "sz399")):   # 指数不受涨跌停约束
+        return False
+    if "退" in (name or ""):       # 退市整理：首日不设限且数据不再用于决策
+        return False
+    import datetime
     is_etf = _is_etf(code)
     threshold_extra = 12.0 if is_etf else 0.0
     # 记录每根是否超阈值
     flags = []
-    for prev, r in zip(rows, rows[1:]):
+    for idx, (prev, r) in enumerate(zip(rows, rows[1:])):
         pc = prev.get("close")
         c = r.get("close")
         if not pc or pc <= 0 or not c or c <= 0:
             flags.append(False)
             continue
+        if idx < 10:               # 新股上市初段（前5个交易日不设涨跌幅）
+            flags.append(False)
+            continue
+        try:                       # 长期停牌复牌/退市整理首日
+            d0 = datetime.date.fromisoformat(prev["date"])
+            d1 = datetime.date.fromisoformat(r["date"])
+            if (d1 - d0).days > 30:
+                flags.append(False)
+                continue
+        except (ValueError, KeyError, TypeError):
+            pass
         lim = _limit_pct(code, name, r["date"])
         if lim is None:
             flags.append(False)
             continue
+        if lim < 10.0:             # 主板ST旧规5%：现名回溯历史会误伤，放宽到10%
+            lim = 10.0
         chg = abs(c / pc - 1) * 100
         flags.append(chg > lim + 3.0 + threshold_extra)
     if not any(flags):
@@ -1062,9 +1175,9 @@ def _fetch_sina(full, count=600):
 def _fetch_remote_rows(full, count=600):
     """多源自动切换 + 熔断调度：腾讯ifzq → 东财 → 新浪 → 网易163。
 
-    2026-08 实测：web.ifzq.gtimg.cn 已下线(501)，proxy.finance.qq.com
-    返回404，现役主域为 ifzq.gtimg.cn；东财 push2his 整域故障期间
-    自动降级；网易163服务端502时段排到最后。
+    2026-09 实测：ifzq.gtimg.cn 整域 501，现役可用域为
+    proxy.finance.qq.com 与 web.ifzq.gtimg.cn；东财 push2his 整域故障
+    （连接重置/502）期间自动降级；网易163服务端502时段排到最后。
     运行逻辑：
     1. 按优先级遍历数据源，跳过处于熔断冷却期的源；
     2. 若所有源都在冷却（极端503风暴），退化为「半开探测」：
@@ -1118,10 +1231,10 @@ _LAST_REQ = [0.0]
 _KLINE_HEAL_TS = [0.0]          # 上次自愈探测时间（10分钟限频）
 _KLINE_HEAL_LOCK = threading.Lock()
 _KLINE_DEFAULTS = (
-    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
-    "http://ifzq.gtimg.cn/appstock/app/fqkline/get",
     "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
     "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "http://ifzq.gtimg.cn/appstock/app/fqkline/get",
 )
 
 
@@ -1262,7 +1375,8 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     # 2) 有数据但过期或涨幅异常 → 拉远端（异常时清空全量替换）
     if rows:
         try:
-            remote = [r for r in _fetch_remote_rows(full, count=1100)
+            remote = [r for r in _fetch_remote_rows(
+                full, count=CFG.MAX_FETCH_BARS)
                       if (r["date"] < today
                           or (allow_today and r["date"] == today))
                       and _bar_ok(r)]
@@ -1281,8 +1395,12 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
                             break
                 rebase = rebase and checked >= 5
             with db_conn(commit=True) as conn2:
-                # 只有新数据足够长才允许全量替换，防止短源摧毁深历史
-                if (bad_cache or rebase) and len(remote) >= min(400, len(rows) // 2):
+                # 只有新数据足够长才允许全量替换，防止短源摧毁深历史。
+                # bad_cache 存在误报（新股/停牌/ST历史）：必须覆盖90%才清空；
+                # rebase（复权基期真变了）维持原「≥缓存一半」口径，保证口径统一。
+                cover = (max(400, int(len(rows) * 0.9)) if bad_cache
+                         else min(400, len(rows) // 2))
+                if (bad_cache or rebase) and len(remote) >= cover:
                     conn2.execute("DELETE FROM daily_bars WHERE code=?",
                                   (full,))
                 if remote:
@@ -1312,7 +1430,7 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
 
     # 4) 从未获取过 → 网络请求
     try:
-        remote = _fetch_remote_rows(full, count=1100)
+        remote = _fetch_remote_rows(full, count=CFG.MAX_FETCH_BARS)
     except Exception as e:
         # 未上市/无数据识别：行情快照也拿不到有效价 → 静默记为未上市
         listed = True
@@ -1458,7 +1576,8 @@ def _bf_tx_fetch(full, end, count):
             txt = _http_get(u + param, decode="utf-8", retries=1, timeout=8)
             _BF_TX_I[0] = (_BF_TX_I[0] + k + 1) % len(_BF_TX_HOSTS)
             d = (json.loads(txt).get("data") or {}).get(full) or {}
-            bars = d.get("qfqday") or d.get("day") or []
+            # 请求的是 hfq（后复权），腾讯返回 hfqday；指数无复权返回 day
+            bars = d.get("hfqday") or d.get("day") or []
             out = []
             for b in bars:
                 try:
@@ -1475,21 +1594,31 @@ def _bf_tx_fetch(full, end, count):
     raise last
 
 
-def _bf_fetch_one(full, page=800):
-    """单只：腾讯翻页为主源（后复权），东财全量兜底。返回 (rows, raw_last)。"""
+def _bf_fetch_one(full, page=800, target=None):
+    """单只：腾讯翻页为主源（后复权），东财全量兜底。返回 (rows, raw_last)。
+
+    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）；按需继续翻页直到
+    达到目标或源侧没有更早数据（2000 根需 3 页）。"""
+    import datetime
+    target = target or max(CFG.MAX_FETCH_BARS, page * 2)
     rows1 = _bf_tx_fetch(full, "", page)
     if not rows1:
         raise RuntimeError("腾讯空数据")
-    if len(rows1) >= page - 10:                 # 触顶 → 翻页补历史
-        import datetime
+    have = {r["date"] for r in rows1}
+    pages = 1
+    while len(rows1) < target and pages < 5 and len(rows1) >= page - 10:
         d0 = datetime.date.fromisoformat(rows1[0]["date"])
         end = (d0 - datetime.timedelta(days=1)).isoformat()
         try:
-            rows2 = _bf_tx_fetch(full, end, page)
-            have = {r["date"] for r in rows1}
-            rows1 = [r for r in rows2 if r["date"] not in have] + rows1
+            older = _bf_tx_fetch(full, end, page)
         except Exception:
-            pass                                # 第二页失败就只装第一页
+            break                               # 更早一页失败就保留已有
+        new = [r for r in older if r["date"] not in have]
+        if not new:
+            break                               # 源侧已无更早数据
+        rows1 = new + rows1
+        have.update(r["date"] for r in new)
+        pages += 1
     if len(rows1) >= 300:
         return rows1, _raw_last_price(full)
     try:
@@ -1502,8 +1631,12 @@ def _bf_fetch_one(full, page=800):
 
 
 def backfill_full_market(progress=None, force=False, limit=0,
-                         workers=6, throttle=0.45, min_bars=950):
-    """全市场日K批量回填（≥min_bars根，断点续传）。返回统计dict。"""
+                         workers=6, throttle=0.45, min_bars=None):
+    """全市场日K批量回填（≥min_bars根，断点续传）。返回统计dict。
+
+    min_bars 缺省 = max(950, CFG.MAX_FETCH_BARS)：设置页「最大拉取样本量」调到
+    2000 时，回填会自动翻到 3 页（≈2400 根上限）直到 2000 根目标。"""
+    min_bars = min_bars or max(950, CFG.MAX_FETCH_BARS)
     global _MIN_INTERVAL
     old_iv = _MIN_INTERVAL
     _MIN_INTERVAL = throttle
@@ -1549,7 +1682,7 @@ def backfill_full_market(progress=None, force=False, limit=0,
             if time.time() < _BF_PAUSE[0]:
                 time.sleep(_BF_PAUSE[0] - time.time())
             try:
-                fetched, raw_last = _bf_fetch_one(c)
+                fetched, raw_last = _bf_fetch_one(c, target=min_bars)
                 rows = [r for r in fetched
                         if (r["date"] < today
                             or (_allow_today_bar() and r["date"] == today))
@@ -1909,10 +2042,65 @@ def _is_money_etf(code, name=""):
     return any(code.startswith(p) for p in _MMF_PRE)
 
 
-def refresh_etf_codes(progress=None, exclude_mmf=True):
-    """拉取东财 ETF/LOF 代码表写入 stocks（industry='ETF'），保留原有 A 股行。
+def _refresh_etf_codes_sina(progress=None, exclude_mmf=True):
+    """新浪 ETF/LOF 代码表兜底（东财整域故障时）：node=etf_hq_fund/lof_hq_fund。
 
-    返回 (写入条数, 货币类剔除数)。"""
+    新浪 mktcap 单位为万元，×1e4 转成元，与东财 f20 口径一致。"""
+    import re
+    items = []
+    for node in ("etf_hq_fund", "lof_hq_fund"):
+        for page in range(1, 31):
+            u = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+                 "json_v2.php/Market_Center.getHQNodeData"
+                 f"?page={page}&num=100&sort=symbol&asc=1&node={node}")
+            try:
+                txt = _http_get(
+                    u, retries=2, timeout=15, decode="gbk",
+                    headers={"Referer": "https://finance.sina.com.cn/"},
+                    src_name="新浪ETF表")
+            except Exception as e:
+                log.debug("新浪ETF表 %s 第%d页失败: %s", node, page, e)
+                break
+            try:
+                batch = json.loads(re.sub(r'(?<=[{,])(\w+):', r'"\1":', txt)
+                                   or "[]")
+            except Exception:
+                log.debug("新浪ETF表 %s 第%d页解析失败", node, page)
+                break
+            if not batch:
+                break
+            for it in batch:
+                full = (it.get("symbol") or "").lower()
+                name = it.get("name") or ""
+                if len(full) != 8 or not _is_etf(full):
+                    continue
+                if exclude_mmf and _is_money_etf(full, name):
+                    continue
+                cap = it.get("mktcap")
+                items.append((full, name,
+                              float(cap) * 1e4
+                              if isinstance(cap, (int, float)) else None))
+            if progress and page % 3 == 0:
+                progress(f"新浪ETF表 {len(items)} 只 ({node} 第{page}页)")
+            if len(batch) < 100:
+                break
+            time.sleep(0.3)
+    if not items:
+        raise RuntimeError("新浪 ETF 代码表拉取失败")
+    uniq = {}
+    for full, name, cap in items:
+        uniq[full] = (full, name, "ETF", cap, None, time.strftime("%Y-%m-%d"))
+    with db_conn(commit=True) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO stocks(code,name,industry,mktcap,tier,updated) "
+            "VALUES(?,?,?,?,?,?)", list(uniq.values()))
+    if progress:
+        progress(f"ETF 代码表完成(新浪): {len(uniq)} 只（已排除货币类）")
+    return len(uniq)
+
+
+def _refresh_etf_codes_em(progress=None, exclude_mmf=True):
+    """东财 ETF/LOF 代码表（主源）。返回写入条数。"""
     hosts = ("https://push2delay.eastmoney.com", "https://push2.eastmoney.com",
              "http://push2.eastmoney.com")
     UT = "fa5fd1943c7b386f172d6893dbfba10b"
@@ -1973,6 +2161,19 @@ def refresh_etf_codes(progress=None, exclude_mmf=True):
     return len(uniq)
 
 
+def refresh_etf_codes(progress=None, exclude_mmf=True):
+    """拉取 ETF/LOF 代码表写入 stocks（industry='ETF'），保留原有 A 股行。
+
+    主源东财，整域故障（连接重置/超时）时自动改走新浪 ETF/LOF 列表兜底。"""
+    try:
+        return _refresh_etf_codes_em(progress, exclude_mmf)
+    except Exception as e:
+        log.warning("东财 ETF 代码表失败，改走新浪: %s", e)
+    if progress:
+        progress("东财 ETF 代码表不可用，改用新浪 ...")
+    return _refresh_etf_codes_sina(progress, exclude_mmf)
+
+
 def backfill_etf_history(codes=None, progress=None, workers=6,
                          min_rows=200, only_stale=True):
     """回填 ETF 日K（hfg 口径，与主库一致）。返回统计 dict。
@@ -2008,7 +2209,7 @@ def backfill_etf_history(codes=None, progress=None, workers=6,
 
     def work(code):
         try:
-            rows = _fetch_remote_rows(code, count=1100)
+            rows = _fetch_remote_rows(code, count=CFG.MAX_FETCH_BARS)
             if not rows:
                 raise RuntimeError("空数据")
             data = [r for r in rows if _bar_ok(r)]
@@ -2181,7 +2382,10 @@ INDEX_CODES = [
 
 UP, DOWN, PRED_C = "#ff5252", "#26c281", "#4da3ff"
 TPRED_C = "#ffffff"   # 暗色主题下白色虚线；亮色主题自动切换为黑色
-MA_COLORS = {5: "#ffa94d", 10: "#74c0fc", 20: "#e599f7", 30: "#69db7c", 60: "#d5a021"}
+# 指标线配色（随主题切换，见 THEMES；高对比主题用更亮的线）
+MA_COLORS = {5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff", 30: "#7bf08b", 60: "#e8c14a"}
+C_ORANGE, C_BLUE = "#ffa94d", "#5dade2"      # RSI6/DIF/K 与 RSI12/DEA/D
+C_PURPLE, C_GOLD = "#d0a9f5", "#e8c14a"      # KDJ·J/BOLL中轨 与 BOLL轨道/BOLL%
 BG = "#14181e"
 GRID_C = "#232b34"
 GUIDE_C = "#39434e"
@@ -2207,6 +2411,10 @@ THEMES = {
         FG_MAIN="#d7dee6",
         BTN_BG="#222a33", BTN_FG="#d7dee6", BTN_HOVER="#2b3540",
         BTN_BORDER="#333e4a",
+        MA_COLORS={5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff",
+                   30: "#7bf08b", 60: "#e8c14a"},
+        C_ORANGE="#ffa94d", C_BLUE="#5dade2",
+        C_PURPLE="#d0a9f5", C_GOLD="#e8c14a",
     ),
     "light": dict(
         UP="#e03131", DOWN="#0ca678", PRED_C="#1971c2", TPRED_C="#111111",
@@ -2216,6 +2424,10 @@ THEMES = {
         FG_MAIN="#1f2933",
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
         BTN_BORDER="#bbbbbb",
+        MA_COLORS={5: "#e8590c", 10: "#1971c2", 20: "#ae3ec9",
+                   30: "#2f9e44", 60: "#b08900"},
+        C_ORANGE="#e8590c", C_BLUE="#1971c2",
+        C_PURPLE="#9c36b5", C_GOLD="#b08900",
     ),
     # 高对比：纯黑底 + 纯白字 + 亮边框/亮黄光标，适合弱光或视力不佳场景
     "contrast": dict(
@@ -2226,6 +2438,10 @@ THEMES = {
         FG_MAIN="#ffffff",
         BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
         BTN_BORDER="#ffffff",
+        MA_COLORS={5: "#ffb000", 10: "#00d4ff", 20: "#ff7ae0",
+                   30: "#39ff88", 60: "#ffee00"},
+        C_ORANGE="#ffb000", C_BLUE="#00b7ff",
+        C_PURPLE="#ff7ae0", C_GOLD="#ffee00",
     ),
 }
 
@@ -2325,23 +2541,86 @@ _TOP_SECTORS_LAST = ([], [])    # 最近一次成功结果（网络全挂时回�
 _TOP_SECTORS_WARN_TS = 0.0      # 失败警告降噪：10分钟内只警告一次
 
 
+def _fetch_top_sectors_tencent():
+    """腾讯行业板块榜（东财整域故障时兜底）：返回 [(name, pct), ...]。
+    o=0 涨幅榜 / o=1 跌幅榜，各取前10。"""
+    out = []
+    for o in (0, 1):
+        try:
+            txt = _http_get(
+                "https://ifzq.gtimg.cn/appstock/app/mktHs/rank"
+                f"?l=10&p=1&t=01/averatio&o={o}",
+                retries=1, timeout=8, src_name="腾讯板块")
+            for it in (json.loads(txt).get("data") or []):
+                name = it.get("bd_name")
+                pct = it.get("bd_zdf")
+                if name and pct is not None:
+                    out.append((name, float(pct)))
+        except Exception as e:
+            log.debug("腾讯板块榜 o=%s 失败: %s", o, e)
+    return out
+
+
+_AKSHARE_MOD = [None, 0]        # [模块, 状态] 状态: 0=未探测 1=可用 -1=不可用
+
+
+def _akshare():
+    """懒加载 akshare（可选依赖：未安装/导入失败返回 None，只探测一次）。
+
+    客户端默认不依赖 akshare；装了则自动作为末位兜底源启用。"""
+    if _AKSHARE_MOD[1] != 0:
+        return _AKSHARE_MOD[0]
+    try:
+        import akshare as ak
+        _AKSHARE_MOD[0] = ak
+        _AKSHARE_MOD[1] = 1
+        log.info("akshare 兜底源可用: %s", getattr(ak, "__version__", "?"))
+    except Exception as e:
+        _AKSHARE_MOD[1] = -1
+        log.info("未安装 akshare，跳过末位兜底（%s）", e)
+    return _AKSHARE_MOD[0]
+
+
+def _fetch_top_sectors_akshare():
+    """akshare（Sina 行业线路）板块榜兜底：返回 [(name, pct), ...]。
+    东财/腾讯全挂且本机已安装 akshare 时才会走到这里。"""
+    ak = _akshare()
+    if ak is None:
+        return []
+    try:
+        df = ak.stock_sector_spot(indicator="行业")
+        out = []
+        for _, row in df.iterrows():
+            name = str(row.get("板块") or "").strip()
+            pct = row.get("涨跌幅")
+            if name and pct is not None:
+                out.append((name, float(pct)))
+        return out
+    except Exception as e:
+        log.debug("akshare 行业榜失败: %s", e)
+        return []
+
+
 def fetch_top_sectors():
     """获取今日行业板块涨跌幅排行（Top3涨/Top3跌）。
     返回 [(name, pct), ...] 的两个列表，带10分钟缓存。
     缓存读写持有 _STATE_LOCK；请求统一走熔断 _http_get。
     网络全挂时回退最近一次成功结果（可能滞后，但好于空白）。"""
     global _TOP_SECTORS_CACHE, _TOP_SECTORS_TS, _TOP_SECTORS_WARN_TS
+    global _TOP_SECTORS_LAST
     now = time.time()
     with _STATE_LOCK:
         if _TOP_SECTORS_CACHE and now - _TOP_SECTORS_TS < 600:
             return _TOP_SECTORS_CACHE
     UT = "fa5fd1943c7b386f172d6893dbfba10b"
     hdr = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
-    # HTTPS/HTTP × 主域/延迟域：连接被重置时逐个轮换
-    hosts = ("https://push2delay.eastmoney.com",
-             "https://push2.eastmoney.com",
-             "http://push2delay.eastmoney.com",
-             "http://push2.eastmoney.com")
+    # HTTPS/HTTP × 主域/延迟域：连接被重置时逐个轮换；
+    # 熔断期内直接跳过东财（改走腾讯/akshare兜底），避免每轮白等数秒
+    hosts = () if not _cb_ok("东财板块") else (
+        "https://push2delay.eastmoney.com",
+        "https://push2.eastmoney.com",
+        "http://push2delay.eastmoney.com",
+        "http://push2.eastmoney.com")
     items = []
     vals = []
     fail_cnt = 0
@@ -2377,6 +2656,12 @@ def fetch_top_sectors():
             break
     if now - _TOP_SECTORS_WARN_TS > 600:
         _TOP_SECTORS_WARN_TS = now
+    if not items:
+        # 东财整域故障（连接被重置/502）时改走腾讯行业板块榜兜底
+        items = _fetch_top_sectors_tencent()
+    if not items:
+        # 腾讯也挂：akshare（Sina 线路）末位兜底；未装 akshare 自动跳过
+        items = _fetch_top_sectors_akshare()
     if items:
         items.sort(key=lambda x: x[1], reverse=True)
         result = (items[:3], items[-3:][::-1])
@@ -2401,6 +2686,9 @@ def fetch_sector_context(full):
         hit = _SECTOR_CACHE.get(full)
         if hit and now - hit[0] < _SECTOR_CACHE_TTL:
             return hit[1]
+    if not _cb_ok("东财板块"):
+        # 东财板块接口熔断期内：板块上下文不是必需项，直接跳过省时
+        return None, {}, None
     UT = "fa5fd1943c7b386f172d6893dbfba10b"
     hdr = {"User-Agent": "Mozilla/5.0",
            "Referer": "https://quote.eastmoney.com/"}
@@ -2502,18 +2790,151 @@ def fetch_sector_context(full):
             _SECTOR_CACHE[full] = (time.time(),
                                    (ind_name, chg_by_date, today_chg))
         return ind_name, chg_by_date, today_chg
-    except Exception:
-        log.warning("fetch_sector_context 失败 %s", full, exc_info=True)
+    except Exception as e:
+        # 东财整域故障时属预期失败，降噪为单行（板块上下文缺失不影响主预测）
+        log.warning("fetch_sector_context 失败 %s（忽略）: %s", full, e)
         return None, {}, None
 
 
-def fetch_quote(full):
+def _fetch_quote_tencent(full):
     f = http_get(QT_URL + full).split("~")
     if len(f) < 35 or not f[3]:
-        raise ValueError("未查询到该股票")
+        raise ValueError("腾讯未查询到该股票")
     return {"name": f[1], "price": float(f[3]), "prev_close": float(f[4]),
             "open": float(f[5]), "high": float(f[33]), "low": float(f[34]),
             "time": f[30]}
+
+
+def _fetch_quote_sina(full):
+    """新浪行情快照（GBK，需带 Referer）。字段与腾讯同序：
+    name/open/prev_close/price/high/low/date/time。"""
+    txt = _http_get("https://hq.sinajs.cn/list=" + full, retries=2,
+                    timeout=10, decode="gbk",
+                    headers={"Referer": "https://finance.sina.com.cn/"},
+                    src_name="新浪行情")
+    body = txt.split('"')[1] if '"' in txt else ""
+    f = body.split(",")
+    if len(f) < 32 or not f[3] or float(f[3] or 0) <= 0:
+        raise ValueError("新浪未查询到该股票")
+    return {"name": f[0], "price": float(f[3]), "prev_close": float(f[2]),
+            "open": float(f[1]), "high": float(f[4]), "low": float(f[5]),
+            "time": f[31]}
+
+
+def _fetch_quote_em(full):
+    """东财 ulist 行情快照（push2 整域故障时通常也挂，作末位兜底）。"""
+    secid = _code_to_em(full)
+    if not secid:
+        raise ValueError("不支持的市场")
+    u = ("https://push2.eastmoney.com/api/qt/ulist.np/get"
+         f"?secids={secid}&fltt=2&invt=2"
+         f"&fields=f2,f12,f14,f15,f16,f17,f18,f124&ut={UT}")
+    d = json.loads(_http_get(
+        u, retries=2, timeout=8,
+        headers={"Referer": "https://quote.eastmoney.com/"},
+        src_name="东财行情"))
+    diff = (d.get("data") or {}).get("diff") or {}
+    it = (list(diff.values())[0] if isinstance(diff, dict)
+          else (diff[0] if diff else None))
+    if not it or it.get("f2") in (None, "-"):
+        raise ValueError("东财未查询到该股票")
+    try:
+        # f124 为最后行情时间戳（秒），保留完整日期供休市/盘前判定
+        qtime = time.strftime("%Y%m%d%H%M%S",
+                              time.localtime(float(it.get("f124"))))
+    except (TypeError, ValueError, OSError):
+        qtime = time.strftime("%Y%m%d%H%M%S")
+    return {"name": it.get("f14") or full, "price": float(it["f2"]),
+            "prev_close": float(it.get("f18") or 0),
+            "open": float(it.get("f17") or 0),
+            "high": float(it.get("f15") or 0),
+            "low": float(it.get("f16") or 0),
+            "time": qtime}
+
+
+def fetch_quote(full):
+    """行情快照多源容灾：腾讯 → 新浪 → 东财，任一成功即返回。"""
+    last = None
+    for name, fetcher in (("腾讯行情", _fetch_quote_tencent),
+                          ("新浪行情", _fetch_quote_sina),
+                          ("东财行情", _fetch_quote_em)):
+        try:
+            q = fetcher(full)
+            if full == "sh000001":
+                _note_index_snap(q.get("time"))    # 休市判定锚
+            return q
+        except Exception as e:
+            last = e
+            log.debug("%s失败 %s: %s", name, full, e)
+    raise RuntimeError(f"所有行情源均失败: {last}")
+
+
+def _batch_tencent(codes):
+    raw = http_get(QT_URL + ",".join(codes))
+    out = {}
+    for seg in raw.split(";"):
+        seg = seg.strip()
+        if "=" not in seg or "~" not in seg:
+            continue
+        code = seg.split("=")[0].strip().replace("v_", "", 1).lower()
+        f = seg.split("~")
+        if len(f) < 34 or not f[3]:
+            continue
+        try:
+            out[code] = {"name": f[1], "price": float(f[3]),
+                         "chg": float(f[32]), "time": f[30]}
+        except ValueError:
+            continue
+    return out
+
+
+def _batch_sina(codes):
+    txt = _http_get("https://hq.sinajs.cn/list=" + ",".join(codes),
+                    retries=2, timeout=10, decode="gbk",
+                    headers={"Referer": "https://finance.sina.com.cn/"},
+                    src_name="新浪行情")
+    out = {}
+    for line in txt.split(";"):
+        if '"' not in line:
+            continue
+        code = (line.split("=")[0].strip()
+                .replace("var hq_str_", "").lower())
+        f = line.split('"')[1].split(",")
+        if not code or len(f) < 6 or not f[3]:
+            continue
+        try:
+            price = float(f[3])
+            prev = float(f[2] or 0)
+        except ValueError:
+            continue
+        if price <= 0:
+            continue
+        tstr = ""
+        if len(f) > 31 and f[30]:
+            tstr = f[30].replace("-", "") + f[31].replace(":", "")
+        out[code] = {"name": f[0], "price": price,
+                     "chg": (price / prev * 100 - 100) if prev else 0.0,
+                     "time": tstr}
+    return out
+
+
+def fetch_batch_quotes(codes):
+    """批量行情快照（自选池名称/指数栏用）：腾讯 → 新浪。"""
+    codes = [c for c in codes if c]
+    if not codes:
+        return {}
+    last = None
+    for fetcher in (_batch_tencent, _batch_sina):
+        try:
+            d = fetcher(codes)
+            if d:
+                if "sh000001" in d:
+                    _note_index_snap(d["sh000001"].get("time"))
+                return d
+        except Exception as e:
+            last = e
+    log.debug("批量行情全失败: %s", last)
+    return {}
 
 
 def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
@@ -3626,12 +4047,20 @@ def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
 
 
 def market_phase_text(time_str):
-    """行情快照时间(YYYYMMDDHHMMSS...) -> 'HH:MM 市场阶段'。"""
+    """行情快照时间(YYYYMMDDHHMMSS...) -> 'HH:MM 市场阶段'。
+
+    快照日期非今日时（休市/停牌/数据未更新）标注日期，避免把上一交易日的
+    16:14 显示成"今天已收盘"（时间不匹配的观感问题）。"""
+    s = time_str or ""
     try:
-        hhmm = int((time_str or "")[8:12])
+        hhmm = int(s[8:12])
     except ValueError:
         return "时间未知"
     hm = f"{hhmm // 100}:{hhmm % 100:02d}"
+    snap_d = s[:8].replace("-", "")
+    if (len(snap_d) == 8 and snap_d.isdigit()
+            and snap_d != time.strftime("%Y%m%d")):
+        return f"{snap_d[4:6]}-{snap_d[6:8]} {hm} 收盘（快照非今日）"
     if hhmm < 915:
         return hm + " 盘前"
     if hhmm < 925:
@@ -4687,6 +5116,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "boll": lambda: _sig_boll(rows),
         "ma_trend": lambda: _sig_ma_trend(rows),
         "l1_pattern": lambda: _sig_l1_pattern(rows),
+        "l2_ind": lambda: _sig_l2_industry(rows, industry=industry),
         "chip_peak": lambda: _sig_chip_peak(rows),
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
     }
@@ -4792,11 +5222,18 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     scored = [(t, s) for t, s in scored if s is not None]
     recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
     vol = _annualized_vol(rows)
+    high_vol = bool(vol is not None and vol > 0.45)
+    # 高波动股保守档紧止损易被反复触发：推荐改在 稳健/激进 中取较优，
+    # 与弹窗提示保持一致（否则会出现"推荐保守但提示别选保守"的自相矛盾）
+    if high_vol and recommend == "保守":
+        alt = [(t, s) for t, s in scored if t in ("稳健", "激进")]
+        if alt:
+            recommend = max(alt, key=lambda x: x[1])[0]
 
     out = {"mode_candidates": mode_candidates,
            "recommend": recommend,
            "vol_ann": vol,
-           "high_vol": bool(vol is not None and vol > 0.45),
+           "high_vol": high_vol,
            "ts": time.time(), "bars": n, "train_n": split,
            "val_n": n - split}
     if progress:
@@ -5177,6 +5614,7 @@ def analyze(full, progress=None, quick=False):
     today_compact = today_str.replace("-", "")
     pre_open = (not had_today_bar and not post_close
                 and snap_d >= today_compact)
+    stale_snap = bool(snap_d) and snap_d < today_compact
     if post_close:
         o_today = q["price"] or prev_close
         anchor = "今收"
@@ -5186,6 +5624,11 @@ def analyze(full, progress=None, quick=False):
     elif live is not None:
         o_today = q["open"] or prev_close
         anchor = "今开"
+    elif stale_snap:
+        # 快照停在上一交易日（休市/停牌/数据未更新）：以快照收盘为锚。
+        # 不能再用 q["prev_close"]（那是再前一日收盘，会把预测整体锚错一天）
+        o_today = q["price"] or prev_close
+        anchor = f"最近收盘({snap_d[4:6]}-{snap_d[6:8]})"
     else:
         o_today = prev_close
         anchor = "今收"
@@ -5193,7 +5636,10 @@ def analyze(full, progress=None, quick=False):
 
     # 市场阶段（按行情快照时间）
     phase = market_phase_text(q.get("time"))
-    next_label = "今日(T)" if (pre_open and not post_close) else "次日(T+1)"
+    next_label = ("今日(T)" if (pre_open and not post_close)
+                  else ("下一交易日(T+1)" if stale_snap else "次日(T+1)"))
+    t_pred_label = ("下一交易日收盘预测" if stale_snap
+                    else "今日(T)收盘预测")
 
     samples = []
     max_pred_days = 10  # 最多预测10天
@@ -5716,7 +6162,8 @@ def analyze(full, progress=None, quick=False):
 
     return {
         "quote": q, "full_code": full, "disp_rows": disp_rows,
-        "anchor": anchor, "pre_open": pre_open,
+        "anchor": anchor, "pre_open": pre_open, "stale_snap": stale_snap,
+        "t_pred_label": t_pred_label,
         "phase": phase, "next_label": next_label,
         "tpred_bar": tpred_bar,
         "t5_pred": t_pred.get("t5"),
@@ -8209,7 +8656,8 @@ def _ai_http_json(url, payload=None, api_key="", timeout=60, session=""):
         with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
 
-    openers = ([_PROXY_OPENER] if _PROXY_OPENER is not None else []) \
+    openers = ([_PROXY_OPENER]
+               if _PROXY_OPENER is not None and not _proxy_dead() else []) \
         + [urllib.request.build_opener()]
     last = None
     for attempt in range(2):
@@ -8736,8 +9184,10 @@ class App:
         # ---- 右侧：预测参考 / 插件面板（先pack，防止遮挡图表；小屏省略）----
         right = None
         if not self.compact:
-            right = ttk.LabelFrame(body, text=" 预测参考 ", padding=4)
-            right.pack(side="right", fill="y", padx=(2, 8), pady=6)
+            rt_col = tk.Frame(body, bg=DARK_BG)
+            rt_col.pack(side="right", fill="y", padx=(2, 8), pady=6)
+            right = ttk.LabelFrame(rt_col, text=" 预测参考 ", padding=4)
+            right.pack(fill="both", expand=True)
             self._w_right = right
 
             rt = tk.Frame(right, bg=DARK_BG)
@@ -8774,6 +9224,13 @@ class App:
                 self._rt_select.pack(side="left", fill="x", expand=True,
                                      padx=(0, 4))
             self._switch_rt(self._rt_choice)
+
+            # 市场状态：独立一栏常驻面板下方（不随预测参考滚动）
+            self.phase_var = tk.StringVar(value="市场状态 ● -")
+            tk.Label(rt_col, textvariable=self.phase_var, bg=DARK_BG,
+                     fg="#4da3ff", anchor="w",
+                     font=("Microsoft YaHei", 10, "bold")).pack(
+                         fill="x", pady=(3, 0))
         self._w_right = getattr(self, "_w_right", None)
 
         # ---- 左侧：自选池（固定宽度；小屏省略）----
@@ -9790,7 +10247,8 @@ class App:
             f"基于近{abl['bars']}个交易日回测选策略 "
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
-            f"每档在全部候选（8算法+多维评分 × 3风险参数）上独立选优\n"
+            f"每档按各自风险目标在候选中选优"
+            f"（9算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
@@ -9798,10 +10256,11 @@ class App:
         _vol = abl.get("vol_ann")
         if _vol is not None:
             _msg = (f"该股近一年年化波动率 {_vol * 100:.0f}%；"
-                    f"验证集 Calmar 最优档：{rec}")
+                    f"训练集 Calmar 最优档：{rec}"
+                    f"（验证集仅防过拟合参考，不参与选择）")
             if abl.get("high_vol"):
                 _msg += ("。高波动股保守档的紧止损易被反复触发，"
-                         "建议优先 稳健/激进。")
+                         "推荐已改在 稳健/激进 中取较优。")
             ttk.Label(win, text=_msg, foreground=AXIS_TXT, wraplength=560,
                       justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         # 可滚动容器 + 屏幕限高：小屏也不会把内容顶出可视区
@@ -10149,6 +10608,11 @@ class App:
                 f"{q['name']} ({res['full_code']})  "
                 f"昨收{res['prev_close']:.2f}  "
                 f"现价{q['price']:.2f}({chg:+.2f}%)  快照{q['time']}")
+        elif res.get("stale_snap"):
+            self.info_var.set(
+                f"{q['name']} ({res['full_code']})  昨收{res['prev_close']:.2f} "
+                f"最近开{q['open']:.2f}  收盘{q['price']:.2f}({chg:+.2f}%)  "
+                f"快照{q['time']}（非今日）")
         else:
             self.info_var.set(
                 f"{q['name']} ({res['full_code']})  昨收{res['prev_close']:.2f} "
@@ -10287,7 +10751,7 @@ class App:
                            font=("Consolas", 8), fill=AXIS_TXT)
         return ymap
 
-    def _line(self, cv, xs_fn, vals, ymap, color, width=1):
+    def _line(self, cv, xs_fn, vals, ymap, color, width=2):
         """整条折线一次绘制（None 断开），item 数从 N 段降为少数几条。"""
         pts = []
         segs = []
@@ -10320,7 +10784,7 @@ class App:
                                   fill="#ffffff",
                                   font=("Consolas", 9, "bold"))
         g["pbg"] = cv.create_rectangle(0, 0, 0, 0, state="hidden",
-                                       fill="#1971c2", outline="")
+                                       fill=PRED_C, outline="")
         g["did"] = cv.create_text(0, 0, text="", state="hidden",
                                   fill="#ffffff",
                                   font=("Consolas", 9, "bold"))
@@ -10375,11 +10839,11 @@ class App:
                 self._line(cv, xs, v["ma"][nn], ymap, MA_COLORS[nn])
 
         if show_boll:
-            self._line(cv, xs, v["boll_up"], ymap, "#e8a838")
-            self._line(cv, xs, v["boll_low"], ymap, "#e8a838")
-            self._line(cv, xs, v["boll_mid"], ymap, "#9a76d0")
+            self._line(cv, xs, v["boll_up"], ymap, C_GOLD, width=1)
+            self._line(cv, xs, v["boll_low"], ymap, C_GOLD, width=1)
+            self._line(cv, xs, v["boll_mid"], ymap, C_PURPLE)
             cv.create_text(g["w"] - 6, g["T"] - 3, text="BOLL(20,2)",
-                           fill="#e8a838", font=("Consolas", 8, "bold"),
+                           fill=C_GOLD, font=("Consolas", 8, "bold"),
                            anchor="e")
 
         # 筹码峰：独立右列，只画可见价格区间的bin，均匀排列
@@ -10529,10 +10993,10 @@ class App:
         if len(vols) >= 5:
             mv = sum(vols[-5:]) / 5
             cv.create_line(g["L"], ymap(mv), g["w"] - g["R"], ymap(mv),
-                           fill="#e8890c", dash=(5, 3))
+                           fill=C_ORANGE, dash=(5, 3), width=2)
             cv.create_text(g["w"] - g["R"] - 4, ymap(mv) - 7,
                            text=f"5日均量 {mv/10000:.0f}万手",
-                           anchor="e", font=("Consolas", 8), fill="#e8890c")
+                           anchor="e", font=("Consolas", 8), fill=C_ORANGE)
         cv.create_text(g["L"] + 2, g["T"] - 3, text="VOLUME(手)", anchor="w",
                        font=("Microsoft YaHei", 8), fill=TITLE_TXT)
         step = max(1, n // 10)
@@ -10575,7 +11039,7 @@ class App:
                            fill=col, dash=(2, 3) if gv in (20, 80) else ())
             cv.create_text(g["L"] - 4, ymap(gv), text=str(gv),
                            font=("Consolas", 7), fill=AXIS_TXT, anchor="e")
-        self._line(cv, xs, pct, ymap, "#e8a838", width=1)
+        self._line(cv, xs, pct, ymap, C_GOLD)
         lastv = next((x for x in reversed(pct) if x is not None), None)
         info = f"%B={lastv:.0f}" if lastv is not None else ""
         cv.create_text(g["L"] + 2, g["T"] - 3,
@@ -10611,9 +11075,9 @@ class App:
             cv.create_text(g["L"] - 4, ymap(gv), text=str(gv),
                            font=("Consolas", 7), fill=AXIS_TXT, anchor="e")
         self._axes(cv, g, lo, hi, "{:.0f}", 2)
-        self._line(cv, xs, pdi, ymap, "#e8890c")
-        self._line(cv, xs, mdi, ymap, "#26c281")
-        self._line(cv, xs, adx, ymap, "#1971c2", width=2)
+        self._line(cv, xs, pdi, ymap, C_ORANGE)
+        self._line(cv, xs, mdi, ymap, C_BLUE)
+        self._line(cv, xs, adx, ymap, C_PURPLE, width=2)
         lv = lambda arr: [x for x in arr if x is not None]
         lp_, lm_, la_ = lv(pdi), lv(mdi), lv(adx)
         info = (f"+DI:{lp_[-1]:.0f} -DI:{lm_[-1]:.0f} ADX:{la_[-1]:.0f}"
@@ -10655,8 +11119,8 @@ class App:
             cv.create_rectangle(xs(i) - mbw2, min(y, zero),
                                 xs(i) + mbw2, max(y, zero),
                                 fill=c, outline=c)
-        self._line(cv, xs, dif, ymap, "#e8890c")
-        self._line(cv, xs, dea, ymap, "#1971c2")
+        self._line(cv, xs, dif, ymap, C_ORANGE)
+        self._line(cv, xs, dea, ymap, C_BLUE)
         lv = lambda arr: [x for x in arr if x is not None]
         ld, la, lh = (lv(dif), lv(dea), lv(mh))
         info = f"DIF:{ld[-1]:.3f}  DEA:{la[-1]:.3f}  MACD:{lh[-1]:.3f}" \
@@ -10686,9 +11150,9 @@ class App:
                            fill=GUIDE_C if gv != 50 else GRID_C)
             cv.create_text(g["L"] - 4, y, text=str(gv), anchor="e",
                            font=("Consolas", 8), fill=AXIS_TXT)
-        self._line(cv, xs, k, ymap, "#e8890c")
-        self._line(cv, xs, d, ymap, "#1971c2")
-        self._line(cv, xs, j, ymap, "#9c36b5")
+        self._line(cv, xs, k, ymap, C_ORANGE)
+        self._line(cv, xs, d, ymap, C_BLUE)
+        self._line(cv, xs, j, ymap, C_PURPLE)
         cv.create_text(g["L"] + 2, g["T"] - 3,
                        text=(f"KDJ  橙K / 蓝D / 紫J    "
                              f"K:{k[-1]:.1f}  D:{d[-1]:.1f}  J:{j[-1]:.1f}"),
@@ -10714,8 +11178,8 @@ class App:
                            fill=GUIDE_C if gv != 50 else GRID_C)
             cv.create_text(g["L"] - 4, y, text=str(gv), anchor="e",
                            font=("Consolas", 8), fill=AXIS_TXT)
-        self._line(cv, xs, v["rsi6"], ymap, "#e8890c")
-        self._line(cv, xs, v["rsi12"], ymap, "#1971c2")
+        self._line(cv, xs, v["rsi6"], ymap, C_ORANGE)
+        self._line(cv, xs, v["rsi12"], ymap, C_BLUE)
         last6 = [x for x in v["rsi6"] if x is not None]
         last12 = [x for x in v["rsi12"] if x is not None]
         label = f"RSI  橙RSI6:{last6[-1]:.1f} / 蓝RSI12:{last12[-1]:.1f}" \
@@ -10864,7 +11328,8 @@ class App:
                    if res["sector_name"] and res["sector_chg_today"] is not None
                    else "未知")
         L.append(f"大盘(上证) {idx_txt} | 板块 {sec_txt} | 本股量能 {vr_txt}")
-        L.append(f"-- 今日(T)预测 -- 锚定{res.get('anchor', '今开')}")
+        L.append(f"-- {res.get('t_pred_label', '今日(T)收盘预测')} -- "
+                 f"锚定{res.get('anchor', '今开')}")
         for p in (10, 25, 50, 75, 90):
             L.append(f"P{p}: 收盘{tp['cl'][p]:.2f} 最高{tp['hi'][p]:.2f} "
                      f"最低{tp['lo'][p]:.2f}")
@@ -10971,7 +11436,8 @@ class App:
             "#ffd34d")
         if not st:
             p("  (工具→重选策略 可运行多算法消融回测)")
-        p(f"■ 今日(T)收盘预测  [锚定{res.get('anchor', '今开')}]")
+        p(f"■ {res.get('t_pred_label', '今日(T)收盘预测')}  "
+          f"[锚定{res.get('anchor', '今开')}]")
         for pp in (10, 50, 90):
             p(f"  P{pp}: 收{tp['cl'][pp]:.2f} 高{tp['hi'][pp]:.2f} 低{tp['lo'][pp]:.2f}")
         p(f"  上行概率 {tp['up_prob']*100:.0f}%  "
@@ -11015,13 +11481,11 @@ class App:
         if res["has_live"] and res["clamped"]:
             p(f"  [实时修正] 盘中已实现 高{res['live_high']:.2f} "
               f"低{res['live_low']:.2f}")
-        p()
         p(f"■ {res.get('next_label', '次日(T+1)')}预测")
         p(f"  开{pred['open']:.2f} 收{pred['close']:.2f}")
         p(f"  高{pred['high']:.2f} 低{pred['low']:.2f}")
         cp_ = res.get("chips")
         if cp_:
-            p()
             p("■ 筹码参考")
             p(f"  平均成本 {cp_['avg_cost']:.2f} | 现价 {cp_['cur']:.2f}")
             p(f"  获利盘 {cp_['profit']*100:.0f}%"
@@ -11043,7 +11507,6 @@ class App:
         bl_low = next((x for x in reversed(res["ind"]["boll_low"])
                        if x is not None), None)
         if None not in (bl_up, bl_mid, bl_low):
-            p()
             p("■ 布林带(20,2)")
             p(f"  上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | 下轨 {bl_low:.2f}")
             cur_px = res["quote"]["price"]
@@ -11059,7 +11522,6 @@ class App:
         _mdi = next((x for x in reversed(res["ind"]["mdi"])
                      if x is not None), None)
         if None not in (_adx, _pdi, _mdi):
-            p()
             p("■ ADX/DMI(14)")
             p(f"  ADX {_adx:.0f}"
               + ("（强趋势）" if _adx >= 25
@@ -11068,7 +11530,6 @@ class App:
               + (" 多头占优" if _pdi > _mdi else " 空头占优"))
         act = res.get("action")
         if act:
-            p()
             p("■ 综合评估(买卖点)")
             if act.get("band_note"):
                 p("  ◆ " + act["band_note"])
@@ -11087,7 +11548,6 @@ class App:
         # 多日预测
         multi = res.get("multi_pred")
         if multi:
-            p()
             p("■ 多日预测趋势")
             p(f"{'周期':<8}{'收盘预测':>8}{'最高预测':>8}{'最低预测':>8}{'上行概率':>8}{'累计涨跌':>8}")
             for mp in multi:
@@ -11097,7 +11557,6 @@ class App:
                   f"{mp['price_lo']:>8.2f}"
                   f"{mp['up_prob']*100:>7.0f}%"
                   f"{mp['cum_cl']*100:>+7.1f}%")
-        p()
         p("■ 相似历史参考日期")
         p(f"(近{W_WINDOW}日形态匹配 候选{CFG.CANDIDATE_TOPK}→筛选{TOPK})")
         p(f"{'T日':<11}{'T+1日':<11}{'次日涨跌':>8}{'权重':>6}{'相似度':>6}")
@@ -11109,7 +11568,6 @@ class App:
             weight = s.get("weight", 1.0)
             similarity = s.get("similarity_score", 0)
             p(f"{s['t_date']:<11}{n1_date:<11}{chg1:>+7.1f}% {mark}{weight:>5.2f}{similarity:>6.2f}")
-        p()
         p("* = 开盘缺口与今日接近  | 权重基于相似度/时间/质量  | 相似度越低越相似")
         p("──────────────────────")
         p("■ 最近买卖信号")
@@ -11126,7 +11584,6 @@ class App:
         # 回测统计
         bt = res.get("bt_stats")
         if bt:
-            p()
             p("■ 回测统计（样本内全部信号）")
             p(f"  总交易 {bt['trades']} 笔 | 已平仓 {bt['closed']} 笔 | 盈利 {bt['wins']} 笔")
             if bt.get("winrate") is not None:
@@ -11137,16 +11594,12 @@ class App:
                 p(f"  未平仓浮盈 {bt['floating']*100:+.1f}%")
         p("提示：前复权价统计推断，")
         p("仅供参考，不构成投资建议")
-        p("──────────────────────")
-        p("■ 市场状态")
-        tg_ph = "phase_tag"
-        t.insert("end", f"  ● {res.get('phase', '时间未知')}"
-                 + ("（未开盘·预测锚定昨收）" if res.get("pre_open") else "")
-                 + "\n", (tg_ph,))
-        t.tag_config(tg_ph, foreground="#4da3ff",
-                     font=("Microsoft YaHei", 10, "bold"))
+        # 市场状态：独立栏显示（见 phase_var），不再写入预测参考文本
+        if getattr(self, "phase_var", None) is not None:
+            self.phase_var.set(
+                "市场状态 ● " + str(res.get("phase", "时间未知"))
+                + ("（未开盘·预测锚定昨收）" if res.get("pre_open") else ""))
         if getattr(self, "ai_text", ""):
-            p()
             p("══════════════════════")
             tag_cfg = self.side_txt.tag_config
             self.side_txt.insert("end", "■ AI 分析\n", ("h3",))
@@ -11263,18 +11716,8 @@ class App:
             return
 
         def fn():
-            names = {}
-            raw = http_get(QT_URL + ",".join(self.watchlist))
-            for seg in raw.split(";"):
-                seg = seg.strip()
-                if "=" not in seg or "~" not in seg:
-                    continue
-                var_name = seg.split("=")[0].strip()   # 如 v_sz002241
-                code = var_name.replace("v_", "", 1).lower()
-                f = seg.split("~")
-                if len(f) > 1 and code:
-                    names[code] = f[1]
-            return names
+            return {c: v["name"] for c, v in
+                    fetch_batch_quotes(self.watchlist).items()}
 
         def done(names, err):
             if err is None:
@@ -11290,22 +11733,7 @@ class App:
         codes = [c for c, _ in INDEX_CODES]
 
         def fn():
-            data = {}
-            raw = http_get(QT_URL + ",".join(codes))
-            for seg in raw.split(";"):
-                seg = seg.strip()
-                if "=" not in seg or "~" not in seg:
-                    continue
-                code = seg.split("=")[0].strip().replace("v_", "", 1).lower()
-                f = seg.split("~")
-                if len(f) < 34 or not f[3]:
-                    continue
-                try:
-                    data[code] = {"name": f[1], "price": float(f[3]),
-                                  "chg": float(f[32])}
-                except ValueError:
-                    continue
-            return data
+            return fetch_batch_quotes(codes)
 
         def done(data, err):
             self.idx_data = data or {}
@@ -11911,6 +12339,8 @@ class App:
             ("RSI权重", _float_var("RSI_W"), "0-3"),
             ("量变权重", _float_var("VOLCHG_W"), "0-3"),
             ("周线环境权重", _float_var("WEEKLY_W"), "0-3"),
+            ("最大拉取样本量", _int_var("MAX_FETCH_BARS", 100, 3000),
+             "单只联网拉取根数(读库不限)"),
         ]
         pvars = []
         for i, (lab, var, hint) in enumerate(prows):
@@ -12062,6 +12492,7 @@ class App:
                 apply_f("RSI_W", pvars[8][1], 0.0, 3.0)
                 apply_f("VOLCHG_W", pvars[9][1], 0.0, 3.0)
                 apply_f("WEEKLY_W", pvars[10][1], 0.0, 3.0)
+                apply_i("MAX_FETCH_BARS", pvars[11][1], 100, 3000, 1000)
                 if risk_var.get() in CFG.RISK_PARAMS:
                     CFG.RISK_MODE = risk_var.get()
                     cp.set("predict", "risk_mode", CFG.RISK_MODE)

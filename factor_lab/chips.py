@@ -125,11 +125,16 @@ def _daily_ic(feats, y1, dates):
     return np.where(cnt > 0, ic / np.maximum(cnt, 1), np.nan), cnt
 
 
+# 筹码参数寻优的评估窗口：与 panel.EVAL_DAYS（2000）对齐
+CHIP_EVAL_DAYS = 2000
+
+
 def evaluate_config(sample, params, train_dates):
     """sample=[(bars, dates, y1)], 返回按训练日截面IC统计的配置得分。"""
     feats_all, y_all, d_all = [], [], []
     for bars, dates, y1 in sample:
-        f, _ = chip_features_stock(bars, max(0, len(bars) - 1000), params)
+        f, _ = chip_features_stock(
+            bars, max(0, len(bars) - CHIP_EVAL_DAYS), params)
         feats_all.append(f)
         y_all.append(y1)
         d_all.append(dates)
