@@ -3,7 +3,10 @@
 > **版本 v6.1.4　更新于 2026-09-25**
 > 配套：《README.md》（回测报告与四口径结果）、`reports/回测复核报告_20260913.md`（审计报告）。
 > 本文只讲两件事：**这套东西的架构**、**每个环节用的什么算法**。历史版本（v3.2/v3.3）的架构描述已被本文取代。
-> 2026-09-25：新增**第六节 下游 ai-quant 常驻模拟盘（股票版）**——CLI 选股 + LLM 组合决策 + A股账本与全缓存回测。
+> 2026-09-25：**ai-quant 拆分独立仓库**（<https://github.com/Languangxun/ai-quant>，公开）——
+> 模拟盘/决策链/状态页（6 图 + 休市日历）/备份均移出本仓库；第六节改写为**对接接口 + CLI 同源回测口径**。
+> 2026-09-25 数据源容灾热修：2.1 节重写为**通道策略 / 快照多源 / 日K多源 / 板块多源 / 熔断口径**，
+> 覆盖「VPN 一挂全源 Connection refused」与「东财整域连接重置」两类故障（变更索引见第七节）。
 
 ---
 
@@ -35,6 +38,7 @@
 | `stock_gui.py` | **唯一算法源**：内嵌缓存层 + 数据获取 + 指标 + 分析 + **三档组合引擎** + **10 类消融信号** + AI 客户端 + Tkinter GUI |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 抽取拼装），**勿手改** |
 | `build_cli.py` | GUI → CLI 打包器；按锚点注释抽取「缓存块」「算法块」，并做 tkinter 残留 / 语法校验 |
+| `stock_firstaid.py` | 数据源急救箱（独立于 GUI）：候选域体检 `--check` / 把实测可用K线源写回 ini / `--ai` 求救（AI 只提议 URL，实测验证后才采用） |
 | `backtests/` | 研究脚本（27 个）：标准回测、三档分段、荐股逐笔、策略消融，以及历史实验（因子/退出/横截面/激进双引擎）。全部带项目根路径引导，根目录直接运行 |
 | `factor_lab/` | 因子级消融框架（21 原子因子、2^21 穷举、BH-FDR 过拟合治理）+ 筹码特征；结论为负面证据（pass=0） |
 | `plugins/` | 插件体系（`plugins/api.py` 暴露受控 API，`trade_log.py` 做交易记录与账户联动） |
@@ -65,18 +69,42 @@
 | `backtests/backtest_strategy_ablation.py` | **策略消融** | 全对象逐个消融（10 类信号 × 3 档风险），覆盖率清单 + 聚合统计 |
 | `backtests/backtest_tiers.py` / `backtest_picks_v6.py` | 分段/荐股回测 | `--segment full/val/bull/yearly`、`--universe`、参数敏感性 |
 | `plugins/trade_log.py` | 插件 | 交易记录、账户资金联动（荐股按可用资金算手数） |
-| `~/ai-quant/` | 下游系统 | 常驻模拟盘（股票版，见第六节）：CLI 选股 + `deepseek-v4.1-flash` 组合决策 + A股账本/全缓存回测；接收 `--push` 推送的 `stock_<code>_<date>.json` |
+| `~/ai-quant/` | 下游系统（独立仓库） | 常驻模拟盘，2026-09-25 起拆分至 [Languangxun/ai-quant](https://github.com/Languangxun/ai-quant)；接收 `--push` 推送的 `stock_<code>_<date>.json`（见第六节） |
 
 ---
 
 ## 二、数据层
 
-### 2.1 多源日K容灾 + 节流 + 熔断
-优先级：**腾讯(三域名轮换) → 东方财富(4 host 轮询) → 网易163(CSV) → 新浪(JSON)**；失败还有 AI 找源兜底（AI 只提议 URL，程序逐个实测验证后才启用）。
+### 2.1 数据源容灾：通道策略 + 快照/日K/板块多源（2026-09-25 热修）
 
-- **熔断器**：每源维护 `[连续失败数, 熔断截止]`；限流类（429/502/503/504）连续 ≥2 次 → 冷却 `60s × 2^(n−2)`，上限 600s；全源冷却时对最早解禁源做半开探测；
-- **节流**：全局 `_MIN_INTERVAL=0.16s`；指数退避带 ±25% 抖动；限流错误只重试 1 次就切源；
-- **负缓存**：拉取失败记 `failed(ts, reason)`，1 小时内不再重试，反复失败按 2 倍退避（上限 24h）。
+**通道策略 `_open_url()`**：`_PROXY_OPENER`（ini `[proxy]`，通常指向本地 VPN）不再是默认前置通道。
+按域名选路：**国内行情域名直连优先（失败再走代理），国外（AI 接口）代理优先（失败再直连）**；
+代理端口被拒（VPN 未开/重启中）自动旁路 120s，避免每次请求双倍超时。国内域名集合见
+`_DOMESTIC_SUFFIX`（eastmoney/gtimg/qq/sina/163/sse/szse/cninfo/csindex）。
+这修复了「VPN 一挂全部源报 `[Errno 111] Connection refused`」的全局故障。
+
+**行情快照 `fetch_quote`**：**腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`（带 Referer、GBK）→ 东财 `ulist.np`**，
+任一成功即返回；自选池名称与五大指数走 `fetch_batch_quotes`（腾讯→新浪），不再是腾讯单源。
+
+**日K `_fetch_remote_rows`**：腾讯多域名（`KLINE_URL`，默认 `proxy.finance.qq.com`；`web.ifzq` / `ifzq` HTTPS/HTTP 备用）
+→ 东财 4 host 轮询（`push2his` / `92` / `93` / `97`）。新浪/网易163 为不复权或减法前复权，
+**不做持久化源**（避免与库内 hfq 混用产生假跳变），仅急救箱探测用。全域失败时
+`_auto_heal_kline()` 10 分钟限频探测候选域并写入内存+ini；仍无解才触发 AI 找源
+（AI 只提议 URL，`_probe_kline_url` 实测有数据才采用）。
+
+**板块**：排行 = 东财 clist（HTTPS/HTTP × 主域/延迟域 4 host 轮换）→ **腾讯行业榜
+`ifzq.gtimg.cn/appstock/app/mktHs/rank`** → akshare（可选依赖 `stock_sector_spot`，未装自动跳过），
+并缓存上次成功结果兜底；个股板块上下文（行业名 + 板块日K）走东财，
+`东财板块` 熔断期内直接返回空（板块上下文非必需，不影响主预测）。
+
+- **熔断器**：每源维护 `[连续失败数, 熔断截止]`；限流/封禁类连续 ≥2 次 → 冷却
+  `60s × 2^(n−2)`，上限 600s。封禁类除 HTTP 429/502/503/504 外，**新增连接被重置特征**：
+  `RemoteDisconnected` / `Remote end closed` / `Connection reset` / `Connection aborted`
+  （东财反爬/整域故障的典型表现，此前不触发冷却导致每源反复撞墙）；
+- **节流**：全局 `_MIN_INTERVAL=0.16s`；指数退避带 ±25% 抖动；限流/重置错误只重试 1 次就切源；
+- **负缓存**：拉取失败记 `failed(ts, reason)`，1 小时内不再重试，反复失败按 2 倍退避（上限 24h）；
+- **2026-09-25 实测**：东财 `push2/push2his` 对部分 IP 整域连接重置（体检 0/5），
+  新股/停牌股腾讯返回空 K 线属数据缺失而非网络故障；腾讯/新浪链路正常时主流程不受影响。
 
 ### 2.2 SQLite 缓存（`stock_cache.db`）
 
@@ -86,6 +114,7 @@
 | `stocks(code,name,industry,mktcap,tier,updated)` | 代码表：A 股 + **ETF（`industry='ETF'`）** |
 | `adjust(code,k,ts)` | 复权缩放系数：`k = 同一交易日不复权收盘 / 库内收盘` |
 | `meta` | 键值元数据（代码表时间、**AI 对话缓存** `ai:<code>:<model>`、策略缓存等） |
+| `adj_done(code,ts,bars,last_date)` | 复权迁移进度（`data_clean.py --all-adj` 断点续传用） |
 | `failed` / `delisted` | 负缓存 / 退市登记 |
 
 - WAL + NORMAL 同步；连接统一走 `db_conn()` 上下文管理器；
@@ -298,58 +327,31 @@ Pi 网站 `/`（浏览器 JS 自算）与 `/text`（服务端算）：
 
 ---
 
-## 六、下游 ai-quant 常驻模拟盘（股票版）
+## 六、下游 ai-quant 常驻模拟盘（独立仓库）
 
-`~/ai-quant/`（OrangePi Zero 2W · Ubuntu 24.04）是与本预测系统配套的常驻模拟交易
-系统：**本系统的 CLI 负责预测/选股，ai-quant 负责组合决策、交易账本与回测**。
+`ai-quant` 已于 **2026-09-25 拆分至独立仓库（公开）**：
+<https://github.com/Languangxun/ai-quant>（本地 `~/桌面/ai-quant`）。
+账户与交易规则、实盘决策链、`/quant/` 状态页、休市日历、备份与运维等
+细节均随该仓库维护（见其 `README.md`）；本仓库只保留**对接接口**与
+**CLI 同源回测口径**。
 
-### 6.1 数据流
+### 6.1 对接接口
 
 ```
-stock_predict.py（本仓库唯一算法源生成物，部署在 ai-quant/scripts/cli/）
+stock_predict.py（本仓库唯一算法源生成物，部署在 Pi ~/ai-quant/scripts/cli/）
    │ ① 缓存  scripts/cli/stock_cache.db（全市场日K·后复权，约 813 万根）
    │ ② 选股  daily_pick_score 多维评分 + 空头趋势闸门 + ST/退市过滤
    │ ③ 信号  _composite_signals（因果多维评分 + 冷却 + 风险参数）
-   ▼
-ai-quant
-   ├─ 实盘 sim.run（默认股票模式，cron 14:50）
-   │    CLI 候选 → 腾讯实时行情 → deepseek-v4.1-flash 组合决策
-   │    → qwen3-embedding 相似记忆(RAG) → StockExecutor 执行
-   │    → 状态 / 复盘 / 记忆 / U 盘快照
-   └─ 回测 scripts/stock_backtest.py（全缓存）
-        CLI 信号事件表 → 组合逐日推进（A股规则）→ 净值曲线 / 绩效
+   ├─▶ --push  → ~/ai-quant/memory/inbox/stock_<code>_<date>.json
+   └─▶ build_cli.py 生成物 → 部署 ai-quant/scripts/cli/（选股/回测同源）
 ```
 
-### 6.2 账户与交易规则（A股）
+- `--push` 链路（`stock_predict.py` 内 SSH 推送）不变，收件箱仍在 Pi 的
+  `~/ai-quant/memory/inbox/`；
+- ai-quant 的选股/信号算法与本仓库 CLI **同源**，CLI 升级后需同步部署到
+  Pi 的 `~/ai-quant/scripts/cli/`。
 
-| 规则 | 实现（`trading/stock_account.py` / `stock_executor.py`） |
-|---|---|
-| 整手 | 买入必须 100 股整数倍（`lot_size`），卖出可零股 |
-| T+1 | 每批买入记 `sellable_date` = 下一交易日，未解锁不可卖 |
-| 费用 | 佣金万2.5（最低5元）+ 过户费0.001%；卖出另计印花税0.05% |
-| 涨跌停 | 主板±10%、创业板/科创板±20%；涨停不买、跌停不卖 |
-| 组合 | 最多 5 只、单票 ≤20% 总资产、单笔 ≥5000 元、现金不足自动缩量 |
-
-账本按批次（`StockLot`）记账，卖出 FIFO 分摊成本，实时输出已实现/未实现收益。
-
-### 6.3 实盘决策链（每交易日 14:50）
-
-1. `data/stock/cli_bridge.py` 扫描缓存（默认市值前 120 只（可调））→ `daily_pick_score`
-   排名取 Top N 候选（含评分/理由/波段适合度）；
-2. 腾讯实时快照补全候选与持仓的现价、昨收（失败回退缓存最新收盘）；
-3. 上下文 = 候选 + 持仓 + 账户 + 经验教训 + `qwen3-embedding` 相似历史
-   + `memory/inbox/` 里 CLI `--push` 推送的个股报告；
-4. `deepseek-flash`（DeepSeek-V4.1-Flash，`config/model.yaml`）输出
-   `{market_view, orders[]}`：`BUY` 带目标仓位、`SELL` 为清仓；
-5. `StockExecutor` 做风控校验（持仓上限/单票上限/整手/T+1/涨跌停）后成交；
-6. 落盘：`sim/state/stock_account.json`、`memory/daily/stock-<date>.json`、
-   `股票复盘-<date>.md`，并写入向量记忆。
-
-模型与记忆：决策用 `.env` 的 `DEEPSEEK_API_KEY` 调 `api.deepseek.com`；
-记忆用 Ollama `qwen3-embedding:0.6b`。旧版场外 ETF 联接 C 类基金模式
-（etf-c）保留：`python -m sim.run --mode fund`。
-
-### 6.4 回测口径（与 CLI 同源）
+### 6.2 同源回测口径（实测留档）
 
 - **信号**：T 日收盘生成，T+1 成交（默认收盘价，`--exec-px open` 可换开盘价）；
 - **退出**：ATR(14) 跟踪止损 —— 止损位 `entry − atr_mult×ATR`，浮盈超过
@@ -371,16 +373,8 @@ ai-quant
 | 全市场 | +6.9% | +1.0% | -34.6% | 0.14 | -23.5pp |
 
 **结论：信号边际集中在高流动性大市值股**；小市值噪声/涨跌停/费用拖累显著。
-实盘候选默认按市值取前 120 只扫描，与该结论一致；`--limit/--boards` 可复现上表。
-
-### 6.5 备份与运维
-
-- **U 盘快照**：`scripts/usb_backup.py` —— 时间戳快照目录 + `manifest.json`
-  （路径/大小/sha256）+ 复制后逐项校验 + 只保留最近 14 份，挂载点自动探测
-  （`/media/*`、`/mnt/usb` 等）；
-- **cron**：`14:50 周一~五` 股票模拟、`21:00` 夜间复盘（提炼经验教训）、
-  每 30 分钟健康检查；
-- **结构约定**：历史备份统一进 `archive/`，密钥只放 `.env`/主目录授权文件。
+ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
+`--limit/--boards` 可复现上表（详见 ai-quant 仓库 `backtest/results/`）。
 
 ---
 
@@ -388,6 +382,9 @@ ai-quant
 
 | 版本 | 主要变更 |
 |---|---|
+| **拆分 ai-quant**<br>（2026-09-25） | ai-quant 移出本仓库，独立为 [Languangxun/ai-quant](https://github.com/Languangxun/ai-quant)（公开）；主库只保留 `--push` 对接与 `build_cli.py` 同源部署；第六节改写。迁出前最后一版能力：`/quant/` 看板（6 图 + 指标总表 + ★实盘同口径 + 休市顶栏）、`config/holidays.json` 休市日历与 `sim.run` 交易日闸门 |
+| **ai-quant 看板/日历**<br>（2026-09-25） | （已随仓库拆分）新增 `scripts/gen_status.py`：`/quant/` 升级为股票模拟盘 + 回测看板（6 张内联 SVG）+ 指标总表；新增 `config/holidays.json`（2026 交易所休市），`TradingCalendar` 默认加载，`sim.run` 非交易日跳过（`--force` 强制） |
+| **v6.1.4 热修**<br>（2026-09-25） | **数据源容灾**：`fetch_quote` 改腾讯→新浪→东财多源、批量行情加新浪兜底；国内域名直连优先 / 代理被拒自动旁路 120s；`RemoteDisconnected`/连接重置纳入熔断；板块榜腾讯→akshare 兜底、板块上下文熔断期跳过；2.1 节重写 |
 | **v6.1.4** | AI 网关兼容（自有 UA + `x-opencode-session`）；修复保存设置覆盖 ini（base_url/model/predict/picks/data 丢失）；单股买卖点支持筹码峰/板块轮动 + 连续同向压缩 + 激进档信号密度兜底；后台主动预取未分析股K线；factor_lab 大样本支持（`--db`/`--out-dir`、筹码缺失中性填充、`--stage all` 补 panel） |
 | v6.1.3 | 消融新增 **L2（同行业+行业ETF）** 对象；消融回测 **numpy 加速**（181s vs 251s，结果逐笔等值）；README 补齐算法细则（2.5–2.8 节） |
 | v6.1.2 | **ETF 全量接入**：东财代码表 1491 只 + 历史回填 1202 只；新增 `etf`/`all_etf` 口径（共四口径）与 `tier_rank_base` 排名隔离；消融**覆盖所有对象**（含 ETF，门槛 200 根）+ 覆盖率清单 |

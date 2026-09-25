@@ -41,8 +41,7 @@ htmlcov/
 .vscode/
 
 # --- 2026-09-13 上证冠军配置入库时的排除项 ---
-# ai-quant 子项目：v6.1.4 起随主库入库；.env / 大缓存 / 运行态数据
-# 由 ai-quant/.gitignore 排除（提交前务必核对 git status 无密钥）
+# ai-quant 已于 2026-09-25 拆分独立仓库（Languangxun/ai-quant），主库不再包含
 # 插件运行数据（交易记录/设置）
 _data/
 # 编辑器配置

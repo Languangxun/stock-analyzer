@@ -13,7 +13,21 @@
 > 全库滚动补齐（跳过北交所/退市），收盘 15:05 后自动回补当日K线；
 > `stock_gui.ini [predict] auto_prefetch = 0` 可关；
 > ④ **因子实验室支持大样本**：新增 `--db`/`--out-dir`（独立库与产物目录，避免与 GUI 争用主库）、
-> 筹码缺失因子按截面中性填充、修复 `--stage all` 漏组装面板；全A 分层抽样复核产物随研究包分发。
+> 筹码缺失因子按截面中性填充、修复 `--stage all` 漏组装面板；全A 分层抽样复核产物随研究包分发；
+> ⑤ **数据源容灾热修（2026-09-25）**：行情快照改**腾讯→新浪→东财**多源，自选池/五大指数批量行情加新浪兜底；
+> 国内行情域名**直连优先**、代理仅兜底且被拒后自动旁路 2 分钟（VPN 掉线不再拖垮数据层）；
+> `RemoteDisconnected`/连接重置纳入熔断快速降级；板块榜东财故障时自动走**腾讯行业榜→akshare（可选）**，
+> 板块上下文熔断期直接跳过；K线维持腾讯多域名→东财 4 host + 全域自愈（急救箱 `stock_firstaid.py`）；
+> ⑥ **ai-quant 状态页升级**（2026-09-25）：`/quant/` 由单卡片页升级为**股票模拟盘 + 回测看板**，
+> 新增 6 张内联 SVG 图表（净值对比 / 回撤 / 年化对比 / 年度收益 / 月度热力图 / 单笔收益分布）
+> 与回测指标总表（区间/收益/年化/回撤/Sharpe/胜率/交易/基准/超额）；「市值前300」标 **★实盘同口径**，
+> 顶栏显示**休市/交易日**；生成器入库 `ai-quant/scripts/gen_status.py`，cron 入口改为 wrapper（详见 ARCHITECTURE 6.4）；
+> ⑦ **交易日历接入法定节假日**（2026-09-25）：新增 `ai-quant/config/holidays.json`（上交所 2026 全年休市），
+> `TradingCalendar` 默认加载；`python -m sim.run` 周末/节假日**直接跳过**（`--force` 可强制），
+> 避免休市日拿陈旧行情误成交。
+> ⑧ **ai-quant 拆分独立仓库**（2026-09-25）：模拟盘/决策链/回测/状态页/休市日历整体迁至
+> **<https://github.com/Languangxun/ai-quant>**（公开；本地 `~/桌面/ai-quant`）；
+> 主库只保留 CLI 同源接口（`--push` 收件箱与 `build_cli.py` 部署物），⑥⑦ 能力随新仓库维护。
 >
 > **v6.1.3（2026-09-19）**：
 > ① **消融新增 L2 对象（同行业 + 行业ETF）**——每个行业构造一条"行业指数"，
@@ -695,7 +709,14 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 
 ## 六、数据
 
-- 行情源：腾讯 → 东方财富多源容灾；本地 SQLite `stock_cache.db`。
+- 行情源（2026-09-25 容灾热修，细节见 `ARCHITECTURE.md` 2.1）：
+  - **快照**：腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn` → 东财 `ulist`；自选/指数批量走 `fetch_batch_quotes`（腾讯→新浪）；
+  - **日K**：腾讯多域名（`kline_url`/`proxy.finance.qq.com`/`ifzq HTTP`）→ 东财 4 host；新浪/163 因复权口径不混用，
+    仅作急救箱探测；全灭时 `_auto_heal_kline` 自动探测切换，可再走 `stock_firstaid.py --ai`；
+  - **板块**：东财 clist → 腾讯行业榜 → akshare（可选依赖，未装自动跳过）；
+  - **代理**：国内域名直连优先、代理兜底；国外（AI 接口）代理优先。代理端口被拒自动旁路 120s，
+    因此 `[proxy]` 配了本地 VPN 也不影响国内行情；VPN 重启期间的 `Connection refused` 不再拖垮数据层。
+  - 缓存：本地 SQLite `stock_cache.db`。
 - **复权口径修复（2026-09-16/17，重要）**：审计发现并修复三处数据问题：
   1. **库内混用复权口径**：此前约九成代码实际存的是**不复权/前复权价**，而非文档口径的后复权 hfq。
      已用 `data_clean.py --all-adj` 全库迁移为腾讯**后复权**（5449/5495 只成功，约 1600 根/只）；
@@ -744,6 +765,7 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 | `build_cli.py` | GUI → CLI 打包器，保证算法同步 |
 | `build_client_zip.py` | 生成客户端发布包（**空 Key 模板 + 打包后全包 Key 自检**） |
 | `sync_adjust.py` | 批量刷新 `adjust` 现价缩放系数（hfq → 乘法前复权） |
+| `stock_firstaid.py` | **数据源急救箱**（独立于 GUI）：体检全部候选域 `--check`、把实测可用K线源写回 ini、`--ai` 向 DeepSeek 求救（只提议URL，程序实测验证后才采用） |
 | `stock_gui.py` → `refresh_etf_codes()` | 东财 ETF/LOF 代码表刷新（剔除货币类），写入 `stocks`（`industry='ETF'`） |
 | `stock_gui.py` → `backfill_etf_history()` | ETF 历史回填（hfq 口径、断点续传、6 线程、同步 `adjust`） |
 | `stock_gui.py` → `sector_l2_series()` / `_sig_l2_industry()` | L2 行业参照序列（优先同名行业ETF，否则同行业等权合成）与 L2 信号（v6.1.3） |
