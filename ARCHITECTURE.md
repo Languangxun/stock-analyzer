@@ -65,7 +65,7 @@
 | `stock_gui.py` | 唯一算法源 | Tkinter GUI + 全部算法；同时是研究脚本的引擎来源 |
 | `build_cli.py` | 打包器 | 保证 GUI/CLI 同源；有 assert 校验禁止 tkinter 混入算法块 |
 | `stock_predict.py` | CLI 生成物 | 纯标准库单文件：分析、`--tiers`/`--tiers-backtest`/`--picks-backtest`、`--refresh-cache`、`--refresh-etf`、`--backfill`、`--clean`、`--research`、`--push` |
-| `backtests/backtest_v61.py` | **标准回测** | 4 口径 × 4 类产品（稳健/均衡/激进 + 荐股），产物 `research/v61_report*.json/md` |
+| `backtests/backtest_v61.py` | **标准回测** | 4 口径 × 4 类产品（稳健/均衡/激进 + 荐股），产物 `research/v61_report*.json/md`；跑完自动出图，`--charts-only`/`--compare all` 做**跨版本对比**（`backtests/v61_charts.py`，纯标准库 SVG） |
 | `backtests/backtest_strategy_ablation.py` | **策略消融** | 全对象逐个消融（10 类信号 × 3 档风险），覆盖率清单 + 聚合统计 |
 | `backtests/backtest_tiers.py` / `backtest_picks_v6.py` | 分段/荐股回测 | `--segment full/val/bull/yearly`、`--universe`、参数敏感性 |
 | `plugins/trade_log.py` | 插件 | 交易记录、账户资金联动（荐股按可用资金算手数） |
@@ -318,7 +318,8 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 ### 4.1 研究脚本与产物
 | 脚本 | 作用 | 产物 |
 |---|---|---|
-| `backtests/backtest_v61.py` | 标准回测（4 口径 × 组合/荐股） | `research/v61_report{,_val,_bull}.{json,md}` |
+| `backtests/backtest_v61.py` | 标准回测（4 口径 × 组合/荐股） | `research/v61_report{,_val,_bull}.{json,md}`；`research/charts/*.svg`（箱线图/柱状图） |
+| `backtests/v61_charts.py` | 图表模块（纯标准库 SVG） | 单报告：相位/逐笔箱线 + 收益柱状；`--compare`：跨版本对比图 |
 | `backtests/backtest_strategy_ablation.py` | 全对象消融（10 信号 × 3 档） | `research/strategy_ablation_{per_stock,summary}.json` |
 | `backtests/backtest_tiers.py` | 三档分段/逐年/参数敏感性 | `research/tiers_*.json` |
 | `backtests/backtest_picks_v6.py` | 荐股逐笔（口径/区间/逐年） | `research/picks_v6_*.json` |
@@ -326,12 +327,16 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 
 ### 4.2 报告流水线（单一权威链）
 ```
-stock_gui.py（引擎）
+stock_gui.py（引擎：tier_eval.phase_anns / tier_picks_stats.rets）
    └─ backtests/backtest_v61.py ──▶ research/v61_report*.json ──▶ README 第三节表格
+                                   ├─ research/charts/*.svg（箱线图/柱状图）
                                    └─ 数字核验脚本（README ↔ JSON 逐项比对，须 0 不一致）
 ```
 - README 第三节的每个数字都来自 `research/v61_report*.json`；
-- 数据口径变动（如 `adjust` 重定基）会让同配置数字小幅漂移 → **重跑报告并同步 README**。
+- 数据口径变动（如 `adjust` 重定基）会让同配置数字小幅漂移 → **重跑报告并同步 README**；
+- **图表与版本对比（2026-09-25）**：报告带 `label`/`db_stats` 元数据；跑完自动出图
+  `research/charts/v61_<segment>[_<tag>]/`；`--charts-only` 只补图不跑回测，
+  `--compare all` 扫描同 segment 的历史报告做跨版本箱线/柱状对比（纯 SVG，无 matplotlib）。
 
 ### 4.3 发布流程
 1. `python build_client_zip.py` —— 生成 `dist/stock-analyzer-client-v<版本>-<日期>.zip`
@@ -414,6 +419,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.1.4 热修⑧**<br>（2026-09-25 夜） | **回测标准化 + 图表化版本对比**：`tier_eval` 输出 `phase_anns`、`tier_picks_stats` 输出 `rets`；新增 `backtests/v61_charts.py`（纯标准库 SVG：相位/逐笔箱线 + 收益柱状）；`backtest_v61.py` 自动出图 + `--charts-only`/`--compare all`/`--label`/`--no-charts`，报告带 `label`/`db_stats`；产物 `research/charts/`（gitignore）；4.1/4.2 节更新 |
 | **v6.1.4 热修⑦**<br>（2026-09-25 夜） | **2000 日全库回归 + 因子实验室结论**：深拉 6806/7277（库内 1266 万根、≥2000 根 3774 只，指数 2400 根）；`_pull2000` 四口径报告**提升为第三节权威**；全库面板（1431 只 × 2000 日）top 1 万组合全过 BH-FDR、WF OOS IC +0.032（9/10 折正），稳定因子 量能/板块/布林带；新增 `progress.py` 进度看板；**版本号保持 v6.1.4** |
 | **v6.1.4 热修⑥**<br>（2026-09-25） | **深挖修复 + 2000 日回填**：`_bf_tx_fetch` 改解析 `hfqday`（存量 bug）；回填目标 = `max(950, 最大拉取样本量)`，2000 → 3 页/≈2400 根；后台「全市场拉取 → 四口径回测」产物另存 `research/v61_report*_pull2000.*`；2.5 节更新 |
 | **v6.1.4 热修⑤**<br>（2026-09-25） | **ETF 宇宙恢复 + 图表可读性**：`refresh_etf_codes` 新增新浪兜底（东财故障时）；恢复 1796 只 ETF/LOF、1500 只有 K 线（主库 924 万根）；四口径回测重跑再同步 README 第三节；图表指标线 2px + 主题化提亮（RSI/均线/MACD/KDJ/ADX/BOLL）；2.4 节更新 |

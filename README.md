@@ -62,6 +62,12 @@
 > 训练/验证相关 0.869、Walk-Forward 10 折平均 OOS IC +0.032（9 折为正）**，
 > 稳定因子 **量能/板块/布林带** —— 因子结论由早期「pass=0 负面证据」更新为
 > 「稳定为正、因子集可解释」。
+> ⑮ **回测标准化 + 图表化版本对比（2026-09-25，版本仍 v6.1.4）**：`tier_eval` 新增
+> `phase_anns`（各相位年化收益）、`tier_picks_stats` 新增 `rets`（逐笔收益分布，抽样≤1500）；
+> `backtest_v61.py` 跑完自动出图（`--no-charts` 可关）：各口径 **相位箱线图 / 逐笔箱线图 /
+> 总收益·逐笔均值柱状图**；新增 `backtests/v61_charts.py`（**纯标准库 SVG，不依赖 matplotlib**）、
+> `--charts-only`（不跑回测只出图）、`--compare all`（扫描历史报告做**跨版本对比**），
+> 报告新增 `label`/`db_stats` 元数据；产物 `research/charts/`（已 gitignore，随研究包分发）。
 >
 > **v6.1.3（2026-09-19）**：
 > ① **消融新增 L2 对象（同行业 + 行业ETF）**——每个行业构造一条"行业指数"，
@@ -111,10 +117,13 @@
 一键复现（产物 `research/v61_report.json` + `research/v61_report.md`）：
 
 ```bash
-python backtests/backtest_v61.py                    # 四口径 × 全期
+python backtests/backtest_v61.py                    # 四口径 × 全期（跑完自动出图）
 python backtests/backtest_v61.py --universe etf     # 只看 ETF
 python backtests/backtest_v61.py --universe all_etf # 全A含ETF
 python backtests/backtest_v61.py --segment val --tag val   # 样本外（另存，不覆盖）
+python backtests/backtest_v61.py --charts-only --tag val   # 不跑回测，只补画已有报告
+python backtests/backtest_v61.py --compare all             # 扫全部历史报告做跨版本对比
+python backtests/backtest_v61.py --label v6.1.4-2000d      # 给本次报告打版本标签
 ```
 
 ### 1.2 ETF 支持（v6.1.2）
@@ -800,7 +809,8 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 |---|---|
 | `stock_gui.py` | 本地 GUI + **三档引擎/信号源权威实现**（`tier_*`、`_sig_*`、`pick_ablation_multi`）+ AI 客户端 |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 从 GUI 自动抽取）：`--tiers` / `--tiers-backtest` / `--picks-backtest` / `--ai-tier` / `--universe` |
-| `backtests/backtest_v61.py` | **标准回测**（**四口径** × 四类产品，产物 `research/v61_report.*`） |
+| `backtests/backtest_v61.py` | **标准回测**（**四口径** × 四类产品，产物 `research/v61_report.*`；跑完自动出图，支持 `--charts-only` / `--compare all` 版本对比） |
+| `backtests/v61_charts.py` | 回测图表模块（**纯标准库 SVG**，箱线图/分组柱状图；相位年化·逐笔收益·跨版本对比，产物 `research/charts/`） |
 | `backtests/backtest_tiers.py` | 三档分段回测封装（`--segment full/val/bull/yearly`、`--universe`、参数敏感性） |
 | `backtests/backtest_picks_v6.py` | 荐股逐笔收益回测（按风险偏好/口径/逐年） |
 | `backtests/backtest_strategy_ablation.py` | 全对象多算法消融（**逐个对象覆盖**，**10 类算法**含 L2 同行业+行业ETF，× 3 档，多指标结合，numpy 加速，AI 不参与，输出覆盖率清单） |

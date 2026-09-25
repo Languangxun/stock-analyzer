@@ -19,6 +19,8 @@ plugins/_data/
 # factor_lab 中间缓存/结果（由 backtest_factor_ablation.py 生成，可重跑）
 research/factor_lab/
 *.npz
+# 回测图表产物（backtest_v61.py 自动生成，可重跑）
+research/charts/
 
 # 全A消融逐股明细（>100MB，超出 GitHub 单文件上限；随 Release 资产 research_v6.1.zip 分发）
 research/strategy_ablation_per_stock*.json

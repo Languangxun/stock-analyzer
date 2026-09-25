@@ -8315,6 +8315,7 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         anns = [_tier_metrics(e[:L], dates)["ann"] for e in norms]
         m["phase_ann_min"] = min(anns)
         m["phase_ann_max"] = max(anns)
+        m["phase_anns"] = [float(x) for x in anns]   # 箱线图/版本对比用
         bench_code = (TIER_BENCH.get((universe, tier))
                       or TIER_BENCH[("all", tier)])
         # 多基准对照（v6.1.1）：主基准 + 其余指数，避免单一强基准让超额恒负
@@ -8338,6 +8339,14 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         m["range"] = [dates[0], dates[-1]]
         out[tier] = m
     return out
+
+
+def _sample_returns(rr, cap=1500):
+    """箱线图用收益分布：超过 cap 时等步长抽样后升序返回（保留两端尾部）。"""
+    a = np.sort(np.asarray(rr, float))
+    if len(a) > cap:
+        a = a[np.linspace(0, len(a) - 1, cap).astype(int)]
+    return [float(round(x, 6)) for x in a]
 
 
 def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
@@ -8405,6 +8414,7 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
             "tail20": float((rr > 0.20).mean()),
             "tail50": float((rr > 0.50).mean()),
             "by_reason": reasons,
+            "rets": _sample_returns(rr),      # 逐笔收益分布（箱线图/对比用）
         }
     return out
 

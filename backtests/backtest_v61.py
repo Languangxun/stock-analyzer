@@ -28,14 +28,31 @@ if ROOT not in _sys_boot.path:
 import argparse
 import json
 import os
+import sys
 import time
 
 import stock_gui as sg
 
 HERE = ROOT
+BT_DIR = os.path.dirname(os.path.abspath(__file__))
+if BT_DIR not in sys.path:
+    sys.path.insert(0, BT_DIR)
 TIERS = tuple(sg.TIER_CFG)
 UNI_NAME = dict(sg.UNIVERSE_NAME)          # all/main/etf/all_etf
 UNIS = ("all", "main", "etf", "all_etf")   # 报告依次输出四个口径
+
+
+def _db_stats():
+    """报告元数据：库内规模（版本对比时标注数据口径）。"""
+    try:
+        with sg.db_conn() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+            c = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars"
+                             ).fetchone()[0]
+            mx = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0]
+        return {"bars": n, "codes": c, "max_date": mx}
+    except Exception:
+        return {}
 
 
 def _run_universe(universe, segment, progress):
@@ -69,12 +86,15 @@ def _tier_table(rep, tier):
         "excess_total": tv.get("excess_total"),
         "phase_ann_min": tv.get("phase_ann_min"),
         "phase_ann_max": tv.get("phase_ann_max"),
+        "phase_anns": tv.get("phase_anns"),      # 相位年化分布（箱线图/对比）
     }
 
 
 def build_md(report):
+    lab = report.get("label")
     lines = [f"### v6.1 标准回测（{report['segment']}，"
-             f"数据截至 {report['data_end']}）", ""]
+             f"数据截至 {report['data_end']}"
+             + (f"，{lab}" if lab else "") + "）", ""]
     for uni in UNIS:
         rep = report["results"].get(uni)
         if not rep:
@@ -159,6 +179,11 @@ def build_md(report):
     return "\n".join(lines)
 
 
+def _load_report(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--universe", default="all4",
@@ -167,7 +192,61 @@ def main():
                     choices=["full", "train", "val", "val2025", "bull"])
     ap.add_argument("--out", default=os.path.join(HERE, "research"))
     ap.add_argument("--tag", default="")
+    ap.add_argument("--label", default="",
+                    help="版本标签（图表/对比用；缺省=tag，再缺省=当天日期）")
+    ap.add_argument("--no-charts", action="store_true",
+                    help="只写 JSON/MD，不生成图表")
+    ap.add_argument("--charts-only", action="store_true",
+                    help="不跑回测：按 --tag/--label 读取已有报告并出图")
+    ap.add_argument("--compare", nargs="?", const="all", default=None,
+                    help="版本对比出图：all=扫描 research/v61_report*.json；"
+                         "或逗号分隔的 tag 列表")
     args = ap.parse_args()
+    label = args.label or args.tag or time.strftime("%Y%m%d")
+    chart_dir = os.path.join(
+        args.out, "charts",
+        f"v61_{args.segment}" + (f"_{args.tag}" if args.tag else ""))
+
+    # ---- 只对比出图（不跑回测）----
+    if args.compare is not None:
+        from v61_charts import discover_reports, draw_compare
+        if args.compare in ("all", ""):
+            reps = discover_reports(args.out, args.segment)
+        else:
+            reps = []
+            for tag in args.compare.split(","):
+                tag = tag.strip()
+                fn = f"v61_report_{tag}.json" if tag else "v61_report.json"
+                p = os.path.join(args.out, fn)
+                if os.path.exists(p):
+                    r = _load_report(p)
+                    r["label"] = tag or "default"
+                    reps.append(r)
+                else:
+                    print(f"跳过（不存在）: {p}")
+        made = draw_compare(reps, chart_dir, args.segment)
+        print(f"版本对比：{len(reps)} 个版本 → 图表 {len(made)} 张"
+              f" @ {chart_dir}")
+        for p in made:
+            print("  " + p)
+        return
+
+    # ---- 只出图（不跑回测）----
+    if args.charts_only:
+        suffix = f"_{args.tag}" if args.tag else ""
+        p = os.path.join(args.out, f"v61_report{suffix}.json")
+        if not os.path.exists(p):
+            raise SystemExit(f"缺少 {p}：先跑一次回测或指定 --tag")
+        report = _load_report(p)
+        report.setdefault("label", label)
+        from v61_charts import draw_report
+        made = draw_report(report, chart_dir)
+        print(f"出图 {len(made)} 张 @ {chart_dir}")
+        for p in made:
+            print("  " + p)
+        return
+
+    # ---- 正常回测 ----
     if args.universe in ("all4", "both"):
         unis = list(UNIS)
     else:
@@ -175,7 +254,8 @@ def main():
     t0 = time.time()
     codes, cal, C, V = sg.tier_load_panel()
     report = {"ts": time.strftime("%Y-%m-%d %H:%M"),
-              "segment": args.segment, "data_end": cal[-1],
+              "label": label, "segment": args.segment,
+              "data_end": cal[-1], "db_stats": _db_stats(),
               "results": {}}
     for uni in unis:
         report["results"][uni] = _run_universe(uni, args.segment, print)
@@ -190,6 +270,13 @@ def main():
     print("\n" + md)
     print(f"写入 {jpath}")
     print(f"写入 {mpath}")
+    if not args.no_charts:
+        try:
+            from v61_charts import draw_report
+            made = draw_report(report, chart_dir)
+            print(f"图表 {len(made)} 张 @ {chart_dir}")
+        except Exception as e:
+            print(f"图表生成失败（不影响报告）: {e}")
     print(f"耗时 {time.time() - t0:.0f}s")
 
 
