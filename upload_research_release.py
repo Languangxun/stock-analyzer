@@ -33,6 +33,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
 
 BODY_DEFAULT = (
+    "## v6.1.5（2026-09-26）\n\n"
+    "### 回测产物版本化 + 全样本重跑\n"
+    "- `APP_VERSION=6.1.5`；`backtests/backtest_v61.py` 每次运行自动新建\n"
+    "  `research/backtest_v6.1.5_<时间戳>_<区间>[_tag]/`：`report.json/md`、"
+    "`run_meta.json`、\n"
+    "  `tables/*.csv`（组合/逐笔/相位/逐笔分布/基准/净值曲线）、`charts/*.svg`"
+    "（相位箱线/逐笔箱线/收益柱状）；\n"
+    "  research 根保留最新报告副本，`--compare`/发布链不变。\n"
+    "- 全样本四口径重跑（数据截至 2026-09-24，109s，10 图 / 6 表）："
+    "全A/主板与 v6.1.4 权威口径逐项一致；\n"
+    "  ETF/全A含ETF 因当日新缓存 ETF 入池小幅变化（详见 README 第三节 3.5/3.6）。\n\n"
+    "### 工具→信号胜率（回测面板）\n"
+    "- 策略**全历史**信号回测（训练前75%/验证后25%）+ IC(T+1/T+5) + "
+    "信号后 1/5 日收益；\n"
+    "- 收益曲线只画训练集净值（验证集仅指标）；「导出回测」支持 "
+    ".txt（完整明细+净值数据）/ .csv（逐日净值+回撤）。\n\n"
+    "### 数据层修复随版\n"
+    "- 节假日锚（1.7G 缓存不再周末全量空拉）；`stock_fetch.log` 逐条拉取诊断；\n"
+    "- 死源热修：web.ifzq 对 hfq 曾返 501（时段性）不再被自愈写入、501 纳入熔断、"
+    "探测改 hfq；急救箱腾讯探测同步改 hfq。\n\n"
     "## v6.1.4（2026-09-25）\n\n"
     "### AI 网关兼容与配置修复\n"
     "- AI 请求带自有 UA `stock-analyzer/6.1.4`（Cloudflare 会以 error code 1010 拦截"
@@ -195,7 +215,7 @@ def upload_asset(rel_id, upload_url, path, token):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="v6.1.4")
+    ap.add_argument("--tag", default="v6.1.5")
     ap.add_argument("--name", default=None, help="Release 标题（默认 stock-analyzer <tag>）")
     ap.add_argument("--body", default=BODY_DEFAULT)
     ap.add_argument("--asset", nargs="*", default=[], help="要上传的本地文件")

@@ -61,7 +61,12 @@ from logging.handlers import RotatingFileHandler  # noqa: E402
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stock_gui.log")
+# 数据层专项日志（诊断"1.7G缓存为何还联网拉取"）：只记缓存判定/拉取/数据源，
+# 不落通用噪声，独立滚动2MBx2；不想看时直接删文件即可（会自动重建）。
+FETCH_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "stock_fetch.log")
 log = logging.getLogger("stock")
+flog = logging.getLogger("stock.fetch")     # 缓存/拉取/源诊断
 
 
 def setup_logging():
@@ -82,10 +87,59 @@ def setup_logging():
     sh.setFormatter(fmt)
     sh.setLevel(logging.WARNING)
     log.addHandler(sh)
+    # 拉取诊断日志：独立文件，不向 stock_gui.log 冒泡
+    flog.setLevel(logging.INFO)
+    flog.propagate = False
+    if not flog.handlers:
+        try:
+            fh2 = RotatingFileHandler(FETCH_LOG_PATH,
+                                      maxBytes=2 * 1024 * 1024,
+                                      backupCount=2, encoding="utf-8")
+            fh2.setFormatter(fmt)
+            fh2.setLevel(logging.INFO)
+            flog.addHandler(fh2)
+        except OSError:
+            flog.addHandler(logging.NullHandler())
     return log
 
 
 setup_logging()
+
+# 应用版本号（回测产物目录/关于/UA 共用；2026-09-26 升 6.1.5）
+APP_VERSION = "6.1.5"
+
+
+# ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
+_FSTAT = {"calls": 0, "hit": 0, "stale": 0, "anomaly": 0, "empty": 0,
+          "neg": 0, "pull_ok": 0, "pull_fail": 0, "pull_rows": 0}
+_FSTAT_LOCK = threading.Lock()
+_FSTAT_EVERY = 200              # 每 N 次 get_daily 打一行汇总
+
+
+def _fstat_inc(key, n=1):
+    with _FSTAT_LOCK:
+        _FSTAT[key] = _FSTAT.get(key, 0) + n
+
+
+def _fstat_log(force=False):
+    """输出缓存命中/联网拉取累计统计（force=True 时忽略采样间隔）。"""
+    with _FSTAT_LOCK:
+        s = dict(_FSTAT)
+    if s["calls"] == 0:
+        return
+    if not force and s["calls"] % _FSTAT_EVERY:
+        return
+    flog.info("统计: 调用=%d 直读缓存=%d 过期拉取=%d 异常拉取=%d 无缓存=%d "
+              "负缓存=%d | 联网成功=%d 失败=%d 入库根数=%d",
+              s["calls"], s["hit"], s["stale"], s["anomaly"],
+              s["empty"], s["neg"], s["pull_ok"], s["pull_fail"],
+              s["pull_rows"])
+
+
+try:
+    atexit.register(_fstat_log, True)   # 退出时落最后一行累计统计
+except Exception:
+    pass
 
 KLINE_URL = ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
              "fqkline/get")
@@ -571,19 +625,21 @@ def _cb_record(name, ok, err=None):
 
 
 def _is_ratelimit_err(e):
-    """识别服务端限流/封禁类错误：HTTP 429/502/503/504 或连接被重置。
+    """识别服务端限流/封禁类错误：HTTP 429/501/502/503/504 或连接被重置。
 
     东财反爬/整域故障表现为 RemoteDisconnected / Connection reset
-    （非 HTTP 状态码），同样应触发熔断降级，避免每个源反复撞墙。"""
+    （非 HTTP 状态码），同样应触发熔断降级，避免每个源反复撞墙；
+    腾讯对反爬域名（如 web.ifzq 的 hfq 请求）返回 501，若不纳入熔断，
+    配置里的死源会每只股票都被重试一次。"""
     code = getattr(e, "code", None)
     if code is not None:
-        return code in (429, 502, 503, 504)
+        return code in (429, 501, 502, 503, 504)
     s = str(e)
     if any(c in s for c in ("RemoteDisconnected", "Remote end closed",
                             "Connection reset", "Connection aborted",
                             "连接被重置")):
         return True
-    return any(c in s for c in ("503", "502", "504", "429",
+    return any(c in s for c in ("501", "502", "503", "504", "429",
                                 "Service Unavailable"))
 
 
@@ -710,13 +766,62 @@ def _prev_weekday(d):
     return d
 
 
+def _is_index_code(code: str) -> bool:
+    """是否指数代码（sh000* / sz399*）：指数日K用作全库交易日历锚。"""
+    return code.startswith(("sh000", "sz399"))
+
+
+_INDEX_TD_CACHE = {"ts": 0.0, "date": ""}
+_INDEX_PULL_TS = [0.0]          # 最近一次指数拉取尝试（防收盘后重复空拉）
+
+
+def _index_last_td(max_age=60.0):
+    """库内指数日K的最新日期（=真实上一交易日，节假日安全），60s 缓存。
+    指数只有 3 只且由 stale_codes/analyze 持续回补，适合做全库日历锚。"""
+    now = time.time()
+    if now - _INDEX_TD_CACHE["ts"] < max_age:
+        return _INDEX_TD_CACHE["date"]
+    d = ""
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(date) FROM daily_bars WHERE code IN "
+                "('sh000001','sz399001','sz399006')").fetchone()
+        d = (row[0] or "") if row else ""
+    except Exception:
+        log.debug("指数日历锚读取失败", exc_info=True)
+    _INDEX_TD_CACHE["date"], _INDEX_TD_CACHE["ts"] = d, now
+    return d
+
+
+def _index_expected_td():
+    """指数应有最新日K：收盘后（当日确为交易日）为今日，否则维持库内锚。
+
+    指数是交易日历锚，不能像个股那样用锚否定自身更新；这里用行情快照
+    （`_allow_today_bar`）判定"收盘后"才要求今日数据，盘中/休市一律回到锚。
+    修复 2026-09-26：此前按自然日历把休市日（中秋 09-25）当应有交易日，
+    周末每次用到指数K线（分析/市场简报/消融 regime）都联网重拉一遍。"""
+    import datetime
+    if _allow_today_bar() and time.time() - _INDEX_PULL_TS[0] >= 300:
+        return _dstr(datetime.date.today())
+    return _index_last_td()
+
+
 def last_completed_td():
-    """库中最后一天日K应为的日期：收盘后（≥15:05）为今天，否则上一工作日。
-    2026-09-16 起：收盘后允许把今日已收盘的日K入库（此前永远等次日）。"""
+    """库中最后一天日K应为的日期（节假日安全）。
+
+    自然日历（收盘后≥15:05取今日，否则上一工作日）只作上界；当上一"应该
+    交易日"实际休市（中秋/国庆调休）时，以库内指数日K最新日期为准。
+    修复 2026-09-26：休市日 prev_weekday 指向未开市的日历工作日（如中秋
+    09-25），全库 7000+ 对象被判"过期"而反复联网空拉（1.7G 缓存仍拉取）。"""
     import datetime
     if _allow_today_bar():
         return _dstr(datetime.date.today())
-    return _dstr(_prev_weekday(datetime.date.today()))
+    naive = _dstr(_prev_weekday(datetime.date.today()))
+    anchor = _index_last_td()
+    if anchor and anchor < naive:
+        return anchor
+    return naive
 
 
 # 上证指数最近一次行情快照日期（YYYYMMDD）：判定今日是否交易日
@@ -1172,18 +1277,20 @@ def _fetch_sina(full, count=600):
     return out
 
 
-def _fetch_remote_rows(full, count=600):
-    """多源自动切换 + 熔断调度：腾讯ifzq → 东财 → 新浪 → 网易163。
+def _fetch_remote_rows(full, count=600, info=None):
+    """多源自动切换 + 熔断调度：腾讯(配置域) → 腾讯代理 → 腾讯ifzq
+    → 腾讯HTTP → 东财。
 
-    2026-09 实测：ifzq.gtimg.cn 整域 501，现役可用域为
-    proxy.finance.qq.com 与 web.ifzq.gtimg.cn；东财 push2his 整域故障
-    （连接重置/502）期间自动降级；网易163服务端502时段排到最后。
+    2026-09 实测：web.ifzq.gtimg.cn 对 hfq 返回 501（腾讯反爬），
+    稳定可用域为 proxy.finance.qq.com 与 ifzq.gtimg.cn；东财 push2his
+    连接重置/502 属时段性故障，熔断后自动降级。
     运行逻辑：
     1. 按优先级遍历数据源，跳过处于熔断冷却期的源；
     2. 若所有源都在冷却（极端503风暴），退化为「半开探测」：
        选冷却结束最早的源强行试一次，成功即重置熔断；
     3. 单次调用内只对一个源做至多2次限流重试，
-       失败立刻切下一源，避免整体请求被单源拖死。"""
+       失败立刻切下一源，避免整体请求被单源拖死。
+    info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。"""
         # 注意：只使用后复权(hfq)源。163/新浪只提供不复权(或减法前复权)，
     # 与库内后复权口径混用会产生假跳变，不再作为持久化源。
     sources = [
@@ -1192,6 +1299,9 @@ def _fetch_remote_rows(full, count=600):
             full, count,
             "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
             "fqkline/get")),
+        ("腾讯ifzq", lambda: _fetch_tencent(
+            full, count,
+            "https://ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("腾讯HTTP", lambda: _fetch_tencent(
             full, count,
             "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
@@ -1199,25 +1309,50 @@ def _fetch_remote_rows(full, count=600):
     ]
     last_err = None
     usable = [(n, f) for n, f in sources if _cb_ok(n)]
+    if len(usable) < len(sources):
+        flog.debug("%s 熔断跳过源: %s", full,
+                   [n for n, _ in sources if not _cb_ok(n)])
     if not usable:
         # 半开探测：挑最早解禁的源
         probe = min(sources,
                     key=lambda nf: _SRC_CB.get(nf[0], [0, 0.0])[1])
         usable = [probe]
+        flog.info("%s 全源熔断，半开探测 %s", full, probe[0])
+    tried = []
+    saw_soft = False            # 源正常应答但该股无数据（新股/退市）
+    saw_hard = False            # 网络/限流类失败
     for name, fetcher in usable:
+        tried.append(name)
         try:
             rows = fetcher()
             _cb_record(name, True)
             # 新股可能只有几根K线：>=5 即视为有效（分析层另有30根门槛）
             if rows and len(rows) >= 5:
+                if info is not None:
+                    info["src"], info["tries"] = name, tried
+                if len(tried) > 1:
+                    flog.info("%s 首源失败，%s 接管（尝试序列 %s）",
+                              full, name, tried)
                 return rows
+            saw_soft = True
             last_err = RuntimeError(f"{name}返回空K线")
+            flog.debug("%s 源%s返回空K线", full, name)
         except Exception as e:
+            if "空K线" in str(e) or "空数据" in str(e):
+                saw_soft = True
+            else:
+                saw_hard = True
             _cb_record(name, False, e)
             last_err = e
+            flog.debug("%s 源%s失败: %s", full, name, e)
             continue
-    _auto_heal_kline()          # 全灭时自动探测候选域并切换
-    _maybe_ai_rescue()          # 仍无解：弹窗询问是否让AI找源(GUI)
+    # 只有"确实连不上源"才自愈/AI找源；全源正常应答但无此代码数据
+    # （新 ETF 未上市、退市股）不应改写 K 线源配置（2026-09-26 修复）。
+    if saw_hard and not saw_soft:
+        _auto_heal_kline()      # 全灭时自动探测候选域并切换
+        _maybe_ai_rescue()      # 仍无解：弹窗询问是否让AI找源(GUI)
+    if info is not None:
+        info["tries"] = tried
     raise RuntimeError(f"所有数据源均失败: {last_err}")
 
 
@@ -1232,22 +1367,30 @@ _KLINE_HEAL_TS = [0.0]          # 上次自愈探测时间（10分钟限频）
 _KLINE_HEAL_LOCK = threading.Lock()
 _KLINE_DEFAULTS = (
     "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
-    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
     "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
     "http://ifzq.gtimg.cn/appstock/app/fqkline/get",
 )
 
 
 def _probe_kline_url(base):
-    """实测一个K线接口是否真的有数据（近5根日K + JSON合法）。"""
-    try:
-        txt = _http_get(base + "?param=sz002241,day,,,5,qfq",
-                        retries=1, timeout=6)
-        d0 = (json.loads(txt).get("data") or {}).get("sz002241") or {}
-        bars = d0.get("qfqday") or d0.get("day") or []
-        return len(bars) >= 5
-    except Exception:
-        return False
+    """实测一个K线接口是否真的有数据（近5根**后复权**日K + JSON合法）。
+
+    生产入库口径是 hfq：部分腾讯域对 qfq 正常但对 hfq 返回 501，
+    若用 qfq 探测会把"持久化不可用"的域名写进配置（2026-09-26 实测
+    web.ifzq 就是这种域）。连测2次都成功才判活，避免瞬时抖动误判。"""
+    for _ in range(2):
+        try:
+            txt = _http_get(base + "?param=sz002241,day,,,5,hfq",
+                            retries=1, timeout=6)
+            d0 = (json.loads(txt).get("data") or {}).get("sz002241") or {}
+            bars = d0.get("hfqday") or d0.get("day") or []
+            if len(bars) >= 5:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
 
 
 def _persist_kline_url(u):
@@ -1352,6 +1495,28 @@ def _display_rows(full, rows, tail=None):
     return rows[-tail:] if (tail and len(rows) > tail) else rows
 
 
+def _record_fail(full, reason):
+    """写入负缓存（prefetch 按 TTL 跳过；反复失败 2 倍退避，上限 24h）。
+
+    用于两类"拉不到更新"：网络失败、以及源侧停牌/退市导致末日不前进
+    （2026-09-26：后者此前每小时都重拉一次，长停牌股每次几百根）。"""
+    new_ttl = FAIL_TTL
+    try:
+        with db_conn() as conn:
+            row = conn.execute("SELECT ts FROM failed WHERE code=?",
+                               (full,)).fetchone()
+        if row:
+            prev_ttl = max(FAIL_TTL - (time.time() - row[0]), FAIL_TTL)
+            new_ttl = min(prev_ttl * 2, 86400)
+    except Exception:
+        log.exception("负缓存退避计算失败(忽略)")
+    with db_conn(commit=True) as conn:
+        # 存 ts 使 ts+FAIL_TTL = now+new_ttl，无需改表结构
+        conn.execute(
+            "INSERT OR REPLACE INTO failed(code,ts,reason) VALUES(?,?,?)",
+            (full, time.time() - (FAIL_TTL - new_ttl), str(reason)[:120]))
+
+
 def get_daily(full: str, min_bars: int = 100, tail=None):
     """带缓存的日K：本地够新且无异常直接返回，否则增量爬一次并入库。
     加载缓存后校验每日涨跌幅是否超出该股允许的涨跌停范围，
@@ -1359,9 +1524,13 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     有缓存数据的股票永远返回数据（即使过期），不抛异常。
     只有从未成功获取过的代码才会触发网络请求和负缓存。
     tail: 非空时只返回最近 tail 根（用于启动快速预览，走缓存秒开）。
-    库内一律存后复权(hfq)；返回前按 adjust 缩放为乘法前复权显示。"""
+    库内一律存后复权(hfq)；返回前按 adjust 缩放为乘法前复权显示。
+    2026-09-26：缓存判定/拉取/来源写入 stock_fetch.log（见 flog）。"""
+    _fstat_inc("calls")
     today = time.strftime("%Y-%m-%d")
-    fresh = last_completed_td()
+    # 指数用"收盘后才有今日"口径（自身是日历锚），个股用节假日安全口径
+    fresh = _index_expected_td() if _is_index_code(full) \
+        else last_completed_td()
     allow_today = _allow_today_bar()
     with db_conn() as conn:
         rows = _db_rows(conn, full)
@@ -1371,12 +1540,24 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     bad_cache = bool(rows) and _bars_anomalous(rows, full, name)
     # 1) 有数据、够新且涨跌幅无异常 → 直接返回
     if rows and rows[-1]["date"] >= fresh and not bad_cache:
+        _fstat_inc("hit")
+        _fstat_log()
         return _display_rows(full, rows, tail)
     # 2) 有数据但过期或涨幅异常 → 拉远端（异常时清空全量替换）
     if rows:
+        old_last = rows[-1]["date"]
+        reason = ("异常" if bad_cache
+                  else f"过期(本地末日{old_last}<应有{fresh})")
+        _fstat_inc("anomaly" if bad_cache else "stale")
+        t_pull = time.time()
+        info = {}
+        if _is_index_code(full):
+            _INDEX_PULL_TS[0] = t_pull
+        flog.info("拉取 %s 原因=%s 本地=%d根(末日%s)",
+                  full, reason, len(rows), old_last)
         try:
             remote = [r for r in _fetch_remote_rows(
-                full, count=CFG.MAX_FETCH_BARS)
+                full, count=CFG.MAX_FETCH_BARS, info=info)
                       if (r["date"] < today
                           or (allow_today and r["date"] == today))
                       and _bar_ok(r)]
@@ -1416,21 +1597,42 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
             with db_conn() as conn3:
                 rows = _db_rows(conn3, full)
             _sync_adjust(full, rows)
+            _fstat_inc("pull_ok")
+            _fstat_inc("pull_rows", len(remote))
+            new_last = rows[-1]["date"] if rows else ""
+            flog.info("入库 %s 源=%s 采用=%d根 合并后=%d根(末日%s) 耗时=%.0fms",
+                      full, info.get("src") or "-", len(remote), len(rows),
+                      new_last or "-", (time.time() - t_pull) * 1000)
+            # 源侧也没更新（停牌/退市整理/新退市）：记负缓存，避免每小时重拉
+            if (not _is_index_code(full) and new_last == old_last
+                    and new_last < fresh):
+                _record_fail(full, f"源无更新({old_last})")
+                flog.info("无新数据 %s 末日=%s<应有%s（负缓存，预取将跳过）",
+                          full, old_last, fresh)
         except Exception:
+            _fstat_inc("pull_fail")
             log.warning("get_daily 增量拉取失败 %s，回退本地缓存",
                         full, exc_info=True)  # 网络失败就用旧缓存，不报错
+        _fstat_log()
         return _display_rows(full, rows, tail)
     # 3) 无数据 → 检查负缓存
+    _fstat_inc("empty")
     with db_conn() as conn:
         frow = conn.execute("SELECT ts, reason FROM failed WHERE code=?",
                             (full,)).fetchone()
         if frow and time.time() - frow[0] < FAIL_TTL:
             reason = (frow[1] or "网络失败") if len(frow) > 1 else "网络失败"
+            _fstat_inc("neg")
+            flog.info("跳过 %s 负缓存剩余%.0f分钟: %s", full,
+                      (FAIL_TTL - (time.time() - frow[0])) / 60, reason)
             raise RuntimeError(f"{full} 近期拉取失败(负缓存中) [{reason}]")
 
     # 4) 从未获取过 → 网络请求
+    t_pull = time.time()
+    info = {}
+    flog.info("拉取 %s 原因=无缓存", full)
     try:
-        remote = _fetch_remote_rows(full, count=CFG.MAX_FETCH_BARS)
+        remote = _fetch_remote_rows(full, count=CFG.MAX_FETCH_BARS, info=info)
     except Exception as e:
         # 未上市/无数据识别：行情快照也拿不到有效价 → 静默记为未上市
         listed = True
@@ -1447,24 +1649,11 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
                     "VALUES(?,?,?)",
                     (full, time.time(), "未上市或无数据"))
             raise RuntimeError(f"{full} 未上市或无行情数据")
+        _fstat_inc("pull_fail")
         log.warning("get_daily 首次拉取失败 %s: %s", full, e)
-        # 失败退避：已有负缓存记录的代码（反复失败），时长翻倍，
-        # 上限24h，避免样本池里拉不到的代码每天反复撞限流
-        new_ttl = FAIL_TTL
-        try:
-            with db_conn() as conn:
-                row = conn.execute("SELECT ts FROM failed WHERE code=?",
-                                   (full,)).fetchone()
-            if row:
-                prev_ttl = max(FAIL_TTL - (time.time() - row[0]), FAIL_TTL)
-                new_ttl = min(prev_ttl * 2, 86400)
-        except Exception:
-            log.exception("负缓存退避计算失败(忽略)")
-        with db_conn(commit=True) as conn:
-            # 存 ts 使 ts+FAIL_TTL = now+new_ttl，无需改表结构
-            conn.execute(
-                "INSERT OR REPLACE INTO failed(code,ts,reason) VALUES(?,?,?)",
-                (full, time.time() - (FAIL_TTL - new_ttl), str(e)[:120]))
+        flog.warning("拉取失败 %s 原因=无缓存 源尝试=%s: %s", full,
+                     info.get("tries") or "-", e)
+        _record_fail(full, e)
         raise
     with db_conn(commit=True) as conn:
         conn.execute("DELETE FROM failed WHERE code=?", (full,))
@@ -1478,6 +1667,13 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
              and _bar_ok(r)])
         rows = [r for r in _db_rows(conn, full)]
     _sync_adjust(full, rows)
+    _fstat_inc("pull_ok")
+    _fstat_inc("pull_rows", len(remote))
+    flog.info("入库 %s 源=%s 远端=%d根 合并后=%d根(末日%s) 耗时=%.0fms",
+              full, info.get("src") or "-", len(remote), len(rows),
+              rows[-1]["date"] if rows else "-",
+              (time.time() - t_pull) * 1000)
+    _fstat_log()
     return _display_rows(full, rows, tail)
 
 
@@ -1506,7 +1702,9 @@ def prefetch(codes, workers=6, progress=None):
     done = [0]
     total = len(codes)
     if total == 0:
+        flog.info("预取: 目标=0 全部跳过（负缓存%d）", len(failed))
         return
+    flog.info("预取: 目标=%d 跳过负缓存=%d", total, len(failed))
     # 进度上报粒度：大批量约每5%报一次，小批量每只都报
     step = max(1, min(10, total // 20 or 1))
 
@@ -1522,6 +1720,7 @@ def prefetch(codes, workers=6, progress=None):
 
     ex = _SHARED_EX                # 全局共享线程池，不再每次新建
     list(ex.map(one, codes))
+    flog.info("预取完成: %d 只", total)
 
 
 def stale_codes(limit=None, skip_bj=True, skip_delisted=True):
@@ -1529,10 +1728,12 @@ def stale_codes(limit=None, skip_bj=True, skip_delisted=True):
 
     只查 stocks/daily_bars（不联网），供后台主动预取挑选目标：
     收盘（15:05）后返回全市场，用于当日K线回补；盘中只返回缺昨日数据的。
+    指数按"收盘后才有今日"口径判断，保证交易日历锚能推进又不空拉。
     skip_bj：排除北交所（与样本池/研究口径一致）；
     skip_delisted：已有数据但最后K线早于180天视为退市，不再重试。"""
     import datetime
     fresh = last_completed_td()
+    fresh_idx = _index_expected_td()
     cutoff = _dstr(datetime.date.today() - datetime.timedelta(days=180))
     with db_conn() as conn:
         codes = [r[0] for r in conn.execute("SELECT code FROM stocks")]
@@ -1540,14 +1741,26 @@ def stale_codes(limit=None, skip_bj=True, skip_delisted=True):
             "SELECT code, MAX(date) FROM daily_bars "
             "GROUP BY code").fetchall())
     out = []
+    n_nodata = n_old = n_delisted = n_bj = 0
     for c in codes:
         if skip_bj and c.startswith("bj"):
+            n_bj += 1
             continue
         d = have.get(c)
+        fr = fresh_idx if _is_index_code(c) else fresh
         if d is None:                   # 无缓存：可能新股，值得拉
+            n_nodata += 1
             out.append(c)
-        elif d < fresh and not (skip_delisted and d < cutoff):
-            out.append(c)
+        elif d < fr:
+            if skip_delisted and d < cutoff:
+                n_delisted += 1
+            else:
+                n_old += 1
+                out.append(c)
+    flog.info("全库新鲜度扫描: 个股应有=%s 指数应有=%s 对象=%d 北交跳过=%d "
+              "无缓存=%d 过期=%d 退市跳过=%d → 待回补=%d",
+              fresh, fresh_idx, len(codes), n_bj, n_nodata, n_old,
+              n_delisted, len(out))
     return out[:limit] if limit else out
 
 
@@ -3289,115 +3502,228 @@ def _exec_mode():
     return os.environ.get("EXEC_PX", "close").lower()
 
 
+def _bt_simulate(rows, signals, rp):
+    """单段事件回测：BUY开仓/SELL平仓 + ATR动态止损/移动止盈。
+
+    早盘信号：信号在 T 日收盘生成，T+1 日收盘成交；止损单用 T-1 日 ATR
+    设定，T 日盘中止损触发才是可执行的挂单（防前视）。
+    返回指标 dict（含净值曲线 curve 与逐笔收益 trades_list）。"""
+    n = len(rows)
+    sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < n}
+    # 计算ATR(14)用于止损
+    atrs = [0.0] * n
+    for i in range(14, n):
+        atrs[i] = sum(max(rows[j]["high"] - rows[j]["low"],
+                          abs(rows[j]["high"] - rows[j-1]["close"]),
+                          abs(rows[j]["low"] - rows[j-1]["close"]))
+                      for j in range(i - 13, i + 1)) / 14
+    exec_open = _exec_mode() == "open"
+    eq = 1.0
+    entry = None
+    highest = None  # 持仓期间最高价
+    trades = []
+    curve = []
+
+    for i, r in enumerate(rows):
+        c = r["close"]
+        h = r["high"]
+        l = r["low"]
+        typ = sig_map.get(i)
+
+        if entry is not None:
+            prev_high = highest
+            highest = max(highest, h) if highest else h
+            # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
+            atr_prev = atrs[i - 1] if i > 0 else 0.0
+            atr_stop = entry - rp["atr_mult"] * atr_prev \
+                if atr_prev > 0 else entry * 0.95
+            trail_stop = prev_high * rp["trail_ratio"] \
+                if prev_high > entry * rp["trail_trigger"] else atr_stop
+
+            # 止损触发（日内最低触及止损价）
+            if l <= trail_stop:
+                exit_price = r["open"] if r["open"] <= trail_stop \
+                    else trail_stop
+                trades.append(exit_price / entry - 1)
+                eq *= exit_price / entry
+                entry = None
+                highest = None
+                curve.append(eq)
+                continue
+
+        if typ == "BUY" and entry is None and c:
+            px_fill = ((r.get("open") or c) if exec_open else c)
+            entry = px_fill
+            highest = px_fill     # 成交时点之前的盘中高点不计入
+        elif typ == "SELL" and entry:
+            px_fill = ((r.get("open") or c) if exec_open else c)
+            trades.append(px_fill / entry - 1)
+            eq *= px_fill / entry
+            entry = None
+            highest = None
+        curve.append(eq * (c / entry) if entry else eq)
+
+    # 未平仓按最后收盘价计算
+    floating = rows[-1]["close"] / entry - 1 if entry else None
+    wins = len([t for t in trades if t > 0])
+    losses = len([t for t in trades if t <= 0])
+
+    import datetime
+    d0 = datetime.date.fromisoformat(rows[signals[0][0]]["date"])
+    d1 = datetime.date.fromisoformat(rows[-1]["date"])
+    years = max((d1 - d0).days / 365.25, 1e-9)
+    total = curve[-1] if curve else 1.0
+    ann = total ** (1 / years) - 1 if total > 0 else -1.0
+
+    peak = 0.0
+    mdd = 0.0
+    for v in curve:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, v / peak - 1)
+
+    avg_win = sum(t for t in trades if t > 0) / wins if wins else 0
+    avg_loss = sum(t for t in trades if t <= 0) / losses if losses else 0
+    return {
+        "trades": len(trades) + (1 if floating is not None else 0),
+        "closed": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "winrate": wins / len(trades) if trades else None,
+        "total": total - 1,
+        "ann": ann,
+        "mdd": mdd,
+        "floating": floating,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_loss": avg_win / abs(avg_loss) if avg_loss != 0 else float('inf'),
+        "curve": curve,
+        "trades_list": trades,
+    }
+
+
+def _rank_avg(vals):
+    """平均秩（并列取平均），用于 Spearman IC。"""
+    n = len(vals)
+    order = sorted(range(n), key=lambda k: vals[k])
+    r = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            r[order[k]] = avg
+        i = j + 1
+    return r
+
+
+def _signal_ic(rows, signals, horizon=5):
+    """信号方向(+1买/-1卖) 与未来 horizon 日收益的 Spearman IC。
+
+    返回 (ic, n)：ic 为 None 表示样本不足/无区分度。"""
+    pairs = []
+    n_all = len(rows)
+    for s in signals:
+        i = s[0]
+        if i + horizon >= n_all:
+            continue
+        c0, c1 = rows[i].get("close"), rows[i + horizon].get("close")
+        if not c0 or not c1 or c0 <= 0:
+            continue
+        pairs.append((1.0 if s[2] == "BUY" else -1.0, c1 / c0 - 1.0))
+    n = len(pairs)
+    if n < 5:
+        return None, n
+    rx = _rank_avg([p[0] for p in pairs])
+    ry = _rank_avg([p[1] for p in pairs])
+    mx, my = sum(rx) / n, sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    dx = math.sqrt(sum((a - mx) ** 2 for a in rx))
+    dy = math.sqrt(sum((b - my) ** 2 for b in ry))
+    if dx <= 1e-12 or dy <= 1e-12:
+        return None, n
+    return num / (dx * dy), n
+
+
+def _signal_forward_stats(rows, signals, horizons=(1, 5)):
+    """BUY/SELL 信号后 H 日平均收益与上涨占比（方向验证）。"""
+    out = {}
+    n_all = len(rows)
+    for typ in ("BUY", "SELL"):
+        sigs = [s[0] for s in signals if s[2] == typ]
+        rec = {}
+        for h in horizons:
+            rs = []
+            for i in sigs:
+                if i + h < n_all:
+                    c0, c1 = rows[i].get("close"), rows[i + h].get("close")
+                    if c0 and c1 and c0 > 0:
+                        rs.append(c1 / c0 - 1.0)
+            rec[h] = (len(rs),
+                      (sum(rs) / len(rs)) if rs else None,
+                      (len([x for x in rs if x > 0]) / len(rs)) if rs else None)
+        out[typ] = rec
+    return out
+
+
 def backtest_signals(rows, signals, rp=None):
     """按买卖点信号模拟交易（早盘信号：信号在 T 日收盘生成，T+1 日收盘成交）。
     BUY开仓/SELL平仓，带ATR动态止损+移动止盈；止损单用 T-1 日 ATR 设定，
     T 日盘中止损触发才是可执行的挂单，避免用当日收盘信息判当日盘中。
-    返回 胜率、区间收益、年化收益、最大回撤。"""
+    返回全期指标 + 训练集(前75%)/验证集(后25%)分段指标 + 信号IC
+    + 信号后1/5日收益，供 GUI 展开显示。"""
     try:
         if not signals or len(rows) < 30:
             return None
-        # 早盘信号：T 日收盘生成的信号，T+1 日开盘前可决策 → T+1 日收盘执行
-        sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < len(rows)}
-        
-        # 计算ATR(14)用于止损
-        atrs = [0.0] * len(rows)
-        for i in range(14, len(rows)):
-            h, l, pc = rows[i]["high"], rows[i]["low"], rows[i-1]["close"]
-            tr = max(h - l, abs(h - pc), abs(l - pc))
-            atrs[i] = sum(max(rows[j]["high"] - rows[j]["low"], 
-                           abs(rows[j]["high"] - rows[j-1]["close"]),
-                           abs(rows[j]["low"] - rows[j-1]["close"])) 
-                      for j in range(i-13, i+1)) / 14
-        
         rp = rp or CFG.risk_params()
-        exec_open = _exec_mode() == "open"
-        eq = 1.0
-        entry = None
-        highest = None  # 持仓期间最高价
-        trades = []
-        curve = []
-
-        for i, r in enumerate(rows):
-            c = r["close"]
-            h = r["high"]
-            l = r["low"]
-            typ = sig_map.get(i)
-
-            if entry is not None:
-                prev_high = highest
-                highest = max(highest, h) if highest else h
-                # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
-                atr_prev = atrs[i - 1] if i > 0 else 0.0
-                atr_stop = entry - rp["atr_mult"] * atr_prev \
-                    if atr_prev > 0 else entry * 0.95
-                trail_stop = prev_high * rp["trail_ratio"] \
-                    if prev_high > entry * rp["trail_trigger"] else atr_stop
-
-                # 止损触发（日内最低触及止损价）
-                if l <= trail_stop:
-                    exit_price = r["open"] if r["open"] <= trail_stop \
-                        else trail_stop
-                    trades.append(exit_price / entry - 1)
-                    eq *= exit_price / entry
-                    entry = None
-                    highest = None
-                    curve.append(eq)
-                    continue
-            
-            if typ == "BUY" and entry is None and c:
-                px_fill = ((r.get("open") or c) if exec_open else c)
-                entry = px_fill
-                highest = px_fill     # 成交时点之前的盘中高点不计入
-            elif typ == "SELL" and entry:
-                px_fill = ((r.get("open") or c) if exec_open else c)
-                trades.append(px_fill / entry - 1)
-                eq *= px_fill / entry
-                entry = None
-                highest = None
-            curve.append(eq * (c / entry) if entry else eq)
-        
-        # 未平仓按最后收盘价计算
-        floating = rows[-1]["close"] / entry - 1 if entry else None
-        
-        wins = len([t for t in trades if t > 0])
-        losses = len([t for t in trades if t <= 0])
-        
-        import datetime
-        d0 = datetime.date.fromisoformat(rows[signals[0][0]]["date"])
-        d1 = datetime.date.fromisoformat(rows[-1]["date"])
-        years = max((d1 - d0).days / 365.25, 1e-9)
-        total = curve[-1] if curve else 1.0
-        ann = total ** (1 / years) - 1 if total > 0 else -1.0
-        
-        peak = 0.0
-        mdd = 0.0
-        for v in curve:
-            peak = max(peak, v)
-            if peak > 0:
-                mdd = min(mdd, v / peak - 1)
-        
-        # 平均盈利/平均亏损
-        avg_win = sum(t for t in trades if t > 0) / wins if wins else 0
-        avg_loss = sum(t for t in trades if t <= 0) / losses if losses else 0
-        
-        return {
-            "trades": len(trades) + (1 if floating is not None else 0),
-            "closed": len(trades),
-            "wins": wins,
-            "losses": losses,
-            "winrate": wins / len(trades) if trades else None,
-            "total": total - 1,
-            "ann": ann,
-            "mdd": mdd,
-            "floating": floating,
-            "avg_win": avg_win,
-            "avg_loss": avg_loss,
-            "profit_loss": avg_win / abs(avg_loss) if avg_loss != 0 else float('inf'),
-        }
+        out = _bt_simulate(rows, signals, rp)
+        n = len(rows)
+        split = max(30, int(n * 0.75))
+        out["split_i"] = split if 0 < split < n else None
+        out["train"] = out["val"] = None
+        if 0 < split < n:
+            tr_sigs = [s for s in signals if s[0] < split]
+            va_sigs = [(s[0] - split,) + tuple(s[1:])
+                       for s in signals if split <= s[0] < n]
+            if tr_sigs:
+                out["train"] = _bt_simulate(rows[:split], tr_sigs, rp)
+            if va_sigs:
+                out["val"] = _bt_simulate(rows[split:], va_sigs, rp)
+        out["ic1"] = _signal_ic(rows, signals, 1)
+        out["ic5"] = _signal_ic(rows, signals, 5)
+        out["fwd"] = _signal_forward_stats(rows, signals)
+        return out
     except Exception:
         log.exception("backtest_signals 回测失败")
         return None
+
+
+def strategy_signals_full(rows, strat, industry=""):
+    """按所选策略在**全历史**上重算信号（工具→信号胜率回测用）。
+
+    主图买卖点只展示近 250 根（性能/可读性），若直接拿展示信号做 75/25
+    训练/验证切分，指标型策略信号会全部落在验证段 → 训练集恒"信号不足"。
+    这里按消融选型同口径在全历史重算（raw 信号，不做展示端压缩）。"""
+    algo = (strat or {}).get("algo", "composite")
+    rp = (strat or {}).get("params") or CFG.risk_params()
+    try:
+        if algo == "composite":
+            pre = _composite_precompute(rows)
+            return _composite_signals(rows, rp, pre=pre)
+        if algo == "l2_ind":
+            return _sig_l2_industry(rows, industry=industry)
+        if algo == "sector_rot":
+            return _sig_sector_rot(rows, industry=industry)
+        gen = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
+               "boll": _sig_boll, "ma_trend": _sig_ma_trend,
+               "l1_pattern": _sig_l1_pattern,
+               "chip_peak": _sig_chip_peak}.get(algo)
+        return gen(rows) if gen else []
+    except Exception:
+        log.exception("全历史策略信号生成失败 %s", algo)
+        return []
 
 
 def _l1_up_prob_last(rows):
@@ -5211,6 +5537,12 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
                        "激进": _pick("激进")}
+    # 三档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
+    # 属训练集选型结果而非故障）；记录以便在日志中直接核对（如 sz002241）。
+    log.info("消融选型 %s: 保守=%s | 稳健=%s | 激进=%s", full,
+             mode_candidates["保守"]["label"],
+             mode_candidates["稳健"]["label"],
+             mode_candidates["激进"]["label"])
 
     # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
     def _tc(t):
@@ -5459,6 +5791,36 @@ def _multi_day_prediction(o_today, levels, max_days=10):
         multi_pred.append(day_pred)
     
     return multi_pred
+
+
+def _build_ghosts(o_today, multi_pred):
+    """由多日预测构造幽灵K线（T+5/T+10；T+1 由 pred 承担）。
+
+    2026-09-26：抽成独立函数，增量加载（_apply_progressive）也会重算，
+    避免快速分析后幽灵K线与更新后的多日预测脱节/缺失。"""
+    def _ghost(day_pred, label):
+        if not day_pred:
+            return None
+        o = o_today
+        if label != "T+1" and multi_pred:
+            idx = int(label[2:]) - 2
+            if 0 <= idx < len(multi_pred):
+                o = multi_pred[idx]["price_cl"]      # 前一预测日收盘为开
+        hi = day_pred.get("price_hi") or day_pred["close"]
+        lo = day_pred.get("price_lo") or day_pred["close"]
+        cl = day_pred.get("price_cl") or day_pred["close"]
+        hi = max(hi, o, cl)
+        lo = min(lo, o, cl)
+        return {"date": f"{label}预测", "open": round(o, 2),
+                "close": round(cl, 2), "high": round(hi, 2),
+                "low": round(lo, 2), "vol": None}
+    ghosts = []
+    for dd in (5, 10):
+        if multi_pred and len(multi_pred) >= dd:
+            g = _ghost(multi_pred[dd - 1], f"T+{dd}")
+            if g:
+                ghosts.append(g)
+    return ghosts
 
 
 def analyze(full, progress=None, quick=False):
@@ -6135,30 +6497,9 @@ def analyze(full, progress=None, quick=False):
         except Exception:
             log.exception("回测统计失败(bt_stats=None)")
 
-    # ---- 幽灵K线：T+1 / T+5 / T+10（白色虚线边框，随所选策略融合预测）----
-    def _ghost(day_pred, label):
-        if not day_pred:
-            return None
-        o = o_today
-        if label != "T+1" and multi_pred:
-            idx = int(label[2:]) - 2
-            if 0 <= idx < len(multi_pred):
-                o = multi_pred[idx]["price_cl"]      # 前一预测日收盘为开
-        hi = day_pred.get("price_hi") or day_pred["close"]
-        lo = day_pred.get("price_lo") or day_pred["close"]
-        cl = day_pred.get("price_cl") or day_pred["close"]
-        hi = max(hi, o, cl)
-        lo = min(lo, o, cl)
-        return {"date": f"{label}预测", "open": round(o, 2),
-                "close": round(cl, 2), "high": round(hi, 2),
-                "low": round(lo, 2), "vol": None}
-    # T+1 已由 pred 承担（slice_view 追加），幽灵只补 T+5 / T+10
-    ghosts = []
-    for dd in (5, 10):
-        if multi_pred and len(multi_pred) >= dd:
-            g = _ghost(multi_pred[dd - 1], f"T+{dd}")
-            if g:
-                ghosts.append(g)
+    # ---- 幽灵K线：T+5 / T+10（白色虚线边框，随所选策略融合预测）----
+    # T+1 已由 pred 承担（slice_view 追加）；增量加载时同口径重算（见 _apply_progressive）
+    ghosts = _build_ghosts(o_today, multi_pred)
 
     return {
         "quote": q, "full_code": full, "disp_rows": disp_rows,
@@ -6168,7 +6509,7 @@ def analyze(full, progress=None, quick=False):
         "tpred_bar": tpred_bar,
         "t5_pred": t_pred.get("t5"),
         "pred": pred, "t_pred": t_pred, "multi_pred": multi_pred,
-        "ghosts": ghosts,
+        "ghosts": ghosts, "o_today": o_today,
         "strategy": strat,
         "risk_mode": (strat or {}).get("mode",
                                        CFG.RISK_MODE if sel_algo == "composite"
@@ -8303,17 +8644,22 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         m["phase_ann_min"] = min(anns)
         m["phase_ann_max"] = max(anns)
         m["phase_anns"] = [float(x) for x in anns]   # 箱线图/版本对比用
+        # 相位平均净值曲线（降采样≤600点，网页/绘图用；首值=1）
+        cd, cv = _sample_series(dates, E)
+        m["curve_dates"], m["curve"] = cd, cv
         bench_code = (TIER_BENCH.get((universe, tier))
                       or TIER_BENCH[("all", tier)])
         # 多基准对照（v6.1.1）：主基准 + 其余指数，避免单一强基准让超额恒负
         extra = [c for c in ("sh000001", "sz399006", "sh000688")
                  if c != bench_code]
         benches = {}
+        bseries = {}
         for code in [bench_code] + extra:
             try:
                 bcl, _ = tier_idx_series(cal, code)
                 bmap = {d: v for d, v in zip(cal, bcl)}
                 bseg = np.array([bmap.get(d, np.nan) for d in dates], float)
+                bseries[code] = bseg
                 benches[code] = _tier_metrics(bseg, dates)
             except Exception:
                 continue
@@ -8321,6 +8667,9 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         m["benchmark"] = bench_code
         m["bench"] = bm
         m["benches"] = benches
+        if bench_code in bseries:
+            bd, bv = _sample_series(dates, bseries[bench_code])
+            m["bench_curve_dates"], m["bench_curve"] = bd, bv
         m["excess_total"] = (m["total"] - bm["total"]) \
             if bm and bm["total"] is not None else None
         m["range"] = [dates[0], dates[-1]]
@@ -8334,6 +8683,20 @@ def _sample_returns(rr, cap=1500):
     if len(a) > cap:
         a = a[np.linspace(0, len(a) - 1, cap).astype(int)]
     return [float(round(x, 6)) for x in a]
+
+
+def _sample_series(dates, arr, cap=600):
+    """曲线降采样（保留首尾），净值归一化到首值=1；返回 (dates, values)。
+    供报告/网页画收益曲线（控制 JSON 体积）。"""
+    a = np.asarray(arr, float)
+    n = len(a)
+    if n == 0:
+        return [], []
+    idx = (np.linspace(0, n - 1, cap).astype(int) if n > cap
+           else np.arange(n))
+    base = a[0] if a[0] else 1.0
+    ds = [dates[i] for i in idx] if dates is not None else []
+    return ds, [float(round(a[i] / base, 6)) for i in idx]
 
 
 def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
@@ -8573,15 +8936,19 @@ def slice_view(res, show_n, pan=0):
         vis_chips = calc_chips(vis, vis[-1]["close"]) if vis else None
     except Exception:
         vis_chips = None
-    # 幽灵K线追加：T+1预测 + T+5/T+10（白色虚线边框）
-    ghosts = [g for g in (res.get("ghosts") or []) if g]
+    # 预测（T+1 + 幽灵K线 T+5/T+10）只在视野到达最新K线时追加；
+    # 翻看历史（pan>0）时整体隐藏，避免预测悬浮在历史区间中间。
+    at_latest = end >= n_total
+    ghosts = [g for g in (res.get("ghosts") or []) if g] if at_latest else []
+    extras = ([res["pred"]] + ghosts) if at_latest else []
+    extra_dates = (["T+1" if pd.startswith("T+") else "T日"]
+                   + [g["date"] for g in ghosts]) if at_latest else []
     view = {
-        "bars": vis + [res["pred"]] + ghosts,
-        "dates": ([r["date"] for r in vis]
-                  + ["T+1" if pd.startswith("T+") else "T日"]
-                  + [g["date"] for g in ghosts]),
+        "bars": vis + extras,
+        "dates": [r["date"] for r in vis] + extra_dates,
         "off": off,
-        "tpred": res.get("tpred_bar"),
+        "at_latest": at_latest,
+        "tpred": res.get("tpred_bar") if at_latest else None,
         "chips": vis_chips or res.get("chips"),
         "phase": (res.get("phase", "")
                   + (" · 预测锚定昨收" if res.get("pre_open") else "")),
@@ -8595,7 +8962,7 @@ def slice_view(res, show_n, pan=0):
         "boll_mid": res["ind"]["boll_mid"][off:end],
         "boll_up": res["ind"]["boll_up"][off:end],
         "boll_low": res["ind"]["boll_low"][off:end], "pdi": res["ind"]["pdi"][off:end], "mdi": res["ind"]["mdi"][off:end], "adx": res["ind"]["adx"][off:end],
-        "vols": res["vols"][off:end] + [None] * (1 + len(ghosts)),
+        "vols": res["vols"][off:end] + [None] * len(extras),
         "signals": [(i - off, dt, t, txt) for i, dt, t, txt in res["signals"]
                     if off <= i < end],
     }
@@ -8622,7 +8989,7 @@ AI_CACHE_MAX = 24          # 单股缓存对话条数上限（含首条数据上
 
 # 自有客户端标识：opencode zen 等网关要求非通用 HTTP 库 UA（否则 Cloudflare
 # 以 error code 1010 拦截），并推荐以客户端名标识
-AI_UA = "stock-analyzer/6.1.4"
+AI_UA = f"stock-analyzer/{APP_VERSION}"
 
 
 def _ai_session_id(*parts) -> str:
@@ -10191,6 +10558,10 @@ class App:
         res["tpred_bar"] = tpred_bar
         res["pool_note"] = pool_note
         res["multi_pred"] = multi_pred
+        # 幽灵K线随多日预测同步重算：否则增量加载后 T+5/T+10 与预测脱节
+        # （快速分析的旧幽灵残留），平移查看历史时观感像"自动消失"。
+        res["ghosts"] = _build_ghosts(res.get("o_today"),
+                                      multi_pred) or res.get("ghosts") or []
         res["t5_pred"] = t_pred.get("t5")
         res["levels"] = [
             {"key": k, "label": LV_LABEL[k], "n": len(smp),
@@ -10892,6 +11263,7 @@ class App:
         yo = yc = None
         ghost_lab = {"T+1预测": "T+1", "T日预测": "T日",
                      "T+5预测": "T+5", "T+10预测": "T+10"}
+        n_real = len(bars) - 1 - int(v.get("ghost_n", 0))
         for i, b in enumerate(bars):
             x = xs(i)
             if b["date"] in ghost_lab:
@@ -10907,7 +11279,7 @@ class App:
                                fill=TPRED_C, dash=(3, 2))
                 cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
                                     fill="", outline=TPRED_C, dash=(4, 3))
-                cv.create_text(x, ty - 9, text=ghost_lab[b["date"]],
+                cv.create_text(x, max(ty - 9, g["T"] + 6), text=ghost_lab[b["date"]],
                                fill=TPRED_C, font=("Consolas", 7, "bold"))
                 continue
             up = b["close"] >= b["open"]
@@ -10921,6 +11293,15 @@ class App:
                 by2 = ty + 1
             cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
                                 fill=color, outline=color)
+
+        # 预测区分隔线：只在视野到达最新K线时出现（翻看历史时随幽灵K线隐藏）
+        if v.get("at_latest", True) and 0 < n_real < len(bars):
+            xd = g["L"] + g["bw"] * n_real
+            cv.create_line(xd, g["T"] + 2, xd, g["h"] - g["B"],
+                           fill=TPRED_C, dash=(2, 4))
+            cv.create_text(xd + 3, g["h"] - g["B"] - 2, text="预测",
+                           fill=TPRED_C, anchor="sw",
+                           font=("Microsoft YaHei", 7, "bold"))
 
         for i, day, typ, txt in v["signals"]:
             if i >= len(bars) - 1:
@@ -10952,8 +11333,10 @@ class App:
                            text=f"C:{pb['close']:.2f}",
                            fill=PRED_C,
                            font=("Microsoft YaHei", 8, "bold"))
-        # T+5 预测标注（图表左上角，预测P50/区间/上行概率）
-        t5v = self.res.get("t5_pred") if getattr(self, "res", None) else None
+        # T+5 预测标注（图表左上角，预测P50/区间/上行概率；翻看历史时隐藏）
+        t5v = (self.res.get("t5_pred")
+               if getattr(self, "res", None) and v.get("at_latest", True)
+               else None)
         if t5v:
             c5 = t5v["cl"]
             cv.create_text(g["L"] + 2, g["T"] + 11,
@@ -11965,9 +12348,12 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("工具")
         win.configure(bg=DARK_BG)
+        _sw = self.root.winfo_screenwidth()
         _sh = self.root.winfo_screenheight()
-        win.geometry(f"680x{min(780, max(560, int(_sh * 0.62)))}")
-        win.minsize(560, 480)
+        win.geometry(f"{min(1320, max(760, int(_sw * 0.92)))}x"
+                     f"{min(980, max(600, int(_sh * 0.88)))}")
+        win.minsize(min(980, int(_sw * 0.72)),
+                    min(620, max(520, _sh - 180)))
         win.resizable(True, True)
         win.transient(self.root)
         win.grab_set()
@@ -11975,62 +12361,378 @@ class App:
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # ── 胜率计算 ──
+        # ── 胜率计算（收益曲线 + 全期/训练/验证 + IC 明细）──
         f_bt = ttk.Frame(nb, padding=10)
         nb.add(f_bt, text=" 信号胜率 ")
+
+        bt_bar = ttk.Frame(f_bt)
+        bt_bar.pack(side="bottom", fill="x")     # 先占底部，避免被 Text 挤没
+
+        bt_canvas = tk.Canvas(f_bt, height=340, bg=BG, highlightthickness=0)
+        bt_canvas.pack(side="top", fill="x", pady=(0, 6))
 
         bt_result = tk.Text(f_bt, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
                             wrap="word", state="disabled")
-        bt_bar = ttk.Frame(f_bt)
-        bt_bar.pack(side="bottom", fill="x")     # 先占底部，避免被 Text 挤没
         bt_scroll = ttk.Scrollbar(f_bt, command=bt_result.yview)
         bt_result.configure(yscrollcommand=bt_scroll.set)
         bt_scroll.pack(side="right", fill="y")
         bt_result.pack(fill="both", expand=True)
 
-        def run_bt():
-            if not self.res:
+        _bt_last = [None]
+
+        def _fmt_pct(v, sign=False):
+            if v is None:
+                return "-"
+            return f"{v * 100:+.1f}%" if sign else f"{v * 100:.1f}%"
+
+        def _draw_curve(bt):
+            """收益曲线：净值/回撤只画训练集（验证集不显示净值，仅底色+分界）。"""
+            cv = bt_canvas
+            cv.delete("all")
+            if not bt or not bt.get("curve"):
+                cv.create_text(12, 16, anchor="w", text="信号不足，无收益曲线",
+                               fill=AXIS_TXT, font=("Microsoft YaHei", 9))
                 return
-            rp = ((self.res.get("strategy") or {}).get("params")
+            W = max(cv.winfo_width(), 480)
+            H = int(cv["height"])
+            L, R, T, B = 56, 58, 20, 16
+            h_eq = int((H - T - B) * 0.68)
+            h_dd = (H - T - B) - h_eq - 14
+            y0_dd = T + h_eq + 14
+            curve = bt["curve"]
+            n = len(curve)
+            si = bt.get("split_i") or n          # 只画到训练集结束
+            show = curve[:si]
+            lo = min(min(show), 1.0)
+            hi = max(max(show), 1.0)
+            pad = max((hi - lo) * 0.08, 0.02)
+            lo, hi = lo - pad, hi + pad
+
+            def xm(i):
+                return L + (W - L - R) * (i / max(n - 1, 1))
+
+            def ym(v):
+                return T + (hi - v) / (hi - lo) * h_eq
+
+            # 验证集区域：底色 + 分界（不画净值，仅文字指标展示在下方）
+            if si < n:
+                xs_ = xm(si)
+                cv.create_rectangle(xs_, T, W - R, H - B, fill=PANEL_BG,
+                                    outline="")
+                cv.create_line(xs_, T, xs_, H - B, fill=C_GOLD, dash=(4, 3))
+                cv.create_text(L + 6, T + 10, anchor="w",
+                               text=f"训练集 {int(si * 100 / n)}%（显示净值）",
+                               fill=C_GOLD, font=("Microsoft YaHei", 8))
+                cv.create_text(xs_ + 6, T + 10, anchor="w",
+                               text=f"验证集 {100 - int(si * 100 / n)}%（不显示净值）",
+                               fill=PRED_C, font=("Microsoft YaHei", 8))
+            # 网格 + 净值刻度
+            for k in range(5):
+                v = lo + (hi - lo) * k / 4
+                yy = ym(v)
+                cv.create_line(L, yy, W - R, yy, fill=GRID_C, dash=(2, 3))
+                cv.create_text(L - 4, yy, anchor="e", text=f"{v:.2f}",
+                               fill=AXIS_TXT, font=("Consolas", 8))
+            # 净值曲线（起点=1.0，只画训练段）
+            x_end_tr = xm(max(si - 1, 0))
+            cv.create_line(L, ym(1.0), x_end_tr, ym(1.0), fill="#555f6b")
+            pts = []
+            for i, v in enumerate(show):
+                pts.extend((xm(i), ym(v)))
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=C_GOLD, width=2,
+                               joinstyle="round", capstyle="round")
+            # 交易点：只画训练段 B/S（信号过多时省略点，避免糊成一片）
+            sig_pts = [s for s in (bt.get("_signals") or [])
+                       if 0 <= s[0] < si]
+            if len(sig_pts) <= 300:
+                for s_i, _day, s_t, _txt in sig_pts:
+                    cv.create_oval(xm(s_i) - 2, T + h_eq - 2,
+                                   xm(s_i) + 2, T + h_eq + 2,
+                                   fill=UP if s_t == "BUY" else DOWN, outline="")
+            # 回撤子图（相对峰值，只画训练段）
+            peak = 0.0
+            dds = []
+            for v in show:
+                peak = max(peak, v)
+                dds.append(v / peak - 1 if peak > 0 else 0.0)
+            dd_lo = min(min(dds), -0.01)
+            for k in range(3):
+                v = dd_lo * k / 2
+                yy = y0_dd + (0 - v) / (0 - dd_lo) * h_dd
+                cv.create_line(L, yy, W - R, yy, fill=GRID_C, dash=(2, 3))
+                cv.create_text(L - 4, yy, anchor="e", text=f"{v * 100:.1f}%",
+                               fill=AXIS_TXT, font=("Consolas", 8))
+            pts = [L, y0_dd]
+            for i, v in enumerate(dds):
+                pts.extend((xm(i), y0_dd + (0 - v) / (0 - dd_lo) * h_dd))
+            pts.extend((x_end_tr, y0_dd))
+            cv.create_polygon(*pts, fill=DOWN, stipple="gray25", outline=DOWN)
+            peak_t = 0.0
+            mdd_t = 0.0
+            for v in show:
+                peak_t = max(peak_t, v)
+                if peak_t > 0:
+                    mdd_t = min(mdd_t, v / peak_t - 1)
+            cv.create_text(L, T - 8, anchor="w",
+                           text=f"训练集净值（起始=1.0） 期末 {show[-1]:.3f} "
+                                f"({(show[-1] - 1) * 100:+.1f}%)  "
+                                f"训练最大回撤 {mdd_t * 100:.1f}%",
+                           fill=TITLE_TXT, font=("Microsoft YaHei", 9, "bold"))
+            cv.create_text(L, y0_dd - 9, anchor="w", text="训练集回撤",
+                           fill=DOWN, font=("Microsoft YaHei", 8, "bold"))
+            cv.create_text(W - R, T - 8, anchor="e",
+                           text=f"区间 {self.res['disp_rows'][0]['date']} ~ "
+                                f"{self.res['disp_rows'][-1]['date']}",
+                           fill=AXIS_TXT, font=("Microsoft YaHei", 8))
+
+        def run_bt():
+            if not self.res or not win.winfo_exists():
+                return
+            strat = self.res.get("strategy") or {}
+            rp = (strat.get("params")
                   or CFG.RISK_PARAMS.get(self.res.get("risk_mode"))
                   or CFG.risk_params())
-            bt = backtest_signals(self.res["disp_rows"], self.res["signals"],
-                                  rp=rp)
+            # 用**全历史**重算该策略信号：主图只生成/展示近 250 根，
+            # 直接做 75/25 切分会把信号全放进验证段 → 训练集恒"信号不足"。
+            try:
+                info = get_stock_info(self.res["full_code"]) or {}
+                industry = info.get("industry") or ""
+            except Exception:
+                industry = ""
+            sig_use = strategy_signals_full(self.res["disp_rows"], strat,
+                                            industry)
+            if not sig_use:
+                sig_use = self.res["signals"]
+            bt = backtest_signals(self.res["disp_rows"], sig_use, rp=rp)
+            if bt:
+                bt["_signals"] = sig_use
+            _bt_last[0] = bt
             bt_result.config(state="normal")
             bt_result.delete("1.0", "end")
-            if not bt or bt.get("winrate") is None:
-                bt_result.insert("end", "信号不足，无法计算胜率")
-            else:
-                wr = f"{bt['winrate']*100:.0f}%"
+
+            def _seg(title, m, extra="", n_sig=None):
+                if not m:
+                    if n_sig == 0:
+                        why = "该段无信号"
+                    elif n_sig is not None:
+                        why = f"该段 {n_sig} 个信号，但未形成可回测交易"
+                    else:
+                        why = "信号不足"
+                    bt_result.insert("end",
+                        f"\n  ── {title} ──{extra}\n  {why}\n")
+                    return
                 bt_result.insert("end",
-                    f"  近120日信号回测（无手续费）\n"
-                    f"  ─────────────────────────\n"
-                    f"  交易 {bt['trades']} 次（已平仓 {bt['closed']}）\n"
-                    f"  胜率 {wr}（{bt['wins']}/{bt['closed']}）\n"
-                    f"  区间收益 {bt['total']*100:+.1f}%\n"
-                    f"  年化收益 {bt['ann']*100:+.1f}%\n"
-                    f"  最大回撤 {bt['mdd']*100:.1f}%\n")
+                    f"\n  ── {title} ──{extra}\n"
+                    f"  交易 {m['trades']} 次（已平仓 {m['closed']}）  "
+                    f"胜率 {_fmt_pct(m.get('winrate'))}"
+                    f"（{m['wins']}/{m['closed']}）\n"
+                    f"  区间收益 {_fmt_pct(m.get('total'), True)}  "
+                    f"年化 {_fmt_pct(m.get('ann'), True)}  "
+                    f"最大回撤 {_fmt_pct(m.get('mdd'))}\n"
+                    f"  盈亏比 {m.get('profit_loss', 0):.2f}  "
+                    f"均盈 {_fmt_pct(m.get('avg_win'), True)}  "
+                    f"均亏 {_fmt_pct(m.get('avg_loss'), True)}\n")
+
+            if not bt or bt.get("winrate") is None:
+                bt_result.insert("end", "该策略在全历史上没有可回测交易（信号不足）")
+            else:
+                rows_ = self.res["disp_rows"]
+                si = bt.get("split_i")
+                _seg("全期（无手续费）", bt,
+                     f"  {rows_[0]['date']} ~ {rows_[-1]['date']}")
                 if bt["floating"] is not None:
                     bt_result.insert("end",
-                        f"  未平仓浮盈 {bt['floating']*100:+.1f}%\n")
+                        f"  未平仓浮盈 {_fmt_pct(bt['floating'], True)}\n")
+                if si:
+                    n_tr = len([s for s in sig_use if s[0] < si])
+                    _seg("训练集（前75%）", bt.get("train"),
+                         f"  {rows_[0]['date']} ~ {rows_[si - 1]['date']}",
+                         n_sig=n_tr)
+                    _seg("验证集（后25%）", bt.get("val"),
+                         f"  {rows_[si]['date']} ~ {rows_[-1]['date']}",
+                         n_sig=len(sig_use) - n_tr)
+                ics = []
+                for h, k in ((1, "ic1"), (5, "ic5")):
+                    ic, nic = (bt.get(k) or (None, 0))
+                    ics.append(f"IC(T+{h})={'%.3f' % ic if ic is not None else '-'}"
+                               f"(n={nic})")
                 bt_result.insert("end",
-                    f"\n  提示：信号基于多维打分+方向切换触发，\n"
-                    f"  每日最多一个B/S标记，仅供参考。\n")
+                    f"\n  ── 信号质量 ──\n"
+                    f"  {'  '.join(ics)}\n")
+                fwd = bt.get("fwd") or {}
+                for typ, name in (("BUY", "买入信号后"), ("SELL", "卖出信号后")):
+                    rec = fwd.get(typ) or {}
+                    parts = []
+                    for h in (1, 5):
+                        n_, avg, up = rec.get(h, (0, None, None))
+                        if avg is None:
+                            parts.append(f"T+{h} 无样本")
+                        else:
+                            parts.append(
+                                f"T+{h} 均值{avg * 100:+.2f}% 上涨{up * 100:.0f}%"
+                                f"(n={n_})")
+                    bt_result.insert("end", f"  {name}: " + "  ".join(parts) + "\n")
+                bt_result.insert("end",
+                    f"\n  提示：回测用所选策略**全历史**信号，T日收盘信号/T+1成交，\n"
+                    f"  带ATR止损+移动止盈；训练/验证按时间前75%/后25%切分，\n"
+                    f"  验证集不参与选型、仅供检验。\n")
             bt_result.config(state="disabled")
+            _draw_curve(bt)
 
-        btn_bt = tk.Button(bt_bar, text="计算胜率", command=run_bt,
+        _curve_job = [None]
+
+        def _curve_resize(_e=None):
+            if _bt_last[0] is None:
+                return
+            if _curve_job[0]:
+                try:
+                    self.root.after_cancel(_curve_job[0])
+                except Exception:
+                    pass
+            _curve_job[0] = self.root.after(
+                120, lambda: (_draw_curve(_bt_last[0])
+                              if bt_canvas.winfo_exists() else None))
+        bt_canvas.bind("<Configure>", _curve_resize)
+
+        def export_bt():
+            """导出回测：.txt=完整明细+净值，.csv=净值曲线，.json=结构化数据。
+
+            同时向 research/gui_backtests/ 写一份 JSON（整合到本地网页仪表盘）。"""
+            bt = _bt_last[0]
+            if not bt:
+                messagebox.showinfo("导出", "请先计算胜率/收益曲线",
+                                    parent=win)
+                return
+            desk = os.path.join(os.path.expanduser("~"), "Desktop")
+            if not os.path.isdir(desk):
+                desk = os.path.expanduser("~")
+            r = self.res
+            strat = r.get("strategy") or {}
+            rows_ = r["disp_rows"]
+            curve = bt.get("curve") or []
+            peak = 0.0
+            dds = []
+            for v in curve:
+                peak = max(peak, v)
+                dds.append((v / peak - 1) if peak > 0 else 0.0)
+            payload = {
+                "kind": "gui_backtest",
+                "version": APP_VERSION,
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "code": r["full_code"],
+                "name": (r.get("quote") or {}).get("name", ""),
+                "strategy": {"label": strat.get("label", "默认·未消融"),
+                             "algo": strat.get("algo"),
+                             "mode": strat.get("mode"),
+                             "params": strat.get("params")
+                             or CFG.risk_params()},
+                "range": [rows_[0]["date"], rows_[-1]["date"]],
+                "split_i": bt.get("split_i"),
+                "exec": ("open" if _exec_mode() == "open" else "close"),
+                "full": {k: v for k, v in bt.items()
+                         if k not in ("curve", "trades_list", "train", "val",
+                                      "_signals")},
+                "train": bt.get("train"),
+                "val": bt.get("val"),
+                "ic1": bt.get("ic1"), "ic5": bt.get("ic5"),
+                "fwd": bt.get("fwd"),
+                "curve_dates": [x["date"] for x in rows_],
+                "curve": curve,
+                "drawdown": dds,
+                "signals": [[s[0], s[1], s[2], s[3]]
+                            for s in (bt.get("_signals")
+                                      or r.get("signals") or [])],
+            }
+            # 自动留档到研究仪表盘目录（失败不影响用户选择的导出）
+            try:
+                gdir = os.path.join(
+                    os.path.dirname(os.path.abspath(DB_PATH)),
+                    "research", "gui_backtests")
+                os.makedirs(gdir, exist_ok=True)
+                gp = os.path.join(
+                    gdir, f"gui_{r['full_code']}_"
+                          f"{time.strftime('%Y%m%d_%H%M%S')}.json")
+                with open(gp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+            except Exception:
+                log.exception("写入 gui_backtests 失败（忽略）")
+
+            fn = filedialog.asksaveasfilename(
+                parent=win, initialdir=desk,
+                initialfile=f"回测_{r['full_code']}_{time.strftime('%Y%m%d')}.txt",
+                defaultextension=".txt",
+                filetypes=[("文本报告", "*.txt"), ("净值曲线CSV", "*.csv"),
+                           ("JSON数据", "*.json")])
+            if not fn:
+                return
+
+            def _curve_lines():
+                out = []
+                for i, v in enumerate(curve):
+                    d = rows_[i]["date"] if i < len(rows_) else ""
+                    out.append(f"{d},{v:.6f},{dds[i]:.6f}\n")
+                return out
+
+            try:
+                if fn.lower().endswith(".csv"):
+                    with open(fn, "w", encoding="utf-8-sig",
+                              newline="") as f:
+                        f.write("date,net_value,drawdown\n")
+                        f.writelines(_curve_lines())
+                elif fn.lower().endswith(".json"):
+                    with open(fn, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=1)
+                else:
+                    head = (
+                        f"{'=' * 60}\n"
+                        f"单股回测（信号胜率）\n"
+                        f"股票: {r['full_code']}  "
+                        f"策略: {strat.get('label', '默认·未消融')}\n"
+                        f"参数: {strat.get('params') or CFG.risk_params()}\n"
+                        f"区间: {rows_[0]['date']} ~ {rows_[-1]['date']}"
+                        f"  切分: 训练前75% / 验证后25%\n"
+                        f"成交: T日收盘信号 → T+1"
+                        f"{'开盘' if _exec_mode() == 'open' else '收盘'}"
+                        f"成交，ATR止损+移动止盈，无手续费\n"
+                        f"净值曲线只画训练集；验证集仅为指标检验\n"
+                        f"{'=' * 60}\n")
+                    with open(fn, "w", encoding="utf-8") as f:
+                        f.write(head)
+                        f.write(bt_result.get("1.0", "end").rstrip() + "\n")
+                        f.write("\n-- 净值曲线数据(日期,净值,回撤) --\n")
+                        f.writelines(_curve_lines())
+                        f.write(f"\n作者：{AUTHOR}  邮箱：{AUTHOR_EMAIL}  "
+                                f"QQ：{AUTHOR_QQ}\n{DISCLAIMER}\n")
+                self.progress_var.set(
+                    f"已导出: {fn}（副本存 research/gui_backtests/）")
+            except Exception as e:
+                log.exception("导出回测失败")
+                messagebox.showerror("导出失败", str(e), parent=win)
+
+        btn_row = ttk.Frame(bt_bar)
+        btn_row.pack(pady=(6, 6))
+        btn_bt = tk.Button(btn_row, text="计算胜率/收益曲线", command=run_bt,
                            bg=BTN_BG, fg=BTN_FG,
                            activebackground=BTN_HOVER, activeforeground=BTN_FG,
                            relief="flat", cursor="hand2",
                            font=("Microsoft YaHei", 10, "bold"))
-        btn_bt.pack(pady=(6, 2), ipadx=16, ipady=4)
-        tk.Button(bt_bar, text="重选策略(消融回测)", command=self._rerun_strategy,
+        btn_bt.pack(side="left", padx=(0, 6), ipadx=16, ipady=4)
+        tk.Button(btn_row, text="导出回测", command=export_bt,
                   bg=BTN_BG, fg=BTN_FG,
                   activebackground=BTN_HOVER, activeforeground=BTN_FG,
                   relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 10, "bold")).pack(
-                      pady=(2, 6), ipadx=10, ipady=4)
+                      side="left", padx=6, ipadx=16, ipady=4)
+        tk.Button(btn_row, text="重选策略(消融回测)", command=self._rerun_strategy,
+                  bg=BTN_BG, fg=BTN_FG,
+                  activebackground=BTN_HOVER, activeforeground=BTN_FG,
+                  relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 10, "bold")).pack(
+                      side="left", padx=6, ipadx=10, ipady=4)
+        # 打开即算一次，省得用户再点
+        self.root.after(80, run_bt)
 
         # ── AI 分析（多轮对话，共享同一份数据上下文，带会话缓存） ──
         f_ai = ttk.Frame(nb, padding=10)
@@ -12581,7 +13283,7 @@ class App:
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=29, column=0, columnspan=3, sticky="we")
-        about.insert("end", "版本：v6.1.4（2026-09）\n")
+        about.insert("end", f"版本：v{APP_VERSION}（2026-09）\n")
         about.insert("end", "作者：獨白\n")
         about.insert("end", "邮箱：kingrux106@gmail.com\n")
         about.insert("end", "QQ：2180287399\n")

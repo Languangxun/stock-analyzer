@@ -110,13 +110,13 @@ def probe(url_builder, validator, timeout=10):
 
 def v_tencent(base):
     def build():
-        return base + f"?param={TEST_CODE},day,,,5,qfq"
+        return base + f"?param={TEST_CODE},day,,,5,hfq"
 
     def check(txt):
         try:
             d = json.loads(txt)
             bars = ((d.get("data") or {}).get(TEST_CODE) or {}).get(
-                "qfqday") or ((d.get("data") or {}).get(TEST_CODE) or {}
+                "hfqday") or ((d.get("data") or {}).get(TEST_CODE) or {}
                               ).get("day") or []
             return len(bars) >= 5 and RECENT in str(bars[-1][:1])
         except Exception:
@@ -276,7 +276,7 @@ def rescue(results, use_ai=False):
     for u in cands:
         if not u.lower().startswith(("http://", "https://")):
             continue
-        ok, detail = probe(lambda: u + f"?param={TEST_CODE},day,,,5,qfq",
+        ok, detail = probe(lambda: u + f"?param={TEST_CODE},day,,,5,hfq",
                            v_tencent(u)[1])
         print(f"  [{'验证通过' if ok else '验证失败'}] {u}\n        {detail}")
         if ok:

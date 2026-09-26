@@ -21,6 +21,12 @@ research/factor_lab/
 *.npz
 # 回测图表产物（backtest_v61.py 自动生成，可重跑）
 research/charts/
+# 回测版本化产物目录（backtest_v61.py 每次运行新建；report/tables/charts，
+# 根目录仍保留 v61_report*.json/md 最新副本，明细随研究包分发，不入仓）
+research/backtest_v*/
+# 本地网页仪表盘与 GUI 单股回测留档（v61_dashboard.py 生成，可重跑）
+research/dashboard.html
+research/gui_backtests/
 
 # 全A消融逐股明细（>100MB，超出 GitHub 单文件上限；随 Release 资产 research_v6.1.zip 分发）
 research/strategy_ablation_per_stock*.json
