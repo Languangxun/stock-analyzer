@@ -21,6 +21,7 @@ import os
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.request
@@ -28,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import font as tkfont
 
 try:
     import numpy as np            # 数值加速（缺失时自动退回纯Python）
@@ -3294,31 +3296,19 @@ def calc_chips(rows, cur_price=None, nbin=120):
             p95 = m
             break
 
-    # 支撑/压力：在筹码分布中找“局部峰”（局部极大值），再取现价上下方
-    # 最密集的峰，作为支撑位/压力位。相比原“单根最密集bin”，局部峰能
-    # 避免选中噪声尖刺，且更贴近“最密集筹码峰”的语义。
-    def _peaks():
-        out = []
-        for k in range(1, nbin):
-            w = chips[k]
-            if w > chips[k - 1] and w >= chips[k + 1] and w > 0:
-                out.append((mids[k], w))
-        return out
-
+    # 支撑/压力：现价下方/上方“最密集的筹码带”。先做 3bin 平滑，
+    # 避免单 bin 噪声；不用“局部极大值”是因为现价切在主峰侧面时，
+    # 主力筹码带会落在下降坡上而非局部峰，反而被远处的小凸起压过
+    # （实测 002241：全历史口径 压力 27.33 只有 0.7% 筹码，而
+    # 24~25 元的厚筹码带被判为“非峰”）。
     def _strongest(below):
-        pk = _peaks()
-        if below:
-            cand = [(m, w) for m, w in pk if m < cur_price]
-        else:
-            cand = [(m, w) for m, w in pk if m > cur_price]
-        if not cand:
-            # 退化为最密集单bin（避免无峰时返回空）
-            best_w, best_m = -1.0, None
-            for w, m in zip(chips, mids):
-                if (m < cur_price) == below and w > best_w:
-                    best_w, best_m = w, m
-            return best_m
-        return max(cand, key=lambda x: x[1])[0]   # 最密集峰
+        sm = [(chips[max(0, k - 1)] + chips[k]
+               + chips[min(nbin, k + 1)]) / 3.0 for k in range(nbin + 1)]
+        best_w, best_m = -1.0, None
+        for k, m in enumerate(mids):
+            if (m < cur_price) == below and sm[k] > best_w:
+                best_w, best_m = sm[k], m
+        return best_m
 
     return {"bins": list(zip(mids, chips)),
             "avg_cost": round(avg_cost, 3), "profit": profit,
@@ -5259,6 +5249,25 @@ def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
     return dict(pool[i]), "近窗不一致→无多维候选，按全窗"
 
 
+def _pick_one_from_pool(pool, key):
+    """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
+
+    key: 保守/稳健/激进；保守档限定「保守/稳健参数」候选，其余目标：
+    保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar（见 _ablation_weights）。
+    返回 (picked, note)。"""
+    p = pool
+    if key == "保守":
+        p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
+        if p2:
+            p = p2
+    obj = "激进" if key in ("均衡", "激进") else "稳健"
+    picked, note = pick_ablation_consistent(
+        p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+    if not picked:
+        return dict(p[0]), "回退池内首个"
+    return picked, note
+
+
 def _ablation_pf(trades):
     """由逐笔收益算盈亏比。"""
     gp = sum(x for x in trades if x > 0)
@@ -5367,7 +5376,7 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             "curve": curve, "i0": i0}
 
 
-RECENT_ABL_BARS = 250       # 选型一致性用的近端子窗长度（截至最新，含验证段）
+RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾，不碰验证段）
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
 
 
@@ -5592,7 +5601,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
-        rc = _ablation_recent(rows, sigs, rp, n, atrs)
+        # 近端一致性门槛只用「训练段末尾」(split 前) 的数据：
+        # 此前用 rows[0:n] 的最近 250 根，而 n=1000 时那正是验证段 →
+        # 验证集参与了选型门槛（top25% 否决），验证段指标偏乐观（过拟合）。
+        rc = _ablation_recent(rows, sigs, rp, split, atrs)
         return {"algo": algo, "mode": mode, "params": dict(rp),
                 "label": label, "train": train, "val": val,
                 "recent": rc, "bull": bull, "bear": bear}
@@ -5624,19 +5636,9 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
                         key, CFG.RISK_PARAMS["稳健"])),
                     "label": f"多维评分·{key}（样本不足，固定回退）",
                     "train": {}, "val": {}}
-        if key == "保守":
-            # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中选优
-            pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
-            if pool2:
-                pool = pool2
         # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）；
-        # v6.1.5 热修②：+近端子窗一致性，不一致回退该档「多维评分」
-        obj = "激进" if key in ("均衡", "激进") else "稳健"
-        picked, note = pick_ablation_consistent(
-            pool, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
-        if not picked:
-            picked = dict(pool[0])
-            note = "回退池内首个"
+        # v6.1.5 热修②：+近端子窗一致性（训练段末尾），不一致回退该档「多维评分」
+        picked, note = _pick_one_from_pool(pool, key)
         _pick_notes[key] = note
         return picked
 
@@ -9036,12 +9038,9 @@ def slice_view(res, show_n, pan=0):
     end = min(n_total, off + show_n)
     vis = res["disp_rows"][off:end]
     pd = res["pred"]["date"]
-    # 可见区间筹码：平移后筹码随区间变化
-    vis_chips = None
-    try:
-        vis_chips = calc_chips(vis, vis[-1]["close"]) if vis else None
-    except Exception:
-        vis_chips = None
+    # 筹码分布统一用全历史口径（res["chips"]，与右栏「筹码参考」同一份），
+    # 平移/缩放不重算：此前按可见 250 根窗口另算一份，导致图上支/压与右栏
+    # 数字不一致（实测 002241 图上 23.33/24.75 vs 右栏 23.69/27.33）。
     # 预测（T+1 + 幽灵K线 T+5/T+10）只在视野到达最新K线时追加；
     # 翻看历史（pan>0）时整体隐藏，避免预测悬浮在历史区间中间。
     at_latest = end >= n_total
@@ -9055,7 +9054,7 @@ def slice_view(res, show_n, pan=0):
         "off": off,
         "at_latest": at_latest,
         "tpred": res.get("tpred_bar") if at_latest else None,
-        "chips": vis_chips or res.get("chips"),
+        "chips": res.get("chips"),
         "phase": (res.get("phase", "")
                   + (" · 预测锚定昨收" if res.get("pre_open") else "")),
         "pred_label": "T+1" if pd.startswith("T+") else "T日",
@@ -9388,9 +9387,15 @@ class App:
         self.res = None
         self.view = None
         self.scales = {}
+        self._axis_lpad = 0            # 轴标签左边距让位（_draw_main 计算）
         self.show_n = tk.IntVar(value=30 if self.compact else 60)
         self.ind_name = tk.StringVar(value="MACD")
         self.show_chips = tk.BooleanVar(value=not self.compact)
+        # 小屏默认折叠副图（成交量/指标），纵向空间全给主图（类同花顺）；
+        # 分辨率检测：主图预估高度不足 380px 也默认折叠
+        self.fold_sub = tk.BooleanVar(
+            value=self.compact or self.PANEL_H["main"] < 380)
+        self._fold_manual = False      # 用户手动切换后不再自动干预
         self.view_pan = 0       # 平移偏移：0=最新，正=往左看更早
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
 
@@ -9417,6 +9422,7 @@ class App:
         if getattr(self, "_last_code", ""):
             self.code_var.set(self._last_code)
         self._build_body()
+        self._apply_fold()              # 紧凑小屏默认折叠副图
         try:
             self.ent_query.focus_set()      # 启动即聚焦搜索框
         except Exception:
@@ -9600,6 +9606,8 @@ class App:
                               state="readonly", values=["MACD", "KDJ", "RSI", "BOLL", "ADX"])
             ci.pack(side="left", padx=2)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
+            ttk.Checkbutton(top2, text="折叠", width=4, variable=self.fold_sub,
+                            command=self._toggle_sub).pack(side="left", padx=2)
             # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
             ttk.Button(top2, text="工具", width=4,
                        command=lambda: self._tools_menu(top2)
@@ -9634,6 +9642,11 @@ class App:
                                selectcolor=FIELD_BG).pack(side="left")
             tk.Checkbutton(top, text="筹码峰", variable=self.show_chips,
                            command=self._rerender, font=("Consolas", 8),
+                           bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
+                           activeforeground=FG_MAIN,
+                           selectcolor=FIELD_BG).pack(side="left")
+            tk.Checkbutton(top, text="折叠副图", variable=self.fold_sub,
+                           command=self._toggle_sub, font=("Consolas", 8),
                            bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
                            activeforeground=FG_MAIN,
                            selectcolor=FIELD_BG).pack(side="left")
@@ -9703,7 +9716,7 @@ class App:
         self._fit_info()
 
     def _build_body(self):
-        body = tk.Frame(self.root)
+        body = tk.Frame(self.root, bg=DARK_BG)
         body.pack(fill="both", expand=True)
 
         # ---- 右侧：预测参考 / 插件面板（先pack，防止遮挡图表；小屏省略）----
@@ -9794,7 +9807,7 @@ class App:
             self.sector_txt.pack(fill="both", expand=True)
 
         # ---- 中部：图表 + 指数条 ----
-        left = tk.Frame(body)
+        left = tk.Frame(body, bg=DARK_BG)
         left.pack(side="left", fill="both", expand=True)
         self._w_left = left
         self.cv_main = Chart(left, self.PANEL_H["main"])
@@ -11173,19 +11186,21 @@ class App:
             n = 60
         n = max(20, min(n, 250))
         self.view = slice_view(self.res, n, pan=self.view_pan)
+        self._axis_lpad = 0          # 主图按实际字体重新计算轴标签让位
         self._draw_main()
-        self._draw_vol()
-        name = self.ind_name.get()
-        if name == "MACD":
-            self._draw_macd()
-        elif name == "KDJ":
-            self._draw_kdj()
-        elif name == "RSI":
-            self._draw_rsi()
-        elif name == "BOLL":
-            self._draw_bollpct()
-        elif name == "ADX":
-            self._draw_adx()
+        if not self.fold_sub.get():
+            self._draw_vol()
+            name = self.ind_name.get()
+            if name == "MACD":
+                self._draw_macd()
+            elif name == "KDJ":
+                self._draw_kdj()
+            elif name == "RSI":
+                self._draw_rsi()
+            elif name == "BOLL":
+                self._draw_bollpct()
+            elif name == "ADX":
+                self._draw_adx()
         if getattr(self, "side_txt", None):
             self._write_side()
         self._write_report()
@@ -11220,7 +11235,50 @@ class App:
     def _on_resize(self, _event):
         if getattr(self, "_resize_job", None):
             self.root.after_cancel(self._resize_job)
-        self._resize_job = self.root.after(200, self._rerender)
+        self._resize_job = self.root.after(200, self._on_resize_done)
+
+    def _on_resize_done(self):
+        self._resize_job = None
+        self._auto_fold_by_size()
+        self._rerender()
+
+    def _auto_fold_by_size(self):
+        """窗口缩到主图高度不足 320px 时自动折叠副图（手动设置过则不干预）。"""
+        if self._fold_manual or self.fold_sub.get():
+            return
+        try:
+            h = self.cv_main.winfo_height()
+            if h > 1 and h < 320:
+                self.fold_sub.set(True)
+                self._apply_fold()
+        except Exception:
+            pass
+
+    def _apply_fold(self):
+        """按 fold_sub 收起/恢复成交量与指标副图（不重绘）。
+
+        收起时同时把两行的 grid 权重清零——只 grid_remove 的话空行仍按
+        权重 2:3 占据高度，露出父容器底色（浅灰白带）。"""
+        if self.fold_sub.get():
+            self.cv_vol.grid_remove()
+            self.cv_ind.grid_remove()
+            self._w_left.grid_rowconfigure(1, weight=0)
+            self._w_left.grid_rowconfigure(2, weight=0)
+        else:
+            self.cv_vol.grid()
+            self.cv_ind.grid()
+            self._w_left.grid_rowconfigure(1, weight=2)
+            self._w_left.grid_rowconfigure(2, weight=3)
+
+    def _toggle_sub(self):
+        """折叠/展开成交量与指标副图：小屏把纵向空间让给主图（类同花顺）。"""
+        self._fold_manual = True
+        self._apply_fold()
+        self.root.update_idletasks()
+        if getattr(self, "_resize_job", None):
+            self.root.after_cancel(self._resize_job)
+            self._resize_job = None
+        self._rerender()
 
     def _drag_start(self, event):
         self._drag_x = event.x
@@ -11263,12 +11321,18 @@ class App:
 
     # ---------- 绘图工具 ----------
 
-    def _geom(self, cv, n_bars, chips=False):
+    def _geom(self, cv, n_bars, chips=False, lpad=0):
         w = max(cv.winfo_width(), 240)
-        h = int(cv["height"])
+        # 优先用实际高度：grid 拉伸/折叠副图后 config 的 height 不再是真实
+        # 高度，用请求值会把图挤在顶部（小屏折叠后尤其明显）
+        h = cv.winfo_height()
+        if h <= 1:
+            h = int(cv["height"])
         # 小屏压缩左右留白，确保K线尽量占满屏幕
         compact = getattr(self, "compact", False)
-        L = 34 if compact else 58
+        # lpad：按实际字体宽度给价格轴标签让位（HiDPI/字体缩放时固定 58px
+        # 会把 5 位数标签首字符画出画布，显示值看起来少一位，如 40.28→0.28）
+        L = (34 if compact else 58) + max(0, int(lpad))
         R = 44 if (chips and compact) else (70 if chips else (28 if compact else 20))
         T, B = 14 if compact else 16, 18 if compact else 20
         pw, ph = w - L - R, h - T - B
@@ -11281,6 +11345,15 @@ class App:
         rng = (hi - lo) or 1.0
         pad = rng * ratio
         return lo - pad, hi + pad
+
+    @staticmethod
+    def _text_px(cv, text, size=8, family="Consolas"):
+        """按实际字体（Tk 缩放）测量文本像素宽，避免标签被画布裁切。"""
+        try:
+            f = tkfont.Font(root=cv, family=family, size=size)
+            return f.measure(text)
+        except Exception:
+            return len(text) * 8
 
     def _axes(self, cv, g, lo, hi, fmt="{:.2f}", ngrid=4):
         def ymap(v):
@@ -11342,7 +11415,6 @@ class App:
         cv.delete("all")
         bars = v["bars"]
         has_chips = self.show_chips.get() and v.get("chips") and v["chips"].get("bins")
-        g = self._geom(cv, len(bars), chips=has_chips)
         if not bars:
             return
 
@@ -11369,6 +11441,18 @@ class App:
         if not los or not his:
             return
         lo, hi = self._pad_range(min(los), max(his))
+        # 轴标签（含副图 MACD）按实际字体宽度预留左边距，避免数字被裁一位
+        base_l = 34 if getattr(self, "compact", False) else 58
+        samples = [f"{max(abs(lo), abs(hi)):.2f}"]
+        if self.ind_name.get() == "MACD":
+            vals = [abs(x) for x in (v["dif"] + v["dea"] + v["mhist"])
+                    if x is not None]
+            if vals:
+                samples.append(f"{max(vals):.2f}")
+        lpad = max(self._text_px(cv, s) + 8 - base_l for s in samples)
+        self._axis_lpad = max(0, lpad)
+        g = self._geom(cv, len(bars), chips=has_chips,
+                       lpad=self._axis_lpad)
 
         def ymap(val):
             return g["T"] + (hi - val) / (hi - lo) * g["ph"]
@@ -11389,7 +11473,9 @@ class App:
                            fill=C_GOLD, font=("Consolas", 8, "bold"),
                            anchor="e")
 
-        # 筹码峰：独立右列，只画可见价格区间的bin，均匀排列
+        # 筹码峰：全历史口径（与右栏一致），独立右列；
+        # 每个 bin 画在 ymap(价格) 位置——此前按 bin 序号从上到下均匀排，
+        # 与价格轴上下颠倒（低位厚筹码带显示在顶部），峰位对不上K线价格。
         if has_chips:
             cp_ = v["chips"]
             chip_w = g["R"] - 6
@@ -11402,10 +11488,8 @@ class App:
                         if w > 0 and lo <= m <= hi]
             if vis_bins:
                 maxw = max(w for _, w in vis_bins)
-                n_vis = len(vis_bins)
-                slot = (ybot - g["T"]) / max(n_vis, 1)  # 每个bin均匀占位
-                for idx, (mid, wgt) in enumerate(vis_bins):
-                    yy = g["T"] + slot * (idx + 0.5)
+                for mid, wgt in vis_bins:
+                    yy = ymap(mid)
                     bar_len = cw * wgt / maxw
                     cv.create_line(xr - bar_len, yy, xr, yy,
                                    fill=UP if mid <= cp_["cur"] else DOWN,
@@ -11418,7 +11502,12 @@ class App:
                     yy = ymap(pv)
                     cv.create_line(g["L"], yy, xr, yy,
                                    fill=colr, dash=(6, 4))
-                    cv.create_text(xl + 2, yy - 7, text=f"{lab} {pv:.2f}",
+                    txt = f"{lab} {pv:.2f}"
+                    # 右缘内收：字体缩放时标签比筹码列宽，避免末位数字被裁
+                    tx = xl + 2
+                    tx = min(tx, g["w"] - 4
+                             - self._text_px(cv, txt, 8, "Microsoft YaHei"))
+                    cv.create_text(max(tx, g["L"] + 2), yy - 7, text=txt,
                                    anchor="w", fill=colr,
                                    font=("Microsoft YaHei", 8))
 
@@ -11532,7 +11621,8 @@ class App:
         while vols and vols[-1] is None:   # 剔除尾部预测占位空槽
             vols.pop()
         n = len(v["bars"])
-        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")))
+        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         vmax = max(vols) if vols else 1.0
         lo, hi = 0, vmax * 1.08
 
@@ -11574,7 +11664,8 @@ class App:
         bars = v["bars"]
         n = len(bars)
         g = self._geom(cv, n, chips=bool(self.show_chips.get()
-                                         and v.get("chips")))
+                                         and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         pct = []
         for i, b in enumerate(bars):
             if i >= len(up) or None in (up[i], low[i]) or up[i] <= low[i]:
@@ -11618,7 +11709,8 @@ class App:
         pdi, mdi, adx = v["pdi"], v["mdi"], v["adx"]
         n = len(v["bars"])
         g = self._geom(cv, n, chips=bool(self.show_chips.get()
-                                         and v.get("chips")))
+                                         and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         vals = [x for x in pdi + mdi + adx if x is not None]
         lo, hi = (0, 60) if not vals else (0, max(60, max(vals) * 1.1))
 
@@ -11656,7 +11748,8 @@ class App:
         cv.delete("all")
         dif, dea, mh = v["dif"], v["dea"], v["mhist"]
         n = len(v["bars"])
-        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")))
+        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         vals = [x for x in dif + dea + mh if x is not None]
         lo, hi = self._pad_range(min(vals + [0]), max(vals + [0]), 0.12)
 
@@ -11694,7 +11787,8 @@ class App:
         cv.delete("all")
         k, d, j = v["k"], v["d"], v["j"]
         n = len(v["bars"])
-        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")))
+        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         lo, hi = self._pad_range(min(j + [0]), max(j + [100]), 0.06)
 
         def ymap(val):
@@ -11722,7 +11816,8 @@ class App:
         cv, v = self.cv_ind, self.view
         cv.delete("all")
         n = len(v["bars"])
-        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")))
+        g = self._geom(cv, n, chips=bool(self.show_chips.get() and v.get("chips")),
+                       lpad=getattr(self, "_axis_lpad", 0))
         lo, hi = self._pad_range(0, 100, 0.02)
 
         def ymap(val):
@@ -11768,7 +11863,8 @@ class App:
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
         txt = fmt(price) if fmt else f"{price:.2f}"
-        px = sg["w"] - sg["R"] + 30
+        # 价格标签贴在右缘内侧；R 较小时（未勾选筹码峰）不回退到画布外
+        px = min(sg["w"] - sg["R"] + 30, sg["w"] - 33)
         cv.coords(sg["pid"], px, y)
         cv.itemconfigure(sg["pid"], text=txt)
         cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
@@ -12515,9 +12611,7 @@ class App:
         return txt
 
     def open_tools(self):
-        if not self.res:
-            messagebox.showinfo("提示", "请先【分析预测】一只股票")
-            return
+        res_ok = bool(self.res)
         win = tk.Toplevel(self.root)
         win.title("工具")
         win.configure(bg=DARK_BG)
@@ -12935,7 +13029,7 @@ class App:
         ai_result.pack(fill="both", expand=True)
 
         # 会话缓存：同股票同模型复用历史（内存 + SQLite meta）
-        code = self.res["full_code"]
+        code = (self.res or {}).get("full_code") or ""
         ses_key = (code, AI_MODEL)
         ses = self._ai_sessions.get(ses_key) or ai_session_load(code)
         if ses:
@@ -13072,6 +13166,303 @@ class App:
                   font=("Microsoft YaHei", 10, "bold")).pack(
                       side="left", padx=(6, 0), ipadx=10, ipady=4)
         _render()
+
+        # ── 数据工具（清洗/复权迁移 + 全库回填 + 每只股回测导出）──
+        f_data = ttk.Frame(nb, padding=10)
+        nb.add(f_data, text=" 数据工具 ")
+        self._build_data_tools(f_data, win)
+        if not res_ok:                   # 未分析股票时只开放数据工具页
+            nb.tab(0, state="disabled")
+            nb.tab(1, state="disabled")
+            nb.select(2)
+
+    # ---------- 数据工具（清洗/回填/回测导出） ----------
+
+    def _build_data_tools(self, parent, win):
+        """数据清洗/复权迁移 + 全库回填 + 每只股回测导出（子进程 + 实时日志）。"""
+        import queue
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        self._ext_proc = None
+        self._ext_q = queue.Queue()
+        self._ext_text = None
+        self._ext_win = win
+
+        # —— 清洗 / 复权迁移 ——
+        cl = ttk.LabelFrame(parent, padding=8,
+                            text=" 数据清洗 / 复权口径迁移（data_clean.py） ")
+        cl.pack(fill="x", pady=(0, 6))
+        r1 = ttk.Frame(cl)
+        r1.pack(fill="x")
+        ttk.Label(r1, text="模式:").pack(side="left")
+        clean_mode = tk.StringVar(value="只扫描")
+        ttk.Combobox(r1, textvariable=clean_mode, width=12, state="readonly",
+                     values=["只扫描", "修复异常", "全库复权迁移"]
+                     ).pack(side="left", padx=(2, 10))
+        ttk.Label(r1, text="库:").pack(side="left")
+        clean_db = tk.StringVar(value=DB_PATH)
+        ttk.Entry(r1, textvariable=clean_db).pack(side="left", padx=2,
+                                                  fill="x", expand=True)
+        r2 = ttk.Frame(cl)
+        r2.pack(fill="x", pady=(6, 0))
+        ttk.Label(r2, text="并发:").pack(side="left")
+        clean_workers = tk.StringVar(value="2")
+        ttk.Spinbox(r2, from_=1, to=16, width=4,
+                    textvariable=clean_workers).pack(side="left", padx=(2, 10))
+        ttk.Label(r2, text="限制只数(0=全部):").pack(side="left")
+        clean_limit = tk.StringVar(value="0")
+        ttk.Spinbox(r2, from_=0, to=99999, width=8,
+                    textvariable=clean_limit).pack(side="left", padx=(2, 10))
+        clean_force = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r2, text="忽略断点(force)",
+                        variable=clean_force).pack(side="left")
+
+        # —— 全库回填 ——
+        bf = ttk.LabelFrame(parent, padding=8,
+                            text=" 全库日K回填（backfill_full.py） ")
+        bf.pack(fill="x", pady=(0, 6))
+        b1 = ttk.Frame(bf)
+        b1.pack(fill="x")
+        ttk.Label(b1, text="目标根数:").pack(side="left")
+        bf_minbars = tk.StringVar(value="950")
+        ttk.Spinbox(b1, from_=100, to=3000, increment=50, width=6,
+                    textvariable=bf_minbars).pack(side="left", padx=(2, 10))
+        ttk.Label(b1, text="过期天数:").pack(side="left")
+        bf_fresh = tk.StringVar(value="6")
+        ttk.Spinbox(b1, from_=1, to=60, width=4,
+                    textvariable=bf_fresh).pack(side="left", padx=(2, 10))
+        ttk.Label(b1, text="单次根数:").pack(side="left")
+        bf_count = tk.StringVar(value="1100")
+        ttk.Spinbox(b1, from_=300, to=3000, increment=100, width=6,
+                    textvariable=bf_count).pack(side="left", padx=(2, 10))
+        b2 = ttk.Frame(bf)
+        b2.pack(fill="x", pady=(6, 0))
+        ttk.Label(b2, text="并发:").pack(side="left")
+        bf_workers = tk.StringVar(value="6")
+        ttk.Spinbox(b2, from_=1, to=24, width=4,
+                    textvariable=bf_workers).pack(side="left", padx=(2, 10))
+        ttk.Label(b2, text="节流秒:").pack(side="left")
+        bf_throttle = tk.StringVar(value="0.45")
+        ttk.Spinbox(b2, from_=0.05, to=3.0, increment=0.05, width=5,
+                    textvariable=bf_throttle).pack(side="left", padx=(2, 10))
+        ttk.Label(b2, text="限制只数(0=全部):").pack(side="left")
+        bf_limit = tk.StringVar(value="0")
+        ttk.Spinbox(b2, from_=0, to=99999, width=8,
+                    textvariable=bf_limit).pack(side="left", padx=(2, 10))
+        bf_force = tk.BooleanVar(value=False)
+        ttk.Checkbutton(b2, text="忽略断点(force)",
+                        variable=bf_force).pack(side="left")
+
+        # —— 每只股回测导出 Excel ——
+        ex = ttk.LabelFrame(parent, padding=8,
+                            text=" 每只股回测导出 Excel（backtests/stock_backtest_export.py） ")
+        ex.pack(fill="x", pady=(0, 6))
+        e1 = ttk.Frame(ex)
+        e1.pack(fill="x")
+        ttk.Label(e1, text="范围:").pack(side="left")
+        ex_pool = tk.StringVar(value="全部(非北交所)")
+        ttk.Combobox(e1, textvariable=ex_pool, width=12, state="readonly",
+                     values=["全部(非北交所)", "主板", "仅缓存≥目标根数"]
+                     ).pack(side="left", padx=(2, 10))
+        ttk.Label(e1, text="近N根:").pack(side="left")
+        ex_bars = tk.StringVar(value="1000")
+        ttk.Spinbox(e1, from_=250, to=2400, increment=50, width=6,
+                    textvariable=ex_bars).pack(side="left", padx=(2, 10))
+        ttk.Label(e1, text="策略档:").pack(side="left")
+        ex_mode = tk.StringVar(value="三档(分表)")
+        ttk.Combobox(e1, textvariable=ex_mode, width=12, state="readonly",
+                     values=["三档(分表)", "保守", "稳健", "激进",
+                             "当前缓存策略"]
+                     ).pack(side="left", padx=(2, 10))
+        e2 = ttk.Frame(ex)
+        e2.pack(fill="x", pady=(6, 0))
+        ttk.Label(e2, text="并发:").pack(side="left")
+        ex_workers = tk.StringVar(value="4")
+        ttk.Spinbox(e2, from_=1, to=24, width=4,
+                    textvariable=ex_workers).pack(side="left", padx=(2, 10))
+        ttk.Label(e2, text="限制只数(0=全部):").pack(side="left")
+        ex_limit = tk.StringVar(value="0")
+        ttk.Spinbox(e2, from_=0, to=99999, width=8,
+                    textvariable=ex_limit).pack(side="left", padx=(2, 10))
+        ttk.Label(e2, text="输出(留空=自动):").pack(side="left")
+        ex_out = tk.StringVar(value="")
+        ttk.Entry(e2, textvariable=ex_out).pack(side="left", padx=2,
+                                                fill="x", expand=True)
+
+        def _pick_out():
+            init = ex_out.get().strip()
+            p = filedialog.asksaveasfilename(
+                parent=win, title="导出 Excel", defaultextension=".xlsx",
+                initialfile=(os.path.basename(init) or
+                             "每只股回测_" + time.strftime("%Y%m%d_%H%M")
+                             + ".xlsx"),
+                initialdir=(os.path.dirname(init) or
+                            os.path.join(here, "research")),
+                filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
+            if p:
+                ex_out.set(p)
+
+        def _ck(var, lo, hi, default):
+            try:
+                return max(lo, min(hi, int(float(var.get()))))
+            except Exception:
+                return default
+
+        def _ckf(var, lo, hi, default):
+            try:
+                return max(lo, min(hi, float(var.get())))
+            except Exception:
+                return default
+
+        def run_clean():
+            mode = clean_mode.get()
+            cmd = [sys.executable, os.path.join(here, "data_clean.py"),
+                   "--db", clean_db.get().strip() or DB_PATH]
+            if mode == "修复异常":
+                cmd.append("--fix")
+            elif mode == "全库复权迁移":
+                cmd += ["--all-adj", "--workers",
+                        str(_ck(clean_workers, 1, 16, 2))]
+            if _ck(clean_limit, 0, 99999, 0):
+                cmd += ["--limit", str(_ck(clean_limit, 0, 99999, 0))]
+            if clean_force.get():
+                cmd.append("--force")
+            self._ext_spawn(cmd, f"清洗[{mode}]")
+
+        def run_backfill():
+            cmd = [sys.executable, os.path.join(here, "backfill_full.py"),
+                   "--min-bars", str(_ck(bf_minbars, 100, 3000, 950)),
+                   "--fresh-days", str(_ck(bf_fresh, 1, 60, 6)),
+                   "--bar-count", str(_ck(bf_count, 300, 3000, 1100)),
+                   "--workers", str(_ck(bf_workers, 1, 24, 6)),
+                   "--throttle", str(_ckf(bf_throttle, 0.05, 3.0, 0.45))]
+            if _ck(bf_limit, 0, 99999, 0):
+                cmd += ["--limit", str(_ck(bf_limit, 0, 99999, 0))]
+            if bf_force.get():
+                cmd.append("--force")
+            self._ext_spawn(cmd, "全库回填")
+
+        def run_export():
+            pool = {"全部(非北交所)": "all", "主板": "main",
+                    "仅缓存≥目标根数": "deep"}.get(ex_pool.get(), "all")
+            mode = {"三档(分表)": "tiers", "保守": "保守", "稳健": "稳健",
+                    "激进": "激进", "当前缓存策略": "cached"}.get(
+                        ex_mode.get(), "tiers")
+            cmd = [sys.executable,
+                   os.path.join(here, "backtests",
+                                "stock_backtest_export.py"),
+                   "--db", DB_PATH,
+                   "--bars", str(_ck(ex_bars, 250, 2400, 1000)),
+                   "--pool", pool, "--mode", mode,
+                   "--workers", str(_ck(ex_workers, 1, 24, 4))]
+            if ex_out.get().strip():     # 留空=脚本自动建 research 版本目录
+                cmd += ["--out", ex_out.get().strip()]
+            if _ck(ex_limit, 0, 99999, 0):
+                cmd += ["--limit", str(_ck(ex_limit, 0, 99999, 0))]
+            self._ext_spawn(cmd, "回测导出")
+
+        br = ttk.Frame(parent)
+        br.pack(fill="x")
+        ttk.Button(br, text="运行清洗", command=run_clean
+                   ).pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="运行回填", command=run_backfill
+                   ).pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="导出回测 Excel", command=run_export
+                   ).pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="选择输出…", command=_pick_out
+                   ).pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="停止", command=self._ext_stop
+                   ).pack(side="right")
+
+        lg = ttk.LabelFrame(parent, text=" 运行日志 ", padding=4)
+        lg.pack(fill="both", expand=True, pady=(6, 0))
+        self._ext_text = tk.Text(lg, height=12, bg=LOG_BG, fg=FG_MAIN,
+                                 font=("Consolas", 9), relief="flat",
+                                 wrap="word", state="disabled",
+                                 insertbackground=FG_MAIN,
+                                 selectbackground=SEL_BG, padx=6, pady=4)
+        sb = ttk.Scrollbar(lg, command=self._ext_text.yview)
+        self._ext_text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._ext_text.pack(fill="both", expand=True)
+        self._ext_log("数据工具：参数可调，后台运行，日志实时输出。\n"
+                      "清洗会直接改库，建议先「只扫描」；回填可断点续传。\n")
+
+        def _on_close():
+            self._ext_stop()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _ext_log(self, s):
+        t = getattr(self, "_ext_text", None)
+        if t is None or not t.winfo_exists():
+            return
+        t.configure(state="normal")
+        t.insert("end", s)
+        t.see("end")
+        t.configure(state="disabled")
+
+    def _ext_spawn(self, cmd, title):
+        """启动外部数据脚本（子进程），stdout 逐行回流到日志区。"""
+        import subprocess
+        import threading
+        proc = getattr(self, "_ext_proc", None)
+        if proc is not None and proc.poll() is None:
+            messagebox.showwarning(
+                "提示", "已有数据工具在运行，请先等待完成或点【停止】",
+                parent=getattr(self, "_ext_win", None))
+            return
+        self._ext_log(f"\n===== {title} =====\n$ {' '.join(cmd)}\n")
+        try:
+            self._ext_proc = subprocess.Popen(
+                cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+        except Exception as e:
+            self._ext_log(f"[启动失败] {e}\n")
+            return
+        q = self._ext_q
+        p = self._ext_proc
+
+        def rd():
+            try:
+                for line in p.stdout:
+                    q.put(line)
+            except Exception:
+                pass
+            q.put(None)
+
+        threading.Thread(target=rd, daemon=True).start()
+        self._ext_poll()
+
+    def _ext_poll(self):
+        import queue
+        q = getattr(self, "_ext_q", None)
+        if q is None:
+            return
+        try:
+            while True:
+                line = q.get_nowait()
+                if line is None:
+                    p = getattr(self, "_ext_proc", None)
+                    rc = p.poll() if p is not None else None
+                    self._ext_log(f"----- 结束（退出码 {rc}）-----\n")
+                    return
+                self._ext_log(line)
+        except queue.Empty:
+            pass
+        win = getattr(self, "_ext_win", None)
+        if win is not None and win.winfo_exists():
+            win.after(120, self._ext_poll)
+
+    def _ext_stop(self):
+        p = getattr(self, "_ext_proc", None)
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+                self._ext_log("已请求停止（terminate）…\n")
+            except Exception:
+                pass
 
     # ---------- 设置 ----------
 
@@ -13522,6 +13913,7 @@ class App:
         self._style_ttk()
         self._build_toolbar()
         self._build_body()
+        self._apply_fold()               # 主题重建后保持折叠状态
         self._notify_plugins("on_theme_changed")
         self._render_watchlist()
         if self.res:

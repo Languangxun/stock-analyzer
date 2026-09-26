@@ -3308,31 +3308,19 @@ def calc_chips(rows, cur_price=None, nbin=120):
             p95 = m
             break
 
-    # 支撑/压力：在筹码分布中找“局部峰”（局部极大值），再取现价上下方
-    # 最密集的峰，作为支撑位/压力位。相比原“单根最密集bin”，局部峰能
-    # 避免选中噪声尖刺，且更贴近“最密集筹码峰”的语义。
-    def _peaks():
-        out = []
-        for k in range(1, nbin):
-            w = chips[k]
-            if w > chips[k - 1] and w >= chips[k + 1] and w > 0:
-                out.append((mids[k], w))
-        return out
-
+    # 支撑/压力：现价下方/上方“最密集的筹码带”。先做 3bin 平滑，
+    # 避免单 bin 噪声；不用“局部极大值”是因为现价切在主峰侧面时，
+    # 主力筹码带会落在下降坡上而非局部峰，反而被远处的小凸起压过
+    # （实测 002241：全历史口径 压力 27.33 只有 0.7% 筹码，而
+    # 24~25 元的厚筹码带被判为“非峰”）。
     def _strongest(below):
-        pk = _peaks()
-        if below:
-            cand = [(m, w) for m, w in pk if m < cur_price]
-        else:
-            cand = [(m, w) for m, w in pk if m > cur_price]
-        if not cand:
-            # 退化为最密集单bin（避免无峰时返回空）
-            best_w, best_m = -1.0, None
-            for w, m in zip(chips, mids):
-                if (m < cur_price) == below and w > best_w:
-                    best_w, best_m = w, m
-            return best_m
-        return max(cand, key=lambda x: x[1])[0]   # 最密集峰
+        sm = [(chips[max(0, k - 1)] + chips[k]
+               + chips[min(nbin, k + 1)]) / 3.0 for k in range(nbin + 1)]
+        best_w, best_m = -1.0, None
+        for k, m in enumerate(mids):
+            if (m < cur_price) == below and sm[k] > best_w:
+                best_w, best_m = sm[k], m
+        return best_m
 
     return {"bins": list(zip(mids, chips)),
             "avg_cost": round(avg_cost, 3), "profit": profit,
@@ -5273,6 +5261,25 @@ def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
     return dict(pool[i]), "近窗不一致→无多维候选，按全窗"
 
 
+def _pick_one_from_pool(pool, key):
+    """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
+
+    key: 保守/稳健/激进；保守档限定「保守/稳健参数」候选，其余目标：
+    保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar（见 _ablation_weights）。
+    返回 (picked, note)。"""
+    p = pool
+    if key == "保守":
+        p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
+        if p2:
+            p = p2
+    obj = "激进" if key in ("均衡", "激进") else "稳健"
+    picked, note = pick_ablation_consistent(
+        p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+    if not picked:
+        return dict(p[0]), "回退池内首个"
+    return picked, note
+
+
 def _ablation_pf(trades):
     """由逐笔收益算盈亏比。"""
     gp = sum(x for x in trades if x > 0)
@@ -5381,7 +5388,7 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             "curve": curve, "i0": i0}
 
 
-RECENT_ABL_BARS = 250       # 选型一致性用的近端子窗长度（截至最新，含验证段）
+RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾，不碰验证段）
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
 
 
@@ -5606,7 +5613,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
-        rc = _ablation_recent(rows, sigs, rp, n, atrs)
+        # 近端一致性门槛只用「训练段末尾」(split 前) 的数据：
+        # 此前用 rows[0:n] 的最近 250 根，而 n=1000 时那正是验证段 →
+        # 验证集参与了选型门槛（top25% 否决），验证段指标偏乐观（过拟合）。
+        rc = _ablation_recent(rows, sigs, rp, split, atrs)
         return {"algo": algo, "mode": mode, "params": dict(rp),
                 "label": label, "train": train, "val": val,
                 "recent": rc, "bull": bull, "bear": bear}
@@ -5638,19 +5648,9 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
                         key, CFG.RISK_PARAMS["稳健"])),
                     "label": f"多维评分·{key}（样本不足，固定回退）",
                     "train": {}, "val": {}}
-        if key == "保守":
-            # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中选优
-            pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
-            if pool2:
-                pool = pool2
         # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）；
-        # v6.1.5 热修②：+近端子窗一致性，不一致回退该档「多维评分」
-        obj = "激进" if key in ("均衡", "激进") else "稳健"
-        picked, note = pick_ablation_consistent(
-            pool, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
-        if not picked:
-            picked = dict(pool[0])
-            note = "回退池内首个"
+        # v6.1.5 热修②：+近端子窗一致性（训练段末尾），不一致回退该档「多维评分」
+        picked, note = _pick_one_from_pool(pool, key)
         _pick_notes[key] = note
         return picked
 

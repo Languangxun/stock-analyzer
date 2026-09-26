@@ -8,7 +8,9 @@
      逐笔荐股收益分布、三基准对照；
   2. research/gui_backtests/*.json —— GUI「工具→信号胜率」导出的单股回测：
      全期/训练/验证指标 + IC/信号后收益 + 净值曲线；
-  3. 产物文件清单（report/tables/charts，相对链接直接点开）。
+  3. reports/每只股回测_*.csv —— 「数据工具→每只股回测导出 Excel」的全库逐只汇总
+     （可搜索/筛选/排序/分页，附 xlsx/csv 相对链接）；
+  4. 产物文件清单（report/tables/charts，相对链接直接点开）。
 
 图表为原生 Canvas 手绘（无第三方库）：折线（净值对比，支持对数轴/hover）、
 分组柱状（指标/跨版本对比）、箱线（相位年化、逐笔收益）。
@@ -19,6 +21,7 @@
   python v61_dashboard.py --max-runs 6          # 内嵌最近 N 次回测
 """
 import argparse
+import csv
 import glob
 import json
 import os
@@ -131,14 +134,51 @@ def collect_gui(research_dir, max_n=30):
     return out[:max_n]
 
 
+def collect_perstock(research_dir, max_files=3):
+    """每只股回测导出（数据工具）：research/perstock_backtest_v*/ + 旧 reports/。"""
+    paths = []
+    paths += glob.glob(os.path.join(research_dir, "perstock_backtest_v*",
+                                    "*.csv"))
+    paths += glob.glob(os.path.join(ROOT, "reports", "每只股回测_*.csv"))
+    out = []
+    for p in sorted(set(paths), key=os.path.getmtime,
+                    reverse=True)[:max_files]:
+        try:
+            with open(p, encoding="utf-8-sig", newline="") as f:
+                rd = [r for r in csv.reader(f) if r]
+        except Exception:
+            continue
+        if len(rd) < 2:
+            continue
+        header, rows = rd[0], rd[1:]
+        rows = [[(v if v != "" else None) for v in r] for r in rows]
+        xlsx = os.path.splitext(p)[0] + ".xlsx"
+        meta = _load_json(os.path.join(os.path.dirname(p), "run_meta.json"))
+        out.append({
+            "name": os.path.relpath(p, research_dir).replace(os.sep, "/"),
+            "mtime": time.strftime("%Y-%m-%d %H:%M",
+                                   time.localtime(os.path.getmtime(p))),
+            "csv": os.path.relpath(p, research_dir).replace(os.sep, "/"),
+            "xlsx": (os.path.relpath(xlsx, research_dir).replace(os.sep, "/")
+                     if os.path.isfile(xlsx) else ""),
+            "meta": ({k: meta.get(k) for k in
+                      ("ts", "mode", "bars", "codes", "rows", "elapsed_s")}
+                     if meta else None),
+            "header": header, "rows": rows,
+        })
+    return out
+
+
 def build_dashboard(research_dir, out=None, max_runs=6):
     runs = collect_runs(research_dir, max_runs=max_runs)
     gui = collect_gui(research_dir)
+    perstock = collect_perstock(research_dir)
     data = {
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "research_dir": os.path.abspath(research_dir),
         "runs": runs,
         "gui": gui,
+        "perstock": perstock,
         "tables": list(TABLE_FILES),
         "charts": list(CHART_FILES),
     }
@@ -231,6 +271,7 @@ tr:hover td{background:var(--panel2)}
   <button data-tab="metrics">指标对比</button>
   <button data-tab="dist">分布箱线</button>
   <button data-tab="gui">单股回测（GUI）</button>
+  <button data-tab="perstock">每只股回测</button>
   <button data-tab="files">明细表 / 文件</button>
 </nav>
 <main>
@@ -281,6 +322,23 @@ tr:hover td{background:var(--panel2)}
       <label><input type="checkbox" id="g-log"> 对数轴</label>
     </div>
     <div id="g-body"></div>
+  </section>
+  <section id="tab-perstock" class="tab">
+    <div class="ctl">
+      <label>数据 <select id="p-sel"></select></label>
+      <label>搜索 <input type="text" id="p-q" placeholder="代码 / 名称"></label>
+      <label>档位 <select id="p-mode"><option value="">全部</option>
+        </select></label>
+      <label><input type="checkbox" id="p-pos"> 只看正收益</label>
+      <label>排序 <select id="p-sort"></select></label>
+      <label>每页 <select id="p-size">
+        <option>100</option><option selected>200</option>
+        <option>500</option><option value="0">全部</option></select></label>
+    </div>
+    <div class="cards" id="p-cards"></div>
+    <div class="note" id="p-note"></div>
+    <div id="p-table" style="max-height:72vh;overflow:auto"></div>
+    <div class="ctl" id="p-page" style="justify-content:center"></div>
   </section>
   <section id="tab-files" class="tab">
     <div id="f-body"></div>
@@ -537,6 +595,10 @@ function renderHeader(){
   $("#hver").textContent = r?("v"+(r.version||"?")):"";
   let s="生成 "+DATA.generated+" | 共 "+DATA.runs.length+" 个回测批次"+
         " | "+DATA.gui.length+" 条单股回测记录";
+  if(DATA.perstock&&DATA.perstock.length){
+    const d=DATA.perstock[0];
+    s+=" | 每只股回测 "+d.rows.length+" 只（"+d.mtime+"）";
+  }
   if(r){ const db=r.db_stats||{};
     s+=" | 最新批次数据截至 "+(r.data_end||"?")+
        (db.codes?("（库内 "+db.codes+" 只 / "+
@@ -693,6 +755,120 @@ function renderGui(){
   Object.assign(opt2,lineChart(cv,mkSeries(),opt2));
   bindHover(cv,()=>{Object.assign(opt2,lineChart(cv,mkSeries(),opt2));},opt2);
 }
+/* ---------- 每只股回测（reports/每只股回测_*.csv） ---------- */
+function median(a){if(!a.length)return null;a=a.slice().sort((x,y)=>x-y);
+  const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+function p1(v){return v==null||!isFinite(v)?"-":(+v).toFixed(1)+"%";}
+let PS={page:1,sortCol:null,sortDesc:true};
+function renderPerstock(){
+  const sel=$("#p-sel");
+  if(!DATA.perstock.length){
+    $("#p-table").innerHTML='<div class="warn">暂无每只股回测数据：在 GUI '+
+      '「工具→数据工具→每只股回测导出 Excel」导出一次（产物在 reports/，'+
+      '本页自动收录）。</div>';
+    sel.innerHTML="";$("#p-cards").innerHTML="";$("#p-page").innerHTML="";
+    return;
+  }
+  if(sel.options.length!==DATA.perstock.length){
+    sel.innerHTML=DATA.perstock.map((d,i)=>
+      `<option value="${i}">${esc(d.name)} · ${esc(d.mtime)} · `+
+      `${d.rows.length}只</option>`).join("");
+  }
+  const d=DATA.perstock[+sel.value||0]; if(!d)return;
+  const H=d.header;
+  const iMode=H.indexOf("档位"), iTotal=H.indexOf("总收益%"),
+        iWr=H.indexOf("胜率%"), iMdd=H.indexOf("最大回撤%");
+  if($("#p-mode").options.length<=1){
+    const modes=Array.from(new Set(d.rows.map(r=>r[iMode]).filter(Boolean)));
+    $("#p-mode").innerHTML='<option value="">全部</option>'+
+      modes.map(m=>`<option>${esc(m)}</option>`).join("");
+    // 三档数据默认看「稳健」，避免卡片统计把三档混在一起
+    if(modes.indexOf("稳健")>=0)$("#p-mode").value="稳健";
+    $("#p-sort").innerHTML=H.map((c,i)=>
+      `<option value="${i}"${i===iTotal?" selected":""}>${esc(c)}</option>`).join("");
+    PS.sortCol=iTotal;
+  }
+  const qi=$("#p-q").value.trim().toLowerCase();
+  const mode=$("#p-mode").value, pos=$("#p-pos").checked;
+  let rows=d.rows.filter(r=>{
+    if(mode && r[iMode]!==mode)return false;
+    if(pos && !(parseFloat(r[iTotal])>0))return false;
+    if(qi && ((r[0]||"")+" "+(r[1]||"")).toLowerCase().indexOf(qi)<0)
+      return false;
+    return true;});
+  const sc=(PS.sortCol==null?iTotal:+$("#p-sort").value);
+  const numCols=new Set(H.map((c,i)=>i).filter(i=>
+    H[i].indexOf("%")>=0||H[i].indexOf("IC")>=0||
+    ["交易数","胜率%","盈亏比","信号数","BUY","SELL","K线根数","年化%"]
+      .indexOf(H[i])>=0));
+  rows.sort((a,b)=>{
+    const x=a[sc],y=b[sc]; let c;
+    if(numCols.has(sc)){const nx=parseFloat(x),ny=parseFloat(y);
+      c=(isFinite(nx)?nx:1e18)-(isFinite(ny)?ny:1e18);}
+    else{const sx=x==null?"":String(x),sy=y==null?"":String(y);
+      c=sx<sy?-1:sx>sy?1:0;}
+    return PS.sortDesc?-c:c;});
+  const tots=rows.map(r=>parseFloat(r[iTotal])).filter(isFinite);
+  const wrs=rows.map(r=>parseFloat(r[iWr])).filter(isFinite);
+  const mdds=rows.map(r=>parseFloat(r[iMdd])).filter(isFinite);
+  const iVal=H.indexOf("验证段收益%");
+  const vals=iVal>=0?rows.map(r=>parseFloat(r[iVal])).filter(isFinite):[];
+  const mean=tots.length?tots.reduce((a,b)=>a+b,0)/tots.length:null;
+  $("#p-cards").innerHTML=[
+    ["筛选后只数",rows.length+" / "+d.rows.length],
+    ["总收益中位（全期·偏乐观）",p1(median(tots))],
+    ["正收益占比（全期）",(tots.length?
+      (100*tots.filter(v=>v>0).length/tots.length).toFixed(0)+"%":"-")],
+    ["验证段中位（留出）",p1(median(vals))],
+    ["验证段正收益",(vals.length?
+      (100*vals.filter(v=>v>0).length/vals.length).toFixed(0)+"%":"-")],
+    ["胜率中位",p1(median(wrs))],
+    ["回撤中位",p1(median(mdds))]
+  ].map(([k,v])=>`<div class="card"><div class="k">${k}</div>`+
+    `<div class="v">${v}</div></div>`).join("");
+  const size=+$("#p-size").value||0;
+  const pages=size?Math.max(1,Math.ceil(rows.length/size)):1;
+  PS.page=Math.max(1,Math.min(PS.page,pages));
+  const view=size?rows.slice((PS.page-1)*size,PS.page*size):rows;
+  let h='<table><tr><th>#</th>'+H.map((c,ci)=>
+    `<th data-ci="${ci}" style="cursor:pointer">${esc(c)}`+
+    `${ci===sc?(PS.sortDesc?" ↓":" ↑"):""}</th>`).join("")+'</tr>';
+  view.forEach((r,k)=>{h+='<tr><td>'+((PS.page-1)*(size||rows.length)+k+1)+
+    '</td>'+r.map(v=>`<td>${v==null?"":esc(v)}</td>`).join("")+'</tr>';});
+  h+='</table>';
+  $("#p-table").innerHTML=h;
+  Array.from($("#p-table").querySelectorAll("th[data-ci]")).forEach(th=>
+    th.onclick=()=>{const ci=+th.dataset.ci;
+      if(PS.sortCol===ci)PS.sortDesc=!PS.sortDesc;
+      else{PS.sortCol=ci;PS.sortDesc=true;}
+      PS.page=1;renderPerstock();});
+  let pg="";
+  if(pages>1){
+    const b=(t,pi,dis)=>`<button ${dis?"disabled":""} data-pg="${pi}" `+
+      `style="background:var(--panel2);border:1px solid var(--line);`+
+      `color:var(--fg);border-radius:5px;padding:4px 10px;cursor:pointer;`+
+      `margin:0 3px">${t}</button>`;
+    pg=b("« 首页",1,PS.page<=1)+b("‹ 上页",PS.page-1,PS.page<=1)+
+       `<span style="color:var(--dim);padding:0 8px">${PS.page} / ${pages}</span>`+
+       b("下页 ›",PS.page+1,PS.page>=pages)+
+       b("末页 »",pages,PS.page>=pages);
+  }
+  $("#p-page").innerHTML=pg;
+  Array.from($("#p-page").querySelectorAll("button[data-pg]")).forEach(bt=>
+    bt.onclick=()=>{PS.page=+bt.dataset.pg;renderPerstock();});
+  let links="数据文件："+esc(d.name)+"（"+d.rows.length+" 行，"+esc(d.mtime)+"）";
+  if(d.xlsx)links+=`　<a href="${esc(d.xlsx)}" target="_blank">下载 xlsx</a>`;
+  if(d.csv)links+=`　<a href="${esc(d.csv)}" target="_blank">CSV</a>`;
+  if(d.meta&&d.meta.ts)links+="　· 运行 "+esc(d.meta.ts)+
+    (d.meta.codes?("，"+d.meta.codes+" 只"):"")+
+    (d.meta.elapsed_s?("，耗时 "+num(d.meta.elapsed_s,0)+"s"):"");
+  links+=(iVal>=0?
+    '　· 三档=消融选型（仅用训练段）：<b>全期收益列含选型段、严重偏乐观</b>，'
+    +'跨股比较请优先看「验证段收益%」（选型之外的留出段）；已默认筛「稳健」':
+    '　· 固定参数回测（无消融选型），样本内口径，绝对值偏乐观，'
+    +'横向比较相对强弱可用');
+  $("#p-note").innerHTML=links;
+}
 function renderFiles(){
   const run=curRun(); if(!run)return;
   let h="";
@@ -759,6 +935,7 @@ function showTab(id){
   if(id==="metrics")renderMetrics();
   if(id==="dist")renderDist();
   if(id==="gui")renderGui();
+  if(id==="perstock")renderPerstock();
   if(id==="files")renderFiles();
 }
 function initTheme(){
@@ -796,13 +973,20 @@ function init(){
   $("#c-tiers").onchange=renderCurve;
   ["#m-metric","#m-run"].forEach(s=>$(s).onchange=renderMetrics);
   $("#d-kind").onchange=renderDist; $("#d-uni").onchange=renderDist;
+  ["#p-q","#p-mode","#p-pos","#p-size"].forEach(s=>
+    $(s).onchange=()=>{PS.page=1;renderPerstock();});
+  $("#p-q").oninput=()=>{PS.page=1;renderPerstock();};
+  $("#p-sel").onchange=()=>{$("#p-mode").innerHTML="";PS.page=1;
+    PS.sortCol=null;renderPerstock();};
+  $("#p-sort").onchange=()=>{PS.page=1;renderPerstock();};
   $$("nav button").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   let rz=null;
   window.onresize=()=>{clearTimeout(rz);rz=setTimeout(()=>{
     const on=$$("nav button").find(b=>b.classList.contains("on"));
     if(on)showTab(on.dataset.tab);},200);};
   const hash=location.hash.replace("#","");
-  showTab(["curve","metrics","dist","gui","files"].includes(hash)?hash:"curve");
+  showTab(["curve","metrics","dist","gui","perstock","files"]
+    .includes(hash)?hash:"curve");
 }
 document.addEventListener("DOMContentLoaded",init);
 </script>
@@ -824,8 +1008,11 @@ def main():
                         max_runs=args.max_runs)
     n_runs = len(collect_runs(args.research, max_runs=args.max_runs))
     n_gui = len(collect_gui(args.research))
+    ps = collect_perstock(args.research)
+    n_ps = ps[0]["rows"].__len__() if ps else 0
     size = os.path.getsize(p) / 1024
-    print(f"已生成 {p}（{size:.0f} KB；回测批次 {n_runs}，单股记录 {n_gui}）")
+    print(f"已生成 {p}（{size:.0f} KB；回测批次 {n_runs}，单股记录 {n_gui}，"
+          f"每只股回测 {n_ps} 只）")
     print("浏览器直接打开该文件即可（file:// 无需服务器）")
 
 

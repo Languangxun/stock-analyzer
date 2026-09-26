@@ -13,6 +13,8 @@
   python backfill_full.py            # 全量回填（断点续传）
   python backfill_full.py --limit 50 # 只回填50只（测试）
   python backfill_full.py --force    # 忽略断点，全部重拉
+  python backfill_full.py --min-bars 2000 --fresh-days 3 --bar-count 2400
+                                     # 目标/过期/单次根数可调（GUI「数据工具」同参数）
 """
 import argparse
 import json
@@ -126,13 +128,24 @@ def _store(full, rows):
 
 
 def main():
+    global MIN_BARS, FRESH_DAYS, BAR_COUNT
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="只处理前N只(测试)")
     ap.add_argument("--force", action="store_true", help="忽略断点全部重拉")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--throttle", type=float, default=0.45,
                     help="全局请求最小间隔秒(防501限流)")
+    ap.add_argument("--min-bars", type=int, default=MIN_BARS,
+                    help=f"断点续传门槛（默认{MIN_BARS}根）")
+    ap.add_argument("--fresh-days", type=int, default=FRESH_DAYS,
+                    help=f"最新bar距今超过该自然日数视为过期（默认{FRESH_DAYS}）")
+    ap.add_argument("--bar-count", type=int, default=BAR_COUNT,
+                    help=f"东财单次请求根数（默认{BAR_COUNT}）")
     args = ap.parse_args()
+
+    MIN_BARS = max(100, int(args.min_bars))
+    FRESH_DAYS = max(1, int(args.fresh_days))
+    BAR_COUNT = max(300, int(args.bar_count))
 
     sg._MIN_INTERVAL = args.throttle     # 批量模式放缓全局节流
     # 探测可用腾讯域，排到轮换队列最前（主域可能被批量限流501）

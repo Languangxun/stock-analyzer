@@ -45,6 +45,7 @@ from stock_gui import (
     _ablation_pf, _ablation_recent, pick_ablation_consistent,
     ALGO_LABEL, CFG, get_daily
 )
+import bt_common            # 回测统一规范（版本化运行目录/run_meta/最新副本）
 
 OUTPUT_DIR = os.path.join(ROOT, "research")
 PER_STOCK_FILE = os.path.join(OUTPUT_DIR, "strategy_ablation_per_stock.json")
@@ -182,7 +183,8 @@ def run_ablation_for_stock(args):
                 train["pf"] = _ablation_pf(tr_tr)
             if va_tr and val is not None:
                 val["pf"] = _ablation_pf(va_tr)
-            rc = _ablation_recent(rows, sigs, rp, n, atrs, arrays=arrays)
+            # 近端门槛只用训练段末尾（split 前），不碰验证段（防验证集参与选型）
+            rc = _ablation_recent(rows, sigs, rp, split, atrs, arrays=arrays)
             cands.append({
                 "algo": algo,
                 "mode": mode,
@@ -220,7 +222,7 @@ def run_ablation_for_stock(args):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
-        rc = _ablation_recent(rows, sigs, rp, n, atrs, arrays=arrays)
+        rc = _ablation_recent(rows, sigs, rp, split, atrs, arrays=arrays)
         cands.append({
             "algo": "composite",
             "mode": mode,
@@ -340,10 +342,17 @@ def main(limit=None, max_workers=None, tag=""):
     t0 = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     suffix = f"_{tag}" if tag else ""
-    per_stock_file = os.path.join(OUTPUT_DIR,
-                                  f"strategy_ablation_per_stock{suffix}.json")
-    summary_file = os.path.join(OUTPUT_DIR,
-                                f"strategy_ablation_summary{suffix}.json")
+    # 统一规范：本次运行建版本化目录 research/ablation_v<版本>_<时间戳>[_tag]/
+    run_dir = bt_common.new_run_dir(OUTPUT_DIR, "ablation", tag=tag,
+                                    stamp=time.strftime("%Y%m%d_%H%M%S"))
+    per_stock_file = os.path.join(run_dir, "per_stock.json")
+    summary_file = os.path.join(run_dir, "summary.json")
+    # 根目录固定名「最新副本」（硬链接，供下游脚本按旧路径读取）
+    per_stock_latest = os.path.join(
+        OUTPUT_DIR, f"strategy_ablation_per_stock{suffix}.json")
+    summary_latest = os.path.join(
+        OUTPUT_DIR, f"strategy_ablation_summary{suffix}.json")
+    print(f"本次运行目录: {run_dir}")
 
     print("加载上证指数 regime...")
     regime = _load_index_regime()
@@ -444,6 +453,16 @@ def main(limit=None, max_workers=None, tag=""):
     summary = build_summary(per_stock, coverage=coverage)
     with open(summary_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # 元数据 + 根目录最新副本（统一规范）
+    bt_common.write_run_meta(
+        run_dir, argv=sys.argv, elapsed=time.time() - t0,
+        objects=len(per_stock), included=len(args_list),
+        skipped=len(skipped_codes), limit=limit, workers=max_workers,
+        tag=tag or None, coverage=coverage)
+    bt_common.link_latest(per_stock_file, per_stock_latest)
+    bt_common.link_latest(summary_file, summary_latest)
+    print(f"根目录最新副本: {per_stock_latest} / {summary_latest}")
 
     # 控制台摘要
     print("\n=== 覆盖率 ===")

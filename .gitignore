@@ -30,6 +30,15 @@ research/gui_backtests/
 
 # 全A消融逐股明细（>100MB，超出 GitHub 单文件上限；随 Release 资产 research_v6.1.zip 分发）
 research/strategy_ablation_per_stock*.json
+# 三档选型瘦身产物（tier_picks_from_ablation.py 生成，可由消融重跑）
+research/perstock_tier_picks.json
+
+# 回测统一规范运行目录（bt_common.py；消融/每只股导出等可重跑，
+# 根目录固定名「最新副本」按需入库，明细随研究包分发）
+research/ablation_v*/
+research/perstock_backtest_v*/
+# 每只股回测导出（数据工具生成，可重跑；规范产物在 research/perstock_backtest_v*/）
+reports/每只股回测_*
 
 # --- 标准 Python 忽略项 ---
 .env
