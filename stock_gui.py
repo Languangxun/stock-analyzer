@@ -2613,6 +2613,12 @@ BTN_BG = "#222a33"
 BTN_FG = "#d7dee6"
 BTN_HOVER = "#2b3540"
 BTN_BORDER = "#333e4a"
+# v6.1.5 UI 优化：统一边框/悬停/选中/强调/日志底色（随主题切换）
+BORDER = "#2a3340"
+HOVER_BG = "#222a34"
+SEL_BG = "#2b3a4d"
+ACCENT = "#4da3ff"
+LOG_BG = "#0d1116"
 
 # ---- 可切换主题 ----
 THEMES = {
@@ -2624,6 +2630,8 @@ THEMES = {
         FG_MAIN="#d7dee6",
         BTN_BG="#222a33", BTN_FG="#d7dee6", BTN_HOVER="#2b3540",
         BTN_BORDER="#333e4a",
+        BORDER="#2a3340", HOVER_BG="#222a34", SEL_BG="#2b3a4d",
+        ACCENT="#4da3ff", LOG_BG="#0d1116",
         MA_COLORS={5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff",
                    30: "#7bf08b", 60: "#e8c14a"},
         C_ORANGE="#ffa94d", C_BLUE="#5dade2",
@@ -2631,12 +2639,14 @@ THEMES = {
     ),
     "light": dict(
         UP="#e03131", DOWN="#0ca678", PRED_C="#1971c2", TPRED_C="#111111",
-        BG="#ffffff", GRID_C="#ececec", GUIDE_C="#f1f3f5",
-        AXIS_TXT="#777777", TITLE_TXT="#444444", CROSS_C="#999999",
-        DARK_BG="#f2f4f7", PANEL_BG="#ffffff", FIELD_BG="#ffffff",
+        BG="#ffffff", GRID_C="#ececec", GUIDE_C="#eef1f4",
+        AXIS_TXT="#6b7684", TITLE_TXT="#3b444e", CROSS_C="#999999",
+        DARK_BG="#f2f4f7", PANEL_BG="#ffffff", FIELD_BG="#f8f9fb",
         FG_MAIN="#1f2933",
-        BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
-        BTN_BORDER="#bbbbbb",
+        BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef2f7",
+        BTN_BORDER="#c9d1d9",
+        BORDER="#d9dee5", HOVER_BG="#eef2f7", SEL_BG="#d8e8ff",
+        ACCENT="#1971c2", LOG_BG="#f7f8fa",
         MA_COLORS={5: "#e8590c", 10: "#1971c2", 20: "#ae3ec9",
                    30: "#2f9e44", 60: "#b08900"},
         C_ORANGE="#e8590c", C_BLUE="#1971c2",
@@ -2649,8 +2659,10 @@ THEMES = {
         AXIS_TXT="#ffffff", TITLE_TXT="#ffffff", CROSS_C="#ffff00",
         DARK_BG="#000000", PANEL_BG="#0a0a0a", FIELD_BG="#111111",
         FG_MAIN="#ffffff",
-        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
+        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#2a2a2a",
         BTN_BORDER="#ffffff",
+        BORDER="#ffffff", HOVER_BG="#2a2a2a", SEL_BG="#555500",
+        ACCENT="#ffee00", LOG_BG="#000000",
         MA_COLORS={5: "#ffb000", 10: "#00d4ff", 20: "#ff7ae0",
                    30: "#39ff88", 60: "#ffee00"},
         C_ORANGE="#ffb000", C_BLUE="#00b7ff",
@@ -3701,11 +3713,11 @@ def backtest_signals(rows, signals, rp=None):
 
 
 def strategy_signals_full(rows, strat, industry=""):
-    """按所选策略在**全历史**上重算信号（工具→信号胜率回测用）。
+    """按所选策略在传入 rows 上重算信号（工具→信号胜率回测用）。
 
     主图买卖点只展示近 250 根（性能/可读性），若直接拿展示信号做 75/25
-    训练/验证切分，指标型策略信号会全部落在验证段 → 训练集恒"信号不足"。
-    这里按消融选型同口径在全历史重算（raw 信号，不做展示端压缩）。"""
+    训练/验证切分，指标型策略信号会全部落在尾部；这里按消融选型同口径
+    重算 raw 信号（调用方传近1000根，与 run_ablation 同窗），不做展示端压缩。"""
     algo = (strat or {}).get("algo", "composite")
     rp = (strat or {}).get("params") or CFG.risk_params()
     try:
@@ -3722,7 +3734,7 @@ def strategy_signals_full(rows, strat, industry=""):
                "chip_peak": _sig_chip_peak}.get(algo)
         return gen(rows) if gen else []
     except Exception:
-        log.exception("全历史策略信号生成失败 %s", algo)
+        log.exception("策略信号生成失败 %s", algo)
         return []
 
 
@@ -4523,9 +4535,13 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 
 # ================= 策略消融引擎（多算法回测+防过拟合选型） =================
 # 每次分析对该股近1000交易日做一次多算法消融回测：
-#   候选 = L1形态up_prob / MACD / KDJ / RSI / 布林带 / MA20-60趋势 / 多维评分×3风险档
+#   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
+#          筹码峰 / 板块轮动 / 多维评分×3风险档（全部 × 3 档风险参数）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
-# 信号只用 T 日及以前数据，信号日收盘成交）。结果缓存 meta 表，5日过期。
+# 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
+# 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
+# 近窗为时点可观测数据，n=1000 时即验证段，只做 top 门槛否决、不参与 rank 打分）。
+# 结果缓存 meta 表，5日过期。
 
 STRAT_TTL = 5 * 86400
 
@@ -5144,17 +5160,26 @@ def _rank01(vals):
     return rk
 
 
-def pick_ablation_multi(cands, objective="稳健", min_trades=8):
-    """消融多指标结合选优（v6.1，仅用训练集指标，防前视）：
-    稳健 = 偏 Calmar+PF；均衡/激进 = 偏年化+Calmar；
-    四个指标各自横截面 rank 后加权，避免量纲/单指标过拟合。"""
+def _ablation_pool(cands, min_trades):
+    """交易活跃度下限池：优先 >=min_trades，不足降到 3 笔，再不足全量。"""
     pool = [c for c in cands if c["train"].get("trades", 0) >= min_trades]
     if not pool:
         pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
     if not pool:
         pool = list(cands)
-    if not pool:
-        return None
+    return pool
+
+
+def _ablation_weights(objective):
+    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进偏年化+Calmar。"""
+    return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
+            if objective == "稳健" else
+            {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
+
+
+def _ablation_ranks(pool, objective, key="train"):
+    """4 指标横截面 rank(0~1) 加权得分（与 pick_ablation_multi 同口径）。
+    key="train" 用训练段指标，key="recent" 用近端子窗指标。"""
 
     def calmar(m):
         return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
@@ -5169,17 +5194,69 @@ def pick_ablation_multi(cands, objective="稳健", min_trades=8):
         return m.get("ann") or 0.0
 
     r = {
-        "calmar": _rank01([calmar(c["train"]) for c in pool]),
-        "pf": _rank01([pf(c["train"]) for c in pool]),
-        "winrate": _rank01([wr(c["train"]) for c in pool]),
-        "ann": _rank01([ann(c["train"]) for c in pool]),
+        "calmar": _rank01([calmar(c[key]) for c in pool]),
+        "pf": _rank01([pf(c[key]) for c in pool]),
+        "winrate": _rank01([wr(c[key]) for c in pool]),
+        "ann": _rank01([ann(c[key]) for c in pool]),
     }
-    w = ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
-         if objective == "稳健" else
-         {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
-    i = max(range(len(pool)),
-            key=lambda k: sum(w[mk] * r[mk][k] for mk in w))
-    return dict(pool[i])
+    w = _ablation_weights(objective)
+    return [sum(w[mk] * r[mk][k] for mk in w) for k in range(len(pool))]
+
+
+def pick_ablation_multi(cands, objective="稳健", min_trades=8):
+    """消融多指标结合选优（v6.1，仅用训练集指标，防前视）：
+    稳健 = 偏 Calmar+PF；均衡/激进 = 偏年化+Calmar；
+    四个指标各自横截面 rank 后加权，避免量纲/单指标过拟合。"""
+    pool = _ablation_pool(cands, min_trades)
+    if not pool:
+        return None
+    sc = _ablation_ranks(pool, objective)
+    return dict(pool[max(range(len(pool)), key=lambda k: sc[k])])
+
+
+def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
+                             recent_of=None, fallback=True):
+    """全窗选优 + 近端子窗一致性（v6.1.5 热修②，防风格切换失配）：
+
+    在全训练窗和最近 `RECENT_ABL_BARS` 根子窗里，各自按同一权重 rank 取
+    前 25%（下限 3 个）；两窗同时在前列者中取全窗得分最高。
+    交集为空（近端 regime 与全窗不一致）→ 回退该档「多维评分」候选；
+    近窗可评估候选 <3 个时视为无法判断，按纯全窗选优。
+    近窗（n=1000 时=验证段）只用于门槛否决，权重打分仍只用训练段指标。
+
+    recent_of(c) 返回候选的近窗指标 dict（trades>=2），无则 None。
+    返回 (picked, note)。"""
+    pool = _ablation_pool(cands, min_trades)
+    if not pool:
+        return None, "无候选"
+    full = _ablation_ranks(pool, objective)
+    if recent_of is None:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "仅全窗"
+    rpool = [i for i, c in enumerate(pool) if recent_of(c)]
+    if len(rpool) < 3:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "近窗样本不足，按全窗"
+    rs = _ablation_ranks([pool[i] for i in rpool], objective, key="recent")
+    kf = max(3, (len(pool) + 3) // 4)
+    kr = max(2, (len(rpool) + 3) // 4)
+    ftop = set(sorted(range(len(pool)), key=lambda k: -full[k])[:kf])
+    rtop = {rpool[j]
+            for j in sorted(range(len(rpool)), key=lambda k: -rs[k])[:kr]}
+    both = ftop & rtop
+    if both:
+        i = max(both, key=lambda k: full[k])
+        return dict(pool[i]), "全窗+近窗一致"
+    if not fallback:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "近窗不一致（未回退）"
+    comp = [c for c in pool if c.get("algo") == "composite"]
+    if comp:
+        cs = _ablation_ranks(comp, objective)
+        i = max(range(len(comp)), key=lambda k: cs[k])
+        return dict(comp[i]), "近窗不一致→回退多维评分"
+    i = max(range(len(pool)), key=lambda k: full[k])
+    return dict(pool[i]), "近窗不一致→无多维候选，按全窗"
 
 
 def _ablation_pf(trades):
@@ -5288,6 +5365,31 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             "winrate": wins / len(trades),
             "total": total - 1, "ann": ann, "mdd": mdd,
             "curve": curve, "i0": i0}
+
+
+RECENT_ABL_BARS = 250       # 选型一致性用的近端子窗长度（截至最新，含验证段）
+ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
+
+
+def _ablation_recent(rows, sigs, rp, n, atrs, arrays=None):
+    """最近 ~250 根（截至最新）的"近端 regime"回测指标；交易<2 返回 None。
+
+    用途：`pick_ablation_consistent` 的近端一致性否决——防"长期横盘/老 regime
+    选出在当下风格里沉默的策略"（如 688012 于 2025-09 突破后的失配）。
+    注意：n=1000 时该子窗即验证段，因此验证段参与"top 门槛否决"但不参与
+    指标 rank 打分；这是时点可观测数据，属选型的一部分（见 ARCHITECTURE 3.8）。"""
+    r0 = max(0, n - RECENT_ABL_BARS)
+    if r0 <= 0 or n - r0 < 100:
+        return None
+    tr_out = []
+    rc = _bt_events(rows, sigs, rp, r0, n, atrs=atrs, trade_out=tr_out,
+                    arrays=arrays)
+    if not rc:
+        return None
+    rc = {k: v for k, v in rc.items() if k != "curve"}
+    if tr_out:
+        rc["pf"] = _ablation_pf(tr_out)
+    return rc
 
 
 def _regime_map(idx_rows, n):
@@ -5410,8 +5512,8 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
           "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
     strat = {"algo","mode","params","train","val","bull","bear","label"}"""
     rows = [r for r in rows if r.get("close") and r["close"] > 0]
-    if len(rows) > 1000:
-        rows = rows[-1000:]
+    if len(rows) > ABL_BARS:
+        rows = rows[-ABL_BARS:]
     if len(rows) < 200:
         return None
     n = len(rows)
@@ -5490,9 +5592,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
+        rc = _ablation_recent(rows, sigs, rp, n, atrs)
         return {"algo": algo, "mode": mode, "params": dict(rp),
                 "label": label, "train": train, "val": val,
-                "bull": bull, "bear": bear}
+                "recent": rc, "bull": bull, "bear": bear}
 
     cands = []
     # 使用线程池并行评估候选（I/O轻、计算密集，GIL会部分释放）
@@ -5510,14 +5613,12 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     # 交易活跃度下限：避免选到“几乎不交易、回撤自然为 0”的假策略
     _MIN_TR = 8
+    _pick_notes = {}
 
     def _pick(key):
-        pool = [c for c in cands if c["train"].get("trades", 0) >= _MIN_TR]
+        pool = _ablation_pool(cands, _MIN_TR)
         if not pool:
-            pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
-        if not pool:
-            pool = list(cands)
-        if not pool:
+            _pick_notes[key] = "样本不足"
             return {"algo": "composite", "mode": key,
                     "params": dict(CFG.RISK_PARAMS.get(
                         key, CFG.RISK_PARAMS["稳健"])),
@@ -5528,21 +5629,25 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
             if pool2:
                 pool = pool2
-        # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）
-        if key in ("均衡", "激进"):
-            picked = pick_ablation_multi(pool, "激进")
-        else:
-            picked = pick_ablation_multi(pool, "稳健")
-        return picked or dict(pool[0])
+        # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）；
+        # v6.1.5 热修②：+近端子窗一致性，不一致回退该档「多维评分」
+        obj = "激进" if key in ("均衡", "激进") else "稳健"
+        picked, note = pick_ablation_consistent(
+            pool, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+        if not picked:
+            picked = dict(pool[0])
+            note = "回退池内首个"
+        _pick_notes[key] = note
+        return picked
 
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
                        "激进": _pick("激进")}
     # 三档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
-    # 属训练集选型结果而非故障）；记录以便在日志中直接核对（如 sz002241）。
-    log.info("消融选型 %s: 保守=%s | 稳健=%s | 激进=%s", full,
-             mode_candidates["保守"]["label"],
-             mode_candidates["稳健"]["label"],
-             mode_candidates["激进"]["label"])
+    # 属训练集选型结果而非故障）；记录选型与一致性结论，便于日志核对。
+    log.info("消融选型 %s: 保守=%s[%s] | 稳健=%s[%s] | 激进=%s[%s]", full,
+             mode_candidates["保守"]["label"], _pick_notes.get("保守"),
+             mode_candidates["稳健"]["label"], _pick_notes.get("稳健"),
+             mode_candidates["激进"]["label"], _pick_notes.get("激进"))
 
     # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
     def _tc(t):
@@ -5564,6 +5669,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     out = {"mode_candidates": mode_candidates,
            "recommend": recommend,
+           "pick_notes": dict(_pick_notes),
            "vol_ann": vol,
            "high_vol": high_vol,
            "ts": time.time(), "bars": n, "train_n": split,
@@ -9365,56 +9471,97 @@ class App:
             pass
 
     def _style_ttk(self):
+        """统一 ttk 观感（clam 基础上按当前主题重着色，主题切换后重跑）。
+
+        v6.1.5 UI 优化：补齐边框/悬停/选中/焦点色，统一按钮/输入/标签页
+        内边距与字体；参照主流桌面软件（VS Code / macOS）的扁平风格。"""
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except Exception:
             pass
         style.configure(".", background=DARK_BG, foreground=FG_MAIN,
-                        fieldbackground=FIELD_BG, bordercolor="#2a3340",
-                        lightcolor=PANEL_BG, darkcolor="#12171d",
-                        troughcolor=DARK_BG)
+                        fieldbackground=FIELD_BG, bordercolor=BORDER,
+                        lightcolor=PANEL_BG, darkcolor=DARK_BG,
+                        troughcolor=DARK_BG, focuscolor=ACCENT,
+                        selectbackground=SEL_BG, selectforeground=FG_MAIN,
+                        font=("Microsoft YaHei", 9))
         style.configure("TFrame", background=DARK_BG)
-        style.configure("TLabelframe", background=DARK_BG,
-                        bordercolor="#2a3340")
+        style.configure("TLabelframe", background=DARK_BG, bordercolor=BORDER,
+                        relief="solid", borderwidth=1)
         style.configure("TLabelframe.Label", background=DARK_BG,
-                        foreground=TITLE_TXT)
+                        foreground=TITLE_TXT,
+                        font=("Microsoft YaHei", 9, "bold"))
         style.configure("TLabel", background=DARK_BG, foreground=FG_MAIN)
+        style.configure("Dim.TLabel", background=DARK_BG, foreground=AXIS_TXT)
         style.configure("TButton", background=BTN_BG, foreground=BTN_FG,
-                        bordercolor=BTN_BORDER)
-        style.map("TButton", background=[("active", BTN_HOVER)])
+                        bordercolor=BTN_BORDER, padding=(10, 4),
+                        font=("Microsoft YaHei", 9))
+        style.map("TButton",
+                  background=[("pressed", BTN_HOVER), ("active", BTN_HOVER),
+                              ("disabled", DARK_BG)],
+                  foreground=[("disabled", AXIS_TXT)],
+                  bordercolor=[("focus", ACCENT)])
         style.configure("Tool.TButton", background=BTN_BG, foreground=BTN_FG,
-                        bordercolor=BTN_BORDER,
-                        font=("Microsoft YaHei", 10, "bold"), padding=(16, 4))
+                        bordercolor=BTN_BORDER, padding=(14, 5),
+                        font=("Microsoft YaHei", 9, "bold"))
         style.map("Tool.TButton",
-                  background=[("pressed", BTN_HOVER), ("active", BTN_HOVER)],
-                  foreground=[("disabled", AXIS_TXT)])
-        style.configure("TEntry", fieldbackground=FIELD_BG, foreground=FG_MAIN)
+                  background=[("pressed", BTN_HOVER), ("active", BTN_HOVER),
+                              ("disabled", DARK_BG)],
+                  foreground=[("disabled", AXIS_TXT)],
+                  bordercolor=[("focus", ACCENT)])
+        style.configure("TEntry", fieldbackground=FIELD_BG, foreground=FG_MAIN,
+                        bordercolor=BORDER, padding=4)
+        style.map("TEntry", bordercolor=[("focus", ACCENT)])
         style.configure("TCombobox", fieldbackground=FIELD_BG,
-                        foreground=FG_MAIN, background=BTN_BG, arrowcolor=FG_MAIN)
+                        foreground=FG_MAIN, background=BTN_BG,
+                        arrowcolor=AXIS_TXT, bordercolor=BORDER, padding=3)
         style.map("TCombobox",
                   fieldbackground=[("readonly", FIELD_BG)],
-                  foreground=[("readonly", FG_MAIN)])
-        style.configure("TScrollbar", background=BTN_BG,
-                        troughcolor=DARK_BG)
-        style.configure("TNotebook", background=DARK_BG,
-                        bordercolor=BTN_BORDER, tabmargins=[4, 4, 4, 0])
-        style.configure("TNotebook.Tab", background=BTN_BG,
-                        foreground=FG_MAIN, bordercolor=BTN_BORDER,
-                        padding=[12, 6])
+                  foreground=[("readonly", FG_MAIN)],
+                  arrowcolor=[("active", ACCENT)],
+                  bordercolor=[("focus", ACCENT)])
+        style.configure("TScrollbar", background=BTN_BG, troughcolor=DARK_BG,
+                        bordercolor=DARK_BG, arrowcolor=AXIS_TXT, gripcount=0)
+        style.map("TScrollbar", background=[("active", BTN_HOVER)])
+        style.configure("TNotebook", background=DARK_BG, bordercolor=BORDER,
+                        lightcolor=DARK_BG, darkcolor=DARK_BG,
+                        tabmargins=[6, 6, 6, 0])
+        style.configure("TNotebook.Tab", background=DARK_BG,
+                        foreground=AXIS_TXT, bordercolor=BORDER,
+                        padding=[14, 7], font=("Microsoft YaHei", 10))
         style.map("TNotebook.Tab",
-                  background=[("selected", BTN_HOVER), ("active", BTN_HOVER)],
-                  foreground=[("selected", "#ffffff")])
+                  background=[("selected", PANEL_BG), ("active", PANEL_BG)],
+                  foreground=[("selected", TITLE_TXT), ("active", FG_MAIN)])
+        style.configure("TSeparator", background=BORDER)
+        style.configure("TProgressbar", background=ACCENT,
+                        troughcolor=FIELD_BG, bordercolor=BORDER)
         # 单选/复选：clam 主题悬停时背景默认近白(#eeebe7)，导致整块按钮变白、
         # 白字不可见。这里显式映射 active/selected/disabled，随主题换色。
         for _sub in ("TRadiobutton", "TCheckbutton"):
             style.configure(_sub, background=DARK_BG, foreground=FG_MAIN,
-                            focuscolor=DARK_BG)
+                            focuscolor=DARK_BG, bordercolor=BORDER,
+                            indicatorcolor=FIELD_BG)
             style.map(_sub,
                       background=[("active", DARK_BG), ("selected", DARK_BG),
                                   ("disabled", DARK_BG)],
                       foreground=[("active", FG_MAIN), ("selected", FG_MAIN),
-                                  ("disabled", AXIS_TXT)])
+                                  ("disabled", AXIS_TXT)],
+                      indicatorcolor=[("selected", ACCENT),
+                                      ("disabled", FIELD_BG)])
+
+    def _center_win(self, win, w=None, h=None, y_ratio=3):
+        """把 Toplevel 居中（垂直略偏上，主流对话框习惯）。"""
+        try:
+            win.update_idletasks()
+            w = int(w or win.winfo_width())
+            h = int(h or win.winfo_height())
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // y_ratio)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     # ---------- 布局 ----------
 
@@ -9433,7 +9580,8 @@ class App:
         self.ent_query.bind("<Escape>", lambda e: self._search_hide())
         self.ent_query.bind(
             "<FocusOut>", lambda e: self._safe_after(180, self._search_hide))
-        self.btn_run = ttk.Button(top, text="分析预测", command=self.run)
+        self.btn_run = ttk.Button(top, text="分析预测", style="Tool.TButton",
+                                  command=self.run)
         self.btn_run.pack(side="left", padx=3)
 
         if self.compact:
@@ -9517,11 +9665,11 @@ class App:
         info_lbl.pack(side="left")
         self.progress_var = tk.StringVar(value="")
         progress_lbl = tk.Label(info_row, textvariable=self.progress_var,
-                                fg="#4da3ff", bg=DARK_BG, anchor="w",
+                                fg=ACCENT, bg=DARK_BG, anchor="w",
                                 font=("Microsoft YaHei", 9))
         progress_lbl.pack(side="left", fill="x", expand=True, padx=(10, 0))
         self.hover_var = tk.StringVar(value="")
-        hk = tk.Label(info_row, textvariable=self.hover_var, foreground="#4da3ff",
+        hk = tk.Label(info_row, textvariable=self.hover_var, foreground=ACCENT,
                       bg=DARK_BG, font=("Consolas", 9))
         hk.pack(side="right", padx=(10, 0))
 
@@ -9591,7 +9739,8 @@ class App:
                                     font=("Microsoft YaHei", 9),
                                     relief="flat", bg=PANEL_BG, fg=FG_MAIN,
                                     insertbackground=FG_MAIN,
-                                    selectbackground="#2b3540")
+                                    selectbackground=SEL_BG,
+                                    padx=6, pady=4, spacing1=1, spacing3=1)
             self.side_txt.pack(fill="both", expand=True)
             self._rt_panels["预测参考"] = pred
 
@@ -9605,7 +9754,7 @@ class App:
             # 市场状态：独立一栏常驻面板下方（不随预测参考滚动）
             self.phase_var = tk.StringVar(value="市场状态 ● -")
             tk.Label(rt_col, textvariable=self.phase_var, bg=DARK_BG,
-                     fg="#4da3ff", anchor="w",
+                     fg=ACCENT, anchor="w",
                      font=("Microsoft YaHei", 10, "bold")).pack(
                          fill="x", pady=(3, 0))
         self._w_right = getattr(self, "_w_right", None)
@@ -9623,9 +9772,10 @@ class App:
             self.watch_list = tk.Listbox(self._wf_content, width=12,
                                          font=("Consolas", 9),
                                          exportselection=False, bg=PANEL_BG,
-                                         fg=FG_MAIN, selectbackground="#2b3540",
-                                         selectforeground="#ffffff",
-                                         relief="flat", highlightthickness=0)
+                                         fg=FG_MAIN, selectbackground=SEL_BG,
+                                         selectforeground=FG_MAIN,
+                                         activestyle="none", relief="flat",
+                                         highlightthickness=0, borderwidth=0)
             self.watch_list.pack(fill="both", expand=True)
             self.watch_list.bind("<Double-Button-1>", self._on_pick)
             bf = ttk.Frame(self._wf_content)
@@ -9688,9 +9838,9 @@ class App:
         self._w_bottom = bottom
         self.txt = tk.Text(bottom, height=self._bottom_lines,
                            font=("Consolas", 9),
-                           bg="#12171d", fg="#cfd8e0",
+                           bg=LOG_BG, fg=FG_MAIN,
                            insertbackground=FG_MAIN, relief="flat",
-                           selectbackground="#2b3540")
+                           selectbackground=SEL_BG, padx=6, pady=3)
         self.txt.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(bottom, command=self.txt.yview)
         sb.pack(side="right", fill="y")
@@ -9725,6 +9875,8 @@ class App:
         if self.compact:
             win.attributes("-fullscreen", True)
             win.bind("<Escape>", lambda e: win.destroy())
+        else:
+            self._center_win(win, 760, 540)
         top = tk.Frame(win, bg=DARK_BG)
         top.pack(fill="x", padx=6, pady=(6, 0))
         tk.Label(top, text="风险偏好：", bg=DARK_BG, fg=FG_MAIN,
@@ -9735,8 +9887,10 @@ class App:
         default_mode = ai_mode if pconf["ai_auto_tier"] else \
             (pconf["risk_pref"] if pconf["risk_pref"] in MODES else "稳健")
         mode = tk.StringVar(value=default_mode)
-        lb = tk.Listbox(win, font=("Consolas", 9), bg="#12171d",
-                        fg="#cfd8e0", selectbackground="#2b3540")
+        lb = tk.Listbox(win, font=("Consolas", 9), bg=LOG_BG,
+                        fg=FG_MAIN, selectbackground=SEL_BG,
+                        selectforeground=FG_MAIN, activestyle="none",
+                        relief="flat", highlightthickness=0)
         lb.pack(fill="both", expand=True, padx=6, pady=6)
 
         def reload(*_a):
@@ -9907,6 +10061,8 @@ class App:
         if getattr(self, "compact", False):
             win.attributes("-fullscreen", True)
             win.bind("<Escape>", lambda e: win.destroy())
+        else:
+            self._center_win(win, 620, 128)
         frm = tk.Frame(win, bg=DARK_BG)
         frm.pack(fill="both", expand=True, padx=6, pady=6)
         for col in range(len(INDEX_CODES)):
@@ -10146,13 +10302,18 @@ class App:
     def _show_text_window(self, title, text):
         win = tk.Toplevel(self.root)
         win.title(title)
-        txt = tk.Text(win, width=132, font=("Consolas", 9), wrap="none")
-        txt.pack(fill="both", expand=True)
-        sb = tk.Scrollbar(txt, command=txt.yview)
-        sb.pack(side="right", fill="y")
+        win.configure(bg=DARK_BG)
+        txt = tk.Text(win, width=110, height=34, font=("Consolas", 9),
+                      bg=LOG_BG, fg=FG_MAIN, relief="flat", wrap="none",
+                      insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                      padx=6, pady=4)
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
         txt.config(yscrollcommand=sb.set)
         txt.insert("end", text)
         txt.see("end")
+        self._center_win(win, 980, 640)
 
     def run_tiers_bg(self):
         """工具菜单：v6.1 三档组合——最新目标持仓（按设置里的股票池/权限）。"""
@@ -10375,9 +10536,10 @@ class App:
             w = tk.Toplevel(self.root)
             w.overrideredirect(True)
             w.attributes("-topmost", True)
-            w.configure(bg="#12171d")
-            lb = tk.Listbox(w, font=("Consolas", 9), bg="#12171d",
-                            fg="#cfd8e0", selectbackground="#2b3540",
+            w.configure(bg=BORDER)
+            lb = tk.Listbox(w, font=("Consolas", 9), bg=LOG_BG,
+                            fg=FG_MAIN, selectbackground=SEL_BG,
+                            selectforeground=FG_MAIN,
                             activestyle="none", highlightthickness=0)
             lb.pack(fill="both", expand=True)
             lb.bind("<Double-Button-1>", lambda e: self._search_commit())
@@ -11348,10 +11510,13 @@ class App:
         lx = g["L"] + 2
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
-                cv.create_text(lx, 6, text=f"MA{nn}",
-                               fill=MA_COLORS[nn],
-                               font=("Consolas", 8, "bold"), anchor="w")
-                lx += 36
+                it = cv.create_text(lx, 3, text=f"MA{nn}",
+                                    fill=MA_COLORS[nn],
+                                    font=("Consolas", 8, "bold"), anchor="nw")
+                try:                    # 按实际字宽推进（HiDPI/字体缩放不重叠）
+                    lx = cv.bbox(it)[2] + 8
+                except Exception:
+                    lx += 36
         step = max(1, len(bars) // 10)
         for i in range(0, len(bars), step):
             cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
@@ -11996,7 +12161,7 @@ class App:
             p("══════════════════════")
             tag_cfg = self.side_txt.tag_config
             self.side_txt.insert("end", "■ AI 分析\n", ("h3",))
-            self.side_txt.tag_config("h3", foreground="#4da3ff",
+            self.side_txt.tag_config("h3", foreground=ACCENT,
                                      font=("Microsoft YaHei", 10, "bold"))
             self.side_txt.insert("end", self.ai_text + "\n")
 
@@ -12212,8 +12377,15 @@ class App:
             return
         win = tk.Toplevel(self.root)
         win.title(f"相似样本明细 - {self.res['full_code']}")
-        txt = tk.Text(win, width=110, font=("Consolas", 9))
-        txt.pack(fill="both", expand=True)
+        win.configure(bg=DARK_BG)
+        txt = tk.Text(win, width=110, height=30, font=("Consolas", 9),
+                      bg=LOG_BG, fg=FG_MAIN, relief="flat",
+                      insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                      padx=6, pady=4)
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        txt.config(yscrollcommand=sb.set)
         hdr = (f"{'T日':<11}{'T+1日':<11}{'T+2日':<11}{'缺口%':>7}{'高/开%':>8}"
                f"{'低/开%':>8}{'收/开%':>8}{'T2高/开%':>9}{'T2低/开%':>9}{'T2收/开%':>9}\n")
         txt.insert("end", hdr)
@@ -12224,9 +12396,10 @@ class App:
             for key in ("gap", "n1_hi", "n1_lo", "n1_cl",
                         "n2_hi", "n2_lo", "n2_cl"):
                 v = s.get(key)
-                txt.insert("end",
-                           f"{v*100:>9.2f}" if v is not None else "        -")
+            txt.insert("end",
+                       f"{v*100:>9.2f}" if v is not None else "        -")
             txt.insert("end", "\n")
+        self._center_win(win, 900, 560)
 
     # ---------- AI 分析（DeepSeek） ----------
 
@@ -12350,16 +12523,17 @@ class App:
         win.configure(bg=DARK_BG)
         _sw = self.root.winfo_screenwidth()
         _sh = self.root.winfo_screenheight()
-        win.geometry(f"{min(1320, max(760, int(_sw * 0.92)))}x"
-                     f"{min(980, max(600, int(_sh * 0.88)))}")
+        _w = min(1320, max(760, int(_sw * 0.92)))
+        _h = min(980, max(600, int(_sh * 0.88)))
         win.minsize(min(980, int(_sw * 0.72)),
                     min(620, max(520, _sh - 180)))
         win.resizable(True, True)
         win.transient(self.root)
         win.grab_set()
+        self._center_win(win, _w, _h)
 
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         # ── 胜率计算（收益曲线 + 全期/训练/验证 + IC 明细）──
         f_bt = ttk.Frame(nb, padding=10)
@@ -12368,12 +12542,15 @@ class App:
         bt_bar = ttk.Frame(f_bt)
         bt_bar.pack(side="bottom", fill="x")     # 先占底部，避免被 Text 挤没
 
-        bt_canvas = tk.Canvas(f_bt, height=340, bg=BG, highlightthickness=0)
-        bt_canvas.pack(side="top", fill="x", pady=(0, 6))
+        bt_canvas = tk.Canvas(f_bt, height=340, bg=BG, highlightthickness=1,
+                              highlightbackground=BORDER, bd=0)
+        bt_canvas.pack(side="top", fill="x", pady=(0, 8))
 
         bt_result = tk.Text(f_bt, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
-                            wrap="word", state="disabled")
+                            wrap="word", state="disabled",
+                            insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                            padx=8, pady=5, spacing1=1, spacing3=2)
         bt_scroll = ttk.Scrollbar(f_bt, command=bt_result.yview)
         bt_result.configure(yscrollcommand=bt_scroll.set)
         bt_scroll.pack(side="right", fill="y")
@@ -12484,8 +12661,8 @@ class App:
             cv.create_text(L, y0_dd - 9, anchor="w", text="训练集回撤",
                            fill=DOWN, font=("Microsoft YaHei", 8, "bold"))
             cv.create_text(W - R, T - 8, anchor="e",
-                           text=f"区间 {self.res['disp_rows'][0]['date']} ~ "
-                                f"{self.res['disp_rows'][-1]['date']}",
+                           text=f"区间 {(bt.get('_rows') or self.res['disp_rows'])[0]['date']} ~ "
+                                f"{(bt.get('_rows') or self.res['disp_rows'])[-1]['date']}",
                            fill=AXIS_TXT, font=("Microsoft YaHei", 8))
 
         def run_bt():
@@ -12495,20 +12672,25 @@ class App:
             rp = (strat.get("params")
                   or CFG.RISK_PARAMS.get(self.res.get("risk_mode"))
                   or CFG.risk_params())
-            # 用**全历史**重算该策略信号：主图只生成/展示近 250 根，
-            # 直接做 75/25 切分会把信号全放进验证段 → 训练集恒"信号不足"。
+            # 与消融同窗（近1000根）+ 同 75/25 切分：主图只展示近250根，
+            # 而消融选型用的是近1000根；若拿全历史(可达2400根)切分，
+            # 训练段会落在策略数据起点之前（如 L2 行业ETF 2024 才有数据）
+            # → 训练集恒空、曲线一条水平线（688012/002491 实测）。
+            rows_bt = self.res["disp_rows"]
+            if len(rows_bt) > ABL_BARS:
+                rows_bt = rows_bt[-ABL_BARS:]
             try:
                 info = get_stock_info(self.res["full_code"]) or {}
                 industry = info.get("industry") or ""
             except Exception:
                 industry = ""
-            sig_use = strategy_signals_full(self.res["disp_rows"], strat,
-                                            industry)
+            sig_use = strategy_signals_full(rows_bt, strat, industry)
             if not sig_use:
                 sig_use = self.res["signals"]
-            bt = backtest_signals(self.res["disp_rows"], sig_use, rp=rp)
+            bt = backtest_signals(rows_bt, sig_use, rp=rp)
             if bt:
                 bt["_signals"] = sig_use
+                bt["_rows"] = rows_bt
             _bt_last[0] = bt
             bt_result.config(state="normal")
             bt_result.delete("1.0", "end")
@@ -12537,9 +12719,9 @@ class App:
                     f"均亏 {_fmt_pct(m.get('avg_loss'), True)}\n")
 
             if not bt or bt.get("winrate") is None:
-                bt_result.insert("end", "该策略在全历史上没有可回测交易（信号不足）")
+                bt_result.insert("end", "该策略在近1000根窗口内没有可回测交易（信号不足）")
             else:
-                rows_ = self.res["disp_rows"]
+                rows_ = bt.get("_rows") or self.res["disp_rows"]
                 si = bt.get("split_i")
                 _seg("全期（无手续费）", bt,
                      f"  {rows_[0]['date']} ~ {rows_[-1]['date']}")
@@ -12576,9 +12758,9 @@ class App:
                                 f"(n={n_})")
                     bt_result.insert("end", f"  {name}: " + "  ".join(parts) + "\n")
                 bt_result.insert("end",
-                    f"\n  提示：回测用所选策略**全历史**信号，T日收盘信号/T+1成交，\n"
-                    f"  带ATR止损+移动止盈；训练/验证按时间前75%/后25%切分，\n"
-                    f"  验证集不参与选型、仅供检验。\n")
+                    f"\n  提示：回测与消融**同窗（近1000根）**，用所选策略信号，\n"
+                    f"  T日收盘信号/T+1成交，带ATR止损+移动止盈；训练/验证按\n"
+                    f"  时间前75%/后25%切分，验证集不参与选型、仅供检验。\n")
             bt_result.config(state="disabled")
             bt_result.yview_moveto(0)   # 每次计算后回到顶部，先看全期/训练/验证
             _draw_curve(bt)
@@ -12612,7 +12794,7 @@ class App:
                 desk = os.path.expanduser("~")
             r = self.res
             strat = r.get("strategy") or {}
-            rows_ = r["disp_rows"]
+            rows_ = bt.get("_rows") or r["disp_rows"]
             curve = bt.get("curve") or []
             peak = 0.0
             dds = []
@@ -12744,7 +12926,9 @@ class App:
         bar.pack(side="bottom", fill="x", pady=6)   # 先占底部，避免被 Text 挤没
         ai_result = tk.Text(f_ai, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
-                            wrap="word", state="disabled")
+                            wrap="word", state="disabled",
+                            insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                            padx=8, pady=5, spacing1=1, spacing3=2)
         ai_scroll = ttk.Scrollbar(f_ai, command=ai_result.yview)
         ai_result.configure(yscrollcommand=ai_scroll.set)
         ai_scroll.pack(side="right", fill="y")
@@ -12919,7 +13103,10 @@ class App:
                 cv.configure(height=max(200, h))
                 wwidth = max(580, min(frm.winfo_reqwidth() + 40,
                                       self.root.winfo_screenwidth() - 20))
-                win.geometry(f"{wwidth}x{h + 6}")
+                if getattr(self, "compact", False):
+                    win.geometry(f"{wwidth}x{h + 6}")
+                else:
+                    self._center_win(win, wwidth, h + 6)
             except Exception:
                 pass
         frm.bind("<Configure>", _fs_fit)
@@ -13103,8 +13290,10 @@ class App:
             inds = []
         lb_ind = tk.Listbox(pfrm, selectmode="extended", height=6, width=26,
                             exportselection=False,
-                            font=("Microsoft YaHei", 8), bg="#12171d",
-                            fg="#cfd8e0", selectbackground="#2b3540")
+                            font=("Microsoft YaHei", 8), bg=LOG_BG,
+                            fg=FG_MAIN, selectbackground=SEL_BG,
+                            selectforeground=FG_MAIN, activestyle="none",
+                            relief="flat", highlightthickness=0)
         lb_ind.pack(side="left", fill="y", padx=(4, 0))
         sb_i = ttk.Scrollbar(pfrm, orient="vertical", command=lb_ind.yview)
         sb_i.pack(side="left", fill="y")
@@ -13324,6 +13513,7 @@ class App:
         """销毁重建全部控件（主题切换后刷新配色）。"""
         for w in self.root.winfo_children():
             w.destroy()
+        self.root.configure(bg=DARK_BG)
         self._search_win = None
         self._search_lb = None
         self._search_open = False

@@ -42,7 +42,7 @@ from stock_gui import (
     _sig_chip_peak, _sig_sector_rot, _sig_l2_industry,
     _composite_signals, _composite_precompute,
     _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
-    _ablation_pf, pick_ablation_multi,
+    _ablation_pf, _ablation_recent, pick_ablation_consistent,
     ALGO_LABEL, CFG, get_daily
 )
 
@@ -116,8 +116,12 @@ def _trim_rows(rows, max_bars=1000):
 def _pick_candidates(cands, key):
     """v6.1 多指标结合选优（训练集 Calmar/PF/胜率/年化 rank 加权）：
     稳健偏 Calmar+PF；均衡/激进偏年化+Calmar；激进=均衡选型 + 组合层
-    弱市覆盖（本脚本不生成，见 backtest_strategy_portfolio.py）。"""
-    return pick_ablation_multi(cands, "稳健" if key == "稳健" else "激进")
+    弱市覆盖（本脚本不生成，见 backtest_strategy_portfolio.py）。
+    v6.1.5 热修②：加"近端子窗一致性"，不一致回退该档「多维评分」。"""
+    picked, _note = pick_ablation_consistent(
+        cands, "稳健" if key == "稳健" else "激进",
+        recent_of=lambda c: c.get("recent"))
+    return picked
 
 
 def run_ablation_for_stock(args):
@@ -178,6 +182,7 @@ def run_ablation_for_stock(args):
                 train["pf"] = _ablation_pf(tr_tr)
             if va_tr and val is not None:
                 val["pf"] = _ablation_pf(va_tr)
+            rc = _ablation_recent(rows, sigs, rp, n, atrs, arrays=arrays)
             cands.append({
                 "algo": algo,
                 "mode": mode,
@@ -185,6 +190,7 @@ def run_ablation_for_stock(args):
                 "label": f"{ALGO_LABEL.get(algo, algo)}·{mode}",
                 "train": train,
                 "val": val,
+                "recent": rc,
                 "bull": bull,
                 "bear": bear,
             })
@@ -214,6 +220,7 @@ def run_ablation_for_stock(args):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
+        rc = _ablation_recent(rows, sigs, rp, n, atrs, arrays=arrays)
         cands.append({
             "algo": "composite",
             "mode": mode,
@@ -221,6 +228,7 @@ def run_ablation_for_stock(args):
             "label": f"多维评分·{mode}",
             "train": train,
             "val": val,
+            "recent": rc,
             "bull": bull,
             "bear": bear,
         })

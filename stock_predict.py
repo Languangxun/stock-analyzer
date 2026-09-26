@@ -2627,6 +2627,12 @@ BTN_BG = "#222a33"
 BTN_FG = "#d7dee6"
 BTN_HOVER = "#2b3540"
 BTN_BORDER = "#333e4a"
+# v6.1.5 UI 优化：统一边框/悬停/选中/强调/日志底色（随主题切换）
+BORDER = "#2a3340"
+HOVER_BG = "#222a34"
+SEL_BG = "#2b3a4d"
+ACCENT = "#4da3ff"
+LOG_BG = "#0d1116"
 
 # ---- 可切换主题 ----
 THEMES = {
@@ -2638,6 +2644,8 @@ THEMES = {
         FG_MAIN="#d7dee6",
         BTN_BG="#222a33", BTN_FG="#d7dee6", BTN_HOVER="#2b3540",
         BTN_BORDER="#333e4a",
+        BORDER="#2a3340", HOVER_BG="#222a34", SEL_BG="#2b3a4d",
+        ACCENT="#4da3ff", LOG_BG="#0d1116",
         MA_COLORS={5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff",
                    30: "#7bf08b", 60: "#e8c14a"},
         C_ORANGE="#ffa94d", C_BLUE="#5dade2",
@@ -2645,12 +2653,14 @@ THEMES = {
     ),
     "light": dict(
         UP="#e03131", DOWN="#0ca678", PRED_C="#1971c2", TPRED_C="#111111",
-        BG="#ffffff", GRID_C="#ececec", GUIDE_C="#f1f3f5",
-        AXIS_TXT="#777777", TITLE_TXT="#444444", CROSS_C="#999999",
-        DARK_BG="#f2f4f7", PANEL_BG="#ffffff", FIELD_BG="#ffffff",
+        BG="#ffffff", GRID_C="#ececec", GUIDE_C="#eef1f4",
+        AXIS_TXT="#6b7684", TITLE_TXT="#3b444e", CROSS_C="#999999",
+        DARK_BG="#f2f4f7", PANEL_BG="#ffffff", FIELD_BG="#f8f9fb",
         FG_MAIN="#1f2933",
-        BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
-        BTN_BORDER="#bbbbbb",
+        BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef2f7",
+        BTN_BORDER="#c9d1d9",
+        BORDER="#d9dee5", HOVER_BG="#eef2f7", SEL_BG="#d8e8ff",
+        ACCENT="#1971c2", LOG_BG="#f7f8fa",
         MA_COLORS={5: "#e8590c", 10: "#1971c2", 20: "#ae3ec9",
                    30: "#2f9e44", 60: "#b08900"},
         C_ORANGE="#e8590c", C_BLUE="#1971c2",
@@ -2663,8 +2673,10 @@ THEMES = {
         AXIS_TXT="#ffffff", TITLE_TXT="#ffffff", CROSS_C="#ffff00",
         DARK_BG="#000000", PANEL_BG="#0a0a0a", FIELD_BG="#111111",
         FG_MAIN="#ffffff",
-        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
+        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#2a2a2a",
         BTN_BORDER="#ffffff",
+        BORDER="#ffffff", HOVER_BG="#2a2a2a", SEL_BG="#555500",
+        ACCENT="#ffee00", LOG_BG="#000000",
         MA_COLORS={5: "#ffb000", 10: "#00d4ff", 20: "#ff7ae0",
                    30: "#39ff88", 60: "#ffee00"},
         C_ORANGE="#ffb000", C_BLUE="#00b7ff",
@@ -3715,11 +3727,11 @@ def backtest_signals(rows, signals, rp=None):
 
 
 def strategy_signals_full(rows, strat, industry=""):
-    """按所选策略在**全历史**上重算信号（工具→信号胜率回测用）。
+    """按所选策略在传入 rows 上重算信号（工具→信号胜率回测用）。
 
     主图买卖点只展示近 250 根（性能/可读性），若直接拿展示信号做 75/25
-    训练/验证切分，指标型策略信号会全部落在验证段 → 训练集恒"信号不足"。
-    这里按消融选型同口径在全历史重算（raw 信号，不做展示端压缩）。"""
+    训练/验证切分，指标型策略信号会全部落在尾部；这里按消融选型同口径
+    重算 raw 信号（调用方传近1000根，与 run_ablation 同窗），不做展示端压缩。"""
     algo = (strat or {}).get("algo", "composite")
     rp = (strat or {}).get("params") or CFG.risk_params()
     try:
@@ -3736,7 +3748,7 @@ def strategy_signals_full(rows, strat, industry=""):
                "chip_peak": _sig_chip_peak}.get(algo)
         return gen(rows) if gen else []
     except Exception:
-        log.exception("全历史策略信号生成失败 %s", algo)
+        log.exception("策略信号生成失败 %s", algo)
         return []
 
 
@@ -4537,9 +4549,13 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 
 # ================= 策略消融引擎（多算法回测+防过拟合选型） =================
 # 每次分析对该股近1000交易日做一次多算法消融回测：
-#   候选 = L1形态up_prob / MACD / KDJ / RSI / 布林带 / MA20-60趋势 / 多维评分×3风险档
+#   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
+#          筹码峰 / 板块轮动 / 多维评分×3风险档（全部 × 3 档风险参数）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
-# 信号只用 T 日及以前数据，信号日收盘成交）。结果缓存 meta 表，5日过期。
+# 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
+# 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
+# 近窗为时点可观测数据，n=1000 时即验证段，只做 top 门槛否决、不参与 rank 打分）。
+# 结果缓存 meta 表，5日过期。
 
 STRAT_TTL = 5 * 86400
 
@@ -5158,17 +5174,26 @@ def _rank01(vals):
     return rk
 
 
-def pick_ablation_multi(cands, objective="稳健", min_trades=8):
-    """消融多指标结合选优（v6.1，仅用训练集指标，防前视）：
-    稳健 = 偏 Calmar+PF；均衡/激进 = 偏年化+Calmar；
-    四个指标各自横截面 rank 后加权，避免量纲/单指标过拟合。"""
+def _ablation_pool(cands, min_trades):
+    """交易活跃度下限池：优先 >=min_trades，不足降到 3 笔，再不足全量。"""
     pool = [c for c in cands if c["train"].get("trades", 0) >= min_trades]
     if not pool:
         pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
     if not pool:
         pool = list(cands)
-    if not pool:
-        return None
+    return pool
+
+
+def _ablation_weights(objective):
+    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进偏年化+Calmar。"""
+    return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
+            if objective == "稳健" else
+            {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
+
+
+def _ablation_ranks(pool, objective, key="train"):
+    """4 指标横截面 rank(0~1) 加权得分（与 pick_ablation_multi 同口径）。
+    key="train" 用训练段指标，key="recent" 用近端子窗指标。"""
 
     def calmar(m):
         return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
@@ -5183,17 +5208,69 @@ def pick_ablation_multi(cands, objective="稳健", min_trades=8):
         return m.get("ann") or 0.0
 
     r = {
-        "calmar": _rank01([calmar(c["train"]) for c in pool]),
-        "pf": _rank01([pf(c["train"]) for c in pool]),
-        "winrate": _rank01([wr(c["train"]) for c in pool]),
-        "ann": _rank01([ann(c["train"]) for c in pool]),
+        "calmar": _rank01([calmar(c[key]) for c in pool]),
+        "pf": _rank01([pf(c[key]) for c in pool]),
+        "winrate": _rank01([wr(c[key]) for c in pool]),
+        "ann": _rank01([ann(c[key]) for c in pool]),
     }
-    w = ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
-         if objective == "稳健" else
-         {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
-    i = max(range(len(pool)),
-            key=lambda k: sum(w[mk] * r[mk][k] for mk in w))
-    return dict(pool[i])
+    w = _ablation_weights(objective)
+    return [sum(w[mk] * r[mk][k] for mk in w) for k in range(len(pool))]
+
+
+def pick_ablation_multi(cands, objective="稳健", min_trades=8):
+    """消融多指标结合选优（v6.1，仅用训练集指标，防前视）：
+    稳健 = 偏 Calmar+PF；均衡/激进 = 偏年化+Calmar；
+    四个指标各自横截面 rank 后加权，避免量纲/单指标过拟合。"""
+    pool = _ablation_pool(cands, min_trades)
+    if not pool:
+        return None
+    sc = _ablation_ranks(pool, objective)
+    return dict(pool[max(range(len(pool)), key=lambda k: sc[k])])
+
+
+def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
+                             recent_of=None, fallback=True):
+    """全窗选优 + 近端子窗一致性（v6.1.5 热修②，防风格切换失配）：
+
+    在全训练窗和最近 `RECENT_ABL_BARS` 根子窗里，各自按同一权重 rank 取
+    前 25%（下限 3 个）；两窗同时在前列者中取全窗得分最高。
+    交集为空（近端 regime 与全窗不一致）→ 回退该档「多维评分」候选；
+    近窗可评估候选 <3 个时视为无法判断，按纯全窗选优。
+    近窗（n=1000 时=验证段）只用于门槛否决，权重打分仍只用训练段指标。
+
+    recent_of(c) 返回候选的近窗指标 dict（trades>=2），无则 None。
+    返回 (picked, note)。"""
+    pool = _ablation_pool(cands, min_trades)
+    if not pool:
+        return None, "无候选"
+    full = _ablation_ranks(pool, objective)
+    if recent_of is None:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "仅全窗"
+    rpool = [i for i, c in enumerate(pool) if recent_of(c)]
+    if len(rpool) < 3:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "近窗样本不足，按全窗"
+    rs = _ablation_ranks([pool[i] for i in rpool], objective, key="recent")
+    kf = max(3, (len(pool) + 3) // 4)
+    kr = max(2, (len(rpool) + 3) // 4)
+    ftop = set(sorted(range(len(pool)), key=lambda k: -full[k])[:kf])
+    rtop = {rpool[j]
+            for j in sorted(range(len(rpool)), key=lambda k: -rs[k])[:kr]}
+    both = ftop & rtop
+    if both:
+        i = max(both, key=lambda k: full[k])
+        return dict(pool[i]), "全窗+近窗一致"
+    if not fallback:
+        i = max(range(len(pool)), key=lambda k: full[k])
+        return dict(pool[i]), "近窗不一致（未回退）"
+    comp = [c for c in pool if c.get("algo") == "composite"]
+    if comp:
+        cs = _ablation_ranks(comp, objective)
+        i = max(range(len(comp)), key=lambda k: cs[k])
+        return dict(comp[i]), "近窗不一致→回退多维评分"
+    i = max(range(len(pool)), key=lambda k: full[k])
+    return dict(pool[i]), "近窗不一致→无多维候选，按全窗"
 
 
 def _ablation_pf(trades):
@@ -5302,6 +5379,31 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             "winrate": wins / len(trades),
             "total": total - 1, "ann": ann, "mdd": mdd,
             "curve": curve, "i0": i0}
+
+
+RECENT_ABL_BARS = 250       # 选型一致性用的近端子窗长度（截至最新，含验证段）
+ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
+
+
+def _ablation_recent(rows, sigs, rp, n, atrs, arrays=None):
+    """最近 ~250 根（截至最新）的"近端 regime"回测指标；交易<2 返回 None。
+
+    用途：`pick_ablation_consistent` 的近端一致性否决——防"长期横盘/老 regime
+    选出在当下风格里沉默的策略"（如 688012 于 2025-09 突破后的失配）。
+    注意：n=1000 时该子窗即验证段，因此验证段参与"top 门槛否决"但不参与
+    指标 rank 打分；这是时点可观测数据，属选型的一部分（见 ARCHITECTURE 3.8）。"""
+    r0 = max(0, n - RECENT_ABL_BARS)
+    if r0 <= 0 or n - r0 < 100:
+        return None
+    tr_out = []
+    rc = _bt_events(rows, sigs, rp, r0, n, atrs=atrs, trade_out=tr_out,
+                    arrays=arrays)
+    if not rc:
+        return None
+    rc = {k: v for k, v in rc.items() if k != "curve"}
+    if tr_out:
+        rc["pf"] = _ablation_pf(tr_out)
+    return rc
 
 
 def _regime_map(idx_rows, n):
@@ -5424,8 +5526,8 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
           "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
     strat = {"algo","mode","params","train","val","bull","bear","label"}"""
     rows = [r for r in rows if r.get("close") and r["close"] > 0]
-    if len(rows) > 1000:
-        rows = rows[-1000:]
+    if len(rows) > ABL_BARS:
+        rows = rows[-ABL_BARS:]
     if len(rows) < 200:
         return None
     n = len(rows)
@@ -5504,9 +5606,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
+        rc = _ablation_recent(rows, sigs, rp, n, atrs)
         return {"algo": algo, "mode": mode, "params": dict(rp),
                 "label": label, "train": train, "val": val,
-                "bull": bull, "bear": bear}
+                "recent": rc, "bull": bull, "bear": bear}
 
     cands = []
     # 使用线程池并行评估候选（I/O轻、计算密集，GIL会部分释放）
@@ -5524,14 +5627,12 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     # 交易活跃度下限：避免选到“几乎不交易、回撤自然为 0”的假策略
     _MIN_TR = 8
+    _pick_notes = {}
 
     def _pick(key):
-        pool = [c for c in cands if c["train"].get("trades", 0) >= _MIN_TR]
+        pool = _ablation_pool(cands, _MIN_TR)
         if not pool:
-            pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
-        if not pool:
-            pool = list(cands)
-        if not pool:
+            _pick_notes[key] = "样本不足"
             return {"algo": "composite", "mode": key,
                     "params": dict(CFG.RISK_PARAMS.get(
                         key, CFG.RISK_PARAMS["稳健"])),
@@ -5542,21 +5643,25 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
             if pool2:
                 pool = pool2
-        # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）
-        if key in ("均衡", "激进"):
-            picked = pick_ablation_multi(pool, "激进")
-        else:
-            picked = pick_ablation_multi(pool, "稳健")
-        return picked or dict(pool[0])
+        # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）；
+        # v6.1.5 热修②：+近端子窗一致性，不一致回退该档「多维评分」
+        obj = "激进" if key in ("均衡", "激进") else "稳健"
+        picked, note = pick_ablation_consistent(
+            pool, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+        if not picked:
+            picked = dict(pool[0])
+            note = "回退池内首个"
+        _pick_notes[key] = note
+        return picked
 
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
                        "激进": _pick("激进")}
     # 三档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
-    # 属训练集选型结果而非故障）；记录以便在日志中直接核对（如 sz002241）。
-    log.info("消融选型 %s: 保守=%s | 稳健=%s | 激进=%s", full,
-             mode_candidates["保守"]["label"],
-             mode_candidates["稳健"]["label"],
-             mode_candidates["激进"]["label"])
+    # 属训练集选型结果而非故障）；记录选型与一致性结论，便于日志核对。
+    log.info("消融选型 %s: 保守=%s[%s] | 稳健=%s[%s] | 激进=%s[%s]", full,
+             mode_candidates["保守"]["label"], _pick_notes.get("保守"),
+             mode_candidates["稳健"]["label"], _pick_notes.get("稳健"),
+             mode_candidates["激进"]["label"], _pick_notes.get("激进"))
 
     # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
     def _tc(t):
@@ -5578,6 +5683,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     out = {"mode_candidates": mode_candidates,
            "recommend": recommend,
+           "pick_notes": dict(_pick_notes),
            "vol_ann": vol,
            "high_vol": high_vol,
            "ts": time.time(), "bars": n, "train_n": split,

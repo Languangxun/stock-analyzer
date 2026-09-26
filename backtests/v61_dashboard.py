@@ -160,20 +160,32 @@ HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#0f1419;--panel:#171d24;--panel2:#1e2630;--fg:#d7dee6;
       --dim:#8b98a5;--line:#2a3440;--gold:#e8c14a;--blue:#4da3ff;
-      --up:#ff5252;--down:#26c281;}
+      --up:#ff5252;--down:#26c281;--grid:#26303b;--cross:#ffffff55;
+      --label:#cfd8e2;--warn:#ffb86b;}
+:root[data-theme=light]{--bg:#f5f6f8;--panel:#ffffff;--panel2:#eef1f5;
+      --fg:#1f2933;--dim:#6b7684;--line:#d9dee5;--gold:#b08900;
+      --blue:#1971c2;--up:#e03131;--down:#0ca678;--grid:#ececec;
+      --cross:#66666640;--label:#3b444e;--warn:#b45309;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
      font:14px/1.5 "Microsoft YaHei","Segoe UI",sans-serif}
-header{padding:14px 20px 8px;border-bottom:1px solid var(--line)}
-h1{font-size:19px;margin:0 0 6px;color:#fff}
+header{padding:14px 20px 8px;border-bottom:1px solid var(--line);
+       position:relative}
+h1{font-size:19px;margin:0 0 6px;color:var(--fg)}
 h1 .v{color:var(--gold)}
+#theme-btn{position:absolute;top:14px;right:20px;background:var(--panel);
+  border:1px solid var(--line);color:var(--fg);border-radius:6px;
+  padding:4px 10px;cursor:pointer;font-size:13px}
+#theme-btn:hover{background:var(--panel2)}
 .sub{color:var(--dim);font-size:12.5px}
 nav{display:flex;gap:4px;padding:8px 16px 0;flex-wrap:wrap;
     border-bottom:1px solid var(--line)}
 nav button{background:transparent;border:1px solid transparent;
   border-bottom:none;color:var(--dim);padding:7px 14px;cursor:pointer;
   font-size:13.5px;border-radius:6px 6px 0 0}
-nav button.on{background:var(--panel);border-color:var(--line);color:#fff}
+nav button:hover{color:var(--fg)}
+nav button.on{background:var(--panel);border-color:var(--line);
+  color:var(--fg)}
 main{padding:14px 18px 40px}
 .tab{display:none}.tab.on{display:block}
 .ctl{display:flex;gap:14px;flex-wrap:wrap;align-items:center;
@@ -189,9 +201,9 @@ canvas{width:100%;display:block;background:var(--panel);
 table{border-collapse:collapse;width:100%;margin:10px 0 18px;font-size:13px}
 th,td{border:1px solid var(--line);padding:5px 8px;text-align:right;
       white-space:nowrap}
-th{background:var(--panel2);color:#cfd8e2;position:sticky;top:0}
+th{background:var(--panel2);color:var(--label);position:sticky;top:0}
 td:first-child,th:first-child{text-align:left}
-tr:hover td{background:#1b232c}
+tr:hover td{background:var(--panel2)}
 .legend{display:flex;gap:16px;flex-wrap:wrap;padding:8px 2px;
         font-size:12.5px;color:var(--dim)}
 .legend span b{display:inline-block;width:10px;height:10px;border-radius:2px;
@@ -205,13 +217,14 @@ tr:hover td{background:#1b232c}
 .files a{color:var(--blue);text-decoration:none;margin-right:16px;
          display:inline-block;padding:2px 0}
 .files a:hover{text-decoration:underline}
-.warn{color:#ffb86b}
+.warn{color:var(--warn)}
 </style>
 </head>
 <body>
 <header>
   <h1>stock-analyzer · 回测仪表盘 <span class="v" id="hver"></span></h1>
   <div class="sub" id="hsub">加载中…</div>
+  <button id="theme-btn" title="切换明/暗主题">☀ / ☾</button>
 </header>
 <nav>
   <button data-tab="curve" class="on">组合净值曲线</button>
@@ -277,8 +290,15 @@ tr:hover td{background:#1b232c}
 const DATA = __DATA__;
 const PALETTE=["#4da3ff","#ffa94d","#69db7c","#e599f7","#f06595",
                "#ffd43b","#63e6be","#a5d8ff","#ffc9c9","#b197fc"];
-const UP="#ff5252", DOWN="#26c281", GOLD="#e8c14a", DIM="#8b98a5",
-      GRID="#26303b", LINE="#2a3440", FG="#d7dee6", PANEL="#171d24";
+/* 图表配色从 CSS 变量读取（支持明/暗切换后重绘） */
+let TH={};
+function readTheme(){
+  const cs=getComputedStyle(document.documentElement);
+  const g=n=>cs.getPropertyValue(n).trim();
+  TH={up:g('--up'),down:g('--down'),gold:g('--gold'),dim:g('--dim'),
+      grid:g('--grid'),line:g('--line'),fg:g('--fg'),panel:g('--panel'),
+      bg:g('--bg'),cross:g('--cross'),label:g('--label')};
+}
 const TIERS=["稳健","均衡","激进"];
 const UNI_NAME={all:"全A",main:"沪深主板",etf:"ETF",all_etf:"全A含ETF"};
 const $=(q)=>document.querySelector(q);
@@ -324,12 +344,12 @@ function lineChart(cv,series,opt){
   const step=niceStep(hi-lo,5);
   for(let v=Math.ceil(lo/step)*step; v<=hi+1e-9; v+=step){
     const y=ymap(v);
-    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(L,y);
+    ctx.strokeStyle=TH.grid; ctx.beginPath(); ctx.moveTo(L,y);
     ctx.lineTo(W-R,y); ctx.stroke();
-    ctx.fillStyle=DIM; ctx.fillText(num(v,2),L-6,y+4);
+    ctx.fillStyle=TH.dim; ctx.fillText(num(v,2),L-6,y+4);
   }
   if(!opt.log && lo<1 && hi>1){ const y=ymap(1);
-    ctx.strokeStyle="#66707c"; ctx.beginPath(); ctx.moveTo(L,y);
+    ctx.strokeStyle=TH.line; ctx.beginPath(); ctx.moveTo(L,y);
     ctx.lineTo(W-R,y); ctx.stroke(); }
   // x 轴日期
   ctx.textAlign="center";
@@ -337,8 +357,8 @@ function lineChart(cv,series,opt){
   for(let i=0;i<ticks;i++){
     const t=x0+(x1-x0)*(i/(ticks-1||1)), x=xmap(t);
     const d=new Date(t), lab=d.toISOString().slice(0,10);
-    ctx.fillStyle=DIM; ctx.fillText(lab,x,H-14);
-    ctx.strokeStyle=GRID; ctx.beginPath(); ctx.moveTo(x,T);
+    ctx.fillStyle=TH.dim; ctx.fillText(lab,x,H-14);
+    ctx.strokeStyle=TH.grid; ctx.beginPath(); ctx.moveTo(x,T);
     ctx.lineTo(x,H-B); ctx.stroke();
   }
   // 曲线
@@ -356,7 +376,7 @@ function lineChart(cv,series,opt){
   const hov=opt.hover;
   if(hov!=null && dates.length){
     const t=hov, x=xmap(t);
-    ctx.strokeStyle="#ffffff55"; ctx.beginPath(); ctx.moveTo(x,T);
+    ctx.strokeStyle=TH.cross; ctx.beginPath(); ctx.moveTo(x,T);
     ctx.lineTo(x,H-B); ctx.stroke();
     series.forEach(s=>{
       let best=null,bd=1e18;
@@ -396,11 +416,11 @@ function barChart(cv,labels,groups,opt){
   const step=niceStep(hi-lo,5);
   ctx.font="11px Consolas,monospace";
   for(let v=Math.ceil(lo/step)*step; v<=hi+1e-9; v+=step){
-    const y=ymap(v); ctx.strokeStyle=GRID; ctx.beginPath();
+    const y=ymap(v); ctx.strokeStyle=TH.grid; ctx.beginPath();
     ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
-    ctx.fillStyle=DIM; ctx.textAlign="right"; ctx.fillText(num(v,2),L-6,y+4);
+    ctx.fillStyle=TH.dim; ctx.textAlign="right"; ctx.fillText(num(v,2),L-6,y+4);
   }
-  const y0=ymap(0); ctx.strokeStyle="#66707c"; ctx.beginPath();
+  const y0=ymap(0); ctx.strokeStyle=TH.line; ctx.beginPath();
   ctx.moveTo(L,y0); ctx.lineTo(W-R,y0); ctx.stroke();
   const slot=pw/Math.max(labels.length,1);
   const bw=Math.min(46,slot*0.72/Math.max(groups.length,1));
@@ -413,17 +433,17 @@ function barChart(cv,labels,groups,opt){
       ctx.fillStyle=g.color; ctx.globalAlpha=0.88;
       ctx.fillRect(x,Math.min(y,y0),bw*0.88,Math.abs(y-y0));
       ctx.globalAlpha=1;
-      ctx.fillStyle="#cfd8e2"; ctx.textAlign="center"; ctx.font="10px Consolas";
+      ctx.fillStyle=TH.label; ctx.textAlign="center"; ctx.font="10px Consolas";
       ctx.fillText(opt.fmt?opt.fmt(v):num(v,2),x+bw*0.44,
                    Math.min(y,y0)-4);
     });
-    ctx.fillStyle=FG; ctx.font="12.5px Microsoft YaHei"; ctx.textAlign="center";
+    ctx.fillStyle=TH.fg; ctx.font="12.5px Microsoft YaHei"; ctx.textAlign="center";
     ctx.fillText(lab,L+slot*(i+0.5),H-30);
   });
   let lx=L+4;
   groups.forEach((g,j)=>{
     ctx.fillStyle=g.color; ctx.fillRect(lx,H-20,10,10);
-    ctx.fillStyle="#cfd8e2"; ctx.textAlign="left";
+    ctx.fillStyle=TH.label; ctx.textAlign="left";
     ctx.font="12px Microsoft YaHei";
     ctx.fillText(g.name,lx+14,H-11);
     lx+=Math.max(90,ctx.measureText(g.name).width+36);
@@ -447,7 +467,7 @@ function boxChart(cv,groups,opt){
     .map(g=>({name:g.name,color:g.color,
       v:g.values.filter(x=>x!=null&&isFinite(x))}))
     .filter(g=>g.v.length);
-  if(!data.length){ctx.fillStyle=DIM;ctx.textAlign="center";
+  if(!data.length){ctx.fillStyle=TH.dim;ctx.textAlign="center";
     ctx.fillText("无数据",W/2,H/2);return;}
   const all=data.flatMap(g=>g.v);
   let lo=Math.min(...all),hi=Math.max(...all);
@@ -457,11 +477,11 @@ function boxChart(cv,groups,opt){
   const step=niceStep(hi-lo,5);
   ctx.font="11px Consolas,monospace";
   for(let v=Math.ceil(lo/step)*step; v<=hi+1e-9; v+=step){
-    const y=ymap(v); ctx.strokeStyle=GRID; ctx.beginPath();
+    const y=ymap(v); ctx.strokeStyle=TH.grid; ctx.beginPath();
     ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
-    ctx.fillStyle=DIM; ctx.textAlign="right"; ctx.fillText(num(v,2),L-6,y+4);
+    ctx.fillStyle=TH.dim; ctx.textAlign="right"; ctx.fillText(num(v,2),L-6,y+4);
   }
-  if(lo<0&&hi>0){const y=ymap(0);ctx.strokeStyle="#66707c";ctx.beginPath();
+  if(lo<0&&hi>0){const y=ymap(0);ctx.strokeStyle=TH.line;ctx.beginPath();
     ctx.moveTo(L,y);ctx.lineTo(W-R,y);ctx.stroke();}
   const slot=pw/data.length, bw=Math.min(64,slot*0.5);
   data.forEach((g,i)=>{
@@ -470,7 +490,7 @@ function boxChart(cv,groups,opt){
     const wlo=Math.min(...s.filter(v=>v>=q1-1.5*iqr));
     const whi=Math.max(...s.filter(v=>v<=q3+1.5*iqr));
     const fl=s.filter(v=>v<wlo||v>whi);
-    ctx.strokeStyle="#66707c"; ctx.lineWidth=1.2;
+    ctx.strokeStyle=TH.line; ctx.lineWidth=1.2;
     ctx.beginPath(); ctx.moveTo(cx,ymap(wlo)); ctx.lineTo(cx,ymap(q1)); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(cx,ymap(q3)); ctx.lineTo(cx,ymap(whi)); ctx.stroke();
     [wlo,whi].forEach(v=>{ctx.beginPath();
@@ -479,16 +499,16 @@ function boxChart(cv,groups,opt){
     ctx.fillRect(cx-bw/2,ymap(q3),bw,Math.max(ymap(q1)-ymap(q3),1));
     ctx.globalAlpha=1; ctx.strokeStyle=g.color;
     ctx.strokeRect(cx-bw/2,ymap(q3),bw,Math.max(ymap(q1)-ymap(q3),1));
-    ctx.strokeStyle="#10161c"; ctx.lineWidth=2.2;
+    ctx.strokeStyle=TH.bg; ctx.lineWidth=2.2;
     ctx.beginPath(); ctx.moveTo(cx-bw/2,ymap(med));
     ctx.lineTo(cx+bw/2,ymap(med)); ctx.stroke();
     ctx.lineWidth=1;
     const show=fl.length>200?fl.filter((_,k)=>k%Math.ceil(fl.length/200)===0):fl;
     show.forEach(v=>{ctx.fillStyle=g.color;ctx.globalAlpha=.5;
       ctx.beginPath();ctx.arc(cx,ymap(v),1.8,0,7);ctx.fill();ctx.globalAlpha=1;});
-    ctx.fillStyle="#cfd8e2"; ctx.font="11px Consolas"; ctx.textAlign="center";
+    ctx.fillStyle=TH.label; ctx.font="11px Consolas"; ctx.textAlign="center";
     ctx.fillText("n="+s.length,cx,ymap(whi)-7);
-    ctx.fillStyle=FG; ctx.font="12.5px Microsoft YaHei";
+    ctx.fillStyle=TH.fg; ctx.font="12.5px Microsoft YaHei";
     ctx.fillText(g.name,cx,H-30);
   });
 }
@@ -545,7 +565,7 @@ function renderCurve(){
     const m=tierOf(run,u,tiers[0]);
     if(m && (m.bench_curve||[]).length)
       series.push({name:"基准 "+(m.benchmark||""),
-        color:"#8b98a5",points:benchPoints(m)});
+        color:TH.dim,points:benchPoints(m)});
   }
   const opt={dates:dates,log:$("#c-log").checked,hover:null};
   const cv=$("#cv-curve");
@@ -667,7 +687,7 @@ function renderGui(){
     `IC(T+5)=${num(ic5[0],3)} (n=${ic5[1]})</div>`+
     `<div class="note">买入信号后：${frow("BUY")}<br>卖出信号后：${frow("SELL")}</div>`;
   const cv=$("#cv-gcurve");
-  const mkSeries=()=>[{name:"训练集净值",color:GOLD,
+  const mkSeries=()=>[{name:"训练集净值",color:TH.gold,
     points:dates.slice(0,si).map((d,i)=>({x:d,y:curve[i]}))}];
   const opt2={dates:dates.slice(0,si),log:$("#g-log").checked,hover:null};
   Object.assign(opt2,lineChart(cv,mkSeries(),opt2));
@@ -730,7 +750,9 @@ function renderFiles(){
 }
 
 /* ---------- 初始化 ---------- */
+let CUR_TAB="curve";
 function showTab(id){
+  CUR_TAB=id;
   $$("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab===id));
   $$(".tab").forEach(s=>s.classList.toggle("on",s.id==="tab-"+id));
   if(id==="curve")renderCurve();
@@ -739,7 +761,21 @@ function showTab(id){
   if(id==="gui")renderGui();
   if(id==="files")renderFiles();
 }
+function initTheme(){
+  let t=localStorage.getItem("dash-theme");
+  if(!t) t=(window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";
+  document.documentElement.setAttribute("data-theme",t);
+  readTheme();
+  $("#theme-btn").onclick=()=>{
+    const n=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+    document.documentElement.setAttribute("data-theme",n);
+    localStorage.setItem("dash-theme",n);
+    readTheme();
+    showTab(CUR_TAB);
+  };
+}
 function init(){
+  initTheme();
   renderHeader();
   if(!DATA.runs.length){$("#hsub").textContent="未发现回测批次（先运行 backtests/backtest_v61.py）";return;}
   R_.index=0;
