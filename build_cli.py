@@ -84,16 +84,26 @@ CACHE_OK = True      # 缓存层已内嵌，恒可用
 CLI_MAIN_MARKER = "# ==================== 以下为 CLI 专属 ===================="
 
 
+def _need(src, marker, what):
+    """锚点存在性检查：缺失时给出明确报错（而不是 ValueError: substring not found）。"""
+    if marker not in src:
+        raise SystemExit(f"锚点缺失（{what}）：{marker!r}；"
+                         "算法块结构被改动时请同步更新 build_cli.py")
+    return src.index(marker)
+
+
 def extract(src, start_marker, end_marker):
-    i = src.index(start_marker)
-    j = src.index(end_marker, i)
+    i = _need(src, start_marker, "起始")
+    j = _need(src[i:], end_marker, "结束") + i
+    if j <= i:
+        raise SystemExit(f"锚点顺序错误：{start_marker!r} 应在 {end_marker!r} 之前")
     return src[i:j]
 
 
 def extract_cache_block(gui_src):
     """缓存层：GUI 内嵌段，从 CACHE_OK = True 后的缓存标记到 QT_URL 前。"""
-    start = gui_src.index("# ================= 内嵌缓存层")
-    end = gui_src.index("QT_URL = ", start)
+    start = _need(gui_src, "# ================= 内嵌缓存层", "缓存块")
+    end = _need(gui_src[start:], "QT_URL = ", "缓存块结束") + start
     return gui_src[start:end]
 
 
@@ -120,10 +130,12 @@ def main():
         raise SystemExit("缺少 %s：CLI 专属尾部只能从既有生成物提取" % CLI_PATH)
     with open(CLI_PATH, encoding="utf-8") as f:
         old_cli = f.read()
+    _need(old_cli, "def build_payload", "CLI 专属尾部")
 
-    cache_start = gui_src.index("# ================= 内嵌缓存层")
-    cache_end = gui_src.index("QT_URL = ", cache_start)
-    algo_start = gui_src.index("QT_URL = ")
+    cache_start = _need(gui_src, "# ================= 内嵌缓存层", "缓存块")
+    cache_end = _need(gui_src[cache_start:], "QT_URL = ", "缓存块结束") \
+        + cache_start
+    algo_start = _need(gui_src, "QT_URL = ", "算法块起始")
     if cache_end > algo_start:
         raise SystemExit("缓存块与算法块区间重叠，拒绝生成")
 

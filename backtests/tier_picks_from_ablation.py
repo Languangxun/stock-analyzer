@@ -66,11 +66,27 @@ def main():
     run_dir = None
     if args.out:
         out_file = args.out
-    elif src_base.startswith("ablation_v"):
-        out_file = os.path.join(src_dir, "tier_picks.json")
     else:
-        run_dir = bt_common.new_run_dir(RESEARCH, "tier_picks")
-        out_file = os.path.join(run_dir, "tier_picks.json")
+        # 源若是根目录「最新副本」（硬链接），回溯到对应消融运行目录，
+        # 让 tier_picks.json 与它所属的那次消融留在一起
+        ab_run = None
+        try:
+            if os.path.isfile(args.src):
+                ino = os.stat(args.src).st_ino
+                cand = bt_common.latest_run_dir(RESEARCH, "ablation")
+                if cand and os.stat(os.path.join(
+                        cand, "per_stock.json")).st_ino == ino:
+                    ab_run = cand
+        except OSError:
+            ab_run = None
+        if src_base.startswith("ablation_v"):
+            out_file = os.path.join(src_dir, "tier_picks.json")
+        elif ab_run:
+            src_dir, run_dir = ab_run, None
+            out_file = os.path.join(ab_run, "tier_picks.json")
+        else:
+            run_dir = bt_common.new_run_dir(RESEARCH, "tier_picks")
+            out_file = os.path.join(run_dir, "tier_picks.json")
     latest = os.path.join(RESEARCH, "perstock_tier_picks.json")
 
     print(f"加载 {args.src} …", flush=True)

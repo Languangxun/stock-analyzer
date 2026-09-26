@@ -12,10 +12,28 @@ import html
 import math
 import json
 import re
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# ---- 简单限流（v6.1.5 热修⑦）：每 IP 60s 内最多 60 次请求 ----
+_RL_LOCK = threading.Lock()
+_RL_WINDOW = 60.0
+_RL_LIMIT = 60
+_RL = {}
+
+
+def _rate_limited(addr):
+    now = time.time()
+    with _RL_LOCK:
+        bucket = _RL.setdefault(addr, [])
+        bucket[:] = [t for t in bucket if now - t < _RL_WINDOW]
+        if len(bucket) >= _RL_LIMIT:
+            return True
+        bucket.append(now)
+        return False
 
 QT_URL = "https://qt.gtimg.cn/q="
 KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
@@ -1070,6 +1088,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(time.strftime("%H:%M:%S"), self.address_string(), fmt % args)
 
+    def _client_addr(self):
+        return self.client_address[0]
+
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         data = body.encode("utf-8")
         self.send_response(code)
@@ -1084,6 +1105,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if _rate_limited(self._client_addr()):
+            self._send(429, "请求过于频繁，请稍后再试",
+                       "text/plain; charset=utf-8")
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send(200, PAGE)
@@ -1095,7 +1120,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(res, ensure_ascii=False),
                            "application/json; charset=utf-8")
             except Exception as e:
-                self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False),
+                # 非 200：前端按 body.error 显示，同时让脚本/监控能区分失败
+                self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False),
                            "application/json; charset=utf-8")
         elif parsed.path == "/quant/" or parsed.path == "/quant":
             try:

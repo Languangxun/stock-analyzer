@@ -181,8 +181,9 @@ _BG_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bg")
 
 class CFG:
     """集中调参（原散落各处的魔数收敛于此；模块级别名保持兼容）。"""
-    W_WINDOW = 20                       # 形态匹配窗口长度（扫描：W20 IC+0.016
-                                        # vs W10≈0，两次独立一致，自适应兼容短历史）
+    W_WINDOW = 20                       # 形态匹配窗口长度（小样本扫描 W20 略优；
+                                        # 全市场样本外 L1 增量≈0，见 README 研究
+                                        # 结论——勿据样本内 IC 调参）
     TOPK = 10                           # Top-K 相似样本数（显示用）
     CANDIDATE_TOPK = 50                 # 候选样本数（扩大后再筛选）
     LV_W = {"L1": 0.6, "L2": 0.3, "L3": 0.1}    # 三级样本池权重
@@ -203,7 +204,8 @@ class CFG:
     SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
                                         # 关闭后 命中50.4%→52.4%, IC -0.043→+0.020）
     QUALITY_FILTER = True               # 是否启用样本质量筛选
-    MAX_DAILY_CHANGE = 10.0             # 单日涨跌停阈值(%) - 超过视为异常
+    # 注：原 MAX_DAILY_CHANGE=10 已删除（死常数、且不区分板块涨跌停；
+    # 清洗层/回测层另有按板块的涨跌停判定，见 _limit_pct/_v4_limit_pct）
     MIN_SAMPLES_REQUIRED = 3            # 最少样本数要求 - 少于则降低置信度
     SIMILARITY_CUTOFF = 2.5             # 相似度截断阈值 - 超过则降低权重
     TIME_DECAY_ENABLED = True           # 是否启用时间衰减
@@ -296,6 +298,8 @@ def _load_predict_cfg():
         CFG.W_WINDOW = gi("w_window", CFG.W_WINDOW, 5, 30)
         CFG.TOPK = gi("topk", CFG.TOPK, 3, 30)
         CFG.CANDIDATE_TOPK = gi("candidate_topk", CFG.CANDIDATE_TOPK, 10, 100)
+        # 漏斗一致性：候选样本数不得小于最终样本数（否则筛选后取不满/参数打架）
+        CFG.CANDIDATE_TOPK = max(CFG.CANDIDATE_TOPK, CFG.TOPK)
         CFG.TIME_DECAY_DAYS = gi("time_decay_days", CFG.TIME_DECAY_DAYS,
                                  0, 1095)
         CFG.TIME_DECAY_RATE = gf("time_decay_rate", CFG.TIME_DECAY_RATE,
@@ -3252,9 +3256,12 @@ def calc_rsi(closes, n):
     return out
 
 
-def calc_chips(rows, cur_price=None, nbin=120):
+def calc_chips(rows, cur_price=None, nbin=360):
     """筹码分布：逐日按换手衰减历史筹码，当日成交量在[低,高]区间均匀摊分。
-    无流通股本数据，换手率用 量/中位量*2% 启发式近似（限幅）。"""
+    无流通股本数据，换手率用 量/中位量*2% 启发式近似（限幅）。
+    nbin=360（v6.1.5 热修⑦）：全历史价格区间下 120 桶在可见窗口只剩约 40 桶，
+    右侧筹码柱太稀疏；360 桶后可见窗口约 120+ 桶、柱间距 ~3px（信号引擎
+    chip_snapshots/_chip_feats_py 各自用 80/200 桶，不受影响）。"""
     bars = [r for r in rows
             if r.get("vol") and r.get("low") and r["low"] > 0
             and r["high"] >= r["low"]]
@@ -4113,7 +4120,10 @@ def logret(seq, is_etf=False):
     return rets
 
 
-W_WINDOW, TOPK = 10, 10
+# v6.1.5 热修⑦：原为 `W_WINDOW, TOPK = 10, 10`，会在导入时覆盖
+# _load_predict_cfg() 读入的 ini 值 → 设置界面显示 W=20 实际跑 W=10，
+# 且「保存并应用」只在当次进程生效、重启又回 10。现改为与 CFG 同步。
+W_WINDOW, TOPK = CFG.W_WINDOW, CFG.TOPK
 
 # ---- 三级样本池：L1自身 / L2同行业 / L3同市值层，融合权重 ----
 LV_W = dict(CFG.LV_W)
@@ -4285,9 +4295,11 @@ def _dynamic_lv_weights(levels):
 
 
 def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
-                topk=TOPK, candidate_topk=None, cur_ctx=None):
-    """多股票池历史窗口匹配；只用样本T及以前的信息，目标收益绝不参与筛选。"""
+                topk=None, candidate_topk=None, cur_ctx=None):
+    """多股票池历史窗口匹配；只用样本T及以前的信息，目标收益绝不参与筛选。
+    topk 缺省在调用时读全局 TOPK（定义期默认值会在「保存并应用」后过期）。"""
     W = W_WINDOW
+    topk = topk or TOPK
     candidate_topk = candidate_topk or CFG.CANDIDATE_TOPK
     info, sims = {}, []
     for code, rows in pool_rows:
@@ -4365,7 +4377,8 @@ def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
             else:
                 for suf in ("date","cl","hi","lo","oc","oh","ol"): s[f"n{d}_{suf}"]=None
         out.append(s)
-    selected=[]; per_code={}; min_gap=max(3,W//2)
+    # v6.1.5 热修⑦：同股样本窗口间隔取 W（互不重叠；原 W//2 重叠一半）
+    selected=[]; per_code={}; min_gap=max(3,W)
     for s in sorted(out,key=lambda x:x["similarity_score"]):
         c=s["code"]; i=s["_match_i"]
         if any(abs(i-j)<min_gap for j in per_code.get(c,[])): continue
@@ -6194,7 +6207,10 @@ def analyze(full, progress=None, quick=False):
                 break
         return pl
 
-    for gap in (max(3, W // 2), 3, 1):
+    # v6.1.5 热修⑦：首选 W（样本窗口互不重叠），不足再逐级放宽；
+    # 原来首档就 W//2，选出的样本窗口彼此重叠一半（同一次波动被重复计入，
+    # 融合权重被同一行情灌水）。
+    for gap in (W, max(3, W // 2), 3, 1):
         picked = _pick(gap)
         if len(picked) >= min(TOPK, 6):
             break
@@ -13620,7 +13636,8 @@ class App:
         prows = [
             ("形态匹配窗口(日)", _int_var("W_WINDOW", 5, 30), "5-30"),
             ("最终样本数", _int_var("TOPK", 3, 30), "3-30"),
-            ("候选样本数", _int_var("CANDIDATE_TOPK", 10, 100), "10-100"),
+            ("候选样本数", _int_var("CANDIDATE_TOPK", 10, 100),
+             "≥最终样本数（10-100，不足自动抬高）"),
             ("时间衰减起始(天)", _int_var("TIME_DECAY_DAYS", 0, 1095),
              "0-1095"),
             ("动态权重强度(0-1)", _float_var("DYN_LV_STRENGTH"),
@@ -13778,6 +13795,12 @@ class App:
                 apply_i("W_WINDOW", pvars[0][1], 5, 30, 10)
                 apply_i("TOPK", pvars[1][1], 3, 30, 10)
                 apply_i("CANDIDATE_TOPK", pvars[2][1], 10, 100, 50)
+                if CFG.CANDIDATE_TOPK < CFG.TOPK:   # 漏斗一致性
+                    CFG.CANDIDATE_TOPK = CFG.TOPK
+                    cp.set("predict", "candidate_topk",
+                           str(CFG.CANDIDATE_TOPK))
+                    pnotes.append(f"候选样本数自动抬高={CFG.CANDIDATE_TOPK}"
+                                  "（须≥最终样本数）")
                 apply_i("TIME_DECAY_DAYS", pvars[3][1], 0, 1095, 90)
                 apply_f("DYN_LV_STRENGTH", pvars[4][1], 0.0, 1.0)
                 apply_i("WEEKLY_N", pvars[5][1], 2, 8, 4)
@@ -13844,7 +13867,9 @@ class App:
                 messagebox.showerror("清除缓存", str(e))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=20, column=0, columnspan=3, pady=(12, 0))
+        # row=30：预测参数占 9~20、说明 21、荐股权限 22~27、关于 28~29
+        # （原先放 20 会与最后一行「最大拉取样本量」重叠）
+        btns.grid(row=30, column=0, columnspan=3, pady=(12, 0))
         ttk.Button(btns, text="保存并应用", command=save).pack(
             side="left", padx=4)
         ttk.Button(btns, text="清除缓存", command=clear_cache).pack(
