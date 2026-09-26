@@ -12389,6 +12389,7 @@ class App:
         def _draw_curve(bt):
             """收益曲线：净值/回撤只画训练集（验证集不显示净值，仅底色+分界）。"""
             cv = bt_canvas
+            cv.configure(bg=BG)      # 跟随当前主题（切换主题后重绘不再黑底白块）
             cv.delete("all")
             if not bt or not bt.get("curve"):
                 cv.create_text(12, 16, anchor="w", text="信号不足，无收益曲线",
@@ -12415,11 +12416,11 @@ class App:
             def ym(v):
                 return T + (hi - v) / (hi - lo) * h_eq
 
-            # 验证集区域：底色 + 分界（不画净值，仅文字指标展示在下方）
+            # 验证集区域：主题色点纹底色 + 分界（不画净值，仅文字指标展示在下方）
             if si < n:
                 xs_ = xm(si)
-                cv.create_rectangle(xs_, T, W - R, H - B, fill=PANEL_BG,
-                                    outline="")
+                cv.create_rectangle(xs_, T, W - R, H - B, fill=AXIS_TXT,
+                                    stipple="gray12", outline="")
                 cv.create_line(xs_, T, xs_, H - B, fill=C_GOLD, dash=(4, 3))
                 cv.create_text(L + 6, T + 10, anchor="w",
                                text=f"训练集 {int(si * 100 / n)}%（显示净值）",
@@ -12579,6 +12580,7 @@ class App:
                     f"  带ATR止损+移动止盈；训练/验证按时间前75%/后25%切分，\n"
                     f"  验证集不参与选型、仅供检验。\n")
             bt_result.config(state="disabled")
+            bt_result.yview_moveto(0)   # 每次计算后回到顶部，先看全期/训练/验证
             _draw_curve(bt)
 
         _curve_job = [None]
