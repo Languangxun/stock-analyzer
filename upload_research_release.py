@@ -33,35 +33,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
 
 BODY_DEFAULT = (
-    "## v6.1.6（2026-09-27）\n\n"
-    "### 每日荐股：「综合(18策略)」\n"
-    "- 下拉「综合(旧评分)」→「综合(18策略)」：移植通达信口径 18 个短线策略"
-    "（布林突破/断板反包/\n"
-    "  均线多头/连板/超跌反弹/回踩/量价齐升…）为自包含实现（stock_gui.py / CLI 同步，"
-    "build_cli 生成）；\n"
-    "- 单次全市场扫描（尾部 500 根、乘法前复权、真实换手、逐策略基础过滤，"
-    "套用荐股权限与股票池），\n"
-    "  各策略候选池内 min-max 归一化打分，综合分 = 命中策略数 × 100 + 命中策略均分"
-    "（共振优先）；\n"
-    "  列表显示共振数/均分/命中策略，双击行直接分析；\n"
-    "- 与源引擎随机 500 只 × 18 策略命中集合对拍全部一致；全A 约 35s（纯本地缓存不联网）。\n\n"
-    "### 一致性与仪表盘\n"
-    "- `dashboard.html` 默认展示最新「全期 + 新复权口径」批次（此前默认最新 ts，"
-    "会落到 val/bull\n"
-    "  分段批次而与 README 不一致）；旧复权口径批次/单股记录/每只股导出统一标注"
-    "「已作废」\n"
-    "  且不参与默认选择；回测/导出产物新增 adj 口径标记，不再靠时间判断；\n"
-    "- 「工具→信号胜率」面板与「策略消融」弹窗改用**同一引擎与切分**"
-    "（`_bt_segments` / `_bt_events`），\n"
-    "  交易/胜率/年化/回撤逐项一致；每只股回测导出同口径；\n"
-    "- 旧口径产物已按新口径重跑：全库消融 7179 只 + 三档选型（刷新策略缓存 + "
-    "`perstock_tier_picks.json`）\n"
-    "  + 每只股回测导出 `research/perstock_backtest_v6.1.6_*`。\n\n"
+    "## v6.1.7（2026-09-27）\n\n"
+    "### 新增第四档 bata（高赔率·低频·允许打板，四口径）\n"
+    "- 全A / 沪深主板 / ETF / 全A含ETF 都加 `bata` 档：动量+低波 Top5、20 日调仓、\n"
+    "  科创50（ETF 为创业板指）MA60 闸门，主基准科创50，**解除「涨停不买」**；\n"
+    "- 选型扫描 100+ 组合（`backtests/sweep_bata.py`，产物 `research/bata_sweep_*/`）：\n"
+    "  β 类选股四口径训练段全负、纯动量次差、reb30/top3 样本外转负，\n"
+    "  最终按「训练段为正 + 样本外为正」定版 `blend_mom` Top5 reb20；\n"
+    "- 全期：年化 +5.2%（主板）~+8.6%（全A含ETF）、回撤 -8.4%~-13.4%、\n"
+    "  交易约 2100 笔（激进档 1/5）、荐股赔率 1.43~1.79；\n"
+    "- 生产端：「每日荐股」/CLI `--tiers --tier bata` 可选，目标持仓对信号日封板\n"
+    "  标的标 `[涨停]` 并提示打板成交口径；AI 自动选档/设置偏好加入 bata。\n\n"
+    "### 回测与文档\n"
+    "- v6.1.7 全期/样本外/强势段四口径重跑（`research/backtest_v6.1.7_*`），\n"
+    "  README 回测报告同步四档数字；仪表盘与 SVG 图表档位含 bata；\n"
+    "- README「四档策略」「bata 档选型说明」、ARCHITECTURE 3.7/七节、CHANGELOG ㊲ 同步；\n"
+    "- `APP_VERSION=6.1.7`；`stock_predict.py` 由 `build_cli.py` 重新生成。\n\n"
     "### 资产说明\n"
-    "- `stock-analyzer-client-v6.1.6-<日期>.zip`：客户端（GUI + CLI + 插件 + "
+    "- `stock-analyzer-client-v6.1.7-<日期>.zip`：客户端（GUI + CLI + 插件 + "
     "**全量数据缓存**），\n"
     "  解压即用；配置为**空 Key 模板**，首次运行请在设置内填自己的 API Key；\n"
-    "- `research_v6.1.6.zip`：回测报告/图表/本地仪表盘/逐对象消融明细与三档选型"
+    "- `research_v6.1.7.zip`：回测报告/图表/本地仪表盘/bata 选型扫描/逐对象消融明细"
     "（排除 legacy 与 *.pkl/*.npz）。\n\n"
     "全部输出仅为历史统计研究，不构成投资建议。"
 )
@@ -196,7 +188,7 @@ def upload_asset(rel_id, upload_url, path, token):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="v6.1.6")
+    ap.add_argument("--tag", default="v6.1.7")
     ap.add_argument("--name", default=None, help="Release 标题（默认 stock-analyzer <tag>）")
     ap.add_argument("--body", default=BODY_DEFAULT)
     ap.add_argument("--asset", nargs="*", default=[], help="要上传的本地文件")

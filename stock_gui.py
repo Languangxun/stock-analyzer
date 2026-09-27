@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-09-26 升 6.1.5）
-APP_VERSION = "6.1.6"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-09-27 升 6.1.7）
+APP_VERSION = "6.1.7"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -9140,7 +9140,18 @@ def _v4_print_report(r):
     print("注：全部为历史统计研究，不构成投资建议。")
 
 
-# ============ v6.1.3 三档组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
+# ============ v6.1.3 组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
+# v6.1.7 新增第四档 bata（高赔率·低频·允许打板；四个口径都有，主基准科创50）：
+#   选型（2026-09-27 扫描 research/bata_sweep_*）：β 类（对科创50/创业板指）全口径
+#   训练段为负，纯动量次之；「动量+低波」族稳健。bata 取 blend_mom、top5、reb20
+#   （与 20 日动量因子半衰期对齐）、科创50/创业板指 MA60 闸门、allow_limit_up=True。
+#   reb30 训练段更优（赔率 2.0+）但样本外转负；top3 reb30 同样样本外崩坏，
+#   故按训练段+样本外双正原则取 top5 reb20。逐口径参数：
+#     all/main       mw0.7 / 科创50 MA60   （主板弹性不足，与全A同参）
+#     etf            mw0.6 / 创业板指 MA60 （ETF 池动量弱，创门显著优于科创50门）
+#     all_etf        mw0.5 / 科创50 MA60   （含 ETF 后低波项权重略高更稳）
+#   打板：仅 bata 档解除「涨停不买」（cfg.allow_limit_up），回测按涨停价成交；
+#   生产端 tier_latest_picks 对信号日已封板标的打「涨停」提示。
 #
 # 原理（详见 README 第二节）：
 #   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
@@ -9150,7 +9161,7 @@ def _v4_print_report(r):
 #          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）
 # 激进档基准（v6.1.1）：两个口径统一对标科创50（sh000688），
 #         不再按是否具备科创板权限区分（多数账户无科创板权限，但仍以科创50
-#         作为「高弹性成长」这一风格的统一参照）。
+#         作为「高弹性成长」这一风格的统一参照）。bata 档同样对标科创50。
 # 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
 #         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
 # 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
@@ -9163,6 +9174,8 @@ TIER_CFG = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
+    "bata": dict(universe="all", score="blend_mom", mom_w=0.7, top=5, reb=20,
+                 gate="sh000688", ma=60, allow_limit_up=True),
 }
 # 主板口径（v6.1.1）：稳健/均衡在沪主板+深主板内运行；
 # 激进档改用 blend_mom（动量0.7/低波0.3）偏弹性 + 高换手（reb10/top20/上证MA20）。
@@ -9181,6 +9194,8 @@ TIER_CFG_MAIN = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
                  gate="sh000001", ma=20),
+    "bata": dict(universe="main", score="blend_mom", mom_w=0.7, top=5, reb=20,
+                 gate="sh000688", ma=60, allow_limit_up=True),
 }
 # ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
 # 故三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
@@ -9192,6 +9207,8 @@ TIER_CFG_ETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
                  gate="sh000001", ma=20),
+    "bata": dict(universe="etf", score="blend_mom", mom_w=0.6, top=5, reb=20,
+                 gate="sz399006", ma=60, allow_limit_up=True),
 }
 # 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
 # （池内混入 ETF 后，创业板高β 不再适用）。
@@ -9202,22 +9219,25 @@ TIER_CFG_ALLETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
+    "bata": dict(universe="all_etf", score="blend_mom", mom_w=0.5, top=5,
+                 reb=20, gate="sh000688", ma=60, allow_limit_up=True),
 }
 TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
                   "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
 UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
                  "all_etf": "全A含ETF"}
-# 激进档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
-# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档，都以科创50 作为主基准。
+# 激进档与 bata 档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
+# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档；bata 四口径均为「高赔率低频」档，
+# 都以科创50 作为主基准。ETF 因池内无科创语义、且实测创业板指门更稳，闸门用创业板指。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
-    ("all", "激进"): "sh000688",
+    ("all", "激进"): "sh000688", ("all", "bata"): "sh000688",
     ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
-    ("main", "激进"): "sh000688",
+    ("main", "激进"): "sh000688", ("main", "bata"): "sh000688",
     ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000001",
-    ("etf", "激进"): "sh000688",
+    ("etf", "激进"): "sh000688", ("etf", "bata"): "sh000688",
     ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000001",
-    ("all_etf", "激进"): "sh000688",
+    ("all_etf", "激进"): "sh000688", ("all_etf", "bata"): "sh000688",
 }
 # 基准指数中文名（报告/对照用）
 BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
@@ -9283,7 +9303,7 @@ def tier_segments(cal):
 def tier_load_panel():
     """全A日K面板（hfq × adjust = 乘法前复权≈现价）。结果缓存。"""
     if np is None:
-        raise RuntimeError("三档引擎需要 numpy")
+        raise RuntimeError("组合引擎需要 numpy")
     if _TIER_CACHE.get("panel") is not None:
         return _TIER_CACHE["panel"]
     t0 = time.time()
@@ -9387,8 +9407,10 @@ def tier_build_features(cal, C, V):
 
     beta60 = _beta("sz399006")        # 对创业板指（全A 激进档用）
     beta60_sh = _beta("sh000001")     # 对上证（主板激进档用）
+    beta60_star = _beta("sh000688")   # 对科创50（bata 档用）
     return dict(ret20=ret20, vol20=vol20, amt20=amt20, barcount=barcount,
-                beta60=beta60, beta60_sh=beta60_sh)
+                beta60=beta60, beta60_sh=beta60_sh,
+                beta60_star=beta60_star)
 
 
 def _tier_rank01(x):
@@ -9422,8 +9444,10 @@ def tier_make_score(feat, kind, mom_w=None, base=None):
     """合成打分：
       blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
+      mom        = 纯 20 日动量百分位（bata 候选）
       beta       = 60日β（对创业板指）
       beta_sh    = 60日β（对上证，主板口径）
+      beta_star  = 60日β（对科创50，bata 档）
     base：横截面排名基数掩码（None=全面板）；见 tier_rank_base。
     注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
@@ -9431,9 +9455,13 @@ def tier_make_score(feat, kind, mom_w=None, base=None):
         return feat["beta60"]
     if kind == "beta_sh":
         return feat.get("beta60_sh", feat["beta60"])
-    if kind in ("blend", "blend_mom"):
+    if kind == "beta_star":
+        return feat.get("beta60_star", feat["beta60"])
+    if kind in ("blend", "blend_mom", "mom"):
         if kind == "blend_mom":
             mw = 0.7 if mom_w is None else float(mom_w)
+        elif kind == "mom":
+            mw = 1.0
         else:
             mw = 0.5
         ret = feat["ret20"]
@@ -9540,7 +9568,8 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
             for k in order:
                 if int(holding.sum()) >= top:
                     break
-                if holding[k] or not fin[k] or limit_up[k, t]:
+                if holding[k] or not fin[k] or \
+                        (limit_up[k, t] and not cfg.get("allow_limit_up")):
                     continue
                 px = col[k] * (1 + _TIER_SLIP)
                 budget = min(equity / top, cash)
@@ -9593,11 +9622,11 @@ def _tier_metrics(eq, dates, trades=None):
 
 def tier_eval(segment="full", tiers=None, phases=None, progress=None,
               overrides=None, universe="all"):
-    """三档回测（相位平均主口径）。overrides 可覆盖 cfg（研究用）。
+    """组合档回测（相位平均主口径；稳健/均衡/激进/bata）。overrides 可覆盖 cfg（研究用）。
     universe: all=全A / main=沪深主板。返回 {tier: metrics}。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
-        progress("三档引擎：构建特征 ...")
+        progress("组合引擎：构建特征 ...")
     key = "feat"
     if _TIER_CACHE.get(key) is None:
         _TIER_CACHE[key] = tier_build_features(cal, C, V)
@@ -9704,7 +9733,7 @@ def _sample_series(dates, arr, cap=600):
 
 def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
                      overrides=None, universe="all"):
-    """荐股收益回测：把三档策略的每一次「推荐→平仓」当一笔交易统计。
+    """荐股收益回测：把各档策略的每一次「推荐→平仓」当一笔交易统计。
 
     与 tier_eval 同引擎（相位平均），区别是输出逐笔荐股口径：
     推荐次数/平均收益/胜率/盈亏比/持有期/右尾占比/退出原因分布。"""
@@ -9860,6 +9889,13 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
               & np.isfinite(score[:, d]) & ~risky)
         cand = np.nonzero(ok)[0]
         order = cand[np.argsort(-score[cand, d], kind="stable")]
+        r1d = np.full(NST, np.nan)
+        if d > 0:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                r1d = np.where(C[:, d - 1] > 0, C[:, d] / C[:, d - 1] - 1.0,
+                               np.nan)
+        limd = np.array([_tier_limit_pct(c) for c in codes])
+        up_d = np.isfinite(r1d) & (r1d >= limd - 0.005)
         picks = []
         per = capital / cfg["top"] if on else 0.0
         for k in order:
@@ -9879,8 +9915,11 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
                 "beta60": float(feat[bkey][k, d])
                 if np.isfinite(feat[bkey][k, d]) else None,
                 "lots": lots, "cost": lots * 100 * px,
+                "day_ret": float(r1d[k]) if np.isfinite(r1d[k]) else None,
+                "limit_up": bool(up_d[k]),
             })
-        out["tiers"][tier] = {"gate_on": on, "cfg": cfg, "picks": picks}
+        out["tiers"][tier] = {"gate_on": on, "cfg": cfg, "picks": picks,
+                              "allow_limit_up": bool(cfg.get("allow_limit_up"))}
         if on and picks and picks[0]["cost"] > 0:
             total = sum(p["cost"] for p in picks)
             out["tiers"][tier]["suggested_cost"] = total
@@ -9891,7 +9930,7 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
     p = tier_latest_picks(capital=capital, tiers=tiers, universe=universe)
     uni_name = UNIVERSE_NAME.get(universe, universe)
-    lines = [f"v6.1.2 三档组合 · {uni_name} · 信号日 {p['signal_date']} · "
+    lines = [f"v6.1.7 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
              "荐股权限（设置内配置，空=全部）：已按板块/行业过滤",
@@ -9899,9 +9938,11 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     for tier, d in p["tiers"].items():
         cfg = d["cfg"]
         flag = "在场" if d["gate_on"] else "空仓（闸门关闭→持现金）"
+        allow_up = d.get("allow_limit_up")
         lines.append(f"【{tier}】{cfg['score']} · top{cfg['top']} · "
                      f"{cfg['reb']}日调仓 · 闸门 {cfg['gate']} MA{cfg['ma']}"
-                     f" → {flag}")
+                     + (" · 允许打板" if allow_up else "")
+                     + f" → {flag}")
         if not d["gate_on"]:
             lines.append("")
             continue
@@ -9909,8 +9950,9 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
                      f"{'金额':>10}{'分数':>8}{'20日波动':>9}{'β60':>7}"
                      f"{'参考止损':>9}")
         for x in d["picks"]:
+            nm = x["name"][:8] + ("[涨停]" if x.get("limit_up") else "")
             lines.append(
-                f"  {x['code']:<9}{x['name'][:8]:<10}{x['price']:>8.2f}"
+                f"  {x['code']:<9}{nm:<10}{x['price']:>8.2f}"
                 f"{x['lots']:>6}{x['cost']:>10.0f}{x['score']:>8.3f}"
                 f"{(x['vol20']*100 if x['vol20'] is not None else 0):>8.1f}%"
                 f"{(x['beta60'] if x['beta60'] is not None else 0):>7.2f}"
@@ -9919,6 +9961,10 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
             lines.append(f"  合计约 {d['suggested_cost']:,.0f} 元"
                          f"（{d['suggested_cost']/capital*100:.0f}% 仓位，"
                          f"买不起的票自动跳过）")
+        if allow_up:
+            lines.append("  打板提示：本档解除「涨停不买」——次日若封涨停，"
+                         "回测口径按涨停价成交；名后标 [涨停] = 信号日已封板，"
+                         "追板风险自负。")
         lines.append(f"  出局规则（回测同口径）：跌出 Top{cfg['top']} / "
                      f"闸门关闭 / 退市；预计持有 ~{cfg['reb']} 个交易日；"
                      f"参考止损=现价−2×20日波动（仅风险提示，回测未用）")
@@ -10150,11 +10196,11 @@ def ai_session_save(code, msgs, prompt_hash="", model=""):
 
 
 def ai_market_brief():
-    """给AI的市场环境简报：指数均线位置/近段涨跌 + 三档闸门状态（单次DB查询）。"""
+    """给AI的市场环境简报：指数均线位置/近段涨跌 + 各档闸门状态（单次DB查询）。"""
     series = {}
     try:
         with db_conn() as conn:
-            for code in ("sh000001", "sz399006"):
+            for code in ("sh000001", "sz399006", "sh000688"):
                 rows = conn.execute(
                     "select date,close from daily_bars where code=? "
                     "order by date desc limit 90", (code,)).fetchall()
@@ -10162,7 +10208,8 @@ def ai_market_brief():
     except Exception:
         log.exception("AI市场简报失败")
     lines = ["市场环境（截至最新交易日收盘）："]
-    for code, name in (("sh000001", "上证指数"), ("sz399006", "创业板指")):
+    for code, name in (("sh000001", "上证指数"), ("sz399006", "创业板指"),
+                       ("sh000688", "科创50")):
         rows = series.get(code) or []
         if len(rows) < 61:
             lines.append(f"· {name}：数据不足")
@@ -10188,28 +10235,30 @@ def ai_market_brief():
         cl = [c for _, c in rows]
         ma_v = sum(cl[-ma_w:]) / ma_w
         gates.append(f"{tier}{'开(可持仓)' if cl[-1] > ma_v else '关(空仓)'}")
-    lines.append("· 三档闸门（T-1）：" + "；".join(gates))
+    lines.append(f"· {len(TIER_CFG)}档闸门（T-1）：" + "；".join(gates))
     return "\n".join(lines)
 
 
 def ai_choose_tier(model="", pref="均衡", timeout=60):
-    """AI 在三档内选一档（按市场环境+用户风险偏好），失败回退 pref。
+    """AI 在各风险档内选一档（按市场环境+用户风险偏好），失败回退 pref。
     返回 (tier, reason)。"""
     pref = pref if pref in TIER_CFG else "均衡"
     key = get_ai_key()
     if not key:
         return pref, "未配置 API Key，按配置风险偏好回退"
     prompt = (
-        "你是量化组合风控官。下面是当前市场环境与三档策略定义：\n"
+        "你是量化组合风控官。下面是当前市场环境与各档策略定义：\n"
         f"{ai_market_brief()}\n\n"
-        "三档策略：\n"
+        "策略档位：\n"
         "· 稳健：全A动量+低波Top20，20日调仓，上证MA20闸门\n"
         "· 均衡：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
-        "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n\n"
+        "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n"
+        "· bata：动量+低波Top5，20日调仓，科创50/创业板指MA60闸门，"
+        "允许涨停价买入（高赔率低频、波动大）\n\n"
         f"用户风险偏好：{pref}（作为默认与锚定）。\n"
         "请判断当前市场环境最适合哪一档；可以偏离偏好，但必须给出一句理由。\n"
         "只输出一行严格 JSON（不要代码块、不要多余文字）："
-        '{"tier": "稳健|均衡|激进", "reason": "不超过40字"}')
+        '{"tier": "稳健|均衡|激进|bata", "reason": "不超过40字"}')
     try:
         text = deepseek_chat(key, prompt, model=model or AI_MODEL,
                              timeout=timeout,
@@ -10771,11 +10820,11 @@ class App:
     # ---------- 折叠 ----------
 
     def _open_picks(self):
-        """每日荐股：AI自动选档 / 三档风险偏好 / 18 策略共振综合（v6.1.6）。"""
+        """每日荐股：AI自动选档 / 四档风险偏好 / 18 策略共振综合（v6.1.7）。"""
         pconf = picks_conf()
         uni_name = UNIVERSE_NAME.get(pconf["universe"], pconf["universe"])
         win = tk.Toplevel(self.root)
-        win.title(f"每日荐股 · {uni_name} · 三档 v6.1.2 / 综合 18 策略 v6.1.6")
+        win.title(f"每日荐股 · {uni_name} · 四档 v6.1.7 / 综合 18 策略 v6.1.6")
         win.configure(bg=DARK_BG)
         win.geometry("760x540" if not self.compact else
                      f"{self.root.winfo_screenwidth()}x"
@@ -10791,7 +10840,7 @@ class App:
                  font=("Microsoft YaHei", 10)).pack(side="left")
         ai_mode = "AI自动(按偏好)"
         MODES = ((ai_mode,) if pconf["ai_auto_tier"] else ()) + \
-            ("稳健", "均衡", "激进", "综合(18策略)")
+            ("稳健", "均衡", "激进", "bata", "综合(18策略)")
         default_mode = ai_mode if pconf["ai_auto_tier"] else \
             (pconf["risk_pref"] if pconf["risk_pref"] in MODES else "稳健")
         mode = tk.StringVar(value=default_mode)
@@ -10822,7 +10871,7 @@ class App:
                         win, lb, data))
                 threading.Thread(target=worker, daemon=True).start()
             else:
-                lb.insert("end", f"{m}：加载 v6.1 三档引擎（首次约1分钟）…")
+                lb.insert("end", f"{m}：加载 v6.1 四档引擎（首次约1分钟）…")
 
                 def worker2():
                     note = None
@@ -10882,7 +10931,9 @@ class App:
         lb.insert("end", f"信号日 {data['signal_date']} · {uni_name} · "
                          f"建议资金 ¥{data['capital']:,.0f} · {mode}："
                          f"{cfg['score']} top{cfg['top']} / {cfg['reb']}日调仓 / "
-                         f"闸门 {cfg['gate']} MA{cfg['ma']} → "
+                         f"闸门 {cfg['gate']} MA{cfg['ma']}"
+                         + (" / 允许打板" if d.get("allow_limit_up") else "")
+                         + " → "
                          + ("在场" if d["gate_on"] else "空仓（闸门关闭）"))
         if not d["gate_on"]:
             lb.insert("end", "闸门关闭：本期不建仓，持有现金等待信号恢复。")
@@ -10892,8 +10943,9 @@ class App:
                          f"{'金额':>8}{'分数':>7}{'波动':>7}{'参考止损':>9}")
         row0 = lb.size()
         for i, x in enumerate(d["picks"]):
+            nm = x["name"][:7] + ("[涨停]" if x.get("limit_up") else "")
             lb.insert("end",
-                      f"{x['code']:<10}{x['name'][:7]:<9}{x['price']:>8.2f}"
+                      f"{x['code']:<10}{nm:<9}{x['price']:>8.2f}"
                       f"{x['lots']:>5}{x['cost']:>8.0f}{x['score']:>7.3f}"
                       f"{(x['vol20']*100 if x['vol20'] is not None else 0):>6.1f}%"
                       f"{(x['stop_ref'] or 0):>9.2f}")
@@ -10903,6 +10955,9 @@ class App:
         lb.insert("end", f"合计约 {d.get('suggested_cost', 0):,.0f} 元；"
                          "出局规则：跌出 Top / 闸门关闭 / 退市；"
                          "参考止损仅风险提示（回测未用）")
+        if d.get("allow_limit_up"):
+            lb.insert("end", "打板提示：本档解除「涨停不买」，次日封板按涨停价"
+                             "成交（回测口径）；[涨停]=信号日已封板。")
         lb.insert("end", "双击某行 → 直接分析该股")
 
         def pick(_e=None):
@@ -11010,23 +11065,23 @@ class App:
             m.add_command(label="v4.0 全A研究（三档风险+消融）",
                           command=self.run_v4_research_bg)
             m.add_separator()
-            m.add_command(label="v6.1.2 三档组合（当前目标持仓）",
+            m.add_command(label="v6.1.7 四档组合（当前目标持仓）",
                           command=self.run_tiers_bg)
-            m.add_command(label="v6.1.2 三档回测（全A，相位平均）",
+            m.add_command(label="v6.1.7 四档回测（全A，相位平均）",
                           command=self.run_tiers_backtest_bg)
-            m.add_command(label="v6.1.2 三档回测（主板）",
+            m.add_command(label="v6.1.7 四档回测（主板）",
                           command=lambda: self.run_tiers_backtest_bg("main"))
-            m.add_command(label="v6.1.2 三档回测（ETF）",
+            m.add_command(label="v6.1.7 四档回测（ETF）",
                           command=lambda: self.run_tiers_backtest_bg("etf"))
-            m.add_command(label="v6.1.2 三档回测（全A含ETF）",
+            m.add_command(label="v6.1.7 四档回测（全A含ETF）",
                           command=lambda: self.run_tiers_backtest_bg("all_etf"))
-            m.add_command(label="v6.1.2 荐股收益回测（全A）",
+            m.add_command(label="v6.1.7 荐股收益回测（全A）",
                           command=self.run_picks_bt_bg)
-            m.add_command(label="v6.1.2 荐股收益回测（主板）",
+            m.add_command(label="v6.1.7 荐股收益回测（主板）",
                           command=lambda: self.run_picks_bt_bg("main"))
-            m.add_command(label="v6.1.2 荐股收益回测（ETF）",
+            m.add_command(label="v6.1.7 荐股收益回测（ETF）",
                           command=lambda: self.run_picks_bt_bg("etf"))
-            m.add_command(label="v6.1.2 荐股收益回测（全A含ETF）",
+            m.add_command(label="v6.1.7 荐股收益回测（全A含ETF）",
                           command=lambda: self.run_picks_bt_bg("all_etf"))
             m.add_separator()
             m.add_command(label="ETF：刷新代码表 + 回填历史",
@@ -11221,13 +11276,13 @@ class App:
         self._center_win(win, 980, 640)
 
     def run_tiers_bg(self):
-        """工具菜单：v6.1 三档组合——最新目标持仓（按设置里的股票池/权限）。"""
+        """工具菜单：v6.1 四档组合——最新目标持仓（按设置里的股票池/权限）。"""
         if getattr(self, "_tiers_running", False):
-            messagebox.showinfo("v6.1 三档", "已在后台运行中，请稍候")
+            messagebox.showinfo("v6.1 四档", "已在后台运行中，请稍候")
             return
         self._tiers_running = True
         uni = picks_conf()["universe"]
-        self.progress_var.set("v6.1 三档：加载面板并计算最新目标持仓 ...")
+        self.progress_var.set("v6.1 四档：加载面板并计算最新目标持仓 ...")
 
         def _job():
             return tier_report_text(universe=uni)
@@ -11237,21 +11292,21 @@ class App:
     def _tiers_done(self, res, err):
         self._tiers_running = False
         if err:
-            self.progress_var.set(f"v6.1 三档失败: {err}")
-            messagebox.showerror("v6.1 三档", str(err))
+            self.progress_var.set(f"v6.1 四档失败: {err}")
+            messagebox.showerror("v6.1 四档", str(err))
             return
-        self._show_text_window("v6.1 三档组合 · 当前目标持仓", res)
-        self.progress_var.set("v6.1 三档：完成")
+        self._show_text_window("v6.1 四档组合 · 当前目标持仓", res)
+        self.progress_var.set("v6.1 四档：完成")
 
     def run_tiers_backtest_bg(self, universe="all"):
-        """工具菜单：三档回测（全期，相位平均，后台；all/main/etf/all_etf）。"""
+        """工具菜单：四档回测（全期，相位平均，后台；all/main/etf/all_etf）。"""
         if getattr(self, "_tiersbt_running", False):
-            messagebox.showinfo("v6.1 三档回测", "已在后台运行中，请稍候")
+            messagebox.showinfo("v6.1 四档回测", "已在后台运行中，请稍候")
             return
         self._tiersbt_running = True
         uni = universe
         uni_name = UNIVERSE_NAME.get(uni, uni)
-        self.progress_var.set(f"v6.1.2 三档回测（{uni_name}）：加载面板（约1分钟）...")
+        self.progress_var.set(f"v6.1.7 四档回测（{uni_name}）：加载面板（约1分钟）...")
 
         def _job():
             return tier_eval(segment="full", progress=self._progress,
@@ -11263,10 +11318,10 @@ class App:
         self._tiersbt_running = False
         uni_name = UNIVERSE_NAME.get(universe, universe)
         if err:
-            self.progress_var.set(f"v6.1 三档回测失败: {err}")
-            messagebox.showerror("v6.1 三档回测", str(err))
+            self.progress_var.set(f"v6.1 四档回测失败: {err}")
+            messagebox.showerror("v6.1 四档回测", str(err))
             return
-        lines = [f"v6.1 三档回测 · {uni_name}"
+        lines = [f"v6.1 四档回测 · {uni_name}"
                  f"（全期 2022-09 ~ 最新，相位平均，含全部费用）",
                  "指标口径见 README；年化/回撤均为相位平均组合", ""]
         for tier, m in res.items():
@@ -11297,8 +11352,8 @@ class App:
         lines.append(f"详情：python backtests/backtest_tiers.py --tier all "
                      f"--segment full --universe {universe}")
         lines.append("注：历史统计研究，不构成投资建议。")
-        self._show_text_window(f"v6.1 三档回测 · {uni_name}", "\n".join(lines))
-        self.progress_var.set("v6.1 三档回测完成")
+        self._show_text_window(f"v6.1 四档回测 · {uni_name}", "\n".join(lines))
+        self.progress_var.set("v6.1 四档回测完成")
 
     def run_etf_sync_bg(self):
         """工具菜单：ETF 刷新代码表 + 回填历史（v6.1.2）。"""
@@ -14701,14 +14756,15 @@ class App:
         ttk.Label(frm, text="AI自动选档").grid(row=25, column=0, sticky="w",
                                                pady=4)
         auto_var = tk.BooleanVar(value=pconf["ai_auto_tier"])
-        ttk.Checkbutton(frm, text="荐股时由AI在三档内选一档（按下方偏好锚定）",
+        ttk.Checkbutton(frm, text="荐股时由AI在稳健/均衡/激进/bata 内选一档"
+                                  "（按下方偏好锚定）",
                         variable=auto_var).grid(row=25, column=1, columnspan=2,
                                                 sticky="w", pady=4)
         ttk.Label(frm, text="荐股偏好").grid(row=26, column=0, sticky="w",
                                              pady=4)
         pref_var = tk.StringVar(value=pconf["risk_pref"])
         ttk.Combobox(frm, textvariable=pref_var, width=6, state="readonly",
-                     values=["稳健", "均衡", "激进"]).grid(
+                     values=["稳健", "均衡", "激进", "bata"]).grid(
                          row=26, column=1, sticky="w", pady=4)
         ttk.Label(frm, text="荐股股票池").grid(row=27, column=0, sticky="w",
                                                pady=4)

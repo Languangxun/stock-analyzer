@@ -5,6 +5,26 @@
 
 ## 版本历史
 
+> ㊲ **v6.1.7：新增第四档 bata（高赔率·低频·允许打板，四口径）**（2026-09-27）：
+> ① **引擎支持**——`tier_build_features` 新增 `beta60_star`（对科创50 的 60 日 β），
+> `tier_make_score` 新增 `mom`（纯动量）/`beta_star`（扫描用，后证伪），
+> `tier_sim_phase` 识别 `cfg.allow_limit_up`（仅 bata 档解除「涨停不买」，回测实测
+> 1.3%~1.9% 的买入发生在涨停价，ETF 池约 0）；四口径 `TIER_CFG*` 各加 `bata`
+> （`blend_mom`/Top5/20 日调仓/MA60 闸门：全A 与主板 mw0.7、ETF mw0.6、全A含ETF mw0.5；
+> 闸门全A/主板/全A含ETF 用科创50，ETF 用创业板指），`TIER_BENCH` 四口径 bata
+> 均对标科创50。② **选型**——新增 `backtests/sweep_bata.py` 扫描（≥100 组合，
+> 产物 `research/bata_sweep_*/`）：β 类四口径训练段全负、纯动量次差、
+> `reb30`/`top3` 训练段最优但样本外转负；按「训练段为正 + 样本外为正」定版
+> `blend_mom Top5 reb20`。③ **生产端**——`tier_latest_picks` 输出 `limit_up`
+> 标记，CLI/GUI 目标持仓对信号日封板标的标 `[涨停]` 并提示打板成交口径；
+> `ai_market_brief` 增科创50 与四档闸门，`ai_choose_tier` 提示词、GUI 每日荐股下拉、
+> 设置「荐股偏好」均加入 bata。④ **回测**——全期/样本外/强势段四口径重跑
+> （`research/backtest_v6.1.7_*`）：bata 全期年化 +5.2%（主板）~+8.6%（全A含ETF）、
+> 回撤 -8.4%~-13.4%、交易约 2100 笔（激进档的 1/5），荐股赔率 1.43~1.79；
+> 样本外 `val`/`bull` 为正但明显低于激进档（牛市中低换手档跑不过高β，README 有声明）。
+> ⑤ **文档/产物**——`APP_VERSION=6.1.7`、`build_cli.py` 重新生成 `stock_predict.py`、
+> `v61_charts`/`v61_dashboard` 档位列表加 bata、README/ARCHITECTURE/CHANGELOG 同步。
+
 > ㊱ **每只股回测加「事件股」检测 + 仪表盘默认剔除（2026-09-27）**：用户实测
 > `sz000578` 盐湖集团（原数码网络）激进档全期 +2564%，核查为 **2007-07-20 停牌 →
 > 2008-03-11 借壳复牌**：复权价单日 +603%（用新浪因子还原的不复权价约 4.8→30.2），

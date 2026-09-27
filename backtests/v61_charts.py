@@ -23,7 +23,7 @@ PALETTE = ["#4da3ff", "#ffa94d", "#69db7c", "#e599f7", "#f06595",
            "#ffd43b", "#63e6be", "#a5d8ff", "#ffc9c9", "#b197fc",
            "#f783ac", "#8ce99a"]
 UNI_NAME = {"all": "全A", "main": "主板", "etf": "ETF", "all_etf": "全A含ETF"}
-TIERS = ("稳健", "均衡", "激进")
+TIERS = ("稳健", "均衡", "激进", "bata")
 
 
 def _esc(s):

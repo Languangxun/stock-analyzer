@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""backtest_v61.py - v6.1.5 标准回测（四口径 × 三档 × 荐股）
+"""backtest_v61.py - v6.1.7 标准回测（四口径 × 四档 × 荐股）
 
 口径：
   all      全A（含沪深主板/创业板/科创板，剔除北交所/ETF）
@@ -8,7 +8,7 @@
   etf      仅 ETF/LOF
   all_etf  全A个股 + ETF
 产品：
-  稳健 / 均衡 / 激进（组合收益，相位平均）+ 荐股（逐笔收益口径）
+  稳健 / 均衡 / 激进 / bata（组合收益，相位平均）+ 荐股（逐笔收益口径）
 输出（每次回测新建时间戳文件夹，报告/明细/图表全在里面）：
   research/backtest_v{版本}_{YYYYMMDD_HHMMSS}_{区间}[_tag]/
     report.json / report.md      原始指标 + 可嵌入 README 的表格
@@ -182,7 +182,8 @@ def build_md(report):
                  "各口径**在自己的基数池内做横截面排名**，互不污染。")
     lines.append("- ETF 池：东财 ETF/LOF 代码表（1491 只，剔除货币/现金类），"
                  "回填历史后 1202 只有 K 线、1145 只 ≥250 根；"
-                 "ETF 三档用 blend/blend_mom + 上证 MA20 闸门（ETF 无创业板语义）。")
+                 "ETF 三档用 blend/blend_mom + 上证 MA20 闸门（ETF 无创业板语义）；"
+                 "bata 档四口径均为 blend_mom top5/reb20 高赔率低频（允许打板）。")
     lines.append("- 基准：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
                  "（不分是否具备科创板权限），另附创业板指/上证对照，"
                  "避免单一强基准使超额恒负。")
@@ -211,7 +212,7 @@ def _write_tables(report, tdir):
     made = []
     unis = list(report.get("results") or {})
 
-    # 1) 组合指标（各口径 × 三档）
+    # 1) 组合指标（各口径 × 各档）
     p = os.path.join(tdir, "tier_metrics.csv")
     with open(p, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)

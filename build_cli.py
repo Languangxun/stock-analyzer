@@ -29,7 +29,7 @@ K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自�
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--refresh-etf] [--backfill]
                              [--clean] [--research] [--v4 [--v4-limit N]]
-                             [--tiers [--tier 稳健|均衡|激进] [--ai-tier]]
+                             [--tiers [--tier 稳健|均衡|激进|bata] [--ai-tier]]
                              [--tiers-backtest] [--universe all|main|etf|all_etf]
                              [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
@@ -39,10 +39,10 @@ K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自�
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
   --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
-  --tiers          v6.1.5 三档组合：输出最新目标持仓/闸门状态（可配 --tier）
-  --ai-tier        荐股前由AI在三档内选一档（按设置里的风险偏好锚定）
+  --tiers          v6.1.7 四档组合：输出最新目标持仓/闸门状态（可配 --tier）
+  --ai-tier        荐股前由AI在四档内选一档（按设置里的风险偏好锚定）
   --universe       标的池：all(全A不含ETF，默认)/main(沪深主板)/etf(仅ETF)/all_etf(全A含ETF)
-  --tiers-backtest v6.1.5 三档组合：全期回测摘要（相位平均，含全部费用）
+  --tiers-backtest v6.1.7 四档组合：全期回测摘要（相位平均，含全部费用）
   --picks-backtest v6.1.5 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 """

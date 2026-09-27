@@ -375,7 +375,7 @@ function readTheme(){
       grid:g('--grid'),line:g('--line'),fg:g('--fg'),panel:g('--panel'),
       bg:g('--bg'),cross:g('--cross'),label:g('--label')};
 }
-const TIERS=["稳健","均衡","激进"];
+const TIERS=["稳健","均衡","激进","bata"];
 const UNI_NAME={all:"全A",main:"沪深主板",etf:"ETF",all_etf:"全A含ETF"};
 const $=(q)=>document.querySelector(q);
 const $$=(q)=>Array.from(document.querySelectorAll(q));
@@ -811,7 +811,7 @@ function renderPerstock(){
     const modes=Array.from(new Set(d.rows.map(r=>r[iMode]).filter(Boolean)));
     $("#p-mode").innerHTML='<option value="">全部</option>'+
       modes.map(m=>`<option>${esc(m)}</option>`).join("");
-    // 三档数据默认看「稳健」，避免卡片统计把三档混在一起
+    // 各档数据默认看「稳健」，避免卡片统计把各档混在一起
     if(modes.indexOf("稳健")>=0)$("#p-mode").value="稳健";
     $("#p-sort").innerHTML=H.map((c,i)=>
       `<option value="${i}"${i===iTotal?" selected":""}>${esc(c)}</option>`).join("");

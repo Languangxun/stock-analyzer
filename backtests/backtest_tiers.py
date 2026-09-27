@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""backtest_tiers.py - v6.1 三档组合策略回测（研究脚本）
+"""backtest_tiers.py - v6.1 四档组合策略回测（研究脚本）
 
 引擎权威实现内嵌在 stock_gui.py（`tier_*` 函数），本脚本只做命令行/产物封装，
 保证 GUI、CLI（stock_predict.py）与研究脚本共用同一套实现，不会出现口径分叉。
@@ -114,7 +114,7 @@ def main():
                        overrides=overrides or None, progress=print,
                        universe=args.universe)
     uni_name = "全A" if args.universe == "all" else "主板"
-    print(f"\n=== v6.1 三档回测 {seg} · {uni_name} （相位平均，含全部费用）===")
+    print(f"\n=== v6.1 四档回测 {seg} · {uni_name} （相位平均，含全部费用）===")
     for tier in tiers:
         m = res.get(tier)
         if not m:
