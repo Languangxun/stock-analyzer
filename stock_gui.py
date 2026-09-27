@@ -199,6 +199,17 @@ class CFG:
     MAX_FETCH_BARS = 1000
     # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
     AUTO_PREFETCH = True
+    # 筹码峰右列（同花顺式，v6.1.5 热修⑧）：显示宽度占画布比例（非紧凑屏生效）
+    # + 右侧价格条宽度（留给十字光标价格标签，筹码柱向左生长不压住它）
+    CHIP_W_RATIO = 0.17
+    CHIP_AXIS_STRIP = 36
+    # 筹码分布算法（显示口径，v6.1.5 热修⑧）：
+    # 价格桶数 + 换手衰减系数。衰减系数 × 当日换手率（有市值时用真实换手
+    # =量×100/总股本，缺市值退回 量/中位量×2% 启发式）；0.5 与同花顺
+    # 002241 剖面（现价上下筹码≈50/50）对齐——1.0 时老筹码消失过快、
+    # 现价上方只剩 ~32%。信号引擎（chip_snapshots/_chip_feats_py）不随此处变化。
+    CHIP_NBIN = 360
+    CHIP_DECAY_SCALE = 0.5
     
     # 样本质量筛选与加权参数
     SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
@@ -3256,12 +3267,15 @@ def calc_rsi(closes, n):
     return out
 
 
-def calc_chips(rows, cur_price=None, nbin=360):
+def calc_chips(rows, cur_price=None, nbin=None, shares=None):
     """筹码分布：逐日按换手衰减历史筹码，当日成交量在[低,高]区间均匀摊分。
-    无流通股本数据，换手率用 量/中位量*2% 启发式近似（限幅）。
-    nbin=360（v6.1.5 热修⑦）：全历史价格区间下 120 桶在可见窗口只剩约 40 桶，
-    右侧筹码柱太稀疏；360 桶后可见窗口约 120+ 桶、柱间距 ~3px（信号引擎
-    chip_snapshots/_chip_feats_py 各自用 80/200 桶，不受影响）。"""
+
+    换手率：shares（总股本，股）给定时用真实换手 = 成交量(手)*100/shares；
+    否则退回 量/中位量*2% 启发式（限幅）。两者再乘 CFG.CHIP_DECAY_SCALE
+    （v6.1.5 热修⑧：0.5 与同花顺剖面形状对齐——1.0 时老筹码消失过快）。
+    nbin 默认 CFG.CHIP_NBIN=360：全历史价格区间下可见窗口约 120+ 桶、柱距 ~3px
+    （信号引擎 chip_snapshots/_chip_feats_py 各自用 80/200 桶，不随此处变化）。"""
+    nbin = int(nbin or CFG.CHIP_NBIN)
     bars = [r for r in rows
             if r.get("vol") and r.get("low") and r["low"] > 0
             and r["high"] >= r["low"]]
@@ -3274,8 +3288,15 @@ def calc_chips(rows, cur_price=None, nbin=360):
     step = (hi_p - lo_p) / nbin
     chips = [0.0] * (nbin + 1)
     med_vol = sorted(r["vol"] for r in bars)[len(bars) // 2] or 1.0
+    scale = max(0.05, float(getattr(CFG, "CHIP_DECAY_SCALE", 0.5)))
+    use_shares = bool(shares and shares > 0)
     for r in bars:
-        t = min(0.20, max(0.002, 0.02 * (r["vol"] / med_vol)))
+        if use_shares:
+            t = min(0.35, max(0.0005,
+                             (r["vol"] * 100.0 / shares) * scale))
+        else:
+            t = min(0.20, max(0.002,
+                             0.02 * (r["vol"] / med_vol) * scale))
         chips = [c * (1.0 - t) for c in chips]
         b_lo = max(0, int((r["low"] - lo_p) / step))
         b_hi = min(nbin, int((r["high"] - lo_p) / step))
@@ -6475,7 +6496,11 @@ def analyze(full, progress=None, quick=False):
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
     chips = None
     try:
-        chips = calc_chips(disp_rows, cur_px)
+        # 真实换手（总股本取自 stocks.mktcap / 现价；缺失时 calc_chips 退回启发式）
+        _mk = (get_stock_info(full) or {}).get("mktcap") or 0
+        _shares = (_mk / cur_px) if (_mk > 0 and cur_px and cur_px > 0) \
+            else None
+        chips = calc_chips(disp_rows, cur_px, shares=_shares)
     except Exception:
         pass
 
@@ -11350,6 +11375,9 @@ class App:
         # 会把 5 位数标签首字符画出画布，显示值看起来少一位，如 40.28→0.28）
         L = (34 if compact else 58) + max(0, int(lpad))
         R = 44 if (chips and compact) else (70 if chips else (28 if compact else 20))
+        if chips and not compact:
+            # 同花顺式筹码峰：右列按画布比例加宽（筹码柱横向铺开，价格轴留最右条）
+            R = max(R, min(int(w * CFG.CHIP_W_RATIO), int(w * 0.30)))
         T, B = 14 if compact else 16, 18 if compact else 20
         pw, ph = w - L - R, h - T - B
         bw = pw / n_bars
@@ -11485,47 +11513,41 @@ class App:
             self._line(cv, xs, v["boll_up"], ymap, C_GOLD, width=1)
             self._line(cv, xs, v["boll_low"], ymap, C_GOLD, width=1)
             self._line(cv, xs, v["boll_mid"], ymap, C_PURPLE)
-            cv.create_text(g["w"] - 6, g["T"] - 3, text="BOLL(20,2)",
+            cv.create_text(g["w"] - g["R"] - 4, g["T"] - 3,
+                           text="BOLL(20,2)",
                            fill=C_GOLD, font=("Consolas", 8, "bold"),
                            anchor="e")
 
-        # 筹码峰：全历史口径（与右栏一致），独立右列；
-        # 每个 bin 画在 ymap(价格) 位置——此前按 bin 序号从上到下均匀排，
-        # 与价格轴上下颠倒（低位厚筹码带显示在顶部），峰位对不上K线价格。
+        # 筹码峰（同花顺式）：全历史口径（与右栏一致），右列横向楔形；
+        # 每个 bin 画在 ymap(价格) 位置、实心矩形连片（间距 dy 由价格映射决定），
+        # 现价下方红(获利盘)/上方绿(套牢盘)；最右留价格条避免标签压住筹码柱。
+        cp_ = None
         if has_chips:
             cp_ = v["chips"]
-            chip_w = g["R"] - 6
-            cw = chip_w * 0.85
-            xr = g["w"] - 3
-            xl = xr - chip_w
+            strip = CFG.CHIP_AXIS_STRIP if g["R"] >= 100 else 6
+            base_x = g["w"] - g["R"]              # 基线＝K线区右缘（同花顺式）
+            limit_x = g["w"] - strip              # 柱最右＝价格条左侧
+            chip_w = max(20, limit_x - base_x)
+            cw = chip_w * 0.94
             ybot = g["h"] - g["B"]
             # 只保留可见价格区间的bin
             vis_bins = [(m, w) for m, w in cp_["bins"]
                         if w > 0 and lo <= m <= hi]
             if vis_bins:
                 maxw = max(w for _, w in vis_bins)
+                mids = [m for m, _ in vis_bins]
+                dy = (abs(ymap(mids[0]) - ymap(mids[1]))
+                      if len(mids) > 1 else 2.0)
+                hb = max(1.5, min(dy * 1.15, 8))     # 柱高≈桶距 → 连成楔形
                 for mid, wgt in vis_bins:
                     yy = ymap(mid)
-                    bar_len = cw * wgt / maxw
-                    cv.create_line(xr - bar_len, yy, xr, yy,
-                                   fill=UP if mid <= cp_["cur"] else DOWN,
-                                   width=2)
-            # 分隔线
-            cv.create_line(xl, g["T"], xl, ybot, fill=GRID_C, dash=(2, 3))
-            for k_, colr, lab in (("sup", UP, "支"), ("res", DOWN, "压")):
-                pv = cp_.get(k_)
-                if pv and lo < pv < hi:
-                    yy = ymap(pv)
-                    cv.create_line(g["L"], yy, xr, yy,
-                                   fill=colr, dash=(6, 4))
-                    txt = f"{lab} {pv:.2f}"
-                    # 右缘内收：字体缩放时标签比筹码列宽，避免末位数字被裁
-                    tx = xl + 2
-                    tx = min(tx, g["w"] - 4
-                             - self._text_px(cv, txt, 8, "Microsoft YaHei"))
-                    cv.create_text(max(tx, g["L"] + 2), yy - 7, text=txt,
-                                   anchor="w", fill=colr,
-                                   font=("Microsoft YaHei", 8))
+                    bar_len = max(0.6, cw * wgt / maxw)
+                    cv.create_rectangle(
+                        base_x, yy - hb / 2, base_x + bar_len, yy + hb / 2,
+                        fill=UP if mid <= cp_["cur"] else DOWN,
+                        outline="")
+            # 基线（筹码柱生长零点，同花顺基线在左、柱向右生长）
+            cv.create_line(base_x, g["T"], base_x, ybot, fill=GRID_C)
 
         yo = yc = None
         ghost_lab = {"T+1预测": "T+1", "T日预测": "T日",
@@ -11589,6 +11611,28 @@ class App:
 
         if not bars:
             return
+
+        # 支撑/压力线最后画（压在K线/筹码之上），标签带底色框：
+        # 此前先画在筹码层、被筹码柱和红绿柱盖住（用户反馈"筹码峰挡住支撑位"）
+        if cp_:
+            strip = CFG.CHIP_AXIS_STRIP if g["R"] >= 100 else 6
+            limit_x = g["w"] - strip
+            for k_, colr, lab in (("sup", UP, "支"), ("res", DOWN, "压")):
+                pv = cp_.get(k_)
+                if not (pv and lo < pv < hi):
+                    continue
+                yy = ymap(pv)
+                cv.create_line(g["L"], yy, limit_x, yy, fill=colr,
+                               dash=(6, 4), width=2)
+                txt = f"{lab} {pv:.2f}"
+                tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
+                # 右对齐到价格条左侧；窄列（紧凑屏）时保证不越出画布左缘
+                tx = max(limit_x - 4, g["L"] + 6 + tw)
+                ly = max(yy - 8, g["T"] + 8)
+                cv.create_rectangle(tx - tw - 4, ly - 8, tx + 4, ly + 8,
+                                    fill=PANEL_BG, outline=colr)
+                cv.create_text(tx, ly, text=txt, anchor="e", fill=colr,
+                               font=("Microsoft YaHei", 8))
 
         # 现价标签挂在最后一根真实K线上（跳过幽灵K线）
         pb_i = len(bars) - 1
@@ -11873,14 +11917,17 @@ class App:
         # 轻操作：竖线/横线/价格标签逐像素跟随（仅悬停面板，缩小重绘区）
         xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
         y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
+        # 筹码宽列（同花顺式）时横线延伸到最右价格条，压住筹码柱不突兀
+        hx = (sg["w"] - CFG.CHIP_AXIS_STRIP + 2
+              if sg.get("R", 0) >= 100 else sg["w"] - sg["R"])
         cv.coords(sg["vid"], xv, sg["T"] + 2, xv, sg["h"] - sg["B"])
-        cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
+        cv.coords(sg["hid"], sg["L"], y, hx, y)
         price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
         txt = fmt(price) if fmt else f"{price:.2f}"
-        # 价格标签贴在右缘内侧；R 较小时（未勾选筹码峰）不回退到画布外
-        px = min(sg["w"] - sg["R"] + 30, sg["w"] - 33)
+        # 价格标签固定在最右价格条内（宽筹码列时不压筹码柱、窄列也不出画布）
+        px = max(sg["L"] + 30, sg["w"] - 33)
         cv.coords(sg["pid"], px, y)
         cv.itemconfigure(sg["pid"], text=txt)
         cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
@@ -13495,25 +13542,34 @@ class App:
             win.attributes("-fullscreen", True)
             win.bind("<Escape>",
                      lambda e: win.attributes("-fullscreen", False))
-        # 可滚动容器：设置内容多，小屏限高+滚轮滚动，按钮永远可达
+        # 可滚动容器：设置内容多，小屏限高+滚轮滚动；
+        # v6.1.5 热修⑨：按钮栏固定在窗口底部（不随内容滚动），滚轮绑到全部子控件。
         maxh = int(self.root.winfo_screenheight() * 0.88)
         cv = tk.Canvas(win, bg=DARK_BG, highlightthickness=0)
         sb = ttk.Scrollbar(win, orient="vertical", command=cv.yview)
         frm = ttk.Frame(cv, padding=14)
         cv.create_window((0, 0), window=frm, anchor="nw", tags="frm")
         cv.configure(yscrollcommand=sb.set)
+        btns = ttk.Frame(win)          # 底部固定按钮栏（先 pack 占位）
 
         def _fs_fit(_e=None):
             cv.configure(scrollregion=cv.bbox("all"))
-            h = min(frm.winfo_reqheight() + 20, maxh)
+            # 下限 320：立即调用时 frm 尚未布局（reqheight=0）会把窗口缩成一条
+            # （热修⑨ 一度出现 580x34 的“迷你设置窗”），布局完成后再按真实高度收缩
+            h = max(320, min(frm.winfo_reqheight() + 20, maxh))
             try:
                 cv.configure(height=max(200, h))
                 wwidth = max(580, min(frm.winfo_reqwidth() + 40,
                                       self.root.winfo_screenwidth() - 20))
+                bh = 12
+                try:
+                    bh += btns.winfo_reqheight()
+                except Exception:
+                    pass
                 if getattr(self, "compact", False):
-                    win.geometry(f"{wwidth}x{h + 6}")
+                    win.geometry(f"{wwidth}x{h + bh}")
                 else:
-                    self._center_win(win, wwidth, h + 6)
+                    self._center_win(win, wwidth, h + bh)
             except Exception:
                 pass
         frm.bind("<Configure>", _fs_fit)
@@ -13526,6 +13582,21 @@ class App:
         cv.bind("<MouseWheel>", _wheel)
         cv.bind("<Button-4>", lambda e: cv.yview_scroll(-1, "units"))
         cv.bind("<Button-5>", lambda e: cv.yview_scroll(1, "units"))
+
+        def _bind_wheel_all(w):
+            """滚轮绑到所有子控件：Tk 里滚轮事件只发给指针下的控件，
+            不冒泡到画布 → 不绑的话鼠标在参数区滚不动（用户反馈）。"""
+            for ev, fn in (("<MouseWheel>", _wheel),
+                           ("<Button-4>", lambda e: cv.yview_scroll(-1, "units")),
+                           ("<Button-5>", lambda e: cv.yview_scroll(1, "units"))):
+                try:
+                    w.bind(ev, fn, add="+")
+                except Exception:
+                    pass
+            for ch in w.winfo_children():
+                _bind_wheel_all(ch)
+
+        btns.pack(side="bottom", fill="x", padx=14, pady=(0, 10))
         cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
@@ -13866,10 +13937,7 @@ class App:
             except Exception as e:
                 messagebox.showerror("清除缓存", str(e))
 
-        btns = ttk.Frame(frm)
-        # row=30：预测参数占 9~20、说明 21、荐股权限 22~27、关于 28~29
-        # （原先放 20 会与最后一行「最大拉取样本量」重叠）
-        btns.grid(row=30, column=0, columnspan=3, pady=(12, 0))
+        # 按钮固定底栏（btns 已在窗口底部 pack；不随内容滚动）
         ttk.Button(btns, text="保存并应用", command=save).pack(
             side="left", padx=4)
         ttk.Button(btns, text="清除缓存", command=clear_cache).pack(
@@ -13903,6 +13971,12 @@ class App:
             "据此操作产生的盈亏与后果由使用者自行承担。"
             "请遵守所在地区法律法规，理性投资。")
         about.config(state="disabled")
+
+        # 内容区全部子控件绑定滚轮（含后建的关于/权限控件）；
+        # 定位放到布局完成之后（立即调用 reqheight 还是 0 → 迷你窗口）
+        _bind_wheel_all(frm)
+        _bind_wheel_all(btns)
+        win.after(60, _fs_fit)
 
     def _shutdown_confirm(self):
         """小屏设备专用：确认后关机（需 sudoers 免密授权 shutdown）。"""

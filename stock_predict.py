@@ -209,6 +209,17 @@ class CFG:
     MAX_FETCH_BARS = 1000
     # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
     AUTO_PREFETCH = True
+    # 筹码峰右列（同花顺式，v6.1.5 热修⑧）：显示宽度占画布比例（非紧凑屏生效）
+    # + 右侧价格条宽度（留给十字光标价格标签，筹码柱向左生长不压住它）
+    CHIP_W_RATIO = 0.17
+    CHIP_AXIS_STRIP = 36
+    # 筹码分布算法（显示口径，v6.1.5 热修⑧）：
+    # 价格桶数 + 换手衰减系数。衰减系数 × 当日换手率（有市值时用真实换手
+    # =量×100/总股本，缺市值退回 量/中位量×2% 启发式）；0.5 与同花顺
+    # 002241 剖面（现价上下筹码≈50/50）对齐——1.0 时老筹码消失过快、
+    # 现价上方只剩 ~32%。信号引擎（chip_snapshots/_chip_feats_py）不随此处变化。
+    CHIP_NBIN = 360
+    CHIP_DECAY_SCALE = 0.5
     
     # 样本质量筛选与加权参数
     SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
@@ -3268,12 +3279,15 @@ def calc_rsi(closes, n):
     return out
 
 
-def calc_chips(rows, cur_price=None, nbin=360):
+def calc_chips(rows, cur_price=None, nbin=None, shares=None):
     """筹码分布：逐日按换手衰减历史筹码，当日成交量在[低,高]区间均匀摊分。
-    无流通股本数据，换手率用 量/中位量*2% 启发式近似（限幅）。
-    nbin=360（v6.1.5 热修⑦）：全历史价格区间下 120 桶在可见窗口只剩约 40 桶，
-    右侧筹码柱太稀疏；360 桶后可见窗口约 120+ 桶、柱间距 ~3px（信号引擎
-    chip_snapshots/_chip_feats_py 各自用 80/200 桶，不受影响）。"""
+
+    换手率：shares（总股本，股）给定时用真实换手 = 成交量(手)*100/shares；
+    否则退回 量/中位量*2% 启发式（限幅）。两者再乘 CFG.CHIP_DECAY_SCALE
+    （v6.1.5 热修⑧：0.5 与同花顺剖面形状对齐——1.0 时老筹码消失过快）。
+    nbin 默认 CFG.CHIP_NBIN=360：全历史价格区间下可见窗口约 120+ 桶、柱距 ~3px
+    （信号引擎 chip_snapshots/_chip_feats_py 各自用 80/200 桶，不随此处变化）。"""
+    nbin = int(nbin or CFG.CHIP_NBIN)
     bars = [r for r in rows
             if r.get("vol") and r.get("low") and r["low"] > 0
             and r["high"] >= r["low"]]
@@ -3286,8 +3300,15 @@ def calc_chips(rows, cur_price=None, nbin=360):
     step = (hi_p - lo_p) / nbin
     chips = [0.0] * (nbin + 1)
     med_vol = sorted(r["vol"] for r in bars)[len(bars) // 2] or 1.0
+    scale = max(0.05, float(getattr(CFG, "CHIP_DECAY_SCALE", 0.5)))
+    use_shares = bool(shares and shares > 0)
     for r in bars:
-        t = min(0.20, max(0.002, 0.02 * (r["vol"] / med_vol)))
+        if use_shares:
+            t = min(0.35, max(0.0005,
+                             (r["vol"] * 100.0 / shares) * scale))
+        else:
+            t = min(0.20, max(0.002,
+                             0.02 * (r["vol"] / med_vol) * scale))
         chips = [c * (1.0 - t) for c in chips]
         b_lo = max(0, int((r["low"] - lo_p) / step))
         b_hi = min(nbin, int((r["high"] - lo_p) / step))
@@ -6487,7 +6508,11 @@ def analyze(full, progress=None, quick=False):
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
     chips = None
     try:
-        chips = calc_chips(disp_rows, cur_px)
+        # 真实换手（总股本取自 stocks.mktcap / 现价；缺失时 calc_chips 退回启发式）
+        _mk = (get_stock_info(full) or {}).get("mktcap") or 0
+        _shares = (_mk / cur_px) if (_mk > 0 and cur_px and cur_px > 0) \
+            else None
+        chips = calc_chips(disp_rows, cur_px, shares=_shares)
     except Exception:
         pass
 
