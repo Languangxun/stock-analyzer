@@ -292,7 +292,9 @@ def stage_build(limit=None, workers=None, sample=None, seed=7):
     groups = {}
     for c in res:
         groups.setdefault(glob["industry_of"].get(c, ""), []).append(c)
-    tasks = [g for g in groups.values() if len(g) >= 2]
+    # 行业未知（退市/长停股）不参与 L2 同行业分组（缺失按中性处理，
+    # v6.1.5 热修⑩：否则所有未知行业股会互相当成“同行业”）
+    tasks = [g for ind, g in groups.items() if ind and len(g) >= 2]
     L2 = {}
     with ProcessPoolExecutor(max_workers=workers,
                              initializer=_worker_init,
@@ -316,7 +318,8 @@ def stage_build(limit=None, workers=None, sample=None, seed=7):
     groups3 = {}
     for c in res:
         groups3.setdefault(glob["tier_of"].get(c, ""), []).append(c)
-    tasks3 = [g for g in groups3.values() if len(g) >= 2]
+    # 市值分层未知同样不参与 L3 分组（v6.1.5 热修⑩）
+    tasks3 = [g for t, g in groups3.items() if t and len(g) >= 2]
     L3 = {}
     if not tasks3:
         print("L3: 无有效分组，跳过")

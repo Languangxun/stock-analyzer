@@ -7,7 +7,7 @@
 import sqlite3
 
 import stock_gui as sg
-from stock_gui import DB_PATH, _is_etf
+from stock_gui import DB_PATH, _is_etf, _is_index_code
 
 
 def load_meta():
@@ -25,8 +25,11 @@ def load_meta():
 def list_codes(min_bars=400, max_bars=None, require_meta=True):
     """满足最少K线数的非ETF个股代码（按代码排序，稳定可复现）。
 
-    require_meta=True 时只保留 stocks 表内且有行业字段的个股，
-    排除指数（sh000001 等）、无行业元数据的代码。
+    require_meta=True 时只要求「在 stocks 表内」，**不再要求 industry 非空**
+    （v6.1.5 热修⑩）：退市/长停股没有行业快照，原口径把它们全部剔除 →
+    面板/IC/枚举/BH-FDR 只含“活到今天的股票”，存在系统性幸存者偏差
+    （实测 229 只退市股 industry 全空）。无行业股在 L2 因子按缺失中性处理，
+    不参与同行业/同市值层分组。
     """
     with sg.db_conn() as conn:
         if max_bars:
@@ -41,7 +44,8 @@ def list_codes(min_bars=400, max_bars=None, require_meta=True):
     codes = sorted(
         r[0] for r in rows
         if not _is_etf(r[0]) and not r[0].startswith("bj")
-        and (not require_meta or (r[0] in meta and meta[r[0]]["industry"])))
+        and not _is_index_code(r[0])                # 指数（sh000/sz399）非个股票本
+        and (not require_meta or r[0] in meta))     # 行业可空（退市股纳入）
     return codes
 
 

@@ -3,8 +3,13 @@
 """backfill_full.py - 全A股日K批量回填（目标≥1000交易日）
 
 复用 stock_gui.py 内嵌缓存层（同一 stock_cache.db / 同一套多源HTTP）。
-- 主源：东财 push2his（一次请求拉全量前复权日K，lmt=1100）
-- 备源：腾讯 ifzq fqkline
+- 主源：腾讯 **不复权**日K（800 根翻页）× 新浪后复权因子 = 真乘法后复权；
+  备源东财 fqt=2。v6.1.5 热修⑪ 起口径修正——腾讯 hfq 实测为分段仿射
+  `hfq≈a×不复权价+b`，段内日收益被逐股缩放（浦发 0.63/茅台 0.82/申华 1.75），
+  不能再直写入库；详见 data_clean.check_adj 与 reports/数据异常报告_20260927.md
+- 库内统一存乘法后复权（见 data_clean.py / stock_gui._bf_fetch_one）
+- 写入前与库内重叠日期比对（收盘偏差>1% 判为口径冲突，跳过该只）
+- 写入后 `_sync_adjust` 刷新显示缩放系数 k（与 GUI/CLI 同口径）
 - 断点续传：本地已有 ≥950 根且最新日期够新的代码直接跳过
 - 并发 8 线程 + 全局限流（_http_get 内置 0.16s 间隔），进度每20只打印
 - 代码表缺失时自动刷新全市场代码表（含市值分层，GUI直接受益）
@@ -17,7 +22,6 @@
                                      # 目标/过期/单次根数可调（GUI「数据工具」同参数）
 """
 import argparse
-import json
 import os
 import sys
 import time
@@ -30,7 +34,7 @@ import stock_gui as sg  # noqa: E402  （内嵌缓存层：DB/多源HTTP/代码�
 
 MIN_BARS = 950           # 断点续传门槛（目标1000根，留余量）
 FRESH_DAYS = 6           # 最新bar距今超过6个自然日视为过期（吸收长假）
-BAR_COUNT = 1100         # 单次请求根数（东财支持，约4.5年）
+BAR_COUNT = 1100         # 单只目标下限根数（与设置页「最大拉取样本量」取大者）
 
 
 def _fresh_date():
@@ -54,63 +58,16 @@ _TX_HOSTS = [
     "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
     "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
 ]
-_tx_i = [0]
-
-
-def _tx_fetch(full, end, count):
-    """腾讯K线单页：三域名轮换，全部501才抛异常（触发上层全局暂停）。"""
-    param = f"?param={full},day,,{end},{count},qfq" if end \
-        else f"?param={full},day,,,{count},qfq"
-    last = None
-    for k in range(len(_TX_HOSTS)):
-        u = _TX_HOSTS[(_tx_i[0] + k) % len(_TX_HOSTS)]
-        try:
-            txt = sg._http_get(u + param, decode="utf-8", retries=1,
-                               timeout=8)
-            _tx_i[0] = (_tx_i[0] + k + 1) % len(_TX_HOSTS)
-            d = (json.loads(txt).get("data") or {}).get(full) or {}
-            bars = d.get("qfqday") or d.get("day") or []
-            out = []
-            for b in bars:
-                try:
-                    if float(b[2]) <= 0:
-                        continue
-                    out.append({"date": b[0], "open": float(b[1]),
-                                "close": float(b[2]), "high": float(b[3]),
-                                "low": float(b[4]), "vol": float(b[5])})
-                except (ValueError, IndexError):
-                    continue
-            return out
-        except Exception as e:
-            last = e
-    raise last
 
 
 def _fetch_one(full):
-    """单只代码拉取：腾讯翻页为主源（单次上限800根，两页1600根≥目标）。
-    返回 rows 或抛异常。"""
-    rows1 = _tx_fetch(full, "", 800)
-    if not rows1:
-        raise RuntimeError("腾讯空数据")
-    if len(rows1) >= 790:               # 触顶 → 翻第二页补历史
-        import datetime
-        d0 = datetime.date.fromisoformat(rows1[0]["date"])
-        end = (d0 - datetime.timedelta(days=1)).isoformat()
-        try:
-            rows2 = _tx_fetch(full, end, 800)
-            have = {r["date"] for r in rows1}
-            rows1 = [r for r in rows2 if r["date"] not in have] + rows1
-        except Exception:
-            pass                        # 第二页失败就用第一页（≥800根）
-    if len(rows1) >= 300:
-        return rows1
-    try:
-        rows = sg._fetch_eastmoney(full, count=BAR_COUNT)
-        if len(rows) >= 300:
-            return rows
-    except Exception:
-        pass
-    raise RuntimeError("有效数据不足300根")
+    """单只：腾讯不复权翻页 + 新浪复权因子（真乘法后复权）；东财兜底。
+
+    v6.1.5 热修⑪：统一走 `stock_gui._bf_fetch_one`，不再直写腾讯 hfq
+    （仿射失真口径）。新浪因子不可得时抛异常，由上层重试/保留原数据。"""
+    target = max(MIN_BARS, sg.CFG.MAX_FETCH_BARS, BAR_COUNT, 1600)
+    rows, _ = sg._bf_fetch_one(full, page=800, target=target)
+    return rows
 
 
 def _store(full, rows):
@@ -118,12 +75,31 @@ def _store(full, rows):
     data = [r for r in rows if r["date"] < today and sg._bar_ok(r)]
     if not data:
         raise RuntimeError("过滤后无有效数据")
+    # 口径冲突防护（v6.1.5 热修⑩）：与库内重叠日期比对收盘，
+    # 偏差>1% 说明源口径不同（如 qfq/hfq 混用）→ 拒绝写入，避免接缝污染
+    with sg.db_conn() as conn:
+        old = {d: c for d, c in conn.execute(
+            "SELECT date, close FROM daily_bars WHERE code=?",
+            (full,)).fetchall()}
+    if old:
+        common = [r for r in data if r["date"] in old][-20:]
+        bad = [r["date"] for r in common
+               if old.get(r["date"]) and r["close"]
+               and abs(r["close"] / old[r["date"]] - 1) > 0.01]
+        if bad:
+            raise RuntimeError(
+                f"口径冲突({len(bad)}/{len(common)}处，如 {bad[0]})，已跳过")
     with sg.db_conn(commit=True) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO daily_bars"
             "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
             [(full, r["date"], r["open"], r["high"], r["low"],
               r["close"], r["vol"]) for r in data])
+    # 刷新显示缩放系数 k（raw/后复权同交易日配对），与 GUI/CLI 读库口径一致
+    try:
+        sg._sync_adjust(full, data)
+    except Exception:
+        pass
     return len(data)
 
 
@@ -140,7 +116,7 @@ def main():
     ap.add_argument("--fresh-days", type=int, default=FRESH_DAYS,
                     help=f"最新bar距今超过该自然日数视为过期（默认{FRESH_DAYS}）")
     ap.add_argument("--bar-count", type=int, default=BAR_COUNT,
-                    help=f"东财单次请求根数（默认{BAR_COUNT}）")
+                    help=f"单只目标根数下限（默认{BAR_COUNT}）")
     args = ap.parse_args()
 
     MIN_BARS = max(100, int(args.min_bars))

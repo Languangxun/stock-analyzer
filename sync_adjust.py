@@ -34,7 +34,7 @@ UA = {"User-Agent": "Mozilla/5.0"}
 
 
 def fetch_daily(code, fq="hfq", count=15):
-    """腾讯日K（多域名轮换 + 全局限速 + 重试）：fq='hfq' 后复权 / '' 不复权。"""
+    """腾讯日K（多域名轮换 + 全局限速 + 重试）：fq='hfq'/'qfq'/'' 不复权。"""
     import data_clean as dc
     param = (f"?param={code},day,,,{count},{fq}" if fq
              else f"?param={code},day,,,{count},")
@@ -49,7 +49,8 @@ def fetch_daily(code, fq="hfq", count=15):
     if not txt:
         raise RuntimeError("all hosts failed")
     d = (json.loads(txt).get("data") or {}).get(code) or {}
-    bars = d.get("hfqday" if fq == "hfq" else "day") or d.get("day") or []
+    key = {"hfq": "hfqday", "qfq": "qfqday"}.get(fq, "day")
+    bars = d.get(key) or d.get("day") or []
     out = {}
     for b in bars:
         try:
@@ -58,6 +59,30 @@ def fetch_daily(code, fq="hfq", count=15):
         except (ValueError, IndexError):
             continue
     return out
+
+
+def fetch_hfq_correct(code, raw=None, count=15):
+    """库内真乘法后复权口径的近端序列（与迁移/GUI 落库口径一致）。
+
+    v6.1.5 热修⑪：腾讯 hfq 是分段仿射（日收益逐股缩放），不能再用作基期
+    漂移对比；改为「不复权×新浪因子」，ETF/LOF 无因子时用腾讯 qfq。"""
+    import data_clean as dc
+    raw = raw if raw is not None else fetch_daily(code, "", count=count)
+    if not raw:
+        return {}
+    ev = [e for e in dc._fetch_sina_factors(code) if abs(e[1] - 1.0) > 1e-9]
+    if ev:
+        import bisect
+        ds = [e[0] for e in ev]
+        fs = [e[1] for e in ev]
+        out = {}
+        for d, p in raw.items():
+            i = bisect.bisect_right(ds, d) - 1
+            out[d] = p * (fs[i] if i >= 0 else fs[0])
+        return out
+    if dc._is_etf(code):
+        return fetch_daily(code, "qfq", count=count)
+    return raw
 
 
 def scan_code(code):
@@ -82,8 +107,11 @@ def scan_code(code):
         last_d, 0.0)
     if not base:
         return None, None, False
-    # 基期漂移：远端 hfq 与库内 hfq 多日整体不一致
-    hfq = fetch_daily(code, "hfq", count=15)
+    # 基期漂移：远端同口径序列与库内多日整体不一致（期间分红/口径变更）
+    try:
+        hfq = fetch_hfq_correct(code, raw=raw, count=15)
+    except Exception:
+        hfq = {}
     diff_ratio = 0
     checked = 0
     for d in common[:-1] if len(common) > 1 else common:

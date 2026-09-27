@@ -1088,6 +1088,64 @@ _tx_raw_cache = {}
 _LAST_RAW = {}
 
 
+_SINA_FQ_CACHE = {}
+
+
+def _sina_hfq_factors(full):
+    """新浪后复权因子 [(date,factor)] 升序；无数据返回 []；解析失败抛异常。
+
+    v6.1.5 热修⑪：腾讯 hfq 实测为分段仿射 `hfq≈a×不复权价+b`，段内日收益
+    被缩放（浦发 0.63/茅台 0.82/申华 1.75），不能作为收益口径。新浪
+    `/realstock/company/<code>/hfq.js` 给出乘法累计因子，×不复权日K 才是真
+    后复权（段内收益=不复权收益、除权日按因子跳变）。"""
+    if full in _SINA_FQ_CACHE:
+        return _SINA_FQ_CACHE[full]
+    import re
+    url = ("https://finance.sina.com.cn/realstock/company/"
+           f"{full}/hfq.js")
+    txt = _http_get(url, retries=2, timeout=15, decode="utf-8",
+                    headers={"Referer": "https://finance.sina.com.cn/"})
+    m = re.search(r"=\s*(\{.*\})", txt, re.S)
+    if not m:
+        raise RuntimeError("新浪复权因子解析失败")
+    data = (json.loads(m.group(1)).get("data") or [])
+    ev = sorted((it["d"], float(it["f"])) for it in data if it.get("d"))
+    _SINA_FQ_CACHE[full] = ev
+    return ev
+
+
+def _apply_hfq_factors(rows, factors):
+    """不复权 rows × 因子 → 后复权 rows（价×f，量不变）。"""
+    import bisect
+    ds = [d for d, _ in factors]
+    fs = [f for _, f in factors]
+    out = []
+    for r in rows:
+        i = bisect.bisect_right(ds, r["date"]) - 1
+        f = fs[i] if i >= 0 else fs[0]
+        out.append({"date": r["date"], "open": r["open"] * f,
+                    "close": r["close"] * f, "high": r["high"] * f,
+                    "low": r["low"] * f, "vol": r["vol"]})
+    return out
+
+
+def _fetch_tencent_mul(full, count=600, host=None, page=800):
+    """腾讯不复权 + 新浪因子 = 真乘法后复权（替代腾讯 hfq 仿射口径）。
+
+    ETF/LOF 新浪无有效因子 → 退腾讯 qfq（日收益同样与不复权一致）；
+    指数/无事件个股 → 不复权即后复权。新浪因子不可得时抛异常，
+    调用方保留本地缓存，绝不回写仿射 hfq。"""
+    rows = _fetch_tencent(full, count=count, host=host, fq="")
+    if not rows:
+        return []
+    factors = _sina_hfq_factors(full)
+    if any(abs(f - 1.0) > 1e-9 for _, f in factors):
+        return _apply_hfq_factors(rows, factors)
+    if _is_etf(full):
+        return _fetch_tencent(full, count=count, host=host, fq="qfq") or rows
+    return rows
+
+
 def _tx_quote_raw(qt):
     """从腾讯若快照 qt 里取最新原始价（不复权）。"""
     if not isinstance(qt, dict):
@@ -1307,19 +1365,19 @@ def _fetch_remote_rows(full, count=600, info=None):
        选冷却结束最早的源强行试一次，成功即重置熔断；
     3. 单次调用内只对一个源做至多2次限流重试，
        失败立刻切下一源，避免整体请求被单源拖死。
-    info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。"""
-        # 注意：只使用后复权(hfq)源。163/新浪只提供不复权(或减法前复权)，
-    # 与库内后复权口径混用会产生假跳变，不再作为持久化源。
+    info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。
+    口径（v6.1.5 热修⑪）：腾讯只作为**不复权**源，落库前乘新浪后复权因子；
+    腾讯 hfq 是仿射失真口径，不再直接入库。东财仅作最后兜底。"""
     sources = [
-        ("腾讯", lambda: _fetch_tencent(full, count)),
-        ("腾讯代理", lambda: _fetch_tencent(
+        ("腾讯", lambda: _fetch_tencent_mul(full, count)),
+        ("腾讯代理", lambda: _fetch_tencent_mul(
             full, count,
             "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
             "fqkline/get")),
-        ("腾讯ifzq", lambda: _fetch_tencent(
+        ("腾讯ifzq", lambda: _fetch_tencent_mul(
             full, count,
             "https://ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("腾讯HTTP", lambda: _fetch_tencent(
+        ("腾讯HTTP", lambda: _fetch_tencent_mul(
             full, count,
             "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("东财", lambda: _fetch_eastmoney(full, count)),
@@ -1795,10 +1853,16 @@ _BF_TX_I = [0]
 _BF_PAUSE = [0.0, 0]            # [暂停截止时间, 连续限流次数]
 
 
-def _bf_tx_fetch(full, end, count):
-    """腾讯K线单页（后复权 hfq）：三域名轮换，全部501才抛（触发全局暂停）。"""
-    param = (f"?param={full},day,,{end},{count},hfq" if end
-             else f"?param={full},day,,,{count},hfq")
+def _bf_tx_fetch(full, end, count, fq="hfq"):
+    """腾讯K线单页（fq=hfq/qfq/''）：三域名轮换，全部失败才抛（触发全局暂停）。
+
+    不复权（fq=''）翻页必须带 end 参数与空复权位（v6.1.5 热修⑪）。"""
+    if fq:
+        param = (f"?param={full},day,,{end},{count},{fq}" if end
+                 else f"?param={full},day,,,{count},{fq}")
+    else:
+        param = (f"?param={full},day,,{end},{count}," if end
+                 else f"?param={full},day,,,{count},")
     last = None
     for k in range(len(_BF_TX_HOSTS)):
         u = _BF_TX_HOSTS[(_BF_TX_I[0] + k) % len(_BF_TX_HOSTS)]
@@ -1806,8 +1870,8 @@ def _bf_tx_fetch(full, end, count):
             txt = _http_get(u + param, decode="utf-8", retries=1, timeout=8)
             _BF_TX_I[0] = (_BF_TX_I[0] + k + 1) % len(_BF_TX_HOSTS)
             d = (json.loads(txt).get("data") or {}).get(full) or {}
-            # 请求的是 hfq（后复权），腾讯返回 hfqday；指数无复权返回 day
-            bars = d.get("hfqday") or d.get("day") or []
+            key = {"hfq": "hfqday", "qfq": "qfqday"}.get(fq, "day")
+            bars = d.get(key) or d.get("day") or []
             out = []
             for b in bars:
                 try:
@@ -1824,31 +1888,55 @@ def _bf_tx_fetch(full, end, count):
     raise last
 
 
-def _bf_fetch_one(full, page=800, target=None):
-    """单只：腾讯翻页为主源（后复权），东财全量兜底。返回 (rows, raw_last)。
-
-    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）；按需继续翻页直到
-    达到目标或源侧没有更早数据（2000 根需 3 页）。"""
+def _bf_tx_pages(full, page=800, target=None, fq="hfq", max_pages=6):
+    """腾讯深历史按需翻页（fq='' 不复权 / 'hfq' / 'qfq'）。"""
     import datetime
     target = target or max(CFG.MAX_FETCH_BARS, page * 2)
-    rows1 = _bf_tx_fetch(full, "", page)
-    if not rows1:
-        raise RuntimeError("腾讯空数据")
-    have = {r["date"] for r in rows1}
+    rows = _bf_tx_fetch(full, "", page, fq)
     pages = 1
-    while len(rows1) < target and pages < 5 and len(rows1) >= page - 10:
-        d0 = datetime.date.fromisoformat(rows1[0]["date"])
+    have = {r["date"] for r in rows}
+    while (rows and len(rows) < target and pages < max_pages
+           and len(rows) >= page - 10):
+        d0 = datetime.date.fromisoformat(rows[0]["date"])
         end = (d0 - datetime.timedelta(days=1)).isoformat()
         try:
-            older = _bf_tx_fetch(full, end, page)
+            older = _bf_tx_fetch(full, end, page, fq)
         except Exception:
             break                               # 更早一页失败就保留已有
         new = [r for r in older if r["date"] not in have]
         if not new:
             break                               # 源侧已无更早数据
-        rows1 = new + rows1
+        rows = new + rows
         have.update(r["date"] for r in new)
         pages += 1
+    return rows
+
+
+def _to_hfq_mul(full, raw, page=800, target=None):
+    """不复权 rows → 真乘法后复权。
+
+    有新浪因子（个股）→ raw×因子；ETF/LOF 无有效因子 → 腾讯 qfq（日收益
+    同样保真）；指数/无除权事件个股 → 不复权即后复权。因子不可得时抛异常，
+    调用方保留原数据，绝不回写腾讯 hfq 仿射口径（v6.1.5 热修⑪）。"""
+    factors = _sina_hfq_factors(full)
+    if any(abs(f - 1.0) > 1e-9 for _, f in factors):
+        return _apply_hfq_factors(raw, factors)
+    if _is_etf(full):
+        q = _bf_tx_pages(full, page=page, target=target, fq="qfq")
+        return q or raw
+    return raw
+
+
+def _bf_fetch_one(full, page=800, target=None):
+    """单只：腾讯**不复权**翻页 → 新浪因子得真乘法后复权；东财兜底。
+
+    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）。v6.1.5 热修⑪：
+    此前直接存腾讯 hfq（仿射失真，日收益被逐股缩放），改走乘法口径。"""
+    target = target or max(CFG.MAX_FETCH_BARS, page * 2)
+    raw = _bf_tx_pages(full, page=page, target=target, fq="")
+    if not raw:
+        raise RuntimeError("腾讯空数据")
+    rows1 = _to_hfq_mul(full, raw, page=page, target=target)
     if len(rows1) >= 300:
         return rows1, _raw_last_price(full)
     try:
@@ -2047,29 +2135,35 @@ def clean_daily_db(fix=True, progress=None):
             if progress and ci % 300 == 0:
                 progress(f"清洗扫描 {ci}/{len(by)}")
             n = len(bars)
+            name = names.get(c, "")
             bad = [b for b in bars if not _clean_bar_valid(b)]
             if bad:
                 issues.setdefault(c, []).append("bad")
                 stats["bad_bars"] += len(bad)
-            # 价格失真：末价过低（除权公式前复权长期做减法导致）
-            if bars and bars[-1][4] is not None and bars[-1][4] < 0.5:
-                issues.setdefault(c, []).append("refetch")
-                stats["refetch"] += 1
-                stats["low_price"] = stats.get("low_price", 0) + 1
-            flags = []
-            name = names.get(c, "")
-            for prev, cur in zip(bars, bars[1:]):
-                pc, cl = prev[4], cur[4]
-                lim = _limit_pct(c, name, cur[0])
-                if not pc or not cl or lim is None:
-                    flags.append(False)
-                    continue
-                flags.append(abs(cl / pc - 1) * 100 > lim + 3.0)
-            viol = any(flags) if not _is_etf(c) else any(
-                a and b for a, b in zip(flags, flags[1:]))
+            # 涨跌幅越界：统一走 _bars_anomalous（新股前10根/停牌复牌/指数/
+            # 退市整理/ST现名回溯/ETF折算全豁免），不再裸比涨跌停——旧规则
+            # 会把科创板ETF 20%涨跌与新股首日误判为坏数据（v6.1.5 热修⑪）
+            viol = _bars_anomalous(
+                [{"date": b[0], "close": b[4]} for b in bars], c, name)
             if viol:
                 issues.setdefault(c, []).append("refetch")
                 stats["refetch"] += 1
+            d1 = bars[-1][0]
+            try:
+                age = (_today - _dt.datetime.strptime(
+                    d1, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = 0
+            if age > 180:
+                issues.setdefault(c, []).append(f"delisted:{d1}")
+                stats["delisted"] += 1
+            elif (bars[-1][4] is not None and bars[-1][4] < 0.5
+                  and not _is_etf(c) and "退" not in name
+                  and not c.startswith(("sh000", "sz399"))):
+                # 低价基金/退市整理股是真实价格；只对非ETF活跃股怀疑失真
+                issues.setdefault(c, []).append("refetch")
+                stats["refetch"] += 1
+                stats["low_price"] = stats.get("low_price", 0) + 1
             gaps = 0
             for a, b in zip(bars, bars[1:]):
                 try:
@@ -2081,15 +2175,6 @@ def clean_daily_db(fix=True, progress=None):
                     continue
             if gaps:
                 stats["suspend"] += 1
-            d1 = bars[-1][0]
-            try:
-                age = (_today - _dt.datetime.strptime(
-                    d1, "%Y-%m-%d").date()).days
-            except ValueError:
-                age = 0
-            if age > 180:
-                issues.setdefault(c, []).append(f"delisted:{d1}")
-                stats["delisted"] += 1
             run = 1
             for a, b in zip(bars, bars[1:]):
                 run = run + 1 if a[4] == b[4] and a[4] else 1
@@ -2114,13 +2199,25 @@ def clean_daily_db(fix=True, progress=None):
                 if ("refetch" in kinds_set or "stale" in kinds_set) \
                         and not c.startswith("bj"):
                     try:
-                        fresh, raw_last = _bf_fetch_one(c)
+                        old_n, old_first, old_last = conn.execute(
+                            "SELECT COUNT(*), MIN(date), MAX(date) "
+                            "FROM daily_bars WHERE code=?", (c,)).fetchone()
+                        # 迁移深度不缩水（v6.1.5 热修⑪）：旧版按设置（默认
+                        # 1600根）重拉会把 2400 根长历史截断
+                        fresh, raw_last = _bf_fetch_one(
+                            c, target=max(old_n or 0, 2400))
                         fd = [r for r in fresh
                               if r["date"] < time.strftime("%Y-%m-%d")]
-                        old_n = conn.execute(
-                            "SELECT COUNT(*) FROM daily_bars WHERE code=?",
-                            (c,)).fetchone()[0]
-                        if len(fd) >= 200 and len(fd) >= min(old_n, 400):
+                        ok = len(fd) >= 200
+                        if old_n:
+                            if (old_first and fd
+                                    and fd[0]["date"] > old_first
+                                    and len(fd) <= old_n):
+                                ok = False     # 首根变晚且没更长 → 丢头
+                            if (old_last and fd
+                                    and fd[-1]["date"] < old_last):
+                                ok = False     # 末根变旧 → 丢新
+                        if ok:
                             conn.execute(
                                 "DELETE FROM daily_bars WHERE code=?", (c,))
                             conn.executemany(
@@ -2133,6 +2230,8 @@ def clean_daily_db(fix=True, progress=None):
                             if raw_last and fd[-1]["close"] > 0:
                                 _set_adjust(c, raw_last / fd[-1]["close"])
                             stats["refetched"] += 1
+                        else:
+                            stats["kept"] = stats.get("kept", 0) + 1
                     except Exception:
                         pass            # 源不可用时保留原数据，下次再修
                 dl = next((k.split(":", 1)[1] for k in kinds
@@ -3983,6 +4082,11 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
                 "SELECT code FROM delisted").fetchall()}
         except sqlite3.OperationalError:
             delisted = set()
+        try:                    # 显示缩放系数（hfq→乘法前复权，仙股过滤用）
+            adj = {r[0]: r[1] for r in conn.execute(
+                "SELECT code, k FROM adjust WHERE k>0").fetchall()}
+        except sqlite3.OperationalError:
+            adj = {}
     ind5_map, ind5_med, ind5_lead = _picks_ind_ctx()
     CH = 500
     cands = []
@@ -4006,7 +4110,9 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
                   if len(r) >= min_bars and not _is_etf(c)
                   and not c.startswith('bj')          # 北交所K线源不支持
                   and c not in delisted               # 退市登记
-                  and r[-1]['close'] and r[-1]['close'] >= 2]   # 剔除仙股
+                  # 剔除仙股：库内是 hfq，须乘显示缩放 k 还原现价口径
+                  # （v6.1.5 热修⑩；原直接比较 hfq 值，阈值形同虚设）
+                  and (r[-1]['close'] or 0) * (adj.get(c) or 1.0) >= 2]
         if progress:
             progress(f"荐股载入 {min(i + CH, len(codes))}/{len(codes)}")
     picks = []
@@ -8405,6 +8511,13 @@ _TIER_PREFIXES = ("sh60", "sh68", "sz00", "sz30",
 _TIER_MIN_PRICE = 1.0
 _TIER_MIN_BARS = 250
 _TIER_MIN_AMOUNT = 3e5            # V(手)×价 = 成交额/100，3e5 → 3000万元
+# ⚠ 口径说明（v6.1.5 审查 P0-2，未引入新数据无法消除，特此备案）：
+# 上面的绝对价/流动性门槛作用在「以今天为锚的乘法前复权价」上（tier_load_panel
+# 用 adjust.k 缩放 hfq）。k 由最新日 raw/hfq 配对算出，含 t 之后的分红/送转信息，
+# 因此历史交易日的绝对价与成交额门槛带**当前锚**：同一回测在不同日期重跑，
+# k 变化会轻微改变历史可交易池（不可完全复现）。收益率类指标（ret20/vol20/
+# beta/闸门）是比值，受 k 影响可约掉；受损面仅限可交易池/绝对阈值。
+# 彻底修复需库内保存**历史复权因子**（point-in-time），届时门槛改用当日 raw 价。
 _TIER_STALE_DAYS = 20
 _TIER_SLIP = 0.001
 _TIER_COMMISSION = 0.00025
@@ -11033,7 +11146,8 @@ class App:
                    f"（源不可用时自动跳过）\n"
                    f"停牌缺口 {res['suspend']} 只 · "
                    f"疑似退市 {res['delisted']} 只已登记\n"
-                    f"价格粘性 {res['stale']} 只")
+                   f"价格粘性 {res['stale']} 只 · "
+                   f"防缩水保留 {res.get('kept', 0)} 只")
             self.progress_var.set("数据清洗完成")
             messagebox.showinfo("数据清洗", msg)
         self._run_bg(work, done)
@@ -11196,26 +11310,40 @@ class App:
         self._notify_plugins("on_analysis", res)
 
     def _set_info(self, q=None):
-        """顶栏信息行（盘前不显示过期今开，锚定提示在图表右下角）。"""
+        """顶栏信息行（盘前不显示过期今开，锚定提示在图表右下角）。
+
+        v6.1.5 热修⑩：末bar距今>180天 → 追加「历史数据·可能已退市」警示
+        （代码被复用/退市股报价缺失时，报价与K线可能不是同一证券，
+        如 sz000827 *ST长兴 2005 退市后现价为同代码基金）。"""
         res = self.res
         q = q or res["quote"]
         chg = (q["price"] / res["prev_close"] - 1) * 100
+        tail = ""
+        try:
+            import datetime as _dt
+            last = (res.get("disp_rows") or [{}])[-1].get("date") or ""
+            if last and (_dt.date.today()
+                         - _dt.date.fromisoformat(last)).days > 180:
+                tail = (f"  ⚠历史数据·最后bar {last}"
+                        "（可能已退市/代码复用，报价仅供参考）")
+        except Exception:
+            tail = ""
         if res.get("pre_open"):
             self.info_var.set(
                 f"{q['name']} ({res['full_code']})  "
                 f"昨收{res['prev_close']:.2f}  "
-                f"现价{q['price']:.2f}({chg:+.2f}%)  快照{q['time']}")
+                f"现价{q['price']:.2f}({chg:+.2f}%)  快照{q['time']}" + tail)
         elif res.get("stale_snap"):
             self.info_var.set(
                 f"{q['name']} ({res['full_code']})  昨收{res['prev_close']:.2f} "
                 f"最近开{q['open']:.2f}  收盘{q['price']:.2f}({chg:+.2f}%)  "
-                f"快照{q['time']}（非今日）")
+                f"快照{q['time']}（非今日）" + tail)
         else:
             self.info_var.set(
                 f"{q['name']} ({res['full_code']})  昨收{res['prev_close']:.2f} "
                 f"今开{q['open']:.2f}(缺口{res['gap_today']:+.2f}%) "
                 f"现价{q['price']:.2f}({chg:+.2f}%)  快照{q['time']}"
-                + ("  [含盘中实时bar]" if res["has_live"] else ""))
+                + ("  [含盘中实时bar]" if res["has_live"] else "") + tail)
 
     def _rerender(self):
         self._drag_job = None
@@ -11525,8 +11653,17 @@ class App:
         if has_chips:
             cp_ = v["chips"]
             strip = CFG.CHIP_AXIS_STRIP if g["R"] >= 100 else 6
+            # v6.1.5 热修⑫：为右侧「支/压」黑底标签预留宽度——此前筹码柱
+            # 一直画到价格条左侧，标签框正好压住筹码峰最厚带（峰尖被遮）。
+            lab_reserve = 0
+            for k_, lab in (("sup", "支"), ("res", "压")):
+                pv = cp_.get(k_)
+                if pv and lo < pv < hi:
+                    tw_ = self._text_px(cv, f"{lab} {pv:.2f}", 8,
+                                        "Microsoft YaHei")
+                    lab_reserve = max(lab_reserve, tw_ + 12)
             base_x = g["w"] - g["R"]              # 基线＝K线区右缘（同花顺式）
-            limit_x = g["w"] - strip              # 柱最右＝价格条左侧
+            limit_x = g["w"] - strip - lab_reserve  # 柱最右＝标签左侧
             chip_w = max(20, limit_x - base_x)
             cw = chip_w * 0.94
             ybot = g["h"] - g["B"]
@@ -11613,7 +11750,9 @@ class App:
             return
 
         # 支撑/压力线最后画（压在K线/筹码之上），标签带底色框：
-        # 此前先画在筹码层、被筹码柱和红绿柱盖住（用户反馈"筹码峰挡住支撑位"）
+        # 此前先画在筹码层、被筹码柱和红绿柱盖住（用户反馈"筹码峰挡住支撑位"）。
+        # v6.1.5 热修⑫：筹码柱已在上方为标签预留宽度（lab_reserve），
+        # 标签右对齐到价格条左侧，不再压住筹码峰最厚带/峰尖。
         if cp_:
             strip = CFG.CHIP_AXIS_STRIP if g["R"] >= 100 else 6
             limit_x = g["w"] - strip
@@ -11626,7 +11765,6 @@ class App:
                                dash=(6, 4), width=2)
                 txt = f"{lab} {pv:.2f}"
                 tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
-                # 右对齐到价格条左侧；窄列（紧凑屏）时保证不越出画布左缘
                 tx = max(limit_x - 4, g["L"] + 6 + tw)
                 ly = max(yy - 8, g["T"] + 8)
                 cv.create_rectangle(tx - tw - 4, ly - 8, tx + 4, ly + 8,
@@ -13260,7 +13398,8 @@ class App:
         ttk.Label(r1, text="模式:").pack(side="left")
         clean_mode = tk.StringVar(value="只扫描")
         ttk.Combobox(r1, textvariable=clean_mode, width=12, state="readonly",
-                     values=["只扫描", "修复异常", "全库复权迁移"]
+                     values=["只扫描", "修复异常", "截断修复", "复权失真体检",
+                             "全库复权迁移"]
                      ).pack(side="left", padx=(2, 10))
         ttk.Label(r1, text="库:").pack(side="left")
         clean_db = tk.StringVar(value=DB_PATH)
@@ -13383,6 +13522,13 @@ class App:
                    "--db", clean_db.get().strip() or DB_PATH]
             if mode == "修复异常":
                 cmd.append("--fix")
+            elif mode == "截断修复":
+                cmd += ["--repair", "--workers",
+                        str(_ck(clean_workers, 1, 16, 2))]
+            elif mode == "复权失真体检":
+                cmd += ["--check-adj", "--workers",
+                        str(_ck(clean_workers, 1, 16, 2)),
+                        "--sample", str(_ck(clean_limit, 0, 99999, 0) or 200)]
             elif mode == "全库复权迁移":
                 cmd += ["--all-adj", "--workers",
                         str(_ck(clean_workers, 1, 16, 2))]
@@ -13449,7 +13595,8 @@ class App:
         sb.pack(side="right", fill="y")
         self._ext_text.pack(fill="both", expand=True)
         self._ext_log("数据工具：参数可调，后台运行，日志实时输出。\n"
-                      "清洗会直接改库，建议先「只扫描」；回填可断点续传。\n")
+                      "清洗会直接改库，建议先「只扫描」；回填可断点续传。\n"
+                      "「截断修复」只补历史不缩水（旧版浅迁移截断用）。\n")
 
         def _on_close():
             self._ext_stop()

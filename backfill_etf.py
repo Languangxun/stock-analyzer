@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
-"""ETF缓存盘点 + 回填主流ETF（新浪源当前可用）"""
-from stock_gui import db_conn, _is_etf, _fetch_sina, _bar_ok
+"""ETF缓存盘点 + 回填主流ETF（v6.1.5 热修⑪：走统一复权口径）。
+
+库内统一存真乘法后复权：`_bf_fetch_one` = 腾讯不复权 × 新浪因子（ETF 无
+有效因子时退腾讯 qfq），不再用新浪不复权直写（会与库内口径混接）。"""
+from stock_gui import (db_conn, _is_etf, _bf_fetch_one, _bar_ok,
+                       _sync_adjust)
 
 with db_conn() as conn:
     codes = [r[0] for r in conn.execute("SELECT DISTINCT code FROM daily_bars")]
@@ -15,14 +19,17 @@ want = ["sh510300", "sh510500", "sh510050", "sz159915", "sh588000",
 got = 0
 for c in want:
     try:
-        rows = [r for r in _fetch_sina(c, 400) if _bar_ok(r)]
+        rows, _raw = _bf_fetch_one(c, target=1600)
+        rows = [r for r in rows if _bar_ok(r)]
         if len(rows) >= 50:
             with db_conn(commit=True) as conn:
+                conn.execute("DELETE FROM daily_bars WHERE code=?", (c,))
                 conn.executemany(
                     "INSERT OR REPLACE INTO daily_bars"
                     "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
                     [(c, r["date"], r["open"], r["high"], r["low"],
                       r["close"], r["vol"]) for r in rows])
+            _sync_adjust(c, rows)
             got += 1
             print(f"  {c}: {len(rows)}根")
         else:
