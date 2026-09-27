@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-OWNER = "monologue-github"
+OWNER = "Languangxun"
 REPO = "stock-analyzer"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
