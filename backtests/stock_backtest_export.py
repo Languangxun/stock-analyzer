@@ -188,6 +188,17 @@ def export_one(code, mode, bars, picks=None):
         except Exception:
             sigs = []
         bt = sg.backtest_signals(rows, sigs, rp) if sigs else None
+        if bt:
+            # v6.1.6：与「策略消融」/GUI 信号胜率面板同引擎同切分
+            # （_bt_events，val=max(200,n/4)），指标与选型口径一致。
+            ev_full, ev_tr, ev_va, _sp = sg._bt_segments(rows, sigs, rp)
+            if ev_full:
+                for _k in ("trades", "closed", "wins", "losses", "winrate",
+                           "total", "ann", "mdd", "floating", "avg_win",
+                           "avg_loss", "profit_loss"):
+                    bt[_k] = ev_full.get(_k)
+                bt["train"] = ev_tr
+                bt["val"] = ev_va
         n_buy = sum(1 for s in sigs if s[2] == "BUY")
         r = dict(base, algo=strat_algo, mode=tier, label=label,
                  n_sig=len(sigs), n_buy=n_buy, n_sell=len(sigs) - n_buy)

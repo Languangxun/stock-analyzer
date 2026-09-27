@@ -118,7 +118,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-09-26 升 6.1.5）
-APP_VERSION = "6.1.5"
+APP_VERSION = "6.1.6"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -4166,6 +4166,716 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
     return picks[:top_n]
 
 
+# ================= 18 策略综合荐股（v6.1.6，chaodi 引擎移植） =================
+# 语义与 chaodi_strategies/et_engine 一致（通达信口径，已逐策略对拍）：
+#   · 单次全市场扫描 → 每只股票按 18 策略过滤 → 各策略候选池内 min-max 归一化打分
+#   · 综合分 = 命中策略数 × 100 + 命中策略均分（共振优先，均分破同）
+# 数据层复用本地缓存：hfq × adjust.k = 乘法前复权（与三档面板同口径）；
+# 换手率优先取 et_shares（总股本），缺失退回 成交额/总市值；北交所不入池
+# （与样本池/研究口径一致）；ST/退市/次新/低价/低市值/低成交额走逐策略基础过滤
+# （趋势突破门槛更高：价 5~200 / 市值≥20亿 / 成交额≥1亿 / 次新 60 日）。
+CHD_MIN_BARS = 250
+CHD_LIMIT_BARS = 500
+CHD_BASIC = {
+    "price_min": 3.0, "price_max": 300.0,
+    "market_cap_min": 1_000_000_000.0,
+    "amount_min": 20_000_000.0,
+    "exclude_new_days": 30,
+}
+_CHD_BASIC_TREND = {**CHD_BASIC, "price_min": 5.0, "price_max": 200.0,
+                    "market_cap_min": 2_000_000_000.0,
+                    "amount_min": 100_000_000.0, "exclude_new_days": 60}
+_CHD_INDEX_PREFIX = ("sh000", "sh880", "sz399", "bj899")
+
+try:
+    from numpy.lib.stride_tricks import sliding_window_view as _chd_win
+except Exception:                                       # pragma: no cover
+    _chd_win = None
+try:
+    from scipy.signal import lfilter as _chd_lfilter
+except Exception:                                       # pragma: no cover
+    _chd_lfilter = None
+
+_SQRT252 = math.sqrt(252.0)
+
+
+# ---------------- 指标工具（TDX 口径） ----------------
+
+def _chd_shift(a, n=1):
+    out = np.full(len(a), np.nan)
+    if n < len(a):
+        out[n:] = a[:-n]
+    return out
+
+
+def _chd_ma(a, n):
+    out = np.full(len(a), np.nan)
+    if len(a) >= n:
+        cs = np.cumsum(np.insert(np.nan_to_num(a, nan=0.0), 0, 0.0))
+        out[n - 1:] = (cs[n:] - cs[:-n]) / n
+    return out
+
+
+def _chd_recur(a, alpha, y0=None):
+    """y[i] = alpha*x[i] + (1-alpha)*y[i-1]；y0=None 时首值取 x[0]。"""
+    a = np.asarray(a, dtype=np.float64)
+    n = len(a)
+    if n == 0:
+        return a.copy()
+    if _chd_lfilter is not None and not np.isnan(a).any():
+        zi = (1.0 - alpha) * (a[0] if y0 is None else y0)
+        y, _ = _chd_lfilter([alpha], [1.0, -(1.0 - alpha)], a, zi=[zi])
+        return y
+    out = np.full(n, np.nan)
+    prev = np.nan if y0 is None else y0
+    for i in range(n):
+        x = a[i]
+        if np.isnan(x):
+            continue
+        prev = x if np.isnan(prev) else alpha * x + (1 - alpha) * prev
+        out[i] = prev
+    return out
+
+
+def _chd_ema(a, n):
+    return _chd_recur(a, 2.0 / (n + 1.0))
+
+
+def _chd_rolling_std(a, n, ddof=1):
+    out = np.full(len(a), np.nan)
+    if len(a) >= n:
+        out[n - 1:] = _chd_win(a, n).std(axis=1, ddof=ddof)
+    return out
+
+
+def _chd_prev_extreme(a, n, kind="max"):
+    """前 n 根（不含当日）最大/最小值。"""
+    a = np.asarray(a, dtype=np.float64)
+    m = len(a)
+    out = np.full(m, np.nan)
+    if m < 2:
+        return out
+    acc = (np.maximum.accumulate(a) if kind == "max"
+           else np.minimum.accumulate(a))
+    upto = min(n, m)
+    out[1:upto] = acc[:upto - 1]
+    if m > n:
+        w = _chd_win(a, n)
+        out[n:] = (w[:m - n].max(axis=1) if kind == "max"
+                   else w[:m - n].min(axis=1))
+    return out
+
+
+def _chd_cross_up(a, b):
+    out = (a > b) & (_chd_shift(a, 1) <= _chd_shift(b, 1))
+    out[0] = False
+    return np.nan_to_num(out).astype(bool)
+
+
+def _chd_cross_dn(a, b):
+    out = (a < b) & (_chd_shift(a, 1) >= _chd_shift(b, 1))
+    out[0] = False
+    return np.nan_to_num(out).astype(bool)
+
+
+def _chd_limit_pct(code, name=""):
+    """涨跌幅限制（小数）：创业板/科创板 20%，北交所 30%，ST 5%，主板 10%。"""
+    code6 = code[2:] if code[:2] in ("sh", "sz", "bj") else code
+    if "ST" in (name or "").upper():
+        return 0.05
+    if code6.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if code.startswith("bj") or code6.startswith(("92", "83", "87", "43")):
+        return 0.30
+    return 0.10
+
+
+def _chd_indicators(bars):
+    """18 策略所需指标（lite 子集）：MA/EMA/MACD/BOLL/RSI14/动量/波动/成交额。"""
+    o = bars["open"]
+    h = bars["high"]
+    low = bars["low"]
+    c = bars["close"]
+    v = bars["volume"]
+    n = len(c)
+    d = {"open": o, "high": h, "low": low, "close": c, "volume": v}
+    d["prev_close"] = _chd_shift(c, 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d["change_pct"] = c / d["prev_close"] - 1.0
+        d["amplitude"] = (h - low) / d["prev_close"]
+    for k in (5, 10, 20, 60):
+        d["ma%d" % k] = _chd_ma(c, k)
+    d["ema12"] = _chd_ema(c, 12)
+    d["ema26"] = _chd_ema(c, 26)
+    d["vol_ma5"] = _chd_ma(v, 5)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d["vol_ratio_5d"] = v / d["vol_ma5"]
+    dif = d["ema12"] - d["ema26"]
+    d["macd_dif"] = dif
+    d["macd_dea"] = _chd_ema(dif, 9)
+    std20 = _chd_rolling_std(c, 20, ddof=1)
+    d["boll_mid"] = d["ma20"]
+    d["boll_upper"] = d["ma20"] + 2.0 * std20
+    d["boll_lower"] = d["ma20"] - 2.0 * std20
+    # RSI14（Wilder）
+    delta = np.full(n, np.nan)
+    delta[1:] = np.diff(c)
+    up = np.where(delta > 0, delta, 0.0)
+    dn = np.where(delta < 0, -delta, 0.0)
+    up[0] = dn[0] = np.nan
+    k = 14
+    au = np.full(n, np.nan)
+    ad = np.full(n, np.nan)
+    if n > k:
+        au[k] = np.nanmean(up[1:k + 1])
+        ad[k] = np.nanmean(dn[1:k + 1])
+        au[k + 1:] = _chd_recur(up[k + 1:], 1.0 / k, y0=au[k])
+        ad[k + 1:] = _chd_recur(dn[k + 1:], 1.0 / k, y0=ad[k])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rs = au / np.where(ad == 0, np.nan, ad)
+    d["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
+    # 动量
+    for k in (5, 20, 60):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            d["momentum_%dd" % k] = c / _chd_shift(c, k) - 1.0
+    # 年化波动（20 日日收益 std ddof=1 × sqrt(252)）
+    ret = np.full(n, np.nan)
+    ret[1:] = c[1:] / c[:-1] - 1.0
+    av = np.full(n, np.nan)
+    if n >= 20:
+        av[19:] = np.nanstd(_chd_win(ret, 20), axis=1, ddof=1) * _SQRT252
+    d["annual_vol_20d"] = av
+    d["amount"] = v * 100.0 * c
+    return d
+
+
+def _chd_signals(ind, code, name):
+    c = ind["close"]
+    n = len(c)
+    lp = _chd_limit_pct(code, name)
+    ind["signal_ma_golden_5_20"] = _chd_cross_up(ind["ma5"], ind["ma20"])
+    ind["signal_macd_golden"] = _chd_cross_up(ind["macd_dif"], ind["macd_dea"])
+    ind["signal_ma20_breakout"] = _chd_cross_up(c, ind["ma20"])
+    ind["signal_boll_breakout_upper"] = c > ind["boll_upper"]
+    ind["signal_n_day_high"] = np.nan_to_num(
+        c >= _chd_prev_extreme(c, 60, "max")).astype(bool)
+    ind["signal_n_day_low"] = np.nan_to_num(
+        c <= _chd_prev_extreme(c, 60, "min")).astype(bool)
+    prev = ind["prev_close"]
+    up_price = np.round(prev * (1.0 + lp), 2)
+    limit_up = np.nan_to_num(c >= up_price - 1e-9).astype(bool)
+    limit_up[0] = False
+    ind["signal_limit_up"] = limit_up
+    streak = np.zeros(n, dtype=np.int64)
+    run = 0
+    for i in range(n):
+        run = run + 1 if limit_up[i] else 0
+        streak[i] = run
+    ind["consecutive_limit_ups"] = streak
+    ind["limit_pct"] = np.full(n, lp)
+    ind["turnover_rate"] = np.full(n, np.nan)
+    return ind
+
+
+def _chd_last_map(ind):
+    out = {}
+    for k, v in ind.items():
+        out[k] = v[-1] if isinstance(v, np.ndarray) else v
+    return out
+
+
+# ---------------- 18 策略定义（filter/scoring 与 chaodi 逐条一致） ----
+
+def _chd_p(p, key, dflt):
+    v = p.get(key, dflt)
+    return dflt if v is None else v
+
+
+def _chd_opt(cond, enabled):
+    return cond if enabled else True
+
+
+def _chd_and(*conds):
+    out = None
+    for c in conds:
+        out = c if out is None else (out & c)
+    return out
+
+
+def _chd_sig(ind, name):
+    return bool(ind[name])
+
+
+CHD_STRATEGIES = [
+    {"id": "boll_breakout", "name": "布林突破",
+     "scoring": {"vol_ratio_5d": 0.4, "change_pct": 0.3, "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["close"] > ind["boll_upper"],
+                  _chd_p(p, "require_boll_breakout", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "broken_board_recovery", "name": "断板反包",
+     "scoring": {"change_pct": 0.4, "vol_ratio_5d": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_limit_up"),
+                  _chd_p(p, "require_limit_up", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "change_pct_min", 0.03),
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "bullish_alignment", "name": "均线多头",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["ma5"] > ind["ma10"]) & (ind["ma10"] > ind["ma20"])
+                  & (ind["ma20"] > ind["ma60"]),
+                  _chd_p(p, "require_ma_alignment", True)),
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)))},
+    {"id": "consecutive_limit_ups", "name": "连板股",
+     "scoring": {"consecutive_limit_ups": 0.5, "change_pct": 0.3,
+                 "amount": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_limit_up"),
+                  _chd_p(p, "require_limit_up", True)),
+         _chd_opt(ind["consecutive_limit_ups"] >= _chd_p(p, "min_boards", 2),
+                  _chd_p(p, "use_boards_filter", True)))},
+    {"id": "high_turnover_surge", "name": "高换手拉升",
+     "scoring": {"turnover_rate": 0.4, "change_pct": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["turnover_rate"] > _chd_p(p, "min_turnover", 5.0) / 100.0,
+                  _chd_p(p, "use_turnover_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 3.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "limit_up_momentum", "name": "连板接力",
+     "scoring": {"consecutive_limit_ups": 0.4, "change_pct": 0.3,
+                 "amount": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 5.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["consecutive_limit_ups"] >= _chd_p(p, "min_boards", 1),
+                  _chd_p(p, "use_boards_filter", True)))},
+    {"id": "low_volatility_leader", "name": "低波动龙头",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)),
+         _chd_opt(ind["annual_vol_20d"] < _chd_p(p, "vol_max", 0.30),
+                  _chd_p(p, "use_volatility_filter", True)),
+         _chd_opt(ind["close"] > ind["ma20"],
+                  _chd_p(p, "require_above_ma20", True)))},
+    {"id": "ma_golden_cross", "name": "MA 金叉",
+     "scoring": {"momentum_20d": 0.5, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_ma_golden_5_20"),
+                  _chd_p(p, "require_ma_golden", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.2),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)))},
+    {"id": "macd_golden", "name": "MACD 金叉放量",
+     "scoring": {"momentum_60d": 0.4, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_macd_golden"),
+                  _chd_p(p, "require_macd_golden", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "n_day_low_reversal", "name": "新低反转",
+     "scoring": {"change_pct": 0.4, "vol_ratio_5d": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_n_day_low"),
+                  _chd_p(p, "require_n_day_low", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "near_limit_up", "name": "逼近涨停",
+     "scoring": {"change_pct": 0.5, "amount": 0.3, "momentum_5d": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 7.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["change_pct"] < ind["limit_pct"]
+                  - _chd_p(p, "limit_gap", 3.0) / 100.0,
+                  _chd_p(p, "use_limit_gap_filter", True)))},
+    {"id": "oversold_bounce", "name": "超跌反弹",
+     "scoring": {"change_pct": 0.3, "vol_ratio_5d": 0.3,
+                 "momentum_5d": 0.2, "rsi_14": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["rsi_14"] < _chd_p(p, "rsi_max", 30.0),
+                  _chd_p(p, "use_rsi_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.2),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "oversold_reversal", "name": "超跌反转",
+     "scoring": {"change_pct": 0.4, "rsi_14": 0.3, "vol_ratio_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["rsi_14"] < _chd_p(p, "rsi_max", 30.0),
+                  _chd_p(p, "use_rsi_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 1.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["close"] > ind["ma5"],
+                  _chd_p(p, "require_above_ma5", True)))},
+    {"id": "pullback_ma20_bounce", "name": "均线回踩反弹",
+     "scoring": {"momentum_60d": 0.4, "change_pct": 0.3,
+                 "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["close"] >
+                   ind["ma20"] * (1 - _chd_p(p, "ma_proximity", 2.0) / 100.0))
+                  & (ind["close"] <
+                     ind["ma20"] * (1 + _chd_p(p, "ma_proximity", 2.0) / 100.0)),
+                  _chd_p(p, "use_ma20_proximity", True)),
+         _chd_opt((ind["ma5"] > ind["ma20"]) & (ind["ma20"] > ind["ma60"]),
+                  _chd_p(p, "require_ma_alignment", True)),
+         _chd_opt(ind["change_pct"] > 0,
+                  _chd_p(p, "require_positive_change", True)))},
+    {"id": "pullback_to_support", "name": "缩量回踩",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["close"] >
+                   ind["ma20"] * (1 - _chd_p(p, "ma_proximity", 0.02)))
+                  & (ind["close"] <
+                     ind["ma20"] * (1 + _chd_p(p, "ma_proximity", 0.02))),
+                  _chd_p(p, "use_ma20_proximity", True)),
+         _chd_opt(ind["vol_ratio_5d"] < _chd_p(p, "vol_ratio_max", 0.8),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)),
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)))},
+    {"id": "strong_open", "name": "强势高开",
+     "scoring": {"change_pct": 0.4, "amplitude": 0.2, "amount": 0.4},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["open"] > ind["prev_close"]
+                  * (1 + _chd_p(p, "min_open_gap", 3.0) / 100.0),
+                  _chd_p(p, "use_open_gap_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_close_above_open", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 3.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "trend_breakout", "name": "趋势突破",
+     "basic": dict(_CHD_BASIC_TREND),
+     "scoring": {"momentum_60d": 0.4, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)),
+         _chd_opt(_chd_sig(ind, "signal_n_day_high"),
+                  _chd_p(p, "require_n_day_high", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 2.0),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "volume_price_surge", "name": "量价齐升",
+     "scoring": {"vol_ratio_5d": 0.4, "change_pct": 0.3,
+                 "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_ma20_breakout"),
+                  _chd_p(p, "require_ma20_breakout", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 2.0),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)))},
+]
+
+# 各策略参数默认值（与 chaodi 默认一致；后续 GUI 调参用）
+CHD_DEFAULTS = {
+    "boll_breakout": {"require_boll_breakout": True, "use_volume_filter": True,
+                      "vol_ratio_min": 1.5},
+    "broken_board_recovery": {"require_limit_up": True,
+                              "use_volume_filter": True, "vol_ratio_min": 1.5,
+                              "use_change_filter": True, "change_pct_min": 0.03},
+    "bullish_alignment": {"require_ma_alignment": True,
+                          "require_positive_momentum": True},
+    "consecutive_limit_ups": {"require_limit_up": True,
+                              "use_boards_filter": True, "min_boards": 2},
+    "high_turnover_surge": {"use_turnover_filter": True, "min_turnover": 5.0,
+                            "use_change_filter": True, "min_change": 3.0},
+    "limit_up_momentum": {"use_change_filter": True, "min_change": 5.0,
+                          "use_boards_filter": True, "min_boards": 1},
+    "low_volatility_leader": {"require_positive_momentum": True,
+                              "use_volatility_filter": True, "vol_max": 0.30,
+                              "require_above_ma20": True},
+    "ma_golden_cross": {"require_ma_golden": True, "use_volume_filter": True,
+                        "vol_ratio_min": 1.2, "require_above_ma60": True},
+    "macd_golden": {"require_macd_golden": True, "use_volume_filter": True,
+                    "vol_ratio_min": 1.5},
+    "n_day_low_reversal": {"require_n_day_low": True,
+                           "require_bullish_candle": True,
+                           "use_volume_filter": True, "vol_ratio_min": 1.5},
+    "near_limit_up": {"use_change_filter": True, "min_change": 7.0,
+                      "use_limit_gap_filter": True, "limit_gap": 3.0},
+    "oversold_bounce": {"use_rsi_filter": True, "rsi_max": 30.0,
+                        "require_bullish_candle": True,
+                        "use_volume_filter": True, "vol_ratio_min": 1.2},
+    "oversold_reversal": {"use_rsi_filter": True, "rsi_max": 30.0,
+                          "use_change_filter": True, "min_change": 1.0,
+                          "require_above_ma5": True},
+    "pullback_ma20_bounce": {"use_ma20_proximity": True, "ma_proximity": 2.0,
+                             "require_ma_alignment": True,
+                             "require_positive_change": True},
+    "pullback_to_support": {"use_ma20_proximity": True, "ma_proximity": 0.02,
+                            "use_volume_filter": True, "vol_ratio_max": 0.8,
+                            "require_above_ma60": True,
+                            "require_positive_momentum": True},
+    "strong_open": {"use_open_gap_filter": True, "min_open_gap": 3.0,
+                    "require_close_above_open": True, "use_change_filter": True,
+                    "min_change": 3.0},
+    "trend_breakout": {"require_above_ma60": True, "require_n_day_high": True,
+                       "use_volume_filter": True, "vol_ratio_min": 2.0},
+    "volume_price_surge": {"require_ma20_breakout": True,
+                           "use_volume_filter": True, "vol_ratio_min": 2.0,
+                           "require_bullish_candle": True},
+}
+
+
+def _chd_basic_ok(name, close, mktcap, amt, basic, listing, scan_date):
+    """与 chaodi universe.apply_basic 同序同口径（NaN 比较放行）。"""
+    from datetime import date
+    if basic.get("exclude_st", True) and "ST" in name.upper():
+        return False
+    if "退" in name or "PT" in name.upper():
+        return False
+    if not np.isfinite(close) or close <= 0:
+        return False
+    pmin = basic.get("price_min")
+    if pmin is not None and close < pmin:
+        return False
+    pmax = basic.get("price_max")
+    if pmax is not None and close > pmax:
+        return False
+    cmin = basic.get("market_cap_min")
+    if cmin is not None and (mktcap <= 0 or mktcap < cmin):
+        return False
+    amin = basic.get("amount_min")
+    if amin is not None and amt < amin:
+        return False
+    amax = basic.get("amount_max")
+    if amax is not None and amt > amax:
+        return False
+    nd = basic.get("exclude_new_days")
+    if nd and listing and scan_date:
+        try:
+            y, m, d = (int(x) for x in listing.split("-"))
+            y2, m2, d2 = (int(x) for x in scan_date.split("-"))
+            if (date(y2, m2, d2) - date(y, m, d)).days < nd:
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _chd_eval_one(code, seq, meta, shares, k, params_by_sid,
+                  min_bars=CHD_MIN_BARS, limit_bars=CHD_LIMIT_BARS,
+                  scan_date=None):
+    """单只股票：指标/信号/逐策略基础过滤/18 策略过滤（只看最后一根）。
+    返回 {sid: fields}；全部未通过时返回 {}。"""
+    n = len(seq)
+    if n < min_bars:
+        return None
+    dates = [r[0] for r in seq]
+    o = np.array([r[1] or np.nan for r in seq], dtype=np.float64)
+    h = np.array([r[2] or np.nan for r in seq], dtype=np.float64)
+    low = np.array([r[3] or np.nan for r in seq], dtype=np.float64)
+    c = np.array([r[4] or np.nan for r in seq], dtype=np.float64)
+    v = np.array([r[5] or 0.0 for r in seq], dtype=np.float64)
+    if k and k > 0:
+        o, h, low, c = o * k, h * k, low * k, c * k
+    code6 = code[2:] if code[:2] in ("sh", "sz", "bj") else code
+    if code6.startswith(("688", "689")):
+        v = v / 100.0
+    name, industry, mktcap = meta.get(code, ("", "", 0.0))
+    ind = _chd_indicators({"open": o, "high": h, "low": low,
+                           "close": c, "volume": v})
+    _chd_signals(ind, code, name)
+    sh = shares.get(code) or 0.0
+    if sh > 0:
+        ind["turnover_rate"] = v * 100.0 / sh * 100.0
+    elif mktcap > 0:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ind["turnover_rate"] = ind["amount"] / mktcap * 100.0
+    close = float(c[-1])
+    amt = float(ind["amount"][-1])
+    listing = dates[0] if n < limit_bars else ""
+    last = _chd_last_map(ind)
+    hits = {}
+    for spec in CHD_STRATEGIES:
+        basic = spec.get("basic") or CHD_BASIC
+        if not _chd_basic_ok(name, close, mktcap, amt, basic,
+                             listing, scan_date):
+            continue
+        p = params_by_sid[spec["id"]]
+        try:
+            mask = spec["filter"](last, p)
+        except Exception:
+            continue
+        if not bool(mask):
+            continue
+        fields = {"code": code, "name": name, "industry": industry,
+                  "mktcap": mktcap, "close": close,
+                  "chg": float(last["change_pct"]) * 100.0
+                  if np.isfinite(last["change_pct"]) else 0.0}
+        for f in spec["scoring"]:
+            val = last.get(f)
+            try:
+                fields[f] = float(val)
+            except (TypeError, ValueError):
+                fields[f] = None
+        hits[spec["id"]] = fields
+    return hits
+
+
+def _chd_universe_ok(code, universe):
+    if universe == "main":
+        return code.startswith(("sh60", "sz00"))
+    if universe == "etf":
+        return _is_etf(code)
+    if universe == "all_etf":
+        return True
+    return not _is_etf(code)
+
+
+def chd_comprehensive_picks(progress=None, top_n=30, universe="all",
+                            apply_perms=True, min_bars=CHD_MIN_BARS,
+                            limit_bars=CHD_LIMIT_BARS, time_budget=300):
+    """全市场 18 策略共振综合荐股（纯本地缓存，不联网）。
+
+    返回 {signal_date, universe, scanned, eligible, pool, truncated,
+          by_strategy, picks, elapsed}；picks 按综合分降序：
+    综合分 = hit_n×100 + mean_score（命中策略数优先，命中策略均分破同）。
+    """
+    if np is None:
+        raise RuntimeError("18 策略综合需要 numpy（pip install numpy）")
+    from datetime import date
+    t0 = time.time()
+    with db_conn() as conn:
+        meta = {c: (nm or "", ind or "", float(cap or 0.0))
+                for c, nm, ind, cap in conn.execute(
+                    "SELECT code,name,industry,mktcap FROM stocks")}
+        try:
+            shares = {c: float(s) for c, s in conn.execute(
+                "SELECT code,shares FROM et_shares") if s}
+        except sqlite3.OperationalError:
+            shares = {}
+        adj = {c: k for c, k in conn.execute(
+            "SELECT code,k FROM adjust WHERE k>0")}
+        try:
+            delisted = {r[0] for r in conn.execute("SELECT code FROM delisted")}
+        except sqlite3.OperationalError:
+            delisted = set()
+        last_by_code = {c: (nb, last) for c, nb, last in conn.execute(
+            "SELECT code, COUNT(*), MAX(date) FROM daily_bars "
+            "GROUP BY code HAVING COUNT(*)>=?", (min_bars,))}
+    if not last_by_code:
+        raise RuntimeError("缓存为空：请先更新行情")
+    cnt = {}
+    for _c, (_nb, last) in last_by_code.items():
+        cnt[last] = cnt.get(last, 0) + 1
+    mkt_date = max(cnt.items(), key=lambda kv: kv[1])[0]
+    codes = []
+    for c, (nb, last) in last_by_code.items():
+        if c.startswith(_CHD_INDEX_PREFIX) or c in delisted:
+            continue
+        if c.startswith("bj"):          # 北交所：与样本池/研究口径一致不入池
+            continue
+        if not _chd_universe_ok(c, universe):
+            continue
+        if apply_perms and not pick_allowed(c, meta.get(c, ("", "", 0.0))[1]):
+            continue
+        try:
+            y, m, d = (int(x) for x in last.split("-"))
+            y2, m2, d2 = (int(x) for x in mkt_date.split("-"))
+            if (date(y2, m2, d2) - date(y, m, d)).days > 3:
+                continue                # 停牌/退市边缘：最后K线过旧
+        except Exception:
+            pass
+        codes.append(c)
+    codes.sort()
+    params_by_sid = {s["id"]: dict(CHD_DEFAULTS[s["id"]])
+                     for s in CHD_STRATEGIES}
+    cands = {s["id"]: [] for s in CHD_STRATEGIES}
+    scanned = 0
+    truncated = False
+    ch = 400
+    for i in range(0, len(codes), ch):
+        chunk = codes[i:i + ch]
+        with db_conn() as conn:
+            ph = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT code,date,open,high,low,close,vol FROM ("
+                "  SELECT code,date,open,high,low,close,vol,"
+                "         ROW_NUMBER() OVER (PARTITION BY code "
+                "                            ORDER BY date DESC) rn"
+                "  FROM daily_bars WHERE code IN (%s)"
+                ") WHERE rn<=? ORDER BY code, date" % ph,
+                chunk + [limit_bars]).fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rows:
+            by.setdefault(c, []).append((d, o, h, l, cl, v))
+        for c, seq in by.items():
+            hits = _chd_eval_one(c, seq, meta, shares,
+                                 adj.get(c) or 1.0, params_by_sid,
+                                 min_bars, limit_bars, mkt_date)
+            scanned += 1
+            if not hits:
+                continue
+            for sid, fields in hits.items():
+                cands[sid].append(fields)
+        if progress:
+            progress("综合扫描 %d/%d，命中池 %d 只（%.0fs）" % (
+                min(i + ch, len(codes)), len(codes),
+                len({r["code"] for rs in cands.values() for r in rs}),
+                time.time() - t0))
+        if time.time() - t0 > time_budget:
+            truncated = True
+            break
+    # 各策略候选池内 min-max 归一化打分（score = 100 × Σ w×norm）
+    for spec in CHD_STRATEGIES:
+        rows_s = cands[spec["id"]]
+        for f, w in spec["scoring"].items():
+            vals = np.array([r.get(f) if r.get(f) is not None else np.nan
+                             for r in rows_s], dtype=np.float64)
+            finite = np.isfinite(vals)
+            if finite.sum() == 0:
+                continue
+            mn, mx = vals[finite].min(), vals[finite].max()
+            norm = np.zeros(len(rows_s))
+            if mx > mn:
+                norm[finite] = (vals[finite] - mn) / (mx - mn)
+            else:
+                norm[finite] = 0.5      # 单候选：与 chaodi 服务端口径一致
+            for r, nv in zip(rows_s, norm):
+                r["score"] = (r.get("score") or 0.0) + w * float(nv)
+        for r in rows_s:
+            r["score"] = round(float(r.get("score") or 0.0) * 100.0, 4)
+    merged = {}
+    for spec in CHD_STRATEGIES:
+        for r in cands[spec["id"]]:
+            m = merged.setdefault(r["code"], {
+                "code": r["code"], "name": r["name"],
+                "industry": r["industry"], "close": r["close"],
+                "chg": r["chg"], "hits": []})
+            m["hits"].append({"sid": spec["id"], "name": spec["name"],
+                              "score": r["score"]})
+    picks = list(merged.values())
+    for m in picks:
+        m["hits"].sort(key=lambda x: -x["score"])
+        m["hit_n"] = len(m["hits"])
+        m["mean_score"] = sum(h["score"] for h in m["hits"]) / m["hit_n"]
+        m["score"] = m["hit_n"] * 100.0 + m["mean_score"]
+        m["hit_names"] = [h["name"] for h in m["hits"]]
+    picks.sort(key=lambda m: (-m["score"], -m["mean_score"], m["code"]))
+    return {"signal_date": mkt_date, "universe": universe,
+            "scanned": scanned, "eligible": len(codes),
+            "pool": len(merged), "truncated": truncated,
+            "by_strategy": {s["id"]: {"name": s["name"],
+                                      "n": len(cands[s["id"]])}
+                            for s in CHD_STRATEGIES},
+            "picks": picks[:top_n], "elapsed": time.time() - t0}
+
+
 def chip_snapshots(rows, nbin=80, tail=120):
     """逐日演化筹码分布，返回 {日期: (支撑价, 压力价, 获利比例)}（仅尾部tail天）。"""
     bars = [r for r in rows
@@ -5522,14 +6232,45 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             if peak > 0:
                 mdd = min(mdd, v / peak - 1)
     ann = total ** (1 / years) - 1 if total > 0 else -1.0
-    return {"trades": len(trades), "wins": wins,
-            "winrate": wins / len(trades),
+    # v6.1.6：补齐「信号胜率」面板/导出所需字段，与 _bt_simulate 同义
+    # （trades 只计已平仓；浮动仓单独给 floating；面板与消融逐项一致）。
+    closed = len(trades)
+    losses = closed - wins
+    floating = (c_a[i1 - 1] / entry - 1.0) if entry else None
+    _wins = [t for t in trades if t > 0]
+    _loss = [t for t in trades if t <= 0]
+    avg_win = (sum(_wins) / len(_wins)) if _wins else 0.0
+    avg_loss = (sum(_loss) / len(_loss)) if _loss else 0.0
+    return {"trades": closed, "closed": closed, "wins": wins,
+            "losses": losses,
+            "winrate": wins / closed if closed else None,
             "total": total - 1, "ann": ann, "mdd": mdd,
+            "floating": floating,
+            "avg_win": avg_win, "avg_loss": avg_loss,
+            "profit_loss": (avg_win / abs(avg_loss) if avg_loss
+                            else float("inf")),
+            "trades_list": trades,
             "curve": curve, "i0": i0}
 
 
 RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾，不碰验证段）
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
+
+
+def _bt_segments(rows, signals, rp):
+    """全期/训练/验证三段回测（v6.1.6）：与 `run_ablation` 同引擎（`_bt_events`）
+    同切分（val=max(200, n/4)、预计算 ATR），供 GUI 面板与每只股导出复用，
+    保证与「策略消融」弹窗的交易/胜率/年化/回撤逐项一致。
+    返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。"""
+    nb = len(rows)
+    split = nb - max(200, nb // 4)
+    atrs = _precompute_atr(rows, 0, nb)
+    full = _bt_events(rows, signals, rp, 0, nb, atrs=atrs)
+    tr = (_bt_events(rows, signals, rp, 0, split, atrs=atrs)
+          if split >= 30 else None)
+    va = (_bt_events(rows, signals, rp, split, nb, atrs=atrs)
+          if nb - split >= 30 else None)
+    return full, tr, va, split
 
 
 def _ablation_recent(rows, sigs, rp, n, atrs, arrays=None):

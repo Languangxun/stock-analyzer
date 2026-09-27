@@ -51,6 +51,9 @@ def write_run_meta(run_dir, argv=None, elapsed=None, **fields):
     meta = {
         "version": app_version(),
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # 复权口径标记：2026-09-27 起库内走「真乘法后复权」；
+        # 历史产物无此字段=旧 hfq 仿射口径（仪表盘会标注作废）。
+        "adj": "mul_qfq_sina",
         "argv": list(argv) if argv else [],
         "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
     }

@@ -337,6 +337,9 @@ def _write_meta(report, run_dir, argv, elapsed):
         "universes": list(report.get("results") or {}),
         "data_end": report.get("data_end"),
         "db_stats": report.get("db_stats"),
+        # 复权口径标记（2026-09-27 切换为「真乘法后复权」；
+        # 仪表盘据此区分旧口径批次，历史目录无此字段=旧口径）
+        "adj": "mul_qfq_sina",
         "elapsed_s": round(elapsed, 1),
         "argv": list(argv),
         "python": sys.version.split()[0],

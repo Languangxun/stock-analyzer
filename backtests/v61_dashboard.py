@@ -29,6 +29,11 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 2026-09-27 数据层切换「真乘法后复权」（腾讯不复权 × 新浪复权因子）：
+# 此前的回测/GUI 导出数值全部作废，仪表盘标注「旧复权口径」仅作历史对照；
+# 新产物 run_meta/导出里带 adj 字段，不再依赖时间判断。
+_ADJ_SWITCH_TS = "2026-09-27 12:00"
+
 TABLE_FILES = ("tier_metrics.csv", "picks_metrics.csv", "phase_anns.csv",
                "picks_returns.csv", "benchmarks.csv", "equity_curves.csv")
 CHART_FILES = ("phase_box_all.svg", "phase_box_main.svg", "phase_box_etf.svg",
@@ -82,7 +87,11 @@ def collect_runs(research_dir, max_runs=6):
             rep["_meta"] = {k: meta.get(k) for k in
                             ("version", "ts", "segment", "label",
                              "universes", "data_end", "db_stats",
-                             "elapsed_s", "python", "argv")}
+                             "elapsed_s", "python", "argv", "adj")}
+            rep["legacy"] = (not meta.get("adj")) and \
+                (rep.get("ts") or "") < _ADJ_SWITCH_TS
+        else:
+            rep["legacy"] = (rep.get("ts") or "") < _ADJ_SWITCH_TS
         runs.append(rep)
         seen.add(_key(rep))
     for p in sorted(glob.glob(os.path.join(research_dir,
@@ -93,6 +102,7 @@ def collect_runs(research_dir, max_runs=6):
         if _key(rep) in seen:
             continue
         rep = _slim_report(rep)
+        rep["legacy"] = (rep.get("ts") or "") < _ADJ_SWITCH_TS
         base = os.path.basename(p)[:-5]
         rep["_dir"] = ""
         rep["_file"] = base
@@ -130,6 +140,8 @@ def collect_gui(research_dir, max_n=30):
         if not g or g.get("kind") != "gui_backtest":
             continue
         g["_file"] = os.path.basename(p)
+        g["legacy"] = (not g.get("adj")) and \
+            (g.get("ts") or "") < _ADJ_SWITCH_TS
         out.append(_slim_gui(g))
     return out[:max_n]
 
@@ -154,6 +166,9 @@ def collect_perstock(research_dir, max_files=3):
         rows = [[(v if v != "" else None) for v in r] for r in rows]
         xlsx = os.path.splitext(p)[0] + ".xlsx"
         meta = _load_json(os.path.join(os.path.dirname(p), "run_meta.json"))
+        _ts = ((meta or {}).get("ts")
+               or time.strftime("%Y-%m-%d %H:%M:%S",
+                                time.localtime(os.path.getmtime(p))))
         out.append({
             "name": os.path.relpath(p, research_dir).replace(os.sep, "/"),
             "mtime": time.strftime("%Y-%m-%d %H:%M",
@@ -161,8 +176,10 @@ def collect_perstock(research_dir, max_files=3):
             "csv": os.path.relpath(p, research_dir).replace(os.sep, "/"),
             "xlsx": (os.path.relpath(xlsx, research_dir).replace(os.sep, "/")
                      if os.path.isfile(xlsx) else ""),
+            "legacy": (not (meta or {}).get("adj")) and _ts < _ADJ_SWITCH_TS,
             "meta": ({k: meta.get(k) for k in
-                      ("ts", "mode", "bars", "codes", "rows", "elapsed_s")}
+                      ("ts", "mode", "bars", "codes", "rows", "elapsed_s",
+                       "adj")}
                      if meta else None),
             "header": header, "rows": rows,
         })
@@ -591,7 +608,7 @@ function runLabel(r){
 
 /* ---------- 各页渲染 ---------- */
 function renderHeader(){
-  const r=DATA.runs[0];
+  const r=curRun()||DATA.runs[0];
   $("#hver").textContent = r?("v"+(r.version||"?")):"";
   let s="生成 "+DATA.generated+" | 共 "+DATA.runs.length+" 个回测批次"+
         " | "+DATA.gui.length+" 条单股回测记录";
@@ -599,15 +616,19 @@ function renderHeader(){
     const d=DATA.perstock[0];
     s+=" | 每只股回测 "+d.rows.length+" 只（"+d.mtime+"）";
   }
+  const lgn=DATA.runs.filter(x=>x.legacy).length;
+  if(lgn) s+=" | ⚠ 旧复权口径批次 "+lgn+" 个（2026-09-27 前，仅历史对照）";
   if(r){ const db=r.db_stats||{};
-    s+=" | 最新批次数据截至 "+(r.data_end||"?")+
+    s+=" | 当前批次数据截至 "+(r.data_end||"?")+
        (db.codes?("（库内 "+db.codes+" 只 / "+
-        (db.bars||0).toLocaleString()+" 根）"):""); }
+        (db.bars||0).toLocaleString()+" 根）"):"");
+    if(r.legacy) s+=" ⚠ 当前批次为旧复权口径，数值已作废"; }
   $("#hsub").textContent=s;
 }
 function fillRunSelect(sel){
   sel.innerHTML=DATA.runs.map((r,i)=>
-    `<option value="${i}">${esc(runLabel(r))}</option>`).join("");
+    `<option value="${i}">${esc(runLabel(r))}`+
+    `${r.legacy?"（旧复权口径）":""}</option>`).join("");
   sel.value=String(R_.index);
 }
 function selectedTiers(){
@@ -681,7 +702,8 @@ function renderMetrics(){
     DATA.runs.slice(0,6).forEach((r,ri)=>{
       unis.forEach(u=>TIERS.forEach(t2=>{
         const m=tierOf(r,u,t2); if(!m)return;
-        h+=`<tr><td>${esc(runLabel(r))}</td><td>${esc(UNI_NAME[u]||u)}</td>`+
+        h+=`<tr><td>${esc(runLabel(r))}${r.legacy?" ⚠旧口径":""}</td>`+
+           `<td>${esc(UNI_NAME[u]||u)}</td>`+
            `<td>${esc(t2)}</td><td>${pct(m.total,1,true)}</td>`+
            `<td>${pct(m.ann,1,true)}</td><td>${pct(m.mdd,1)}</td>`+
            `<td>${num(m.sharpe,2)}</td></tr>`;
@@ -712,11 +734,13 @@ function renderGui(){
   if(sel.options.length!==DATA.gui.length){
     sel.innerHTML=DATA.gui.map((g,i)=>
       `<option value="${i}">${esc(g.code)} ${esc(g.name||"")} · `+
-      `${esc((g.strategy||{}).label||"")} · ${esc(g.ts||"")}</option>`).join("");
+      `${esc((g.strategy||{}).label||"")} · ${esc(g.ts||"")}`+
+      `${g.legacy?"（旧口径）":""}</option>`).join("");
   }
   const g=DATA.gui[+sel.value||0]; if(!g)return;
   const dates=g.curve_dates||[], curve=g.curve||[];
   const si=g.split_i||dates.length;
+  const trPct=dates.length?Math.round(100*si/dates.length):75;
   const f=g.full||{}, tr=g.train||{}, va=g.val||{};
   const ic1=g.ic1||[null,0], ic5=g.ic5||[null,0];
   const fwd=g.fwd||{};
@@ -735,11 +759,15 @@ function renderGui(){
     }).join("　");
   }
   const strat=g.strategy||{};
-  $("#g-body").innerHTML=
+  const lgNote=g.legacy?`<div class="warn">⚠ 本记录导出于 2026-09-27 `+
+    `复权口径切换前（旧 hfq 仿射口径），数值已作废；`+
+    `请在 GUI「工具→信号胜率」重新计算并导出。</div>`:"";
+  $("#g-body").innerHTML= lgNote+
     `<div class="note">${esc(g.code)} ${esc(g.name||"")} · 策略 `+
     `<b>${esc(strat.label||"")}</b> · 参数 <code>${esc(JSON.stringify(strat.params||{}))}</code></div>`+
     `<div class="note">区间 ${esc((g.range||[])[0]||"")} ~ ${esc((g.range||[])[1]||"")}`+
-    ` · 成交口径 ${g.exec==="open"?"次日开盘":"次日收盘"} · 训练/验证 = 前75% / 后25%</div>`+
+    ` · 成交口径 ${g.exec==="open"?"次日开盘":"次日收盘"} · 训练/验证 = 前`+
+    `${trPct}% / 后${100-trPct}%（与消融同引擎 _bt_events）</div>`+
     `<canvas id="cv-gcurve" style="height:360px"></canvas>`+
     `<div class="note">仅显示训练集净值（验证集只做指标检验）</div>`+
     `<table><tr><th>区间</th><th>交易</th><th>胜率</th><th>总收益</th>`+
@@ -772,7 +800,7 @@ function renderPerstock(){
   if(sel.options.length!==DATA.perstock.length){
     sel.innerHTML=DATA.perstock.map((d,i)=>
       `<option value="${i}">${esc(d.name)} · ${esc(d.mtime)} · `+
-      `${d.rows.length}只</option>`).join("");
+      `${d.rows.length}只${d.legacy?"（旧口径）":""}</option>`).join("");
   }
   const d=DATA.perstock[+sel.value||0]; if(!d)return;
   const H=d.header;
@@ -814,8 +842,11 @@ function renderPerstock(){
   const iVal=H.indexOf("验证段收益%");
   const vals=iVal>=0?rows.map(r=>parseFloat(r[iVal])).filter(isFinite):[];
   const mean=tots.length?tots.reduce((a,b)=>a+b,0)/tots.length:null;
-  $("#p-cards").innerHTML=[
-    ["筛选后只数",rows.length+" / "+d.rows.length],
+  $("#p-cards").innerHTML=
+    (d.legacy?`<div class="warn" style="grid-column:1/-1">⚠ 本批次导出于 `+
+      `2026-09-27 复权口径切换前，数值已作废；请在 GUI「数据工具→`+
+      `每只股回测导出」用新口径重跑。</div>`:"")+
+    [    ["筛选后只数",rows.length+" / "+d.rows.length],
     ["总收益中位（全期·偏乐观）",p1(median(tots))],
     ["正收益占比（全期）",(tots.length?
       (100*tots.filter(v=>v>0).length/tots.length).toFixed(0)+"%":"-")],
@@ -953,9 +984,14 @@ function initTheme(){
 }
 function init(){
   initTheme();
+  if(!DATA.runs.length){renderHeader();
+    $("#hsub").textContent="未发现回测批次（先运行 backtests/backtest_v61.py）";return;}
+  // v6.1.6：默认选最新「全期且新复权口径」批次，避免默认落到分段/旧口径
+  // 批次而与 README 不一致；分段（val/bull）与旧批次仍可在下拉切换。
+  let idx=DATA.runs.findIndex(r=>!r.legacy&&(r.segment||"full")==="full");
+  if(idx<0)idx=DATA.runs.findIndex(r=>!r.legacy);
+  R_.index=idx<0?0:idx;
   renderHeader();
-  if(!DATA.runs.length){$("#hsub").textContent="未发现回测批次（先运行 backtests/backtest_v61.py）";return;}
-  R_.index=0;
   fillRunSelect($("#c-run")); fillRunSelect($("#m-run")); fillRunSelect($("#d-run"));
   const unis=Object.keys(curRun().results||{});
   ["#c-uni","#d-uni"].forEach(sel=>{

@@ -313,14 +313,19 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 三档风险参数：保守 `(1.5, 1.01, 0.96, 3, 8)`、稳健 `(1.5, 1.02, 0.94, 2, 5)`、激进 `(2.5, 1.05, 0.90, 1, 3)`
 （顺序：atr_mult / trail_trigger / trail_ratio / buy_th / cooldown）。
 
-**GUI 单股回测面板（工具→信号胜率，2026-09-26 升级）**：`backtest_signals` 内部改为
-`_bt_simulate`（单段）+ `backtest_signals`（组合全期/分段）：前 75% 训练集、后 25% 验证集
-独立起跑；另算 **IC(T+1)/IC(T+5)**（信号方向 +1买/-1卖 vs 未来收益的 Spearman 秩相关）
-与 **信号后 1/5 日收益/上涨占比**；返回新增 `train`/`val`/`ic1`/`ic5`/`fwd`/`curve`/`trades_list`
-（旧字段完全兼容）。面板回测**与消融同窗**（`strategy_signals_full` 在近 `ABL_BARS`=1000 根
-上重算；主图仍只展示近 250 根），否则指标型策略信号会落在切分之外、或训练段落在策略数据
-起点之前（如 L2 行业ETF 2024 才有数据 → 训练集恒空、曲线水平线）——v6.1.5 热修④ 统一为
-与 `run_ablation` 相同的 1000 根窗口与 75/25 切分（688012/002491 实测修复）。面板上：收益曲线
+**GUI 单股回测面板（工具→信号胜率，2026-09-26 升级；v6.1.6 与消融统一）**：
+`backtest_signals` 内部为 `_bt_simulate`（单段）+ 组合全期/分段，用于 IC/信号后收益等
+信号质量统计；面板的**全期/训练/验证指标自 v6.1.6 起改用消融同引擎 `_bt_events`
+与同切分**（`val=max(200, n/4)`、预计算 ATR、盘中假K不计入，统一封装为 `_bt_segments`，
+GUI 面板与 `stock_backtest_export.py` 共用），
+保证与「策略消融」弹窗及每只股导出逐项一致（此前两个引擎：trades 含浮仓、
+固定前 75/25、分段 ATR 重算，sz002241 验证集 10 笔/-7.0% vs 弹窗 9 笔/-6.8%）；
+`_bt_events` 同步补齐 `closed/floating/avg_win/avg_loss/profit_loss/trades_list`
+（向后兼容，trades 只计已平仓）。另算 **IC(T+1)/IC(T+5)**（信号方向 +1买/-1卖 vs
+未来收益的 Spearman 秩相关）与 **信号后 1/5 日收益/上涨占比**。面板回测**与消融同窗**
+（`strategy_signals_full` 在近 `ABL_BARS`=1000 根上重算；主图仍只展示近 250 根），
+否则指标型策略信号会落在切分之外、或训练段落在策略数据起点之前（如 L2 行业ETF 2024
+才有数据 → 训练集恒空、曲线水平线）。面板上：收益曲线
 **只画训练集净值**（验证集底纹+指标文本，不显示净值）、训练回撤子图、B/S 信号点；
 工具窗口按屏幕自适应（最高 1320×980）。
 **面板热修（2026-09-26）**：`_draw_curve` 每次重绘先 `cv.configure(bg=BG)`（主题切换后
@@ -465,6 +470,26 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
   停止；回填新增 `--min-bars/--fresh-days/--bar-count` CLI 参数；「每只股回测导出 Excel」
   调用 `backtests/stock_backtest_export.py`（详见 4.1）。
 
+### 3.14 18 策略共振综合荐股（v6.1.6）
+- **来源**：移植 `chaodi_strategies/et_engine`（通达信口径）进 `stock_gui.py` 算法区，
+  自包含单文件（`build_cli.py` 自动并入 CLI），命名前缀 `chd_`/`CHD_`；
+- **指标/信号**：TDX 语义 EMA/递推、BOLL(ddof=1)、Wilder RSI14、5/20/60 日动量、
+  20 日年化波动、成交额≈量×100×价、涨停价 `round(prev×(1+limit_pct),2)` 与连板、
+  60 日新高低、MA/MACD/MA20 突破信号；未用指标（KDJ/ATR/DMI 等）不移植；
+- **数据口径**：hfq×adjust.k 乘法前复权；688/689 成交量「股→手」折算；
+  换手率优先 `et_shares` 总股本（缺失退回 成交额/总市值）；北交所不入池；
+  最后K线晚于市场最新日 3 天以上（停牌/退市边缘）跳过；
+- **逐策略基础过滤**：默认价 3~300 / 市值≥10亿 / 成交额≥2000万 / 剔除 ST·退市 /
+  次新 30 日；趋势突破更严（价 5~200 / 市值≥20亿 / 成交额≥1亿 / 次新 60 日）；
+  套用 `pick_allowed` 权限与 `tier_universe_mask` 同口径股票池（all/main/etf/all_etf）；
+- **打分合成**：每个策略候选池内 `score=100×Σw×(x-min)/(max-min)`（单候选 0.5，
+  与 chaodi 服务端一致），再合成 `综合分 = 命中策略数×100 + 命中策略均分`；
+  `chd_comprehensive_picks()` 返回 `signal_date/scanned/pool/by_strategy/picks/elapsed`，
+  GUI `_picks_fill_chd` 渲染（共振数/均分/命中策略，双击分析）；
+- **对拍与耗时**：500 只随机样本 × 18 策略与 chaodi 引擎命中集合逐策略一致；
+  全A约 35s（主板约 58s），纯本地缓存不联网；旧 `daily_picks` 仅留
+  `backtests/backtest_picks.py` 使用，GUI 不再调用。
+
 ---
 
 ## 四、研究与发布流程
@@ -474,9 +499,9 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 |---|---|---|
 | `backtests/backtest_v61.py` | 标准回测（4 口径 × 组合/荐股） | **每次运行建版本化目录** `research/backtest_v6.1.5_<时间戳>_<区间>[_tag]/`：`report.json/md`、`run_meta.json`、`tables/*.csv`（组合/逐笔/相位/逐笔分布/基准/净值曲线）、`charts/*.svg`；另在 `research/` 根保留 `v61_report*.json/md` 最新副本 |
 | `backtests/v61_charts.py` | 图表模块（纯标准库 SVG） | 单报告：相位/逐笔箱线 + 收益柱状（写入回测目录 `charts/`）；`--compare`：跨版本对比图 |
-| `backtests/v61_dashboard.py` | **本地网页仪表盘生成器**（自包含 HTML，零外部依赖） | `research/dashboard.html`：研究净值曲线/指标对比/分布箱线 + GUI 单股回测（读 `research/gui_backtests/*.json`）+ **每只股回测**（读 `research/perstock_backtest_v*/` 及旧 `reports/` CSV，搜索/筛选/排序/分页 + xlsx/CSV 链接 + 运行元数据）+ 明细文件链接；`backtest_v61.py` 跑完自动刷新 |
+| `backtests/v61_dashboard.py` | **本地网页仪表盘生成器**（自包含 HTML，零外部依赖） | `research/dashboard.html`：研究净值曲线/指标对比/分布箱线 + GUI 单股回测（读 `research/gui_backtests/*.json`，旧口径记录标注作废）+ **每只股回测**（读 `research/perstock_backtest_v*/` 及旧 `reports/` CSV，搜索/筛选/排序/分页 + xlsx/CSV 链接 + 运行元数据）+ 明细文件链接；**默认展示最新「全期 + 新复权口径」批次**，`legacy`（2026-09-27 切换前）批次醒目提示；`backtest_v61.py` 跑完自动刷新 |
 | `backtests/backtest_strategy_ablation.py` | 全对象消融（10 信号 × 3 档） | 版本化目录 `research/ablation_v<版本>_<时间戳>[_tag]/`：`per_stock.json`、`summary.json`、`run_meta.json`；根目录保留 `strategy_ablation_*.json` 最新副本（硬链接，兼容下游） |
-| `backtests/stock_backtest_export.py` | **每只股回测导出**（信号+事件回测逐只汇总；`--mode tiers` 默认按三档选型分表，另有 保守/稳健/激进/cached） | 版本化目录 `research/perstock_backtest_v<版本>_<时间戳>/`：`每只股回测.xlsx`（**三档=3 个工作表** + 说明）、同名 UTF-8 CSV、`run_meta.json`；`--out` 可指定；GUI「工具→数据工具」页同入口（留空=自动目录） |
+| `backtests/stock_backtest_export.py` | **每只股回测导出**（信号+事件回测逐只汇总；`--mode tiers` 默认按三档选型分表，另有 保守/稳健/激进/cached；**v6.1.6 起与消融同引擎 `_bt_segments`**） | 版本化目录 `research/perstock_backtest_v<版本>_<时间戳>/`：`每只股回测.xlsx`（**三档=3 个工作表** + 说明）、同名 UTF-8 CSV、`run_meta.json`（含 `adj` 口径标记）；`--out` 可指定；GUI「工具→数据工具」页同入口（留空=自动目录） |
 | `backtests/tier_picks_from_ablation.py` | 从消融 per-stock JSON 逐只选三档（与 GUI `_pick_one_from_pool` 同口径） | 写进源消融运行目录 `tier_picks.json`（并合并 `run_meta.json`），根目录挂 `research/perstock_tier_picks.json` 最新副本；同时刷新 GUI 策略缓存（推荐档，meta `strategy:*`，5 日 TTL） |
 | `backtests/bt_common.py` | **回测统一规范工具**：`new_run_dir` / `write_run_meta` / `link_latest` | 所有回测程序共用：`research/<kind>_v<版本>_<时间戳>[_<extra>][_<tag>]/` + `run_meta.json`（版本/时间/命令行/耗时/数据规模）+ 根目录最新副本（硬链接，跨盘回退复制） |
 | `backtests/backtest_tiers.py` | 三档分段/逐年/参数敏感性 | `research/tiers_*.json` |
@@ -508,11 +533,15 @@ stock_gui.py（引擎：APP_VERSION / tier_eval.phase_anns / tier_picks_stats.re
   （默认硬链接，跨盘回退复制）供下游脚本兼容读取；已套用：`backtest_v61`（既有）、
   `backtest_strategy_ablation`（ablation_v*）、`stock_backtest_export`（perstock_backtest_v*）、
   `tier_picks_from_ablation`（写进源消融目录）；`reports/` 只保留人类报告（清洗报告等）；
-- **本地网页仪表盘（2026-09-26）**：`v61_dashboard.py` 把回测目录的 `report.json`
-  （含 `tier_eval` 新增的 **`curve`/`curve_dates` 降采样净值曲线（≤600点/档）+ 主基准曲线**
-  `bench_curve`）与 GUI 单股回测留档内联进单个 `research/dashboard.html`（Canvas 原生绘图：
-  折线/柱状/箱线，支持对数轴与 hover），file:// 直接打开，无 CDN/服务器；
-  `backtest_v61.py` 结束自动调用（失败不影响产物）；GUI「导出回测」自动留档
+- **本地网页仪表盘（2026-09-26；v6.1.6 默认批次/口径标注）**：`v61_dashboard.py` 把回测目录的
+  `report.json`（含 `tier_eval` 新增的 **`curve`/`curve_dates` 降采样净值曲线（≤600点/档）+
+  主基准曲线** `bench_curve`）与 GUI 单股回测留档内联进单个 `research/dashboard.html`
+  （Canvas 原生绘图：折线/柱状/箱线，支持对数轴与 hover），file:// 直接打开，无 CDN/服务器；
+  v6.1.6 起**默认选最新「全期 + 新复权口径」批次**（避免默认落到 `val`/`bull` 分段而与
+  README 不一致），`legacy`（2026-09-27 复权切换前）批次/单股记录/每只股导出在下拉与页内
+  **标注「旧复权口径」且不参与默认选择**；新产物 `run_meta`/导出带 `adj="mul_qfq_sina"`
+  标记（`backtest_v61._write_meta`、`bt_common.write_run_meta`、GUI 导出 JSON），
+  不再依赖时间判断；`backtest_v61.py` 结束自动调用（失败不影响产物）；GUI「导出回测」自动留档
   `research/gui_backtests/gui_<代码>_<时间戳>.json`（`_slim_gui` 降采样后内嵌）；
 - **图表与版本对比（2026-09-25）**：报告带 `label`/`db_stats` 元数据；跑完自动出图到回测目录
   `charts/`；`--charts-only` 只补图不跑回测，`--compare all` 扫描同 segment 的历史报告做
@@ -599,6 +628,8 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.1.6 ②**<br>（2026-09-27） | **仪表盘默认批次 + 面板/消融口径统一**：`dashboard.html` 默认改选最新「全期+新复权口径」批次（原默认最新 ts=分段 val/bull，与 README 不一致），2026-09-27 切换前的批次/`gui_backtests`/`perstock` 导出打 `legacy` 标并标注作废；产物新增 `adj="mul_qfq_sina"` 口径标记（`backtest_v61`/`bt_common`/GUI 导出 JSON）。抽出 `_bt_segments`（`_bt_events` 同引擎，val=max(200,n/4)）供「信号胜率」面板与每只股导出共用，`_bt_events` 补 closed/floating/avg/盈亏比/逐笔字段（向后兼容），弹窗/面板/导出逐项一致（sz002241 验证集由 10 笔/-7.0% 对齐为 9 笔/-6.95%）。旧口径产物已重跑：消融 `ablation_v6.1.6_*` + 选型（7179 条策略缓存）+ `perstock_backtest_v6.1.6_*`。3.6/4.1/4.2 节更新 |
+| **v6.1.6 ①**<br>（2026-09-27） | **荐股新增 18 策略共振综合**：GUI 荐股下拉「综合(旧评分)」→「综合(18策略)」，移植 chaodi 通达信口径 18 策略引擎进 `stock_gui.py`（自包含、CLI 同步）：全市场单次扫描（500 根、乘法前复权、真实换手、逐策略基础过滤、权限/股票池）→ 各策略候选池 min-max 打分 → 综合分=命中策略数×100+均分；500 只×18 策略与源引擎对拍一致；旧 `daily_picks` 保留供 `backtest_picks.py` 历史回测；`APP_VERSION=6.1.6`。3.14 节新增 |
 | **v6.1.5 热修⑬**<br>（2026-09-27，版本收尾） | **筹码峰柱改细横条**：柱高由 `≈1.15×桶距、上限 8px`（连片实心楔形，视觉过粗）改为 **`0.5×桶距、上限 3.5px`**（同花顺式细条+间隙），峰形更清晰；支/压标签预留宽度保持不变。3.5 节更新；版本收尾 tag `v6.1.5` |
 | **v6.1.5 热修⑫**<br>（2026-09-27） | **筹码峰标签遮峰修复 + 文档规范化 + 新口径回测重跑**：①K线图「支/压」标签（黑底框）原右对齐到价格条左侧，会压住筹码峰最厚带/峰尖——现筹码柱先为标签预留宽度（`lab_reserve`，标签区与柱体完全错开，仍是最后绘制不被柱体盖住）；②README 重构为**用户向**（功能/快速开始/回测摘要/数据/局限 + 文档索引），历史变更流水迁入新增 `CHANGELOG.md`（`AGENTS.md` 约定同步改为写 CHANGELOG）；③数据层切换新浪因子乘法口径后全量重跑标准回测（全期 118s / 样本外 / 强势段，四口径×三档），README「回测报告」同步新数字，旧 hfq 仿射口径数字全部作废。3.5/4.2 节更新 |
 | **v6.1.5 热修⑪**<br>（2026-09-27） | **清洗程序防截断 + 降误报 + 截断修复 + 复权口径全链切换**：`data_clean.py` 迁移深度改 `max(库内根数, --depth=2400)` 按需翻页（旧版固定 2 页 ≤1600 根，热修⑩ force 修复把约 370 只长历史股截断、全库少 28.2 万根），新增 `keep_head/keep_tail` 防缩水守卫（`--allow-shrink` 才可覆盖）；扫描判定与 `stock_gui._bars_anomalous` 完全同规则（新股前10根/停牌复牌/现名回溯ST/ETF折算/指数豁免），越界 779→59 只、low_price 40→0、停牌 1316→41，新增孤立代码与北交所停更统计，扫描 238s→40s；新增 `--repair`（GUI 数据工具「截断修复」）重拉浅历史；新增 `--check-adj`「复权失真体检」检出腾讯 hfq 为分段仿射（浦发 0.63/茅台 0.82/申华 1.75），随后**全链切换**为「腾讯不复权 × 新浪累计复权因子」真乘法后复权（`stock_gui._fetch_tencent_mul/_bf_fetch_one`、`backfill_full.py`、`sync_adjust.py`、`data_clean._hfq_mul`；ETF/LOF 退 qfq，指数用不复权），全库 `--all-adj --force` 重迁**完成 7103/7105**（2 只防缩水保留），完工 `--check-adj` 300 只**失真 0**、全库扫描结构异常 0/越界 10 只；旧口径回测/因子/策略缓存需重跑。2.5 节与 `reports/数据异常报告_20260927.md` 更新 |
