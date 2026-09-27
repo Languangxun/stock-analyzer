@@ -6,7 +6,10 @@
 移动止盈，与 GUI「工具→信号胜率」同引擎），逐只汇总为一张表：
   代码/名称/区间/策略/交易数/胜率/总收益/年化/最大回撤/盈亏比/训练段/验证段/
   IC(T+1,T+5)/信号数 等。
-无 openpyxl 依赖：内置最小 xlsx 写入器（zipfile+XML），另存一份 CSV 便于查看。
+回测主体是纯 Python 循环（GIL 串行），故用**多进程**（ProcessPoolExecutor）
+而非线程实现 --workers：每只股票独立、只读库，进程间无共享状态。
+无 openpyxl 依赖：内置最小 xlsx 写入器（zipfile+XML），另存一份 CSV 便于查看；
+跑完自动刷新 `research/dashboard.html`（「每只股回测」页，失败不影响产物）。
 
 用法：
   python backtests/stock_backtest_export.py --out reports/每只股回测.xlsx
@@ -20,7 +23,7 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -173,13 +176,42 @@ def _load_rows(code, bars):
              "close": r[4], "vol": r[5]} for r in rs]
 
 
+def _event_note(rows):
+    """事件股检测：返回说明串（'' = 正常）。
+
+    命中任一即视为事件股（收益不可交易/不可复制）：
+      ① 单日复权涨跌 |ret| > 44%：超任意板块涨跌停（复牌无涨跌幅限制日）；
+      ② 相邻K线日历间隔 > 90 天（≈ 停牌超过 60 个交易日）。
+    典型：sz000578 盐湖集团 2007-07-20 停牌 → 2008-03-11 借壳复牌 +603%。"""
+    import datetime as _d
+    notes = []
+    for i in range(1, len(rows)):
+        c0, c1 = rows[i - 1]["close"], rows[i]["close"]
+        try:
+            if c0 and c1 and abs(c1 / c0 - 1.0) > 0.44:
+                notes.append(f"跳变{rows[i]['date']}({c1 / c0 - 1:+.0%})")
+        except (TypeError, ZeroDivisionError):
+            pass
+        try:
+            g = (_d.date.fromisoformat(rows[i]["date"])
+                 - _d.date.fromisoformat(rows[i - 1]["date"])).days
+            if g > 90:
+                notes.append(f"停牌{g}天至{rows[i]['date']}")
+        except (TypeError, ValueError):
+            pass
+        if len(notes) >= 4:
+            notes.append("…")
+            break
+    return "；".join(notes)
+
+
 def export_one(code, mode, bars, picks=None):
     """返回结果行列表（每只 1 行；tiers 三档模式每只 3 行）或 []。"""
     rows = _load_rows(code, bars)
     if not rows or len(rows) < 60:
         return []
     base = {"code": code, "bars": len(rows), "start": rows[0]["date"],
-            "end": rows[-1]["date"]}
+            "end": rows[-1]["date"], "event": _event_note(rows)}
 
     def _row(strat_algo, tier, label, rp):
         try:
@@ -252,6 +284,33 @@ def export_one(code, mode, bars, picks=None):
     return [_row(algo, mk, (strat or {}).get("label", ""), rp)]
 
 
+# ---------------- 多进程 worker（GIL 无关；每只独立、只读库） ----------------
+
+_JOB_MODE = "tiers"
+_JOB_BARS = 1000
+
+
+def _init_worker(mode, bars, db):
+    """子进程初始化：注入回测参数并锁定库路径（覆盖 forkserver/fork 差异）。"""
+    global _JOB_MODE, _JOB_BARS
+    _JOB_MODE, _JOB_BARS = mode, bars
+    if db:
+        sg.DB_PATH = db
+
+
+def _work_one(item):
+    """单只回测任务：item=(code, name, 该股三档选型源)。异常不终止整池。"""
+    code, name, src = item
+    try:
+        got = export_one(code, _JOB_MODE, _JOB_BARS, {code: src})
+    except Exception as e:
+        print(f"  [!] {code} {str(e)[:70]}", flush=True)
+        return []
+    for r in got:
+        r["name"] = name
+    return got
+
+
 COLS = [
     ("代码", "code"), ("名称", "name"), ("K线根数", "bars"),
     ("起始日", "start"), ("结束日", "end"), ("档位", "mode"),
@@ -261,7 +320,7 @@ COLS = [
     ("最大回撤%", "mdd"), ("盈亏比", "pl"), ("平均盈利%", "avg_win"),
     ("平均亏损%", "avg_loss"), ("浮动收益%", "float"),
     ("训练段收益%", "train"), ("验证段收益%", "val"),
-    ("IC(T+1)", "ic1"), ("IC(T+5)", "ic5"),
+    ("IC(T+1)", "ic1"), ("IC(T+5)", "ic5"), ("事件", "event"),
 ]
 
 
@@ -281,7 +340,7 @@ def main():
         ROOT, "research", "perstock_tier_picks.json"),
         help="三档选型 JSON（tier_picks_from_ablation.py 产物；"
              "也兼容 strategy_ablation_per_stock.json 全候选格式）")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=4, help="并行进程数")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--min-bars", type=int, default=250)
     args = ap.parse_args()
@@ -311,34 +370,32 @@ def main():
         print("无标的可导出")
         return
 
-    import threading
     t0 = time.time()
     rows_out = []
-    done = [0]
-    done_lock = threading.Lock()
+    done = 0
+    src_map = picks if isinstance(picks, dict) else {}
+    tasks = [(c, n, src_map.get(c)) for c, n, _n in codes]
+    workers = max(1, min(24, int(args.workers)))
+    print(f"进程池 {workers} 进程并行回测 ...", flush=True)
 
-    def work(item):
-        code, name, _n = item
-        got = []
-        try:
-            got = export_one(code, args.mode, bars, picks)
-        except Exception as e:
-            print(f"  [!] {code} {str(e)[:70]}", flush=True)
-        for r in got:
-            r["name"] = name
-        with done_lock:
-            done[0] += 1
-            if done[0] % 50 == 0 or done[0] == len(codes):
-                el = time.time() - t0
-                eta = el / done[0] * (len(codes) - done[0])
-                print(f"回测 {done[0]}/{len(codes)} "
-                      f"({done[0] * 100 // len(codes)}%) "
-                      f"耗时{el:.0f}s ETA{eta:.0f}s", flush=True)
-        return got
-
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as exp:
-        for got in exp.map(work, codes):
+    with ProcessPoolExecutor(max_workers=workers,
+                             initializer=_init_worker,
+                             initargs=(args.mode, bars, args.db)) as exp:
+        futs = [exp.submit(_work_one, t) for t in tasks]
+        for fut in as_completed(futs):
+            try:
+                got = fut.result()
+            except Exception as e:
+                got = []
+                print(f"  [!] 子进程任务失败: {str(e)[:70]}", flush=True)
             rows_out.extend(got)
+            done += 1
+            if done % 50 == 0 or done == len(codes):
+                el = time.time() - t0
+                eta = el / done * (len(codes) - done)
+                print(f"回测 {done}/{len(codes)} "
+                      f"({done * 100 // len(codes)}%) "
+                      f"耗时{el:.0f}s ETA{eta:.0f}s", flush=True)
 
     header = [c[0] for c in COLS]
     tiers = [t for t in ("保守", "稳健", "激进")
@@ -369,6 +426,9 @@ def main():
              "（全库实测：全期中位 +44~55%、正收益 92~98%，而验证段中位 "
              "-0.7%、正收益仅 46-47%）。跨股/跨档比较请优先看「训练段收益%」"
              "与「验证段收益%」两列，验证段是选型之外的留出数据"],
+            ["事件股口径", "单日复权|涨跌|>44% 或 相邻K线间隔>90天(≈停牌>60个交易日)"
+                       " → 「事件」列标注；此类收益来自重组复牌/退市整理等公司行动，"
+                       "不可交易、不可复制，仪表盘默认从统计中剔除（可在页内勾选查看）"],
             ["注意", "全表为历史统计，含样本内选型偏差，不构成投资建议"]]
 
     run_dir = None
@@ -388,17 +448,25 @@ def main():
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         cw = csv.writer(f)
         cw.writerows(_table(rows_out))
+    ev_codes = {r["code"] for r in rows_out if r.get("event")}
     if run_dir:
         bt_common.write_run_meta(
             run_dir, argv=sys.argv, elapsed=time.time() - t0,
             mode=args.mode, bars=bars, pool=args.pool, workers=args.workers,
             picks=os.path.basename(args.picks) if args.mode == "tiers" else None,
             codes=len({r["code"] for r in rows_out}), rows=len(rows_out),
-            tiers=tiers, xlsx=os.path.basename(out),
+            tiers=tiers, event_codes=len(ev_codes),
+            xlsx=os.path.basename(out),
             csv=os.path.basename(csv_path))
     print(f"完成：{len({r['code'] for r in rows_out})} 只 / "
-          f"{len(rows_out)} 行（档位 {tiers}）\n  Excel: {out}\n"
-          f"  CSV  : {csv_path}")
+          f"{len(rows_out)} 行（档位 {tiers}；事件股 {len(ev_codes)} 只已标注，"
+          f"仪表盘默认剔除）\n  Excel: {out}\n  CSV  : {csv_path}")
+    # 自动刷新本地网页仪表盘「每只股回测」页（失败不影响导出产物）
+    try:
+        from v61_dashboard import build_dashboard
+        print(f"  网页  {build_dashboard(RESEARCH)}")
+    except Exception as e:
+        print(f"网页仪表盘刷新失败（忽略）: {e}")
     print(f"总耗时 {time.time() - t0:.0f}s")
 
 

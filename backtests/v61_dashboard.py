@@ -342,11 +342,12 @@ tr:hover td{background:var(--panel2)}
   </section>
   <section id="tab-perstock" class="tab">
     <div class="ctl">
-      <label>数据 <select id="p-sel"></select></label>
+      <label>导出批次 <select id="p-sel"></select></label>
       <label>搜索 <input type="text" id="p-q" placeholder="代码 / 名称"></label>
       <label>档位 <select id="p-mode"><option value="">全部</option>
         </select></label>
       <label><input type="checkbox" id="p-pos"> 只看正收益</label>
+      <label><input type="checkbox" id="p-ev" checked> 排除事件股</label>
       <label>排序 <select id="p-sort"></select></label>
       <label>每页 <select id="p-size">
         <option>100</option><option selected>200</option>
@@ -818,9 +819,11 @@ function renderPerstock(){
   }
   const qi=$("#p-q").value.trim().toLowerCase();
   const mode=$("#p-mode").value, pos=$("#p-pos").checked;
+  const iEv=H.indexOf("事件"), exEv=$("#p-ev").checked;
   let rows=d.rows.filter(r=>{
     if(mode && r[iMode]!==mode)return false;
     if(pos && !(parseFloat(r[iTotal])>0))return false;
+    if(exEv && iEv>=0 && r[iEv])return false;
     if(qi && ((r[0]||"")+" "+(r[1]||"")).toLowerCase().indexOf(qi)<0)
       return false;
     return true;});
@@ -842,6 +845,8 @@ function renderPerstock(){
   const iVal=H.indexOf("验证段收益%");
   const vals=iVal>=0?rows.map(r=>parseFloat(r[iVal])).filter(isFinite):[];
   const mean=tots.length?tots.reduce((a,b)=>a+b,0)/tots.length:null;
+  const evCodes=new Set((iEv>=0?d.rows.filter(r=>r[iEv]):[])
+    .map(r=>r[0])).size;
   $("#p-cards").innerHTML=
     (d.legacy?`<div class="warn" style="grid-column:1/-1">⚠ 本批次导出于 `+
       `2026-09-27 复权口径切换前，数值已作废；请在 GUI「数据工具→`+
@@ -854,7 +859,8 @@ function renderPerstock(){
     ["验证段正收益",(vals.length?
       (100*vals.filter(v=>v>0).length/vals.length).toFixed(0)+"%":"-")],
     ["胜率中位",p1(median(wrs))],
-    ["回撤中位",p1(median(mdds))]
+    ["回撤中位",p1(median(mdds))],
+    [exEv?"事件股（已剔除）":"事件股（含在统计）",evCodes+" 只"]
   ].map(([k,v])=>`<div class="card"><div class="k">${k}</div>`+
     `<div class="v">${v}</div></div>`).join("");
   const size=+$("#p-size").value||0;
@@ -898,6 +904,8 @@ function renderPerstock(){
     +'跨股比较请优先看「验证段收益%」（选型之外的留出段）；已默认筛「稳健」':
     '　· 固定参数回测（无消融选型），样本内口径，绝对值偏乐观，'
     +'横向比较相对强弱可用');
+  if(iEv>=0)links+='　· 事件股=单日复权|涨跌|>44% 或 停牌>90天（重组复牌/'
+    +'退市整理等，收益不可交易、不可复制）→ 勾选「排除事件股」从统计剔除';
   $("#p-note").innerHTML=links;
 }
 function renderFiles(){
@@ -1009,7 +1017,7 @@ function init(){
   $("#c-tiers").onchange=renderCurve;
   ["#m-metric","#m-run"].forEach(s=>$(s).onchange=renderMetrics);
   $("#d-kind").onchange=renderDist; $("#d-uni").onchange=renderDist;
-  ["#p-q","#p-mode","#p-pos","#p-size"].forEach(s=>
+  ["#p-q","#p-mode","#p-pos","#p-size","#p-ev"].forEach(s=>
     $(s).onchange=()=>{PS.page=1;renderPerstock();});
   $("#p-q").oninput=()=>{PS.page=1;renderPerstock();};
   $("#p-sel").onchange=()=>{$("#p-mode").innerHTML="";PS.page=1;
