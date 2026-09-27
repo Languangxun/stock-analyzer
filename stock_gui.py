@@ -11675,7 +11675,7 @@ class App:
                 mids = [m for m, _ in vis_bins]
                 dy = (abs(ymap(mids[0]) - ymap(mids[1]))
                       if len(mids) > 1 else 2.0)
-                hb = max(1.5, min(dy * 1.15, 8))     # 柱高≈桶距 → 连成楔形
+                hb = max(1.2, min(dy * 0.5, 3.5))   # 细横条（同花顺式，留间隙）
                 for mid, wgt in vis_bins:
                     yy = ymap(mid)
                     bar_len = max(0.6, cw * wgt / maxw)
