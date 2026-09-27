@@ -1,4 +1,4 @@
-# stock-analyzer · v6.1.5
+# stock-analyzer · v6.1.6
 
 A 股短线统计研究工具：**历史形态相似度匹配 + 多维融合 + 三档组合策略 + 全量回测**。
 本地桌面 GUI 与命令行两种用法，计算全部在本地完成，AI 分析为可选增强。
@@ -56,7 +56,7 @@ python data_clean.py --check-adj --sample 300      # 复权收益率保真体检
 python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填（断点续传）
 ```
 
-## 回测报告（v6.1.5 · 数据截至 2026-09-24）
+## 回测报告（数据截至 2026-09-24）
 
 > 2026-09-27 数据层切换为**真乘法后复权**（腾讯不复权 × 新浪复权因子，修复腾讯
 > hfq 的仿射收益失真，见 `reports/数据异常报告_20260927.md`）后全量重跑。
@@ -504,7 +504,7 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 | `research/v61_report_{val,bull}.json` / `.md` | 样本外 / 强势段标准回测产物 |
 | `research/tiers_*.json` | 三档分段/逐年回测产物 |
 | `research/strategy_ablation_*.json` | 逐对象消融两层产物（逐对象 + 聚合，含覆盖率清单） |
-| `ARCHITECTURE.md` | **架构与算法说明（v6.1.4）**：目录职责、数据层、算法层（引擎/消融/AI）、研究与发布流程、已知不一致 |
+| `ARCHITECTURE.md` | **架构与算法说明（v6.1.6）**：目录职责、数据层、算法层（引擎/消融/AI）、研究与发布流程、已知不一致 |
 | `PLUGIN_API.md` | 插件 API 文档（插件开发者用，随客户端包分发） |
 | `research/legacy/results/` | 历史（v3/v4 时代）回测结果归档；对应脚本产出统一写入此处 |
 | `reports/` | 生成类报告归档：数据清洗报告（`data_clean.py` 输出）、回测复核（审计）报告、代码审查 |
