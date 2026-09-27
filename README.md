@@ -473,8 +473,8 @@ python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
 - **ETF 数据**：1785 只有 K 线、合计 181.4 万根；代码表由 `refresh_etf_codes()`
   维护（剔除货币/现金类，东财故障时走新浪兜底）。
 - **客户端数据包与研究产物**：见
-  <https://github.com/monologue-github/stock-analyzer/releases>（当前 v6.1.4 包；
-  新口径数据包待发）。
+  <https://github.com/monologue-github/stock-analyzer/releases>（当前 v6.1.6 包：
+  `stock-analyzer-client-v6.1.6-<日期>.zip` + `research_v6.1.6.zip`）。
 
 ## 项目文件
 | `CHANGELOG.md` | 版本摘要与历史变更（本 README 不再堆变更流水） |

@@ -5,6 +5,15 @@
 
 ## 版本历史
 
+> ㉝ **v6.1.6 发布打包（2026-09-27）**：客户端包名恢复带版本号
+> （`stock-analyzer-client-v6.1.6-<日期>.zip`，`build_client_zip.app_version()`
+> 从 `stock_gui.py` 读 `APP_VERSION`，读取失败退化为纯日期）；
+> `upload_research_release.py` 发布说明更新为 v6.1.6（18 策略综合 + 口径一致性 +
+> 旧口径重跑产物），默认 `--tag` 改 v6.1.6；Release 资产＝客户端包（GUI/CLI/插件 +
+> 全量 `stock_cache.db`、空 Key 模板，打包后 API Key 自检）＋研究包
+> `research_v6.1.6.zip`（回测报告/图表/仪表盘/消融选型与逐对象明细，排除
+> `legacy/` 与 `*.pkl/*.npz`）；`ARCHITECTURE` 4.4 版本链、README 发布索引同步。
+
 > ㉜ **仪表盘默认批次 + 信号胜率面板与消融口径统一（v6.1.6 第二步，2026-09-27）**：
 > ① **dashboard 与 README 不一致修复**——此前仪表盘默认取「最新 ts 批次」，
 > 而 2026-09-27 17:16/17:18 生成的是分段 `val`/`bull` 批次，默认展示强势段数字

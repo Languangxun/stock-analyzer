@@ -14,6 +14,7 @@
 """
 import argparse
 import os
+import re
 import sqlite3
 import time
 import zipfile
@@ -27,6 +28,16 @@ FILES = [
 ]
 PLUGIN_DIR = "plugins"
 PLUGIN_FILES = ["__init__.py", "api.py", "base.py", "trade_log.py"]
+
+
+def app_version():
+    """从 stock_gui.py 读 APP_VERSION（用于包名；失败则退化为纯日期）。"""
+    try:
+        with open(os.path.join(HERE, "stock_gui.py"), encoding="utf-8") as f:
+            m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', f.read())
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 # 客户端配置模板：**绝不打包本地 stock_gui.ini**（内含 API Key / 代理等私有配置）。
 # 发布包只放这份空 Key 模板，用户首次启动自行填写。
@@ -73,8 +84,10 @@ def main():
         raise SystemExit("缺少 stock_cache.db")
     if not args.no_vacuum:
         vacuum(DB)
+    ver = app_version()
     out = args.out or os.path.join(
-        DIST, f"stock-analyzer-client-{time.strftime('%Y%m%d')}.zip")
+        DIST, f"stock-analyzer-client-{('v' + ver + '-') if ver else ''}"
+              f"{time.strftime('%Y%m%d')}.zip")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     t0 = time.time()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
