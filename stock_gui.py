@@ -248,9 +248,15 @@ class CFG:
     # T+5 区间校准系数（n=4500标定 1.4最优：51.6%/79.2%）
     INTERVAL_K5 = 1.4
 
-    # ---- 风险偏好（三级·网格寻优后参数）----
+    # ---- 风险偏好（四级·网格寻优后参数）----
     # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
     # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
+    # bata=高赔率·低频（v6.1.7 热修①）：评分2+冷却8（比稳健少交易），
+    #      宽止损 ATR3.5 + 慢止盈（+5% 触发、回落10%才走），让盈利跑；
+    #      300 只 × 400 根同源对照（2026-09-28，composite 信号）：
+    #      bata 赔率中位 1.73 / 年化中位 +2.0% / 均笔 11.7；
+    #      对照保守 1.50/-1.2%/10.2 笔、稳健 1.69/-1.0%/14.1 笔、
+    #      激进 1.83/+1.5%/18.7 笔（赔率更高但换手也最高）。
     # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
@@ -260,6 +266,8 @@ class CFG:
                  "trail_ratio": 0.94, "buy_th": 2, "cooldown": 5},
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
+        "bata": {"atr_mult": 3.5, "trail_trigger": 1.05,
+                 "trail_ratio": 0.90, "buy_th": 2, "cooldown": 8},
     }
 
     def risk_params():
@@ -5376,7 +5384,8 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 # ================= 策略消融引擎（多算法回测+防过拟合选型） =================
 # 每次分析对该股近1000交易日做一次多算法消融回测：
 #   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
-#          筹码峰 / 板块轮动 / 多维评分×3风险档（全部 × 3 档风险参数）
+#          筹码峰 / 板块轮动 / 多维评分×4风险档（全部 × 4 档风险参数，
+#          v6.1.7 热修① 起含 bata=高赔率·低频）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
 # 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
 # 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
@@ -6011,7 +6020,10 @@ def _ablation_pool(cands, min_trades):
 
 
 def _ablation_weights(objective):
-    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进偏年化+Calmar。"""
+    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进偏年化+Calmar；
+    bata 偏 PF（赔率）+Calmar、弱化胜率（高赔率容忍低胜率与低频）。"""
+    if objective == "bata":
+        return {"calmar": 0.25, "pf": 0.45, "winrate": 0.10, "ann": 0.20}
     return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
             if objective == "稳健" else
             {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
@@ -6102,15 +6114,16 @@ def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
 def _pick_one_from_pool(pool, key):
     """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
 
-    key: 保守/稳健/激进；保守档限定「保守/稳健参数」候选，其余目标：
-    保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar（见 _ablation_weights）。
+    key: 保守/稳健/激进/bata；保守档限定「保守/稳健参数」候选；
+    目标权重：保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar，
+    bata=偏 PF（赔率）+Calmar（见 _ablation_weights）。
     返回 (picked, note)。"""
     p = pool
     if key == "保守":
         p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
         if p2:
             p = p2
-    obj = "激进" if key in ("均衡", "激进") else "稳健"
+    obj = {"均衡": "激进", "激进": "激进", "bata": "bata"}.get(key, "稳健")
     picked, note = pick_ablation_consistent(
         p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
     if not picked:
@@ -6398,7 +6411,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
     v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
 
-    返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat},
+    返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat, bata:strat},
           "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
     strat = {"algo","mode","params","train","val","bull","bear","label"}"""
     rows = [r for r in rows if r.get("close") and r["close"] > 0]
@@ -6524,13 +6537,15 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         return picked
 
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
-                       "激进": _pick("激进")}
-    # 三档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
+                       "激进": _pick("激进"), "bata": _pick("bata")}
+    # 四档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
     # 属训练集选型结果而非故障）；记录选型与一致性结论，便于日志核对。
-    log.info("消融选型 %s: 保守=%s[%s] | 稳健=%s[%s] | 激进=%s[%s]", full,
+    log.info("消融选型 %s: 保守=%s[%s] | 稳健=%s[%s] | 激进=%s[%s] | "
+             "bata=%s[%s]", full,
              mode_candidates["保守"]["label"], _pick_notes.get("保守"),
              mode_candidates["稳健"]["label"], _pick_notes.get("稳健"),
-             mode_candidates["激进"]["label"], _pick_notes.get("激进"))
+             mode_candidates["激进"]["label"], _pick_notes.get("激进"),
+             mode_candidates["bata"]["label"], _pick_notes.get("bata"))
 
     # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
     def _tc(t):
@@ -6538,15 +6553,15 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         if not tr or tr.get("trades", 0) < 3:
             return None
         return _calmar(tr)
-    scored = [(t, _tc(t)) for t in ("保守", "稳健", "激进")]
+    scored = [(t, _tc(t)) for t in ("保守", "稳健", "激进", "bata")]
     scored = [(t, s) for t, s in scored if s is not None]
     recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
     vol = _annualized_vol(rows)
     high_vol = bool(vol is not None and vol > 0.45)
-    # 高波动股保守档紧止损易被反复触发：推荐改在 稳健/激进 中取较优，
+    # 高波动股保守档紧止损易被反复触发：推荐改在 稳健/激进/bata 中取较优，
     # 与弹窗提示保持一致（否则会出现"推荐保守但提示别选保守"的自相矛盾）
     if high_vol and recommend == "保守":
-        alt = [(t, s) for t, s in scored if t in ("稳健", "激进")]
+        alt = [(t, s) for t, s in scored if t in ("稳健", "激进", "bata")]
         if alt:
             recommend = max(alt, key=lambda x: x[1])[0]
 
@@ -11706,7 +11721,7 @@ class App:
                 f"(策略缓存{5 - (time.time() - st.get('ts', 0)) // 86400:.0f}日内有效)")
             return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
-                              "MA/筹码峰/板块轮动/多维×3风险档, 近1000交易日)...")
+                              "MA/筹码峰/板块轮动/多维×4风险档, 近1000交易日)...")
         full = res["full_code"]
         bars = res["disp_rows"][:-1] if res.get("has_live") \
             else res["disp_rows"]
@@ -11751,7 +11766,8 @@ class App:
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
             f"每档按各自风险目标在候选中选优"
-            f"（9算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
+            f"（9算法+多维评分 × 4风险参数；保守档限定保守/稳健参数，"
+            f"bata 偏赔率/低频）\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
@@ -11763,7 +11779,7 @@ class App:
                     f"（验证集仅防过拟合参考，不参与选择）")
             if abl.get("high_vol"):
                 _msg += ("。高波动股保守档的紧止损易被反复触发，"
-                         "推荐已改在 稳健/激进 中取较优。")
+                         "推荐已改在 稳健/激进/bata 中取较优。")
             ttk.Label(win, text=_msg, foreground=AXIS_TXT, wraplength=560,
                       justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         # 可滚动容器 + 屏幕限高：小屏也不会把内容顶出可视区
@@ -11781,7 +11797,7 @@ class App:
                 lambda e: cv.itemconfigure("box", width=max(300, e.width)))
 
         sel_var = tk.StringVar(value=rec)
-        order = ("保守", "稳健", "激进")
+        order = ("保守", "稳健", "激进", "bata")
         try:
             _st = ttk.Style(win)
             _st.configure("Strat.TRadiobutton",
@@ -14641,7 +14657,7 @@ class App:
         ttk.Label(frm, text="— 预测参数（改动后需重新分析生效）—").grid(
             row=7, column=0, columnspan=3, sticky="w")
 
-        # 风险偏好（三级：止损宽度/移动止盈/买入阈值/冷却）
+        # 风险偏好（四级：止损宽度/移动止盈/买入阈值/冷却）
         ttk.Label(frm, text="风险偏好").grid(row=8, column=0, sticky="w",
                                              pady=2)
         risk_var = tk.StringVar(value=CFG.RISK_MODE)
@@ -14649,7 +14665,8 @@ class App:
                                 state="readonly",
                                 values=list(CFG.RISK_PARAMS.keys()))
         cmb_risk.grid(row=8, column=1, sticky="w", pady=2)
-        ttk.Label(frm, text="保守=紧止损少交易 激进=宽止损多交易").grid(
+        ttk.Label(frm, text="保守=紧止损少交易 激进=宽止损多交易 "
+                            "bata=宽止损慢止盈（高赔率低频）").grid(
             row=8, column=2, sticky="w")
 
         def _int_var(attr, lo, hi):

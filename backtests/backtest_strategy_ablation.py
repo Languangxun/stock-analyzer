@@ -5,7 +5,7 @@
 对每个对象（个股 + ETF）逐个独立消融：
   1. 取近 1000 交易日（≥200 根才纳入，覆盖率清单写入 summary.coverage）；
   2. 生成 10 类基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态/
-     **L2同行业+行业ETF**/筹码峰/板块轮动）+ 多维评分 × 3 档风险；
+     **L2同行业+行业ETF**/筹码峰/板块轮动）+ 多维评分 × 4 档风险（v6.1.7 热修① 起含 bata）；
      消融全程本地计算，AI 不参与；
   3. 训练集（前 75%）选型，验证集（后 25%）只报告；
   4. 多指标结合选优：训练集 Calmar/盈亏比/胜率/年化 横截面 rank 加权，
@@ -139,7 +139,7 @@ def run_ablation_for_stock(args):
     # 预计算 ATR(14) 与多维评分指标，所有候选/档位复用（关键提速）
     atrs = _precompute_atr(rows, 0, n)
     # numpy 加速（v6.1.3）：OHLC 平行数组与日期列表只抽一次，
-    # 供本对象全部候选（10 算法 × 3 档）回测复用，避免重复字典取值
+    # 供本对象全部候选（10 算法 × 4 档）回测复用，避免重复字典取值
     arrays = ([r.get("open") or 0.0 for r in rows],
               [r["high"] for r in rows],
               [r["low"] for r in rows],
@@ -197,7 +197,7 @@ def run_ablation_for_stock(args):
                 "bear": bear,
             })
 
-    # 多维评分 × 3 档风险（指标只算一次）
+    # 多维评分 × 4 档风险（指标只算一次）
     comp_pre = _composite_precompute(rows)
     for mode, rp in CFG.RISK_PARAMS.items():
         try:

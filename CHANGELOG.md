@@ -5,6 +5,23 @@
 
 ## 版本历史
 
+> ㊳ **v6.1.7 热修①：买卖点风险偏好新增 bata 档（高赔率·低频，2026-09-28）**：
+> ① **参数**——`CFG.RISK_PARAMS` 增 `bata = (atr_mult 3.5, trail_trigger 1.05,
+> trail_ratio 0.90, buy_th 2, cooldown 8)`：比稳健（ATR1.5/冷却5）止损更宽、
+> 止盈更慢（+5% 才启动移动止盈、回落 10% 才走）、交易更少；经 300 只 × 400 根
+> 同源对照选出（`_composite_signals` + `backtest_signals`）：bata 赔率中位 **1.73** /
+> 年化中位 **+2.0%** / 均笔 11.7，对照保守 1.50/-1.2%/10.2 笔、
+> 稳健 1.69/-1.0%/14.1 笔、激进 1.83/+1.5%/18.7 笔。
+> ② **消融集成**——`_ablation_weights` 新增 bata 目标（PF 0.45 / Calmar 0.25 /
+> 年化 0.20 / 胜率 0.10），`_pick_one_from_pool` 按其映射；`run_ablation` 候选
+> 30→**40**（10 算法 × 4 参数），输出四档 `mode_candidates`、日志与推荐，
+> 高波动股回退范围加 bata；策略弹窗 `order` 加 bata（可单选应用），
+> 设置页「风险偏好」下拉自动含 bata。
+> ③ **文档**——README「四档风险参数」表 + bata 对照段、ARCHITECTURE 3.6/3.8/变更索引、
+> 消融脚本注释同步；`build_cli.py` 重新生成 `stock_predict.py`。
+> 注：逐股多维评分的绝对收益整体偏弱（与既有「样本外归零」结论一致），
+> bata 档定位为同族中「赔率优先、换手更低」的参数档，不代表组合层 bata 策略。
+
 > ㊲ **v6.1.7：新增第四档 bata（高赔率·低频·允许打板，四口径）**（2026-09-27）：
 > ① **引擎支持**——`tier_build_features` 新增 `beta60_star`（对科创50 的 60 日 β），
 > `tier_make_score` 新增 `mom`（纯动量）/`beta_star`（扫描用，后证伪），
