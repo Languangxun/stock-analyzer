@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tier_picks_from_ablation.py - 从消融 per-stock JSON 生成三档选型 + 刷新 GUI 策略缓存
+"""tier_picks_from_ablation.py - 从消融 per-stock JSON 生成四档选型 + 刷新 GUI 策略缓存
 
 用途（v6.1.5 热修⑥，配合"近端门槛改用训练段末尾"的泄漏修复）：
   1. 读 `research/strategy_ablation_per_stock.json`（backtest_strategy_ablation.py 产物，
      含每只股票的全部候选 all_candidates）；
   2. 用与 GUI `run_ablation` 完全相同的选型逻辑（`sg._pick_one_from_pool`）逐只选出
-     保守/稳健/激进三档策略；
-  3. 写瘦身文件 `research/perstock_tier_picks.json`（只含三档 algo/params/label，
+     保守/稳健/激进/bata 四档策略；
+  3. 写瘦身文件 `research/perstock_tier_picks.json`（只含四档 algo/params/label，
      供 stock_backtest_export.py --mode tiers 使用，避免每次加载 100MB+ 全候选）；
   4. 按训练集 Calmar（年化波动 >45% 时避开保守档，与 GUI 推荐一致）选出「推荐档」，
      用 `sg.save_strategy` 写回 GUI 策略缓存（meta 表，5 日 TTL），
@@ -95,7 +95,7 @@ def main():
         per = json.load(f)
     print(f"  {len(per)} 只，耗时 {time.time() - t0:.0f}s", flush=True)
 
-    out, n_rec = {}, {"保守": 0, "稳健": 0, "激进": 0}
+    out, n_rec = {}, {"保守": 0, "稳健": 0, "激进": 0, "bata": 0}
     n_cache = 0
     conn = sg._cx() if not args.no_cache else None
     items = per[:args.limit] if args.limit else per
@@ -107,7 +107,7 @@ def main():
         if not pool:
             continue
         picks, full = {}, {}
-        for tier in ("保守", "稳健", "激进"):
+        for tier in ("保守", "稳健", "激进", "bata"):
             picked, _note = sg._pick_one_from_pool(pool, tier)
             full[tier] = picked
             picks[tier] = {"algo": picked.get("algo", "composite"),
@@ -118,7 +118,7 @@ def main():
         out[code] = picks
         # 推荐档：训练集 Calmar（高波动避开保守），与 GUI run_ablation 一致
         scored = [(t, _calmar(full[t].get("train")))
-                  for t in ("保守", "稳健", "激进")
+                  for t in ("保守", "稳健", "激进", "bata")
                   if (full[t].get("train") or {}).get("trades", 0) >= 3]
         rec = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
         try:
@@ -126,7 +126,7 @@ def main():
         except Exception:
             vol = None
         if rec == "保守" and vol is not None and vol > 0.45:
-            alt = [(t, v) for t, v in scored if t in ("稳健", "激进")]
+            alt = [(t, v) for t, v in scored if t in ("稳健", "激进", "bata")]
             if alt:
                 rec = max(alt, key=lambda x: x[1])[0]
         n_rec[rec] = n_rec.get(rec, 0) + 1

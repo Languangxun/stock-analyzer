@@ -7334,12 +7334,12 @@ def analyze(full, progress=None, quick=False):
             band_algo = "趋势跟踪·MA20/60（无信号→回退多维）"
     # 连续同向信号压缩：同一轮机会只保留首个 B/S 标注（回测开平仓语义不变）
     signals = _dedup_signals(signals)
-    # ---- 激进档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
-    # （沿用该档风险参数：激进=买点门槛1/冷却3），保证震荡区间（如 5~6 元
-    # 箱体）也能标出足够波段买卖点。只影响展示与样本内统计，不改动消融缓存。
+    # ---- 激进/bata 档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
+    # （沿用该档风险参数：激进=买点门槛1/冷却3、bata=门槛2/冷却8），保证震荡区间
+    # （如 5~6 元箱体）也能标出足够波段买卖点。只影响展示与样本内统计，不改动消融缓存。
     _win = max(1, len(disp_rows) - 250)
     _recent_n = len([s for s in signals if s[0] >= _win])
-    _min_need = 8 if sel_mode == "激进" else 2
+    _min_need = 8 if sel_mode in ("激进", "bata") else 2
     if _recent_n < _min_need:
         try:
             _fb = [s for s in _composite_signals(disp_rows, rp)
@@ -10046,6 +10046,34 @@ AI_SYSTEM_PROMPT = (
     "禁止模棱两可、禁止罗列所有可能性。结论先行，再用不超过3条核心依据支撑，"
     "最后一行给风险提示。回答简洁，不写套话。")
 
+# 风险偏好 → AI 行为约束（v6.1.7 热修②）。
+# 档次排序：保守 < 稳健 < 激进 < bata（bata 风险偏好高于激进）。
+# 目的：AI 结论必须随所选风险偏好变化，不再一律"等趋势企稳再观望"。
+RISK_AI_GUIDE = {
+    "保守": "风险偏好=保守（最低档）：重确认、轻仓位；等待趋势企稳／突破确认"
+            "或回踩支撑再介入，宁可错过不可做错，严格控制回撤，仓位建议 ≤2 成。",
+    "稳健": "风险偏好=稳健：兼顾趋势与风险；可接受回踩确认，但必须给出可执行"
+            "的买点/卖点/止损，仓位建议 2~4 成，不要只给『观望』。",
+    "激进": "风险偏好=激进（进攻档）：趋势启动/放量突破即可给出买入或加仓，"
+            "容忍更大波动与回撤；不要用『等待企稳/等待回踩/先观望』作为默认"
+            "结论，仓位建议 4~6 成。",
+    "bata": "风险偏好=bata（最高档，高于激进）：目标是高赔率、低频、敢下手。"
+            "强势突破/加速/涨停附近可直接给出买入或打板（涨停价）建议，允许"
+            "集中仓位（6~8 成）并接受更大回撤；禁止用『等待趋势企稳/等待确认/"
+            "观望』搪塞，必须给出明确的进攻性动作与具体价位。",
+}
+
+
+def ai_risk_guide(mode=""):
+    """按风险偏好返回 AI 行为约束（bata 高于激进；未知/空回退稳健）。"""
+    return RISK_AI_GUIDE.get(mode or CFG.RISK_MODE,
+                             RISK_AI_GUIDE["稳健"])
+
+
+def ai_system_prompt(mode=""):
+    """AI 系统提示词 = 通用分析要求 + 当前风险偏好行为约束。"""
+    return AI_SYSTEM_PROMPT + "\n" + ai_risk_guide(mode)
+
 AI_CACHE_MAX = 24          # 单股缓存对话条数上限（含首条数据上下文）
 
 # 自有客户端标识：opencode zen 等网关要求非通用 HTTP 库 UA（否则 Cloudflare
@@ -10138,20 +10166,24 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
 
 
 def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
-                  session=""):
-    """单轮调用 OpenAI 兼容 chat 接口（纯标准库）。model 缺省用 AI_MODEL。"""
+                  session="", system=None):
+    """单轮调用 OpenAI 兼容 chat 接口（纯标准库）。model 缺省用 AI_MODEL。
+    system 缺省用 ai_system_prompt()（含当前风险偏好行为约束）。"""
     return _deepseek_chat(api_key, [{"role": "user", "content": prompt}],
-                          model, timeout, session=session)
+                          model, timeout, session=session, system=system)
 
 
-def _deepseek_chat(api_key, messages, model=None, timeout=90, session=""):
+def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
+                   system=None):
     """多轮调用 OpenAI 兼容 chat 接口。messages 为 [{role,content},...]，
     首条 user 消息应携带完整共享数据上下文，后续追问只追加新问题，
     从而复用同一份数据（不重复拼装）。model 缺省用 ini 配置的 AI_MODEL。
+    system 缺省用 ai_system_prompt()（通用要求+当前风险偏好约束）。
     session 见 _ai_session_id（opencode zen 必需）。"""
     payload = {
         "model": model or AI_MODEL,
-        "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+        "messages": [{"role": "system",
+                      "content": system or ai_system_prompt()}]
                     + list(messages),
         "temperature": 0.3,
     }
@@ -10276,7 +10308,7 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         '{"tier": "稳健|均衡|激进|bata", "reason": "不超过40字"}')
     try:
         text = deepseek_chat(key, prompt, model=model or AI_MODEL,
-                             timeout=timeout,
+                             timeout=timeout, system=AI_SYSTEM_PROMPT,
                              session=_ai_session_id("tier", model or AI_MODEL))
         m = re.search(r'"tier"\s*:\s*"([^"]+)"', text or "")
         tier = m.group(1).strip() if m else ""
@@ -13567,7 +13599,11 @@ class App:
             f"你是专业A股短线分析师。请给出果断、可执行的结论（禁止模棱两可）："
             f"首行必须明确操作（买入/持有/卖出/观望）与仓位建议，"
             f"随后给具体买点/卖点/止损价位（参考下方支撑/压力），"
-            f"再用不超过3条依据支撑，最后一行风险提示。用中文，300字内。\n\n"
+            f"再用不超过3条依据支撑，最后一行风险提示。用中文，300字内。\n"
+            f"当前风险偏好：{res.get('risk_mode') or CFG.RISK_MODE}｜"
+            f"{ai_risk_guide(res.get('risk_mode') or CFG.RISK_MODE)}\n"
+            f"（必须按该风险偏好给结论：低档可等确认，激进/bata 禁止用"
+            f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
             f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
             f"昨收{res['prev_close']:.2f} 今开{q['open']:.2f}"
             f"(缺口{res['gap_today']:+.2f}%) 现价{cur_px:.2f}\n"
@@ -14298,9 +14334,9 @@ class App:
         ttk.Spinbox(e1, from_=250, to=2400, increment=50, width=6,
                     textvariable=ex_bars).pack(side="left", padx=(2, 10))
         ttk.Label(e1, text="策略档:").pack(side="left")
-        ex_mode = tk.StringVar(value="三档(分表)")
+        ex_mode = tk.StringVar(value="四档(分表)")
         ttk.Combobox(e1, textvariable=ex_mode, width=12, state="readonly",
-                     values=["三档(分表)", "保守", "稳健", "激进",
+                     values=["四档(分表)", "保守", "稳健", "激进", "bata",
                              "当前缓存策略"]
                      ).pack(side="left", padx=(2, 10))
         e2 = ttk.Frame(ex)
@@ -14381,9 +14417,9 @@ class App:
         def run_export():
             pool = {"全部(非北交所)": "all", "主板": "main",
                     "仅缓存≥目标根数": "deep"}.get(ex_pool.get(), "all")
-            mode = {"三档(分表)": "tiers", "保守": "保守", "稳健": "稳健",
-                    "激进": "激进", "当前缓存策略": "cached"}.get(
-                        ex_mode.get(), "tiers")
+            mode = {"四档(分表)": "tiers", "保守": "保守", "稳健": "稳健",
+                    "激进": "激进", "bata": "bata",
+                    "当前缓存策略": "cached"}.get(ex_mode.get(), "tiers")
             cmd = [sys.executable,
                    os.path.join(here, "backtests",
                                 "stock_backtest_export.py"),

@@ -408,7 +408,7 @@ GUI 面板与 `stock_backtest_export.py` 共用），
   策略缓存 5 日。
 - **多档同选说明（2026-09-26 备案）**：选型按指标 rank 而非档位名匹配参数，当同一候选
   在稳健（偏 Calmar/PF）与激进（偏年化）两套权重下都排第一时，各档会选到同一策略，
-  属训练集选型结果（如 sz002241 三档均为「多维评分·稳健」）；抽样 40 只中 18 只同选、
+  属训练集选型结果（如 sz002241 各档均为「多维评分·稳健」）；抽样 40 只中 18 只同选、
   22 只有差异。每次选型写入 `stock_gui.log`（`消融选型 ...`），便于核对；若需强制分化
   须先回测验证，当前不引入。
 
@@ -418,7 +418,7 @@ GUI 面板与 `stock_backtest_export.py` 共用），
   并带稳定会话头 `x-opencode-session`（opencode zen 必需，缺失报 400 MissingSessionID；同股同模型复用，
   换股/换模型/换用途区分）；其他平台忽略该头；
 - **模型列表自动获取**：打开设置自动拉 `GET {base}/models`，可手动刷新，失败可手填；
-- **提示词**：要求「直接给买/卖/观望 + 唯一首选方向 + 价位区间 + 建议仓位」，禁止模棱两可，结论先行、≤3 条依据、末行风险提示；
+- **提示词（v6.1.7 热修② 按风险偏好动态生成）**：通用要求「直接给买/卖/观望 + 唯一首选方向 + 价位区间 + 建议仓位，禁止模棱两可，结论先行、≤3 条依据、末行风险提示」+ `RISK_AI_GUIDE` 行为约束——保守=等确认/轻仓，稳健=兼顾但须可执行，激进=突破即进攻、禁用「等企稳/观望」搪塞，**bata（最高档，高于激进）=高赔率敢下手、可直接给打板（涨停价）与集中仓位建议、禁止等企稳措辞**；系统提示词（`ai_system_prompt`）与首条用户上下文都带该约束（风险偏好变化 → 上下文 hash 变化 → 自动重新提问，不复用旧风险口径的缓存回答）；
 - **数据上下文**：快照/缺口/量比/板块、5/20/60 日收益与 60 日位置、20 日均额与波动、近 15 日 OHLCV、
   MA/MACD/KDJ/RSI/布林/ADX、形态预测分位与上行概率、近期信号、市场简报（含四档闸门+科创50）、筹码分布、多维评估；
 - **多轮缓存**：同股同模型对话存 SQLite（`meta` 的 `ai:<code>:<model>`）与内存，**数据未变直接复用**，
@@ -509,8 +509,8 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 | `backtests/v61_charts.py` | 图表模块（纯标准库 SVG） | 单报告：相位/逐笔箱线 + 收益柱状（写入回测目录 `charts/`）；`--compare`：跨版本对比图 |
 | `backtests/v61_dashboard.py` | **本地网页仪表盘生成器**（自包含 HTML，零外部依赖） | `research/dashboard.html`：研究净值曲线/指标对比/分布箱线 + GUI 单股回测（读 `research/gui_backtests/*.json`，旧口径记录标注作废）+ **每只股回测**（读 `research/perstock_backtest_v*/` 及旧 `reports/` CSV，搜索/筛选/排序/分页 + xlsx/CSV 链接 + 运行元数据；**默认勾选「排除事件股」**，卡片/表格剔除重组复牌/长停牌等不可交易收益）+ 明细文件链接；**默认展示最新「全期 + 新复权口径」批次**，`legacy`（2026-09-27 切换前）批次醒目提示；`backtest_v61.py` 跑完自动刷新 |
 | `backtests/backtest_strategy_ablation.py` | 全对象消融（10 信号 × 3 档） | 版本化目录 `research/ablation_v<版本>_<时间戳>[_tag]/`：`per_stock.json`、`summary.json`、`run_meta.json`；根目录保留 `strategy_ablation_*.json` 最新副本（硬链接，兼容下游） |
-| `backtests/stock_backtest_export.py` | **每只股回测导出**（信号+事件回测逐只汇总；`--mode tiers` 默认按三档选型分表，另有 保守/稳健/激进/cached；**v6.1.6 起与消融同引擎 `_bt_segments`**；回测主体为纯 Python 循环，**v6.1.6 ③ 起 `--workers`=多进程 `ProcessPoolExecutor` 并行进程数**，任务按股票拆分、参数/库路径 initializer 注入；**v6.1.6 ⑤ 起事件股检测**——单日复权|涨跌|>44% 或相邻K线间隔>90天（≈停牌>60交易日）记入「事件」列并计入 `run_meta.event_codes`；跑完自动刷新 `dashboard.html`） | 版本化目录 `research/perstock_backtest_v<版本>_<时间戳>/`：`每只股回测.xlsx`（**三档=3 个工作表** + 说明）、同名 UTF-8 CSV、`run_meta.json`（含 `adj` 口径标记）；`--out` 可指定；GUI「工具→数据工具」页同入口（留空=自动目录） |
-| `backtests/tier_picks_from_ablation.py` | 从消融 per-stock JSON 逐只选三档（与 GUI `_pick_one_from_pool` 同口径） | 写进源消融运行目录 `tier_picks.json`（并合并 `run_meta.json`），根目录挂 `research/perstock_tier_picks.json` 最新副本；同时刷新 GUI 策略缓存（推荐档，meta `strategy:*`，5 日 TTL） |
+| `backtests/stock_backtest_export.py` | **每只股回测导出**（信号+事件回测逐只汇总；`--mode tiers` 默认按四档选型分表，另有 保守/稳健/激进/bata（单档固定风险参数，v6.1.7 热修② 修正并新增 bata）/cached；**v6.1.6 起与消融同引擎 `_bt_segments`**；回测主体为纯 Python 循环，**v6.1.6 ③ 起 `--workers`=多进程 `ProcessPoolExecutor` 并行进程数**，任务按股票拆分、参数/库路径 initializer 注入；**v6.1.6 ⑤ 起事件股检测**——单日复权|涨跌|>44% 或相邻K线间隔>90天（≈停牌>60交易日）记入「事件」列并计入 `run_meta.event_codes`；跑完自动刷新 `dashboard.html`） | 版本化目录 `research/perstock_backtest_v<版本>_<时间戳>/`：`每只股回测.xlsx`（**四档=4 个工作表** + 说明）、同名 UTF-8 CSV、`run_meta.json`（含 `adj` 口径标记）；`--out` 可指定；GUI「工具→数据工具」页同入口（留空=自动目录） |
+| `backtests/tier_picks_from_ablation.py` | 从消融 per-stock JSON 逐只选四档（与 GUI `_pick_one_from_pool` 同口径，含 bata） | 写进源消融运行目录 `tier_picks.json`（并合并 `run_meta.json`），根目录挂 `research/perstock_tier_picks.json` 最新副本；同时刷新 GUI 策略缓存（推荐档，meta `strategy:*`，5 日 TTL） |
 | `backtests/bt_common.py` | **回测统一规范工具**：`new_run_dir` / `write_run_meta` / `link_latest` | 所有回测程序共用：`research/<kind>_v<版本>_<时间戳>[_<extra>][_<tag>]/` + `run_meta.json`（版本/时间/命令行/耗时/数据规模）+ 根目录最新副本（硬链接，跨盘回退复制） |
 | `backtests/backtest_tiers.py` | 四档分段/逐年/参数敏感性 | `research/tiers_*.json` |
 | `backtests/sweep_bata.py` | **bata 档选型扫描**（`score×top×reb×闸门` 100+ 组合 + `--phase` 闸门对照 + `--neighbors` 邻域/打板对照；仅训练段选型） | `research/bata_sweep_<时间戳>/`：`sweep.json` / `phase2.json` / `neighbors.json` |
@@ -638,6 +638,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.1.7 热修②**<br>（2026-09-28） | **AI 提示词按风险偏好 + 风险偏好入口补 bata**：`RISK_AI_GUIDE`/`ai_system_prompt()`（保守<稳健<激进<bata；激进/bata 禁用「等企稳/观望」搪塞，bata 允许打板与集中仓位），系统提示词与首轮上下文均注入且随风险偏好变化使 hash 变化（自动重问、不复用旧答案），`ai_choose_tier` 用基础提示词；逐股导出 `tiers` 加 bata（4 工作表）、单档模式修正为固定该档参数并支持 bata，`tier_picks_from_ablation` 四档选型/推荐、GUI 导出下拉「四档(分表)+bata」、激进档多交易兜底扩至 bata。3.9/3.6/4.1 节与 README/CHANGELOG 同步 |
 | **v6.1.7 热修①**<br>（2026-09-28） | **买卖点风险偏好新增 bata 档（高赔率·低频）**：`CFG.RISK_PARAMS["bata"] = (atr3.5 / 触发+5% / 回落10% / buy_th2 / cd8)`——宽止损 + 慢止盈、比稳健更少交易；`_ablation_weights` 增 bata 目标（PF 0.45 / Calmar 0.25 / 年化 0.20 / 胜率 0.10，偏赔率），`_pick_one_from_pool` 按档映射目标，`run_ablation` 输出四档 `mode_candidates` + 日志 + 推荐，弹窗 `order` 与高波动回退加入 bata，设置页风险偏好下拉自动含 bata；参数由 300 只 × 400 根同源对照选出（赔率中位 1.73 / 年化 +2.0% / 均笔 11.7，对照稳健 1.69/-1.0%/14.1 笔）。3.6/3.8 节与 README/CHANGELOG 同步 |
 | **v6.1.7**<br>（2026-09-27） | **新增第四档 bata（高赔率·低频·允许打板，四口径）**：`TIER_CFG`/`_MAIN`/`_ETF`/`_ALLETF` 各加 `bata`，统一 `blend_mom`／Top5／20 日调仓／MA60 闸门（全A/主板/全A含ETF=科创50门，ETF=创业板指门），主基准科创50、`allow_limit_up=True` 解除「涨停不买」（回测 1.3%~1.9% 买在涨停价）；`tier_sim_phase` 辨识 `cfg.allow_limit_up`，`tier_build_features` 增 `beta60_star`（对科创50 β）、`tier_make_score` 增 `mom`/`beta_star`（扫描后证伪/弃用）；`ai_market_brief` 增科创50 与四档闸门、`ai_choose_tier`/GUI 荐股 MODES/设置偏好加 bata；生产端 `tier_latest_picks` 输出 `limit_up` 标记并在报告/列表提示打板口径；新增 `backtests/sweep_bata.py`（100+ 组合扫描 + 闸门/邻域复核，产物 `research/bata_sweep_*/`）；`APP_VERSION=6.1.7`，全期/样本外/强势段四口径重跑（`research/backtest_v6.1.7_*`），`v61_charts`/`v61_dashboard` 档位列表加 bata。3.7/4.1/4.2 节与 README/CHANGELOG 同步 |
 | **v6.1.6 ⑤**<br>（2026-09-27） | **每只股回测事件股检测 + 仪表盘默认剔除**：`sz000578` 全期 +2564% 核查为 2007-07-20→2008-03-11 借壳复牌（复权 +603%，不复权约 4.8→30.2）的停牌穿越收益；`stock_backtest_export.py` 加「事件」列（单日复权\|涨跌\|>44% 或相邻K线间隔>90天，`run_meta.event_codes`=180/6897），`v61_dashboard.py` 每只股页加「排除事件股」勾选（默认开）并从卡片/表格统计剔除；新批次 `perstock_backtest_v6.1.6_20260927_220255`（8 进程 329s）。4.1 节更新 |

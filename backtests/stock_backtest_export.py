@@ -206,7 +206,7 @@ def _event_note(rows):
 
 
 def export_one(code, mode, bars, picks=None):
-    """返回结果行列表（每只 1 行；tiers 三档模式每只 3 行）或 []。"""
+    """返回结果行列表（每只 1 行；tiers 多档模式每只 4 行）或 []。"""
     rows = _load_rows(code, bars)
     if not rows or len(rows) < 60:
         return []
@@ -262,7 +262,7 @@ def export_one(code, mode, bars, picks=None):
         pool = (sg._ablation_pool(src, 8)
                 if isinstance(src, list) and src else [])
         rows_out = []
-        for tier in ("保守", "稳健", "激进"):
+        for tier in ("保守", "稳健", "激进", "bata"):
             pk = src.get(tier) if isinstance(src, dict) else None
             if pk is None and pool:      # 兼容全候选格式：就地按档选型
                 pk, _note = sg._pick_one_from_pool(pool, tier)
@@ -277,6 +277,12 @@ def export_one(code, mode, bars, picks=None):
                                      sg.CFG.RISK_PARAMS.get(
                                          tier, sg.CFG.RISK_PARAMS["稳健"])))
         return rows_out
+    if mode in sg.CFG.RISK_PARAMS:       # 单档：固定用该档风险参数
+        strat = sg.load_strategy(code)
+        algo = (strat or {}).get("algo") or "composite"
+        rp = dict(sg.CFG.RISK_PARAMS[mode])
+        return [_row(algo, mode,
+                     f"{sg.ALGO_LABEL.get(algo, algo)}·{mode}", rp)]
     strat = sg.load_strategy(code) if mode == "cached" else None
     algo = (strat or {}).get("algo") or "composite"
     rp = (strat or {}).get("params") or sg.CFG.RISK_PARAMS["稳健"]
@@ -299,7 +305,7 @@ def _init_worker(mode, bars, db):
 
 
 def _work_one(item):
-    """单只回测任务：item=(code, name, 该股三档选型源)。异常不终止整池。"""
+    """单只回测任务：item=(code, name, 该股四档选型源)。异常不终止整池。"""
     code, name, src = item
     try:
         got = export_one(code, _JOB_MODE, _JOB_BARS, {code: src})
@@ -334,11 +340,13 @@ def main():
     ap.add_argument("--pool", default="all",
                     choices=["all", "main", "deep"])
     ap.add_argument("--mode", default="tiers",
-                    choices=["tiers", "保守", "稳健", "激进", "cached"],
-                    help="tiers=三档（按消融选型，分表输出，默认）")
+                    choices=["tiers", "保守", "稳健", "激进", "bata",
+                             "cached"],
+                    help="tiers=四档（按消融选型，分表输出，默认）；"
+                         "保守/稳健/激进/bata=单档固定风险参数；cached=当前缓存策略")
     ap.add_argument("--picks", default=os.path.join(
         ROOT, "research", "perstock_tier_picks.json"),
-        help="三档选型 JSON（tier_picks_from_ablation.py 产物；"
+        help="四档选型 JSON（tier_picks_from_ablation.py 产物；"
              "也兼容 strategy_ablation_per_stock.json 全候选格式）")
     ap.add_argument("--workers", type=int, default=4, help="并行进程数")
     ap.add_argument("--limit", type=int, default=0)
@@ -359,9 +367,9 @@ def main():
                     if s and s.get("code"):
                         picks[s["code"]] = s.get("all_candidates") or []
         except Exception as e:
-            print(f"[警告] 读取三档选型失败（{e}），全部按多维评分回退")
+            print(f"[警告] 读取四档选型失败（{e}），全部按多维评分回退")
         else:
-            print(f"三档选型 {len(picks)} 只（{os.path.basename(args.picks)}）")
+            print(f"四档选型 {len(picks)} 只（{os.path.basename(args.picks)}）")
     codes = load_codes(args.db, args.pool, bars, args.min_bars, args.limit)
     print(f"库 {args.db}\n待回测 {len(codes)} 只（近{bars}根，"
           f"策略={args.mode}，pool={args.pool}，workers={args.workers}）",
@@ -398,7 +406,7 @@ def main():
                       f"耗时{el:.0f}s ETA{eta:.0f}s", flush=True)
 
     header = [c[0] for c in COLS]
-    tiers = [t for t in ("保守", "稳健", "激进")
+    tiers = [t for t in ("保守", "稳健", "激进", "bata")
              if any(r.get("mode") == t for r in rows_out)]
 
     def _table(rs):
@@ -417,9 +425,9 @@ def main():
             ["耗时(秒)", round(time.time() - t0)],
             ["口径", "T日收盘信号→T+1成交；ATR止损+移动止盈；"
                      "训练段=前75%，验证段=后25%；IC=信号方向与未来收益Spearman"],
-            ["三档选型", "保守/稳健/激进 = 消融候选池按该档目标（多指标 rank +"
-                     "训练段末尾近端一致性）逐股选优；选型只用训练段，"
-                     "验证段仅报告"],
+            ["四档选型", "保守/稳健/激进/bata = 消融候选池按该档目标（多指标"
+                     " rank + 训练段末尾近端一致性）逐股选优；bata 偏 PF 赔率、"
+                     "弱化胜率；选型只用训练段，验证段仅报告"],
             ["⚠ 口径提醒",
              "「总收益%/年化%/胜率%」是【全周期】回测，含用于选型的训练段，"
              "受“从~30个候选里挑最好”的赢家诅咒影响，数值严重偏乐观"
