@@ -5,6 +5,16 @@
 
 ## 版本历史
 
+> ㊷ **桌面「一键回测」快捷方式 + `run_backtest.sh`（2026-09-28）**：新增仓库根
+> `run_backtest.sh`（`--yearly` 可选、`--dry-run` 预演）按顺序执行
+> ①全期四口径 × 四档 → ②样本外 val → ③强势段 bull → ④全市场逐股回测
+> （进程数=min(核数,8)）；每步终端与 `research/oneclick_backtest_<时间戳>.log`
+> 双写，任一步失败即停并保留窗口；跑完自动打开 `research/dashboard.html`。
+> 桌面快捷方式 `~/桌面/stock_backtest.desktop`（Name=一键回测，Terminal=true，
+> 已设 `metadata::trusted`）双击即可。实测：逐年 95s、全市场逐股 260s
+> （6897 只 / 27588 行 / 四档工作表）均正常；快捷方式默认不含 `--yearly`，
+> 需要逐年数据时执行 `bash run_backtest.sh --yearly`。
+
 > ㊶ **仪表盘支持导出完整回测数据 + 全量回测命令（2026-09-28）**：`dashboard.html`
 > 顶部新增导出按钮——**导出全量数据（JSON）**：全部批次（全期/样本外/强势段/
 > 后续逐年批次）× 口径 × 档位的指标、净值曲线、每只股回测、单股（GUI）记录与
