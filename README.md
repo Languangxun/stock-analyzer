@@ -51,11 +51,15 @@ python stock_predict.py --tiers-backtest  # 组合回测摘要
 python stock_predict.py --picks-backtest  # 荐股逐笔回测
 ```
 
-### 一键全量回测（桌面快捷方式）
+### 一键全量回测（GUI 内置 / 桌面快捷方式）
 
-双击桌面「**一键回测**」即可：全期四口径 × 四档 → 样本外 `val` → 强势段 `bull` →
-全市场逐股回测，跑完自动打开 `research/dashboard.html`（约 15~20 分钟，终端显示进度，
-日志见 `research/oneclick_backtest_*.log`）。命令行等价入口：
+**推荐在 GUI 内使用**：`工具 → 一键全量回测（全期/分段/逐股，后台）`——自动打开
+「数据工具」页并启动，日志实时回流、可随时停止；也可在 `工具 → 数据工具` 页顶部
+「一键全量回测」区块勾选「含逐年分段」后运行。流程：全期四口径 × 四档 → 样本外 `val` →
+强势段 `bull`（可选逐年）→ 全市场逐股回测，各步结束自动刷新
+`research/dashboard.html`，跑完自动打开；`工具 → 打开回测仪表盘（网站）`可随时查看。
+桌面快捷方式「**一键回测**」等价（约 15~20 分钟，日志 `research/oneclick_backtest_*.log`）。
+命令行入口：
 
 ```bash
 bash run_backtest.sh            # 四步全量

@@ -11131,6 +11131,11 @@ class App:
             m.add_command(label="v6.1.7 荐股收益回测（全A含ETF）",
                           command=lambda: self.run_picks_bt_bg("all_etf"))
             m.add_separator()
+            m.add_command(label="一键全量回测（全期/分段/逐股，后台）",
+                          command=self.run_full_backtest_tool)
+            m.add_command(label="打开回测仪表盘（网站）",
+                          command=self.open_dashboard)
+            m.add_separator()
             m.add_command(label="ETF：刷新代码表 + 回填历史",
                           command=self.run_etf_sync_bg)
         m.add_separator()
@@ -13674,6 +13679,7 @@ class App:
 
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self._tools_nb = nb
 
         # ── 胜率计算（收益曲线 + 全期/训练/验证 + IC 明细）──
         f_bt = ttk.Frame(nb, padding=10)
@@ -14234,6 +14240,7 @@ class App:
         # ── 数据工具（清洗/复权迁移 + 全库回填 + 每只股回测导出）──
         f_data = ttk.Frame(nb, padding=10)
         nb.add(f_data, text=" 数据工具 ")
+        self._tools_data_tab = f_data
         self._build_data_tools(f_data, win)
         if not res_ok:                   # 未分析股票时只开放数据工具页
             nb.tab(0, state="disabled")
@@ -14251,6 +14258,22 @@ class App:
         self._ext_q = queue.Queue()
         self._ext_text = None
         self._ext_win = win
+
+        # —— 一键全量回测（组合全期/分段 + 全市场逐股）+ 仪表盘 ——
+        bt = ttk.LabelFrame(parent, padding=8,
+                            text=" 一键全量回测（全期/样本外/强势段 + 全市场逐股） ")
+        bt.pack(fill="x", pady=(0, 6))
+        self._bt_yearly_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bt, text="含逐年分段（多约 1~2 分钟）",
+                        variable=self._bt_yearly_var).pack(side="left")
+        ttk.Button(bt, text="开始一键全量回测",
+                   command=self._start_full_backtest).pack(
+                       side="left", padx=(8, 6))
+        ttk.Button(bt, text="打开回测仪表盘（网站）",
+                   command=self.open_dashboard).pack(side="left", padx=(0, 6))
+        ttk.Label(bt, text="约 15~20 分钟；跑完自动刷新并打开 dashboard.html，"
+                           "日志见下方", foreground=AXIS_TXT).pack(
+                               side="left", padx=6)
 
         # —— 清洗 / 复权迁移 ——
         cl = ttk.LabelFrame(parent, padding=8,
@@ -14465,6 +14488,61 @@ class App:
             self._ext_stop()
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def open_dashboard(self):
+        """打开本地回测仪表盘 research/dashboard.html（零依赖静态网页）。"""
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "research", "dashboard.html")
+        if not os.path.exists(p):
+            messagebox.showinfo(
+                "回测仪表盘",
+                "尚未生成 dashboard.html：\n先跑一次回测"
+                "（工具→一键全量回测，或后台运行 backtests/backtest_v61.py）。")
+            return
+        import webbrowser
+        try:
+            webbrowser.open("file://" + p)
+        except Exception as e:
+            messagebox.showerror("回测仪表盘", f"打开失败：{e}")
+
+    def _start_full_backtest(self):
+        """数据工具/菜单共用：启动 run_backtest.sh（日志回流工具窗口）。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, "run_backtest.sh")
+        if not os.path.exists(script):
+            self._ext_log("[缺少] run_backtest.sh（仓库根一键回测脚本）\n")
+            return
+        cmd = ["bash", script]
+        try:
+            if self._bt_yearly_var.get():
+                cmd.append("--yearly")
+        except Exception:
+            pass
+        self._ext_spawn(cmd, "一键全量回测")
+
+    def run_full_backtest_tool(self):
+        """工具菜单：打开工具窗口直达数据工具页，并启动一键全量回测。"""
+        proc = getattr(self, "_ext_proc", None)
+        if proc is not None and proc.poll() is None:
+            messagebox.showwarning(
+                "提示", "已有数据工具在运行，请先等待完成或点【停止】")
+            return
+        w = getattr(self, "_ext_win", None)
+        if w is None or not w.winfo_exists():
+            self.open_tools()
+        else:
+            try:
+                w.deiconify()
+                w.lift()
+                w.focus_force()
+            except Exception:
+                pass
+        try:
+            self._tools_nb.select(self._tools_data_tab)
+        except Exception:
+            pass
+        self.progress_var.set("一键全量回测：已启动（进度见工具窗口日志）")
+        self._start_full_backtest()
 
     def _ext_log(self, s):
         t = getattr(self, "_ext_text", None)
