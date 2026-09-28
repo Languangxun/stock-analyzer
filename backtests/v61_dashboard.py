@@ -234,6 +234,16 @@ h1 .v{color:var(--gold)}
   border:1px solid var(--line);color:var(--fg);border-radius:6px;
   padding:4px 10px;cursor:pointer;font-size:13px}
 #theme-btn:hover{background:var(--panel2)}
+#expbar{position:absolute;top:14px;right:104px;display:flex;gap:6px;
+  flex-wrap:wrap;justify-content:flex-end;max-width:70%}
+#expbar button,#p-exp,#g-exp,#f-copy{background:var(--panel);
+  border:1px solid var(--line);color:var(--fg);border-radius:6px;
+  padding:4px 10px;cursor:pointer;font-size:13px;white-space:nowrap}
+#expbar button:hover,#p-exp:hover,#g-exp:hover,#f-copy:hover{
+  background:var(--panel2)}
+pre.cmds{background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:10px;overflow:auto;font-size:12.5px;
+  color:var(--fg)}
 .sub{color:var(--dim);font-size:12.5px}
 nav{display:flex;gap:4px;padding:8px 16px 0;flex-wrap:wrap;
     border-bottom:1px solid var(--line)}
@@ -281,6 +291,12 @@ tr:hover td{background:var(--panel2)}
 <header>
   <h1>stock-analyzer · 回测仪表盘 <span class="v" id="hver"></span></h1>
   <div class="sub" id="hsub">加载中…</div>
+  <div id="expbar">
+    <button id="exp-json" title="导出全部批次的完整回测数据（指标+净值曲线+逐股/单股记录，JSON）">导出全量数据</button>
+    <button id="exp-metrics" title="导出全部批次 × 口径 × 档位的组合/荐股指标（CSV）">导出指标CSV</button>
+    <button id="exp-curves" title="导出全部批次 × 口径 × 档位的净值曲线（CSV）">导出曲线CSV</button>
+    <button id="exp-cmd" title="复制全量回测命令（全期+样本外+强势段+逐年+逐股）">全量回测命令</button>
+  </div>
   <button id="theme-btn" title="切换明/暗主题">☀ / ☾</button>
 </header>
 <nav>
@@ -338,6 +354,7 @@ tr:hover td{background:var(--panel2)}
     <div class="ctl">
       <label>单股记录 <select id="g-sel"></select></label>
       <label><input type="checkbox" id="g-log"> 对数轴</label>
+      <button id="g-exp" title="导出当前记录的完整回测数据（含净值曲线，JSON）">导出本记录JSON</button>
     </div>
     <div id="g-body"></div>
   </section>
@@ -353,6 +370,7 @@ tr:hover td{background:var(--panel2)}
       <label>每页 <select id="p-size">
         <option>100</option><option selected>200</option>
         <option>500</option><option value="0">全部</option></select></label>
+      <button id="p-exp" title="按当前筛选/排序导出 CSV（含表头）">导出当前筛选CSV</button>
     </div>
     <div class="cards" id="p-cards"></div>
     <div class="note" id="p-note"></div>
@@ -743,6 +761,7 @@ function renderGui(){
       `${g.legacy?"（旧口径）":""}</option>`).join("");
   }
   const g=DATA.gui[+sel.value||0]; if(!g)return;
+  G_CUR=g;
   const dates=g.curve_dates||[], curve=g.curve||[];
   const si=g.split_i||dates.length;
   const trPct=dates.length?Math.round(100*si/dates.length):75;
@@ -843,6 +862,7 @@ function renderPerstock(){
     else{const sx=x==null?"":String(x),sy=y==null?"":String(y);
       c=sx<sy?-1:sx>sy?1:0;}
     return PS.sortDesc?-c:c;});
+  PS.rows=rows; PS.header=H; PS.dname=d.name||""; PS.mtime=d.mtime||"";
   const tots=rows.map(r=>parseFloat(r[iTotal])).filter(isFinite);
   const wrs=rows.map(r=>parseFloat(r[iWr])).filter(isFinite);
   const mdds=rows.map(r=>parseFloat(r[iMdd])).filter(isFinite);
@@ -965,9 +985,114 @@ function renderFiles(){
        `<td>${r.target||0}/${r.gate||0}/${r.delist||0}</td></tr>`;
   }));
   h+='</table>';
+  h+='<h3>全量回测命令（复制到仓库根目录终端执行）</h3>'+
+     '<div class="note">组合回测（全期/样本外/强势段）+ 全市场逐股回测；'+
+     '跑完刷新本页即可看到新批次。上方「导出」按钮可把当前全部批次数据'+
+     '（指标/曲线/逐股）导出为 CSV/JSON。</div>'+
+     '<pre class="cmds" id="f-cmds">'+esc(rerunCommands().join("\n"))+
+     '</pre><button id="f-copy">复制命令</button>';
   $("#f-body").innerHTML=h;
+  const fc=$("#f-copy");
+  if(fc)fc.onclick=()=>copyText(rerunCommands().join("\n"),fc);
 }
 
+/* ---------- 完整回测数据导出（v6.1.7 热修④） ---------- */
+function _csvCell(v){
+  v=(v==null?"":String(v));
+  return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;
+}
+function _csv(rows){
+  return "\ufeff"+rows.map(function(r){
+    return r.map(_csvCell).join(",");}).join("\n");
+}
+function _dl(fname,text,mime){
+  const blob=new Blob([text],{type:mime||"text/plain;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob); a.download=fname;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},5000);
+}
+function _stamp(){
+  const d=new Date(),p=n=>String(n).padStart(2,"0");
+  return ""+d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+"_"+
+    p(d.getHours())+p(d.getMinutes());
+}
+function rerunCommands(){
+  return ["# 全量回测：四口径 × 全期（all/main/etf/all_etf）",
+    "python backtests/backtest_v61.py",
+    "# 样本外 / 强势段",
+    "python backtests/backtest_v61.py --segment val  --tag val",
+    "python backtests/backtest_v61.py --segment bull --tag bull",
+    "# 逐年分段（研究脚本）",
+    "python backtests/backtest_tiers.py --tier all --segment yearly",
+    "# 全市场逐股全量回测（多进程；产物 research/perstock_backtest_v*）",
+    "python backtests/stock_backtest_export.py --pool all --workers 8"];
+}
+function copyText(txt,btn){
+  const done=()=>{if(btn){const o=btn.textContent;btn.textContent="已复制 ✓";
+    setTimeout(()=>{btn.textContent=o;},1500);}};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(done,
+      ()=>window.prompt("复制以下内容：",txt));
+  } else window.prompt("复制以下内容：",txt);
+}
+function exportAllJson(){
+  const out={generated:DATA.generated,exported:new Date().toISOString(),
+    note:"stock-analyzer 回测全量数据（全部批次：全期/样本外/强势段 × 口径 × 档位；含净值曲线、逐股与单股记录）",
+    rerun:{commands:rerunCommands()},
+    tables:DATA.tables,charts:DATA.charts,runs:DATA.runs,
+    gui:DATA.gui,perstock:DATA.perstock};
+  _dl("stock_backtest_all_"+_stamp()+".json",JSON.stringify(out),
+      "application/json");
+}
+function exportMetricsCsv(){
+  const rows=[["批次版本","批次区间","批次标签","批次时间","数据截至","口径","档位",
+    "区间起","区间止","总收益%","年化%","最大回撤%","Sharpe","交易","主基准",
+    "基准年化%","超额pp","相位年化min%","相位年化max%","荐股笔数","荐股均收益%",
+    "荐股中位%","胜率%","盈亏比","PF","均持有","最好%","最差%",">50%右尾%",
+    "退出_调仓","退出_闸门","退出_退市"]];
+  DATA.runs.forEach(r=>{
+    Object.keys(r.results||{}).forEach(u=>TIERS.forEach(t=>{
+      const m=tierOf(r,u,t); if(!m)return;
+      const b=m.bench||{}, s=picksOf(r,u,t)||{}, rs=s.by_reason||{};
+      rows.push([r.version||"",r.segment||"",r.label||"",r.ts||"",
+        r.data_end||"",u,t,(m.range||[])[0]||"",(m.range||[])[1]||"",
+        m.total,m.ann,m.mdd,m.sharpe,m.trades,m.benchmark,b.ann,
+        m.excess_total,m.phase_ann_min,m.phase_ann_max,
+        s.n||0,s.avg_ret,s.med_ret,s.winrate,s.payoff,s.pf,s.avg_hold,
+        s.best,s.worst,s.tail50,rs.target||0,rs.gate||0,rs.delist||0]);
+    }));
+  });
+  _dl("stock_backtest_metrics_"+_stamp()+".csv",_csv(rows));
+}
+function exportCurvesCsv(){
+  const rows=[["批次版本","批次区间","批次标签","批次时间","口径","档位",
+    "日期","净值","主基准净值"]];
+  DATA.runs.forEach(r=>{
+    Object.keys(r.results||{}).forEach(u=>TIERS.forEach(t=>{
+      const m=tierOf(r,u,t); if(!m)return;
+      const ds=m.curve_dates||[],vs=m.curve||[];
+      const bd=m.bench_curve_dates||[],bv=m.bench_curve||[];
+      const bmap={}; bd.forEach((d,i)=>{bmap[d]=bv[i];});
+      ds.forEach((d,i)=>rows.push([r.version||"",r.segment||"",
+        r.label||"",r.ts||"",u,t,d,vs[i],bmap[d]]));
+    }));
+  });
+  _dl("stock_backtest_curves_"+_stamp()+".csv",_csv(rows));
+}
+let G_CUR=null;
+function exportGuiJson(){
+  if(!G_CUR)return;
+  _dl("gui_backtest_"+G_CUR.code+"_"+_stamp()+".json",
+      JSON.stringify(G_CUR),"application/json");
+}
+function exportPerstockCsv(){
+  if(!PS.rows||!PS.header)return;
+  const rows=[PS.header].concat(PS.rows.map(r=>PS.header.map((_,i)=>r[i])));
+  const nm=("perstock_"+(PS.dname||"")+"_"+PS.rows.length+"rows_"+
+    _stamp()+".csv").replace(/[\/\s:]+/g,"_");
+  _dl(nm,_csv(rows));
+}
 /* ---------- 初始化 ---------- */
 let CUR_TAB="curve";
 function showTab(id){
@@ -996,6 +1121,15 @@ function initTheme(){
 }
 function init(){
   initTheme();
+  const _bj=$("#exp-json"),_bm=$("#exp-metrics"),_bc=$("#exp-curves"),
+        _bx=$("#exp-cmd");
+  if(_bj)_bj.onclick=exportAllJson;
+  if(_bm)_bm.onclick=exportMetricsCsv;
+  if(_bc)_bc.onclick=exportCurvesCsv;
+  if(_bx)_bx.onclick=()=>copyText(rerunCommands().join("\n"),_bx);
+  const _ge=$("#g-exp"),_pe=$("#p-exp");
+  if(_ge)_ge.onclick=exportGuiJson;
+  if(_pe)_pe.onclick=exportPerstockCsv;
   if(!DATA.runs.length){renderHeader();
     $("#hsub").textContent="未发现回测批次（先运行 backtests/backtest_v61.py）";return;}
   // v6.1.6：默认选最新「全期且新复权口径」批次，避免默认落到分段/旧口径
