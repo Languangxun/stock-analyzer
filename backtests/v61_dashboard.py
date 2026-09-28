@@ -303,6 +303,7 @@ tr:hover td{background:var(--panel2)}
     <div class="legend" id="c-legend"></div>
     <canvas id="cv-curve" style="height:420px"></canvas>
     <div class="hover" id="c-hover">鼠标移入查看每日净值</div>
+    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进＝创业板指 MA60、bata＝科创50 MA60。悬浮读数中会标注「空仓」。</div>
     <div id="c-sum"></div>
   </section>
   <section id="tab-metrics" class="tab">
@@ -596,7 +597,7 @@ function tierOf(run,u,t){return (((run.results||{})[u]||{}).tiers||{})[t];}
 function picksOf(run,u,t){return (((run.results||{})[u]||{}).picks||{})[t];}
 function curvePoints(m){
   const ds=m.curve_dates||[], vs=m.curve||[];
-  return ds.map((d,i)=>({x:d,y:vs[i]}));
+  return ds.map((d,i)=>({x:d,y:vs[i],i:i}));
 }
 function benchPoints(m){
   const ds=m.bench_curve_dates||m.curve_dates||[], vs=m.bench_curve||[];
@@ -669,8 +670,11 @@ function renderCurve(){
       const parts=series.map(s=>{
         let b=null,b2=1e18; s.points.forEach(p=>{const d=Math.abs(Date.parse(p.x)-t);
           if(d<b2){b2=d;b=p;}});
+        const vs=(s.points||[]).map(p=>p.y);
+        const flat=(b&&b.i!==undefined&&b.i>0&&vs[b.i]===vs[b.i-1])?
+          " <span style=\"opacity:.65\">（空仓·闸门关）</span>":"";
         return `<span style="color:${s.color}">■</span> ${esc(s.name)} `+
-               (b&&isFinite(b.y)?b.y.toFixed(4):"-");
+               (b&&isFinite(b.y)?b.y.toFixed(4):"-")+flat;
       });
       hov.innerHTML=esc(best.x.slice(0,10))+" | "+parts.join("  ");
     }

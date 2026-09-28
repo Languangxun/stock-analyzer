@@ -542,7 +542,7 @@ stock_gui.py（引擎：APP_VERSION / tier_eval.phase_anns / tier_picks_stats.re
   （默认硬链接，跨盘回退复制）供下游脚本兼容读取；已套用：`backtest_v61`（既有）、
   `backtest_strategy_ablation`（ablation_v*）、`stock_backtest_export`（perstock_backtest_v*）、
   `tier_picks_from_ablation`（写进源消融目录）；`reports/` 只保留人类报告（清洗报告等）；
-- **本地网页仪表盘（2026-09-26；v6.1.6 默认批次/口径标注）**：`v61_dashboard.py` 把回测目录的
+- **本地网页仪表盘（2026-09-26；v6.1.6 默认批次/口径标注；v6.1.7 横线说明）**：`v61_dashboard.py` 把回测目录的
   `report.json`（含 `tier_eval` 新增的 **`curve`/`curve_dates` 降采样净值曲线（≤600点/档）+
   主基准曲线** `bench_curve`）与 GUI 单股回测留档内联进单个 `research/dashboard.html`
   （Canvas 原生绘图：折线/柱状/箱线，支持对数轴与 hover），file:// 直接打开，无 CDN/服务器；
@@ -556,6 +556,8 @@ stock_gui.py（引擎：APP_VERSION / tier_eval.phase_anns / tier_picks_stats.re
 - **图表与版本对比（2026-09-25）**：报告带 `label`/`db_stats` 元数据；跑完自动出图到回测目录
   `charts/`；`--charts-only` 只补图不跑回测，`--compare all` 扫描同 segment 的历史报告做
   跨版本箱线/柱状对比（纯 SVG，无 matplotlib）。
+
+- **净值曲线横线语义（v6.1.7 热修③）**：水平段 = 趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非无数据；曲线页已加横线说明，悬浮读数自动标注「空仓·闸门关」。核验：4 口径 × 4 档 195 处平段全部闸门关 0/N。
 
 ### 4.3 发布流程
 1. `python build_client_zip.py` —— 生成 `dist/stock-analyzer-client-v<版本>-<日期>.zip`
