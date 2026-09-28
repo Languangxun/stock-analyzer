@@ -6,8 +6,9 @@ stock_cache.db-*
 # 实验用独立快照库（大样本研究，避免与主库争用；由 STOCK_DB/--db 指定）
 stock_cache_lab.db
 stock_cache_lab.db-*
-# 运行日志 / 备份 / 字节码
+# 运行日志 / 备份 / 字节码（含日志轮转：foo.log.1 / foo.log.2.gz）
 *.log
+*.log.*
 *.bak
 *.pkl
 __pycache__/

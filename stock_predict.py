@@ -261,13 +261,9 @@ class CFG:
     # ---- 风险偏好（四级·网格寻优后参数）----
     # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
     # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
-    # bata=高赔率·低频（v6.1.7 热修①）：评分2+冷却8（比稳健少交易），
-    #      宽止损 ATR3.5 + 慢止盈（+5% 触发、回落10%才走），让盈利跑；
-    #      300 只 × 400 根同源对照（2026-09-28，composite 信号）：
-    #      bata 赔率中位 1.73 / 年化中位 +2.0% / 均笔 11.7；
-    #      对照保守 1.50/-1.2%/10.2 笔、稳健 1.69/-1.0%/14.1 笔、
-    #      激进 1.83/+1.5%/18.7 笔（赔率更高但换手也最高）。
-    # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
+    # bata=激进破甲版（v6.1.7 热修⑦）：入场同激进（评分1+冷却3，不小家子气），
+    #      止损再放宽（ATR4.0/回落12%）——容忍更大波动换赔率，风险偏好最高。
+    # 前三级数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
         "保守": {"atr_mult": 1.5, "trail_trigger": 1.01,
@@ -276,8 +272,8 @@ class CFG:
                  "trail_ratio": 0.94, "buy_th": 2, "cooldown": 5},
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
-        "bata": {"atr_mult": 3.5, "trail_trigger": 1.05,
-                 "trail_ratio": 0.90, "buy_th": 2, "cooldown": 8},
+        "bata": {"atr_mult": 4.0, "trail_trigger": 1.05,
+                 "trail_ratio": 0.88, "buy_th": 1, "cooldown": 3},
     }
 
     def risk_params():
@@ -5397,7 +5393,7 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 # 每次分析对该股近1000交易日做一次多算法消融回测：
 #   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
 #          筹码峰 / 板块轮动 / 多维评分×4风险档（全部 × 4 档风险参数，
-#          v6.1.7 热修① 起含 bata=高赔率·低频）
+#          v6.1.7 热修⑦ 起含 bata=激进破甲版）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
 # 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
 # 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
@@ -6032,10 +6028,9 @@ def _ablation_pool(cands, min_trades):
 
 
 def _ablation_weights(objective):
-    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进偏年化+Calmar；
-    bata 偏 PF（赔率）+Calmar、弱化胜率（高赔率容忍低胜率与低频）。"""
-    if objective == "bata":
-        return {"calmar": 0.25, "pf": 0.45, "winrate": 0.10, "ann": 0.20}
+    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进/bata 偏年化+Calmar。
+    bata=激进破甲版（v6.1.7 热修⑦），选型目标与激进一致，差异在风险参数
+    （入场同激进、止损更宽、允许打板）而非选股目标。"""
     return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
             if objective == "稳健" else
             {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
@@ -6127,15 +6122,15 @@ def _pick_one_from_pool(pool, key):
     """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
 
     key: 保守/稳健/激进/bata；保守档限定「保守/稳健参数」候选；
-    目标权重：保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar，
-    bata=偏 PF（赔率）+Calmar（见 _ablation_weights）。
+    目标权重：保守/稳健=偏 Calmar+PF，激进/bata=偏年化+Calmar
+    （bata=激进破甲版，同一目标；见 _ablation_weights）。
     返回 (picked, note)。"""
     p = pool
     if key == "保守":
         p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
         if p2:
             p = p2
-    obj = {"均衡": "激进", "激进": "激进", "bata": "bata"}.get(key, "稳健")
+    obj = {"均衡": "激进", "激进": "激进", "bata": "激进"}.get(key, "稳健")
     picked, note = pick_ablation_consistent(
         p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
     if not picked:
@@ -7347,7 +7342,7 @@ def analyze(full, progress=None, quick=False):
     # 连续同向信号压缩：同一轮机会只保留首个 B/S 标注（回测开平仓语义不变）
     signals = _dedup_signals(signals)
     # ---- 激进/bata 档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
-    # （沿用该档风险参数：激进=买点门槛1/冷却3、bata=门槛2/冷却8），保证震荡区间
+    # （沿用该档风险参数：激进/bata 均为买点门槛1/冷却3），保证震荡区间
     # （如 5~6 元箱体）也能标出足够波段买卖点。只影响展示与样本内统计，不改动消融缓存。
     _win = max(1, len(disp_rows) - 250)
     _recent_n = len([s for s in signals if s[0] >= _win])
@@ -9168,17 +9163,12 @@ def _v4_print_report(r):
 
 
 # ============ v6.1.3 组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
-# v6.1.7 新增第四档 bata（高赔率·低频·允许打板；四个口径都有，主基准科创50）：
-#   选型（2026-09-27 扫描 research/bata_sweep_*）：β 类（对科创50/创业板指）全口径
-#   训练段为负，纯动量次之；「动量+低波」族稳健。bata 取 blend_mom、top5、reb20
-#   （与 20 日动量因子半衰期对齐）、科创50/创业板指 MA60 闸门、allow_limit_up=True。
-#   reb30 训练段更优（赔率 2.0+）但样本外转负；top3 reb30 同样样本外崩坏，
-#   故按训练段+样本外双正原则取 top5 reb20。逐口径参数：
-#     all/main       mw0.7 / 科创50 MA60   （主板弹性不足，与全A同参）
-#     etf            mw0.6 / 创业板指 MA60 （ETF 池动量弱，创门显著优于科创50门）
-#     all_etf        mw0.5 / 科创50 MA60   （含 ETF 后低波项权重略高更稳）
-#   打板：仅 bata 档解除「涨停不买」（cfg.allow_limit_up），回测按涨停价成交；
-#   生产端 tier_latest_picks 对信号日已封板标的打「涨停」提示。
+# v6.1.7 热修⑦ 起第四档 bata = 激进破甲版（四口径均直接复制激进配置，仅额外
+#   解除「涨停不买」allow_limit_up=True）：选股/调仓/闸门与激进完全一致，
+#   风险更高体现在 ① 可打板（信号日封板也按涨停价买入）；② 买卖点风险参数
+#   止损更宽（ATR4.0/回落12%，见 CFG.RISK_PARAMS["bata"]）。
+#   原「动量+低波 Top5/20日调仓」高赔率低频实现（v6.1.7 初版）已废弃：
+#   训练段尚可、样本外跑输激进（v61_report 全A +31.3% vs 激进 +56.2%）。
 #
 # 原理（详见 README 第二节）：
 #   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
@@ -9186,9 +9176,9 @@ def _v4_print_report(r):
 #   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
 #   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
 #          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）
-# 激进档基准（v6.1.1）：两个口径统一对标科创50（sh000688），
+#   激进档基准（v6.1.1）：两个口径统一对标科创50（sh000688），
 #         不再按是否具备科创板权限区分（多数账户无科创板权限，但仍以科创50
-#         作为「高弹性成长」这一风格的统一参照）。bata 档同样对标科创50。
+#         作为「高弹性成长」这一风格的统一参照）。
 # 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
 #         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
 # 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
@@ -9201,9 +9191,9 @@ TIER_CFG = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
-    "bata": dict(universe="all", score="blend_mom", mom_w=0.7, top=5, reb=20,
-                 gate="sh000688", ma=60, allow_limit_up=True),
 }
+# bata = 激进破甲版：原样复制激进配置 + 允许打板（改激进时自动同步）
+TIER_CFG["bata"] = dict(TIER_CFG["激进"], allow_limit_up=True)
 # 主板口径（v6.1.1）：稳健/均衡在沪主板+深主板内运行；
 # 激进档改用 blend_mom（动量0.7/低波0.3）偏弹性 + 高换手（reb10/top20/上证MA20）。
 # 依据（2026-09-19 过拟合诊断，全量缓存）：
@@ -9221,9 +9211,9 @@ TIER_CFG_MAIN = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
                  gate="sh000001", ma=20),
-    "bata": dict(universe="main", score="blend_mom", mom_w=0.7, top=5, reb=20,
-                 gate="sh000688", ma=60, allow_limit_up=True),
 }
+# bata = 激进破甲版：原样复制 + 允许打板
+TIER_CFG_MAIN["bata"] = dict(TIER_CFG_MAIN["激进"], allow_limit_up=True)
 # ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
 # 故三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
 # 闸门统一上证 MA20（ETF 池跨沪深，用市场总闸门）。
@@ -9234,9 +9224,9 @@ TIER_CFG_ETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
                  gate="sh000001", ma=20),
-    "bata": dict(universe="etf", score="blend_mom", mom_w=0.6, top=5, reb=20,
-                 gate="sz399006", ma=60, allow_limit_up=True),
 }
+# bata = 激进破甲版：原样复制 + 允许打板
+TIER_CFG_ETF["bata"] = dict(TIER_CFG_ETF["激进"], allow_limit_up=True)
 # 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
 # （池内混入 ETF 后，创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
@@ -9246,16 +9236,16 @@ TIER_CFG_ALLETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
-    "bata": dict(universe="all_etf", score="blend_mom", mom_w=0.5, top=5,
-                 reb=20, gate="sh000688", ma=60, allow_limit_up=True),
 }
+# bata = 激进破甲版：原样复制 + 允许打板
+TIER_CFG_ALLETF["bata"] = dict(TIER_CFG_ALLETF["激进"], allow_limit_up=True)
 TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
                   "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
 UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
                  "all_etf": "全A含ETF"}
 # 激进档与 bata 档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
-# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档；bata 四口径均为「高赔率低频」档，
-# 都以科创50 作为主基准。ETF 因池内无科创语义、且实测创业板指门更稳，闸门用创业板指。
+# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档；bata=激进破甲版，主基准与激进一致。
+# ETF 因池内无科创语义，主基准仍统一用科创50（闸门是另一回事，池内实测用上证 MA20）。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
     ("all", "激进"): "sh000688", ("all", "bata"): "sh000688",
@@ -9434,7 +9424,7 @@ def tier_build_features(cal, C, V):
 
     beta60 = _beta("sz399006")        # 对创业板指（全A 激进档用）
     beta60_sh = _beta("sh000001")     # 对上证（主板激进档用）
-    beta60_star = _beta("sh000688")   # 对科创50（bata 档用）
+    beta60_star = _beta("sh000688")   # 对科创50（研究/初版 bata 扫描用）
     return dict(ret20=ret20, vol20=vol20, amt20=amt20, barcount=barcount,
                 beta60=beta60, beta60_sh=beta60_sh,
                 beta60_star=beta60_star)
@@ -9471,10 +9461,10 @@ def tier_make_score(feat, kind, mom_w=None, base=None):
     """合成打分：
       blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
-      mom        = 纯 20 日动量百分位（bata 候选）
+      mom        = 纯 20 日动量百分位（研究用，v6.1.7 初版 bata 候选）
       beta       = 60日β（对创业板指）
       beta_sh    = 60日β（对上证，主板口径）
-      beta_star  = 60日β（对科创50，bata 档）
+      beta_star  = 60日β（对科创50，研究用，v6.1.7 初版 bata）
     base：横截面排名基数掩码（None=全面板）；见 tier_rank_base。
     注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
@@ -10021,10 +10011,10 @@ RISK_AI_GUIDE = {
     "激进": "风险偏好=激进（进攻档）：趋势启动/放量突破即可给出买入或加仓，"
             "容忍更大波动与回撤；不要用『等待企稳/等待回踩/先观望』作为默认"
             "结论，仓位建议 4~6 成。",
-    "bata": "风险偏好=bata（最高档，高于激进）：目标是高赔率、低频、敢下手。"
-            "强势突破/加速/涨停附近可直接给出买入或打板（涨停价）建议，允许"
-            "集中仓位（6~8 成）并接受更大回撤；禁止用『等待趋势企稳/等待确认/"
-            "观望』搪塞，必须给出明确的进攻性动作与具体价位。",
+    "bata": "风险偏好=bata（最高档，激进破甲版）：选股与入场同激进，止损更宽、"
+            "仓位可更集中，接受更大波动与回撤。强势突破/加速/涨停附近可直接"
+            "给出买入或打板（涨停价）建议（6~8 成）；禁止用『等待趋势企稳/"
+            "等待确认/观望』搪塞，必须给出明确的进攻性动作与具体价位。",
 }
 
 
@@ -10264,8 +10254,8 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "· 稳健：全A动量+低波Top20，20日调仓，上证MA20闸门\n"
         "· 均衡：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
         "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n"
-        "· bata：动量+低波Top5，20日调仓，科创50/创业板指MA60闸门，"
-        "允许涨停价买入（高赔率低频、波动大）\n\n"
+        "· bata：激进破甲版（选股/调仓/闸门与激进完全一致），"
+        "额外允许涨停价买入（打板）、买卖点止损更宽，波动更大\n\n"
         f"用户风险偏好：{pref}（作为默认与锚定）。\n"
         "请判断当前市场环境最适合哪一档；可以偏离偏好，但必须给出一句理由。\n"
         "只输出一行严格 JSON（不要代码块、不要多余文字）："

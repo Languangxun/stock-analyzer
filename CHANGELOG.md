@@ -5,6 +5,23 @@
 
 ## 版本历史
 
+> ㊹ **v6.1.7 热修⑦：bata 档改「激进破甲版」（配置复制激进 + 允许打板 + 宽止损，2026-09-28）**：
+> ① **组合层**——`TIER_CFG`/`_MAIN`/`_ETF`/`_ALLETF` 的 `bata` 改为
+> `dict(同口径激进, allow_limit_up=True)`（全A=创业板高β Top5/10日/创业板指 MA60；
+> 主板/ETF/全A含ETF=blend_mom 0.7 Top20（ETF Top10）/10日/上证 MA20；仅额外解除
+> 「涨停不买」）；初版「blend_mom Top5/20日/科创50 MA60」高赔率低频实现废弃
+> （全A +31.3% 跑输激进 +56.2%），`backtests/sweep_bata.py` 与 `research/bata_sweep_*`
+> 转历史留档（脚本 docstring 标注废弃）。
+> ② **买卖点风险参数**——`CFG.RISK_PARAMS["bata"] = (ATR4.0 / 触发+5% / 回落12% /
+> 买点门槛1 / 冷却3)`：入场与激进完全一致，止损更宽（容忍更大波动、少被震仓），
+> 风险偏好维持最高档。
+> ③ **消融选型**——`_ablation_weights`/`_pick_one_from_pool` 的 bata 目标由「偏 PF 赔率」
+> 改为与激进一致（偏年化+Calmar）；GUI 消融弹窗/设置页按钮说明/AI 提示词
+> （`RISK_AI_GUIDE`、`ai_choose_tier`）同步「激进破甲」口径；`stock_predict.py` 重新生成。
+> ④ **重跑**——四口径全期/样本外/强势段 + 逐年全部重跑（`research/backtest_v6.1.7_20260928_211109_full/`、
+> `v61_report*.md`、`tiers_yearly.json`）：bata 全A +70.4%（年化 +14.1%、超额 +8.2pp）、
+> 主板 +28.2%、ETF +27.8%、全A含ETF +43.8%，全期均 ≥ 同口径激进；README 回测摘要/
+> 四档策略/bata 说明/风险参数表、ARCHITECTURE 3.6/3.7/3.8/4.4/七节与仪表盘横线说明同步。
 > ㊸ **GUI 内置「一键全量回测」入口 + 打开仪表盘（2026-09-28）**：工具菜单新增
 > **「一键全量回测（全期/分段/逐股，后台）」**与**「打开回测仪表盘（网站）」**；
 > 数据工具页顶部新增同名区块（含「含逐年分段」勾选），点击直接调仓库根

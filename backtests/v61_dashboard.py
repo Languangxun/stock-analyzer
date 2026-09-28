@@ -319,7 +319,7 @@ tr:hover td{background:var(--panel2)}
     <div class="legend" id="c-legend"></div>
     <canvas id="cv-curve" style="height:420px"></canvas>
     <div class="hover" id="c-hover">鼠标移入查看每日净值</div>
-    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进＝创业板指 MA60、bata＝科创50 MA60。悬浮读数中会标注「空仓」。</div>
+    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进/bata＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）。悬浮读数中会标注「空仓」。</div>
     <div id="c-sum"></div>
   </section>
   <section id="tab-metrics" class="tab">
