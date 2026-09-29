@@ -39,6 +39,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import stock_gui as sg
 
@@ -65,13 +66,70 @@ def _db_stats():
         return {}
 
 
-def _run_universe(universe, segment, progress):
-    progress(f"=== {UNI_NAME[universe]} · 组合回测 ===")
-    tiers = sg.tier_eval(segment=segment, universe=universe, progress=progress)
-    progress(f"=== {UNI_NAME[universe]} · 荐股逐笔回测 ===")
+def _run_universe(universe, segment):
+    """子进程 worker：跑一个口径的组合+荐股回测。
+    v6.1.8 P1：top-level 函数（picklable），供 ProcessPoolExecutor 并行 4 口径。
+    原顺序版每次调 sg.tier_eval / sg.tier_picks_stats（按 4 档 × 10 相位 串行），
+    多进程下 4 口径同时跑，理论上限 ≈ 4× 加速（受库大小/CPU 核数约束）。
+    progress 改用 sys.stdout.write + flush，避免 print 子进程缓冲导致日志失序。"""
+    import sys as _s
+    def _p(msg):
+        _s.stdout.write(f"[{universe}] {msg}\n")
+        _s.stdout.flush()
+    _p(f"=== {UNI_NAME[universe]} · 组合回测 ===")
+    tiers = sg.tier_eval(segment=segment, universe=universe, progress=_p)
+    _p(f"=== {UNI_NAME[universe]} · 荐股逐笔回测 ===")
     picks = sg.tier_picks_stats(segment=segment, universe=universe,
-                                progress=progress)
+                                progress=_p)
     return {"universe": universe, "tiers": tiers, "picks": picks}
+
+
+def _run_universes_serial(unis, segment, progress):
+    """保留顺序版（CLI --workers=1 或单进程环境回退）。"""
+    out = {}
+    for uni in unis:
+        progress(f"=== {UNI_NAME[uni]} · 组合回测 ===")
+        tiers = sg.tier_eval(segment=segment, universe=uni, progress=progress)
+        progress(f"=== {UNI_NAME[uni]} · 荐股逐笔回测 ===")
+        picks = sg.tier_picks_stats(segment=segment, universe=uni,
+                                    progress=progress)
+        out[uni] = {"universe": uni, "tiers": tiers, "picks": picks}
+    return out
+
+
+def _run_universes_parallel(unis, segment, workers):
+    """多进程并行跑多口径（v6.1.8 P1）：workers 默认 min(len(unis), cpu_count, 4)。
+
+    父进程先预热 `tier_load_panel` + `tier_build_features`，再强制 **fork**
+    启动子进程——面板/特征通过 COW 继承，子进程零重复加载（原实现每进程独立
+    加载 1.6G 库 + 重建特征，4 进程互相争 IO，实测反而比串行慢，见
+    `research/baseline/BASELINE.md`）。fork 不可用时回退默认上下文（子进程自加载）。"""
+    import multiprocessing as _mp
+    if workers <= 1 or len(unis) <= 1:
+        return _run_universes_serial(unis, segment, print)
+    workers = min(workers, len(unis))
+    ctx = None
+    try:
+        codes, cal, C, V = sg.tier_load_panel()
+        if sg._TIER_CACHE.get("feat") is None:
+            sg._TIER_CACHE["feat"] = sg.tier_build_features(cal, C, V)
+        ctx = _mp.get_context("fork")
+        print("  已预热面板/特征，fork 继承（子进程零重复加载）")
+    except Exception as e:
+        print(f"  父进程预热失败（回退默认 start method）：{e}")
+    out = {}
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        futs = {ex.submit(_run_universe, uni, segment): uni for uni in unis}
+        for fut in as_completed(futs):
+            uni = futs[fut]
+            try:
+                out[uni] = fut.result()
+                print(f"  ✓ {UNI_NAME[uni]} 完成")
+            except Exception as e:
+                print(f"  ✗ {UNI_NAME[uni]} 失败：{e}")
+                raise
+    # 报告按 UNIS 顺序输出
+    return {uni: out[uni] for uni in unis if uni in out}
 
 
 def _tier_table(rep, tier):
@@ -357,6 +415,9 @@ def main():
                     choices=["all4", "both", "all", "main", "etf", "all_etf"])
     ap.add_argument("--segment", default="full",
                     choices=["full", "train", "val", "val2025", "bull"])
+    ap.add_argument("--workers", type=int, default=0,
+                    help="并行进程数（0=自动，4 口径时取 min(4, cpu)；"
+                         "1=串行；>4 浪费进程）")
     ap.add_argument("--out", default=os.path.join(HERE, "research"),
                     help="research 根目录（时间戳回测文件夹建在它下面）")
     ap.add_argument("--run-dir", default="",
@@ -422,21 +483,31 @@ def main():
         unis = list(UNIS)
     else:
         unis = [args.universe]
+    # v6.1.8 P1：4 口径默认并行（4 进程），单口径自动回退串行
+    if args.workers == 0:
+        import multiprocessing as _mp
+        args.workers = min(len(unis), _mp.cpu_count() or 4, 4)
+    t0 = time.time()                    # v6.1.8：计时含全部口径回测
+    if args.workers > 1 and len(unis) > 1:
+        print(f"v6.1.8 P1：{len(unis)} 口径并行 ({args.workers} workers)")
+        results = _run_universes_parallel(unis, args.segment, args.workers)
+    else:
+        results = _run_universes_serial(unis, args.segment, print)
     suffix = f"_{args.tag}" if args.tag else ""
     run_dir = args.run_dir or os.path.join(
         args.out, f"backtest_v{VERSION}_{time.strftime('%Y%m%d_%H%M%S')}_"
                   f"{args.segment}{suffix}")
     os.makedirs(run_dir, exist_ok=True)
     print(f"回测产物目录: {run_dir}")
-    t0 = time.time()
-    codes, cal, C, V = sg.tier_load_panel()
+    # v6.1.8 P1：主进程不再重复加载全量面板（各 worker 已各自加载），
+    # data_end 取库内最大交易日（原为 panel cal[-1]，口径一致）
+    stats = _db_stats()
     report = {"version": VERSION,
               "ts": time.strftime("%Y-%m-%d %H:%M"),
               "label": label, "segment": args.segment,
-              "data_end": cal[-1], "db_stats": _db_stats(),
-              "results": {}}
-    for uni in unis:
-        report["results"][uni] = _run_universe(uni, args.segment, print)
+              "data_end": stats.get("max_date", ""),
+              "db_stats": stats,
+              "results": results}
     jpath = os.path.join(run_dir, "report.json")
     mpath = os.path.join(run_dir, "report.md")
     with open(jpath, "w", encoding="utf-8") as f:
