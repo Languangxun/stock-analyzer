@@ -27,12 +27,19 @@
 > README 四档策略/bata 说明/风险参数表、ARCHITECTURE 3.6/3.7/3.8/4.4/七节与仪表盘文案同步。
 > ⑤ **性能与口径修复（P0/P1）**——P0：`_bt_simulate` 年化口径与 `_bt_events` 对齐
 > （用区间起点日期算年数、下限 0.25 年；首信号远晚于区间起点时年化不再虚高）；
-> P1：`backtest_v61.py` 4 口径改多进程并行（新增 `--workers`，0=自动 min(4,CPU)、
-> 1=串行），并且**父进程预热面板/特征后 fork 继承**（初版每进程独立加载 1.6G 库
-> 争 IO，实测 175.9s 反比串行慢；修复后同一命令 **75.6s**，基线 127.9s、目标 ≤80s 达成）；
-> 同时修复 P1 重构产生的计时 bug（`t0` 移到口径回测之前）与主进程重复 `tier_load_panel`
-> （`data_end` 改用库内最大交易日）。数字与基线漂移 <0.1pp。基线协议见
-> `research/baseline/BASELINE.md`。
+> P1：三大回测脚本多进程并行 + 跨档指标复用——① `backtest_v61.py` 4 口径改
+> 多进程并行（新增 `--workers`，0=自动 min(4,CPU)/1=串行），**父进程预热面板/特征后
+> fork 继承**（初版每进程独立加载 1.6G 库争 IO，实测 175.9s 反比串行慢；修复后
+> **75.6s → 74s**，基线 127.9s、目标 ≤80s 达成），修复初版重构产生的计时 bug
+> （`t0` 移到口径回测之前）与主进程重复 `tier_load_panel`（`data_end` 改用库内
+> 最大交易日）；② `stock_backtest_export.py` 逐股回测改 `map+chunksize=20`
+> 批量提交（替代旧 `submit+as_completed` 逐只 IPC，默认 workers 4→8），且**4 档
+> 共用 1 次 ATR(14) 预计算 + composite 算法 4 档共用 1 次 `_composite_precompute`**
+> （ATR/pre 不依赖 rp/sigs，原 4×重复计算），**260s → 204s（-22%）**；③
+> `backtest_strategy_ablation.py` 改 `map+chunksize` + 默认 workers 8→16，
+> **509s → 373s（-27%）**。组合层 v61 数字与 v6.1.7 bata 改激进破甲版完全一致
+> （浮点 <0.01pp）；perstock bata 档漂移 +9.9pp（总收益中位）源自 bata 改 MDD 止损 +
+> 新选型 pool，验证段漂移 -0.4pp 在容差内。基线协议见 `research/baseline/BASELINE.md`。
 > ㊸ **GUI 内置「一键全量回测」入口 + 打开仪表盘（2026-09-28）**：工具菜单新增
 > **「一键全量回测（全期/分段/逐股，后台）」**与**「打开回测仪表盘（网站）」**；
 > 数据工具页顶部新增同名区块（含「含逐年分段」勾选），点击直接调仓库根

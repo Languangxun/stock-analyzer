@@ -6330,14 +6330,16 @@ RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾�
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
 
 
-def _bt_segments(rows, signals, rp):
+def _bt_segments(rows, signals, rp, atrs=None):
     """全期/训练/验证三段回测（v6.1.6）：与 `run_ablation` 同引擎（`_bt_events`）
     同切分（val=max(200, n/4)、预计算 ATR），供 GUI 面板与每只股导出复用，
     保证与「策略消融」弹窗的交易/胜率/年化/回撤逐项一致。
-    返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。"""
+    返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。
+    v6.1.8 P1：可外部传入预计算的 atrs（perstock 多档共享，省 ~75% ATR 算量）。"""
     nb = len(rows)
     split = nb - max(200, nb // 4)
-    atrs = _precompute_atr(rows, 0, nb)
+    if atrs is None:
+        atrs = _precompute_atr(rows, 0, nb)
     full = _bt_events(rows, signals, rp, 0, nb, atrs=atrs)
     tr = (_bt_events(rows, signals, rp, 0, split, atrs=atrs)
           if split >= 30 else None)

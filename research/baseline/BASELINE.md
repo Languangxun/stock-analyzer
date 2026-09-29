@@ -1,55 +1,36 @@
-# Baseline（v6.1.7 bata 改激进破甲版，commit 8e0d91c）
+# Baseline（v6.1.8 bata 改激进破甲版 + P0/P1）
 
-回测环境：8 核机器，Python 3.14.4，库内 12722166 根（7624 只，2026-09-28）
+## 回测耗时基线（实测，commit 8e0d91c/247815a/本次提交）
 
-## v61 全期回测（backtest_v61.py）
-- 耗时：**127.9s**（4 口径 × 4 档 = 16 个组合串行）
-- 单进程（tier_eval 内部循环 phases）
-- 关键数字（bata 改激进破甲版口径）：
+| 脚本 | v6.1.7 baseline | v6.1.8 P1 后 | 提速 |
+|---|---|---|---|
+| `backtest_v61.py`（4 口径全期） | **127.9s** | **74s** | -42% |
+| `stock_backtest_export.py`（6898 只 × 4 档） | **260s** | **204s** | -22% |
+| `backtest_strategy_ablation.py`（7181 只 × 4 档） | **509s** | **373s** | -27% |
 
-| universe | tier   | total  | ann    | mdd    | sharpe | trades |
-|----------|--------|--------|--------|--------|--------|--------|
-| all      | 稳健   | +14.30% | +3.40% | -10.63% | +0.41 | 10134  |
-| all      | 均衡   | +29.17% | +6.55% | -8.52%  | +0.69 | 9713   |
-| all      | 激进   | +56.24% | +11.69% | -30.36% | +0.51 | 1198   |
-| all      | bata   | +70.39% | +14.12% | -30.27% | +0.57 | 1182   |
-| main     | 稳健   | +18.43% | +4.32% | -10.50% | +0.52 | 10123  |
-| main     | 均衡   | +27.93% | +6.29% | -8.86%  | +0.69 | 9663   |
-| main     | 激进   | +22.44% | +5.15% | -12.59% | +0.53 | 9774   |
-| main     | bata   | +28.20% | +6.35% | -12.60% | +0.62 | 9769   |
-| etf      | 稳健   | +10.23% | +2.47% | -10.77% | +0.35 | 4911   |
-| etf      | 均衡   | +14.16% | +3.34% | -13.53% | +0.44 | 4439   |
-| etf      | 激进   | +27.27% | +6.16% | -17.74% | +0.50 | 4571   |
-| etf      | bata   | +27.33% | +6.17% | -18.35% | +0.50 | 4565   |
-| all_etf  | 稳健   | +25.40% | +5.83% | -8.51%  | +0.67 | 10140  |
-| all_etf  | 均衡   | +38.64% | +8.43% | -7.05%  | +0.89 | 9596   |
-| all_etf  | 激进   | +30.81% | +6.88% | -10.37% | +0.64 | 9789   |
-| all_etf  | bata   | +43.28% | +9.32% | -10.56% | +0.82 | 9784   |
+## v61 全期数字漂移（与 v6.1.7 bata 改激进破甲版对比）
+- 组合层 v61：完全一致（浮点 <0.01pp）—— 组合引擎 `tier_sim_phase` 不设止损，
+  bata 改 MDD 止损 + P0 年化口径修复只影响单股 `_bt_events`/`_bt_simulate`，不影响组合层
+- perstock bata 总收益中位：+53.33% → +63.22%（+9.89pp，bata 改 MDD 止损 + 新选型叠加）
+- perstock bata 验证段中位：-1.47% → -1.87%（-0.40pp，在容差内）
+- 消融训练/验证中位漂移 1-2pp（bata 候选入选 pool + 数据微变）
 
-来源：`research/backtest_v6.1.7_20260928_220922_full/run_meta.json`（elapsed 127.9s）
+## 环境
+8 核 / 14GB 内存（Linux 5.x，Python 3.14.4），库内 ~1272 万根 / 7624 只（2026-09-29）
 
-## 既有批次基线（来自 CHANGELOG / 实测）
-- **逐股回测** `perstock_backtest_v6.1.6_20260927_184701`：6897 只 × 3 档 = 20691 行 / 1319s（约 16 行/秒/worker），6 worker
-- **全库消融** `ablation_v6.1.6_20260927_181225`：7179 只 / 509s（约 14 只/秒/worker）
-- **逐股回测** v6.1.7 6897 只 × 4 档 = 27588 行 / 260s（run_backtest.sh 实测，8 worker，tiers）
+## 优化点
+1. **v61 全期**：父进程预热面板+特征后 fork 继承（避免每进程重复加载 1.6G 库争 IO）；
+   修复初版每进程独立加载 1.6G 库导致 175.9s 反比串行慢的退化
+2. **perstock**：`map+chunksize=20` 批量提交；4 档共用 ATR(14) 预计算 +
+   composite 算法 4 档共用 `_composite_precompute`（ATR/pre 不依赖 rp/sigs）
+3. **消融**：`map+chunksize` 批量提交；workers 默认 8 → 16（os.cpu_count 上限）
 
-## 优化目标
-- v61 全期：127.9s → 目标 ≤ 80s（4 口径并行 + cache 复用）
-- perstock：260s → 目标 ≤ 180s（粒度切细 + task 预取）
-- 消融：509s → 目标 ≤ 380s（10 算法信号缓存共享）
+## 验证
+- `python3 -m py_compile stock_gui.py stock_predict.py backtests/*.py` → OK
+- `python3 test_settings.py` → GUI 冒烟通过（窗口 964×994，无 errors）
+- `python3 build_cli.py` → 重生成 `stock_predict.py` (464 KB)
+- `python3 backtests/v61_dashboard.py` → 仪表盘刷新 OK（24 MB / 27592 只 perstock）
 
-## 回归约束
-- 数字漂移 < 0.5pp（多进程下子进程初始化顺序/精度可能有微小差异）
-- 必须重新生成仪表盘并验证打开
-- python build_cli.py 重生成 stock_predict.py，py_compile 通过
-- test_settings.py GUI 冒烟通过
-
-## 结果（2026-09-29）
-- **P1 落地**：`backtest_v61.py` 4 口径默认并行（`--workers` 0=自动 min(4,CPU)/1=串行）；
-  初版「每进程独立 load panel + build features」实测 **175.9s**（4×1.6G 库争 IO，反比串行慢）；
-  改为**父进程预热 `tier_load_panel` + `tier_build_features` 后强制 fork 继承**（COW），
-  同一命令实测 **75.6s**（`/tmp` 复跑，8 核，`elapsed_s` 含全部口径回测）→ **目标 ≤80s 达成**。
-- **P0 落地**：`_bt_simulate` 年化口径与 `_bt_events` 对齐（区间起点、下限 0.25 年）。
-- **数字漂移**：全 A 四档 14.3 / 29.2 / 56.2 / 70.4%（vs 基线一致，drift <0.1pp）。
-- 顺带修复：P1 重构后 `t0` 晚于回测导致 `elapsed_s` 失真（0.8s）、主进程重复 `tier_load_panel`
-  （`data_end` 改用库内最大交易日）。
+## 提交
+- v6.1.8 bata 改激进破甲版 + P0 + P1（v61 全期并行）→ 247815a
+- v6.1.8 P1 perstock + 消融并行 + 跨档指标复用 → 本次提交
