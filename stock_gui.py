@@ -10633,12 +10633,19 @@ class App:
                                       ("disabled", FIELD_BG)])
 
     def _center_win(self, win, w=None, h=None, y_ratio=3):
-        """把 Toplevel 居中（垂直略偏上，主流对话框习惯）。"""
+        """把 Toplevel 居中（垂直略偏上，主流对话框习惯）。
+        y 基于 winfo.vrootheight（已扣除任务栏/菜单栏的可用区），
+        避免窗口底部被 dock/任务栏遮挡。
+        """
         try:
             win.update_idletasks()
             w = int(w or win.winfo_width())
             h = int(h or win.winfo_height())
-            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            sw = win.winfo_screenwidth()
+            try:
+                sh = int(self.root.winfo_vrootheight())
+            except Exception:
+                sh = win.winfo_screenheight()
             x = max(0, (sw - w) // 2)
             y = max(0, (sh - h) // y_ratio)
             win.geometry(f"{w}x{h}+{x}+{y}")
@@ -10656,12 +10663,13 @@ class App:
                                    width=9 if self.compact else 14)
         self.ent_query.pack(side="left", padx=3)
         self.ent_query.bind("<Return>", self._search_enter)
+        self.ent_query.bind("<KP_Enter>", self._search_enter)
         self.ent_query.bind("<KeyRelease>", self._search_key)
         self.ent_query.bind("<Down>", lambda e: self._search_move(1))
         self.ent_query.bind("<Up>", lambda e: self._search_move(-1))
-        self.ent_query.bind("<Escape>", lambda e: self._search_hide())
+        self.ent_query.bind("<Escape>", lambda e: self._search_end())
         self.ent_query.bind(
-            "<FocusOut>", lambda e: self._safe_after(180, self._search_hide))
+            "<FocusOut>", lambda e: self._safe_after(180, self._search_end))
         self.btn_run = ttk.Button(top, text="分析预测", style="Tool.TButton",
                                   command=self.run)
         self.btn_run.pack(side="left", padx=3)
@@ -11588,6 +11596,7 @@ class App:
         self._search_win = None
         self._search_lb = None
         self._search_open = False
+        self._wiz_active = False
 
         def load():
             try:
@@ -11616,6 +11625,11 @@ class App:
             if len(pre) >= 12:
                 break
         return (pre + sub)[:12]
+
+    def _search_end(self):
+        """结束键盘精灵本次搜索会话（下次输入从空搜索栏开始）。"""
+        self._wiz_active = False
+        self._search_hide()
 
     def _search_hide(self):
         self._search_open = False
@@ -11662,11 +11676,15 @@ class App:
             self._search_open = False
 
     def _search_key(self, e=None):
-        if e is not None and e.keysym in ("Up", "Down", "Return", "Escape",
+        if e is not None and e.keysym in ("Up", "Down", "Left", "Right",
+                                          "Home", "End", "Prior", "Next",
+                                          "Return", "KP_Enter", "Escape",
                                           "Tab", "Shift_L", "Shift_R",
                                           "Control_L", "Control_R",
                                           "Alt_L", "Alt_R"):
             return
+        if self.code_var.get():
+            self._wiz_active = True
         self._search_show(self._search_filter(self.code_var.get()))
 
     def _search_move(self, delta):
@@ -11705,8 +11723,14 @@ class App:
         return "break"
 
     def _global_key(self, e):
-        """非输入控件获得焦点时，按键自动聚焦搜索框并写入该字符。"""
-        if not e.char or e.keysym in ("Return", "Escape", "Tab"):
+        """全局按键：自动聚焦搜索框并写入字符。
+
+        类似同花顺键盘精灵——新一次搜索从空的搜索栏开始；
+        同一次搜索会话内（如连续输入 600519）则正常追加。
+        """
+        ch = e.char
+        if not ch or not ch.isprintable() or e.keysym in ("Return", "KP_Enter",
+                                                          "Escape", "Tab"):
             return None
         try:
             w = self.root.focus_get()
@@ -11714,17 +11738,23 @@ class App:
             w = None
         cls = w.winfo_class() if w is not None else ""
         if cls in ("Entry", "TEntry", "Text", "Listbox", "TCombobox",
-                   "Spinbox", "TSpinbox"):
+                   "Spinbox", "TSpinbox") and w is not self.ent_query:
+            return None
+        if getattr(self, "_wiz_active", False):
             return None
         try:
             self.ent_query.focus_set()
-            self.ent_query.insert("end", e.char)
+            if self.code_var.get():
+                self.ent_query.delete(0, "end")
+            self.ent_query.insert("end", ch)
+            self._wiz_active = True
             self._search_show(self._search_filter(self.code_var.get()))
         except Exception:
             pass
         return "break"
 
     def run(self):
+        self._search_end()
         try:
             full = normalize_code(self.code_var.get())
         except ValueError as e:
@@ -14717,7 +14747,11 @@ class App:
                      lambda e: win.attributes("-fullscreen", False))
         # 可滚动容器：设置内容多，小屏限高+滚轮滚动；
         # v6.1.5 热修⑨：按钮栏固定在窗口底部（不随内容滚动），滚轮绑到全部子控件。
-        maxh = int(self.root.winfo_screenheight() * 0.88)
+        try:
+            avail_h = int(self.root.winfo_vrootheight())
+        except Exception:
+            avail_h = int(self.root.winfo_screenheight())
+        maxh = max(360, int(avail_h * 0.88) - 40)
         cv = tk.Canvas(win, bg=DARK_BG, highlightthickness=0)
         sb = ttk.Scrollbar(win, orient="vertical", command=cv.yview)
         frm = ttk.Frame(cv, padding=14)
@@ -15182,6 +15216,7 @@ class App:
         self._search_win = None
         self._search_lb = None
         self._search_open = False
+        self._wiz_active = False
         self.scales = {}
         self.view = None
         self._style_ttk()
