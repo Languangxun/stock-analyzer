@@ -6111,13 +6111,20 @@ def pick_ablation_multi(cands, objective="稳健", min_trades=8):
 
 def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
                              recent_of=None, fallback=True):
-    """全窗选优 + 近端子窗一致性（v6.1.5 热修②，防风格切换失配）：
+    """全窗选优 + 近端子窗一致性（v6.1.5 热修②，防风格切换失配；v6.1.5 热修⑥
+    修复数据泄漏：近窗**严格只用训练段末尾** `RECENT_ABL_BARS` 根，
+    不含验证段）。
 
-    在全训练窗和最近 `RECENT_ABL_BARS` 根子窗里，各自按同一权重 rank 取
-    前 25%（下限 3 个）；两窗同时在前列者中取全窗得分最高。
-    交集为空（近端 regime 与全窗不一致）→ 回退该档「多维评分」候选；
-    近窗可评估候选 <3 个时视为无法判断，按纯全窗选优。
-    近窗（n=1000 时=验证段）只用于门槛否决，权重打分仍只用训练段指标。
+    在全训练窗（`c['train']`，前 75%）和近端子窗（`c['recent']`，训练段末尾
+    `RECENT_ABL_BARS` 根）里，各自按同一权重 rank 取前 25%（下限 3 个）；
+    两窗同时在前列者中取全窗得分最高。交集为空（近端 regime 与全窗不一致）
+    → 回退该档「多维评分」候选；近窗可评估候选 <3 个时视为无法判断，
+    按纯全窗选优。
+
+    ⚠ 重要（v6.1.5 热修⑥）：**验证段不参与任何选型门槛**——
+    全窗打分仅用训练段，近窗指标取自 `_ablation_recent(rows, sigs, rp, split, ...)`
+    即训练段末尾 `split-RECENT_ABL_BARS..split`，不接触验证段。
+    旧版本（v6.1.5 热修⑥ 前）docstring 误称「近窗 = 验证段」，已与实现同步。
 
     recent_of(c) 返回候选的近窗指标 dict（trades>=2），无则 None。
     返回 (picked, note)。"""
@@ -6337,12 +6344,17 @@ def _bt_segments(rows, signals, rp, atrs=None):
 
 
 def _ablation_recent(rows, sigs, rp, n, atrs, arrays=None):
-    """最近 ~250 根（截至最新）的"近端 regime"回测指标；交易<2 返回 None。
+    """近端 regime 回测指标（v6.1.5 热修⑥修复数据泄漏）；交易<2 返回 None。
 
+    参数 `n` 由调用方传**训练段结束位置 split**（不是 len(rows)）：
+      `r0 = max(0, n - RECENT_ABL_BARS)`，取 rows[r0:n] = 训练段末尾 250 根。
     用途：`pick_ablation_consistent` 的近端一致性否决——防"长期横盘/老 regime
     选出在当下风格里沉默的策略"（如 688012 于 2025-09 突破后的失配）。
-    注意：n=1000 时该子窗即验证段，因此验证段参与"top 门槛否决"但不参与
-    指标 rank 打分；这是时点可观测数据，属选型的一部分（见 ARCHITECTURE 3.8）。"""
+
+    ⚠ 重要：原版 v6.1.5 热修⑥前取 `n = len(rows)`，子窗即验证段 → 验证集参与
+    top25% 否决门槛，验证段指标偏乐观（过拟合）。v6.1.5 热修⑥ 改传 split，
+    严格只用训练段末尾 250 根，验证段不参与任何选型门槛（与 ARCHITECTURE 3.8
+    一致）。docstring 旧版本描述已与实现同步。"""
     r0 = max(0, n - RECENT_ABL_BARS)
     if r0 <= 0 or n - r0 < 100:
         return None
@@ -9978,13 +9990,17 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
             v20 = float(feat["vol20"][k, d]) \
                 if np.isfinite(feat["vol20"][k, d]) else None
             bkey = "beta60_sh" if cfg["score"] == "beta_sh" else "beta60"
-            # 参考止损（仅提示）：bata 档与买卖点同口径用 500 日历史最大回撤，
+            # 参考止损（仅提示）：bata 档与买卖点回测同口径用 500 日历史最大回撤，
             # 其余档仍为 2×20日波动（回测未用）。
+            # v6.1.8 P0 修正：end = d + 2（=执行日 T+1），与回测引擎
+            # _bt_events 的 _mdd_stop_dist(c_a, i=执行日, dd_win) 严格一致——
+            # 此前用 d + 1（信号日 T）少算 1 根，与回测口径不一致，
+            # 实盘下单时仍会按当日最新 ATR/MDD 重算，此处只是提示值。
             stop_ref = None
             _ddw = int((CFG.RISK_PARAMS.get(tier) or {})
                        .get("dd_window") or 0)
             if _ddw:
-                _mdd = _mdd_stop_dist(C[k], d + 1, _ddw)
+                _mdd = _mdd_stop_dist(C[k], d + 2, _ddw)
                 if _mdd > 0:
                     stop_ref = px * (1 - min(max(_mdd, 0.08), 0.50))
             if stop_ref is None and v20:

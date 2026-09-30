@@ -299,10 +299,20 @@ def export_one(code, mode, bars, picks=None):
             if pk is None and pool:      # 兼容全候选格式：就地按档选型
                 pk, _note = sg._pick_one_from_pool(pool, tier)
             if pk:
+                # v6.1.8 P0：bata 档**强制用 RISK_PARAMS["bata"]**（MDD 止损），
+                # 选型只决定 algo / 信号源（来自候选），不决定止损参数——
+                # 此前用 pk.get("params")，若选型选中 mode='激进' 候选则 bata
+                # 档实际跑激进 ATR 止损，bata 的 500 日 MDD 止损形同虚设，
+                # 数字与激进完全一致（实测 total/ann/winrate/val 全等）。
+                # bata 改激进破甲版的设计预期：选股/调仓复制激进 + 止损用 500
+                # 日 MDD；现在严格按此实现。
+                if tier == "bata":
+                    rp = sg.CFG.RISK_PARAMS["bata"]
+                else:
+                    rp = pk.get("params") or sg.CFG.RISK_PARAMS.get(
+                        tier, sg.CFG.RISK_PARAMS["稳健"])
                 rows_out.append(_row(pk.get("algo", "composite"), tier,
-                                     pk.get("label", ""),
-                                     pk.get("params")
-                                     or sg.CFG.RISK_PARAMS["稳健"],
+                                     pk.get("label", ""), rp,
                                      atrs=atrs_shared))
             else:   # 不在消融清单：固定多维评分回退
                 rows_out.append(_row("composite", tier,

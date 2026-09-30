@@ -38,8 +38,22 @@
 > （ATR/pre 不依赖 rp/sigs，原 4×重复计算），**260s → 204s（-22%）**；③
 > `backtest_strategy_ablation.py` 改 `map+chunksize` + 默认 workers 8→16，
 > **509s → 373s（-27%）**。组合层 v61 数字与 v6.1.7 bata 改激进破甲版完全一致
-> （浮点 <0.01pp）；perstock bata 档漂移 +9.9pp（总收益中位）源自 bata 改 MDD 止损 +
-> 新选型 pool，验证段漂移 -0.4pp 在容差内。基线协议见 `research/baseline/BASELINE.md`。
+> （浮点 <0.01pp）。基线协议见 `research/baseline/BASELINE.md`。
+> ⑥ **P0 数据正确性二轮修复（2026-09-30）**：深度审查发现并修复——
+> ① **bata 档止损参数实际未生效（P0-12，v6.1.7 bata 改激进破甲版起即存在）**：
+> `tier_picks_from_ablation` / `stock_backtest_export` 的 bata 档直接取选型候选
+> `pk.get("params")`，若选型选中 `mode='激进'` 候选则 bata 档实际跑激进 ATR 止损
+> （ATR2.5x），500 日 MDD 止损形同虚设（perstock bata 与激进 total/ann/winrate/val
+> 全部完全一致）。修复后 bata 强制 `RISK_PARAMS["bata"]`，选型只决定 algo/信号源；
+> perstock bata 总收益中位 +63.22%→**+37.24%**（-25.98pp），胜率 50%→**56%**（+6pp），
+> 盈亏比 2.21→**1.48**（-0.73），呈现「高胜率·低赔率」真实画像，验证段 -2.62%
+> （样本外仍接近 0），其他档不受影响；
+> ② **生产端 bata 参考止损与回测口径差 1 根**：`tier_latest_picks` 用
+> `_mdd_stop_dist(C[k], d+1, ...)` 取 T 日之前 500 根，回测引擎用
+> `_mdd_stop_dist(c_a, i=执行日=T+1, ...)` 取 T+1 日之前；改 `d+2` 对齐；
+> ③ **过拟合相关 docstring 误导修复**：`_ablation_recent` / `pick_ablation_consistent`
+> 旧 docstring 误称「近窗 = 验证段」，实际 v6.1.5 热修⑥ 已改传 `split`，
+> 近窗**严格只用训练段末尾 250 根**；docstring 与实现同步，加 ⚠ 防回归注释。
 > ㊸ **GUI 内置「一键全量回测」入口 + 打开仪表盘（2026-09-28）**：工具菜单新增
 > **「一键全量回测（全期/分段/逐股，后台）」**与**「打开回测仪表盘（网站）」**；
 > 数据工具页顶部新增同名区块（含「含逐年分段」勾选），点击直接调仓库根

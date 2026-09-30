@@ -1,19 +1,32 @@
-# Baseline（v6.1.8 bata 改激进破甲版 + P0/P1）
+# Baseline（v6.1.8 bata 改激进破甲版 + P0/P1 + P0 二轮修复）
 
-## 回测耗时基线（实测，commit 8e0d91c/247815a/本次提交）
+## 回测耗时基线（实测）
 
-| 脚本 | v6.1.7 baseline | v6.1.8 P1 后 | 提速 |
+| 脚本 | v6.1.7 baseline | v6.1.8 后 | 提速 |
 |---|---|---|---|
 | `backtest_v61.py`（4 口径全期） | **127.9s** | **74s** | -42% |
-| `stock_backtest_export.py`（6898 只 × 4 档） | **260s** | **204s** | -22% |
+| `stock_backtest_export.py`（6898 只 × 4 档） | **260s** | **203s** | -22% |
 | `backtest_strategy_ablation.py`（7181 只 × 4 档） | **509s** | **373s** | -27% |
 
-## v61 全期数字漂移（与 v6.1.7 bata 改激进破甲版对比）
-- 组合层 v61：完全一致（浮点 <0.01pp）—— 组合引擎 `tier_sim_phase` 不设止损，
-  bata 改 MDD 止损 + P0 年化口径修复只影响单股 `_bt_events`/`_bt_simulate`，不影响组合层
-- perstock bata 总收益中位：+53.33% → +63.22%（+9.89pp，bata 改 MDD 止损 + 新选型叠加）
-- perstock bata 验证段中位：-1.47% → -1.87%（-0.40pp，在容差内）
-- 消融训练/验证中位漂移 1-2pp（bata 候选入选 pool + 数据微变）
+## 数字漂移（与 v6.1.7 bata 改激进破甲版对比）
+- **组合层 v61**：完全一致（0pp 漂移）—— 组合引擎 `tier_sim_phase` 不设止损
+- **perstock bata 修复前**：总收益中位 +63.22%（与激进完全相等，**P0 bug**——500 日 MDD 形同虚设）
+- **perstock bata 修复后**（本次提交）：总收益 +37.24%（-25.98pp），胜率 56%（+6pp），
+  盈亏比 1.48（-0.73），验证段 -2.62%（样本外仍接近 0）—— 呈现「高胜率·低赔率」真实画像
+- **perstock 其他档**：保守/稳健/激进**完全不受影响**
+- **消融**：训练/验证漂移 1-2pp（bata 候选入选 pool + 数据微变）
+
+## P0 二轮修复（2026-09-30）
+1. **P0-12 bata 档止损参数实际未生效（v6.1.7 bata 改激进破甲版起即存在）**：
+   - `tier_picks_from_ablation` / `stock_backtest_export` 的 bata 档直接取
+     选型候选 `pk.get("params")`，若选型选中 `mode='激进'` 候选则 bata 档
+     实际跑激进 ATR 止损（ATR2.5x），500 日 MDD 形同虚设
+   - 修复：bata 档强制 `RISK_PARAMS["bata"]`，选型只决定 algo/信号源
+2. **P0-3 生产端 bata 参考止损与回测口径差 1 根**：
+   - 改 `_mdd_stop_dist(C[k], d+2, _ddw)` 与回测引擎执行日一致
+3. **过拟合相关 docstring 误导修复**：
+   - `_ablation_recent` / `pick_ablation_consistent` 旧 docstring 误称
+     「近窗 = 验证段」，加 ⚠ 防回归注释（v6.1.5 热修⑥ 已修实现，本轮只同步文档）
 
 ## 环境
 8 核 / 14GB 内存（Linux 5.x，Python 3.14.4），库内 ~1272 万根 / 7624 只（2026-09-29）
@@ -28,9 +41,10 @@
 ## 验证
 - `python3 -m py_compile stock_gui.py stock_predict.py backtests/*.py` → OK
 - `python3 test_settings.py` → GUI 冒烟通过（窗口 964×994，无 errors）
-- `python3 build_cli.py` → 重生成 `stock_predict.py` (464 KB)
+- `python3 build_cli.py` → 重生成 `stock_predict.py` (465 KB)
 - `python3 backtests/v61_dashboard.py` → 仪表盘刷新 OK（24 MB / 27592 只 perstock）
 
-## 提交
-- v6.1.8 bata 改激进破甲版 + P0 + P1（v61 全期并行）→ 247815a
-- v6.1.8 P1 perstock + 消融并行 + 跨档指标复用 → 本次提交
+## 提交链
+- `247815a` v6.1.8: bata 档按500日历史最大回撤止损 + 四口径并行回测 P1(75.6s)/年化口径 P0
+- `b1d9ea3` v6.1.8 P1: perstock + 消融多进程并行 + 跨档指标复用
+- 本次提交：v6.1.8 P0 二轮修复（bata 止损强制 bata 参数 + 生产端 MDD 口径对齐 + docstring 防回归）
