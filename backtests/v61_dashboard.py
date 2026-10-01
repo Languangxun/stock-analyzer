@@ -319,7 +319,7 @@ tr:hover td{background:var(--panel2)}
     <div class="legend" id="c-legend"></div>
     <canvas id="cv-curve" style="height:420px"></canvas>
     <div class="hover" id="c-hover">鼠标移入查看每日净值</div>
-    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进/bata＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）。悬浮读数中会标注「空仓」。</div>
+    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）、高风险＝板块轮动闸门（行业广度为主+大盘均线辅，开得更久）。悬浮读数中会标注「空仓」。</div>
     <div id="c-sum"></div>
   </section>
   <section id="tab-metrics" class="tab">
@@ -394,7 +394,7 @@ function readTheme(){
       grid:g('--grid'),line:g('--line'),fg:g('--fg'),panel:g('--panel'),
       bg:g('--bg'),cross:g('--cross'),label:g('--label')};
 }
-const TIERS=["稳健","均衡","激进","bata"];
+const TIERS=["稳健","均衡","激进","高风险"];
 const UNI_NAME={all:"全A",main:"沪深主板",etf:"ETF",all_etf:"全A含ETF"};
 const $=(q)=>document.querySelector(q);
 const $$=(q)=>Array.from(document.querySelectorAll(q));

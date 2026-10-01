@@ -294,20 +294,17 @@ def export_one(code, mode, bars, picks=None):
         # v6.1.8 P1：4 档共用 1 次 ATR(14)（ATR 不依赖 rp/sigs，原 4× 重算）
         atrs_shared = sg._precompute_atr(rows, 0, len(rows))
         rows_out = []
-        for tier in ("保守", "稳健", "激进", "bata"):
+        for tier in ("保守", "稳健", "激进", "高风险"):
             pk = src.get(tier) if isinstance(src, dict) else None
             if pk is None and pool:      # 兼容全候选格式：就地按档选型
                 pk, _note = sg._pick_one_from_pool(pool, tier)
             if pk:
-                # v6.1.8 P0：bata 档**强制用 RISK_PARAMS["bata"]**（MDD 止损），
-                # 选型只决定 algo / 信号源（来自候选），不决定止损参数——
-                # 此前用 pk.get("params")，若选型选中 mode='激进' 候选则 bata
-                # 档实际跑激进 ATR 止损，bata 的 500 日 MDD 止损形同虚设，
-                # 数字与激进完全一致（实测 total/ann/winrate/val 全等）。
-                # bata 改激进破甲版的设计预期：选股/调仓复制激进 + 止损用 500
-                # 日 MDD；现在严格按此实现。
-                if tier == "bata":
-                    rp = sg.CFG.RISK_PARAMS["bata"]
+                # v6.1.9：高风险档**强制用 RISK_PARAMS["高风险"]**（宽止损、暂不管
+                # 最大回撤），选型只决定 algo / 信号源（来自候选），不决定止损参数。
+                # 高风险=新开发的高风险策略（板块轮动为主参考），入场门槛 1/冷却 2；
+                # 若跟随候选 params 可能选中保守/稳健参数，与其定位不符。
+                if tier == "高风险":
+                    rp = sg.CFG.RISK_PARAMS["高风险"]
                 else:
                     rp = pk.get("params") or sg.CFG.RISK_PARAMS.get(
                         tier, sg.CFG.RISK_PARAMS["稳健"])
@@ -384,10 +381,10 @@ def main():
     ap.add_argument("--pool", default="all",
                     choices=["all", "main", "deep"])
     ap.add_argument("--mode", default="tiers",
-                    choices=["tiers", "保守", "稳健", "激进", "bata",
+                    choices=["tiers", "保守", "稳健", "激进", "高风险",
                              "cached"],
                     help="tiers=四档（按消融选型，分表输出，默认）；"
-                         "保守/稳健/激进/bata=单档固定风险参数；cached=当前缓存策略")
+                         "保守/稳健/激进/高风险=单档固定风险参数；cached=当前缓存策略")
     ap.add_argument("--picks", default=os.path.join(
         ROOT, "research", "perstock_tier_picks.json"),
         help="四档选型 JSON（tier_picks_from_ablation.py 产物；"
@@ -462,7 +459,7 @@ def main():
                       f"耗时{el:.0f}s ETA{eta:.0f}s", flush=True)
 
     header = [c[0] for c in COLS]
-    tiers = [t for t in ("保守", "稳健", "激进", "bata")
+    tiers = [t for t in ("保守", "稳健", "激进", "高风险")
              if any(r.get("mode") == t for r in rows_out)]
 
     def _table(rs):
@@ -481,9 +478,9 @@ def main():
             ["耗时(秒)", round(time.time() - t0)],
             ["口径", "T日收盘信号→T+1成交；ATR止损+移动止盈；"
                      "训练段=前75%，验证段=后25%；IC=信号方向与未来收益Spearman"],
-            ["四档选型", "保守/稳健/激进/bata = 消融候选池按该档目标（多指标"
-                     " rank + 训练段末尾近端一致性）逐股选优；bata=激进破甲版，"
-                     "目标与激进一致（偏年化+Calmar）"],
+            ["四档选型", "保守/稳健/激进/高风险 = 消融候选池按该档目标（多指标"
+                     " rank + 训练段末尾近端一致性）逐股选优；高风险=新开发的"
+                     "高风险策略，目标与激进一致（偏年化+Calmar）"],
             ["⚠ 口径提醒",
              "「总收益%/年化%/胜率%」是【全周期】回测，含用于选型的训练段，"
              "受“从~30个候选里挑最好”的赢家诅咒影响，数值严重偏乐观"

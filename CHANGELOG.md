@@ -5,6 +5,30 @@
 
 ## 版本历史
 
+> ㊻ **v6.1.9：高风险档重做为「新开发的高风险策略」（板块轮动 + 大盘降权 + 提高风险偏好，2026-10-01）**：
+> ① **组合层（进攻性重做）**——第四档由「复制激进的激进破甲版」改为**新开发的板块轮动策略**，
+> 四口径统一 `score="rotate"`（`0.5·rank(行业20日动量) + 0.5·[0.7·rank(个股20日动量)
+> + 0.3·(1−rank(20日波动))]`，强势板块中的强势股优先）+ `Top5 / 10 日调仓` +
+> `gate_mode="rotation"` 板块轮动闸门（`0.6·行业广度 + 0.4·上证MA20 ≥ 0.35`，**大盘权重由
+> 100% 降到 40%**、主参考板块广度；全期开闸 **1010/1636=62%**，明显长于旧闸门
+> 全A 创业指 MA60=777、上证 MA20=857——阀门开得更久，只在板块间来回切换而非空仓）+
+> 保留 `allow_limit_up=True` 打板；
+> ② **新增引擎件**——`tier_sector_features`（行业等权 `ret20` → `sector_ret20`、动量为正行业
+> 占比 `sec_breadth`，缓存 `_TIER_CACHE["sec"]`；ETF/无行业退化为自身动量）、
+> `tier_make_score` 增 `rotate`、新增 `tier_make_rotation_gate` / `tier_build_gate`
+> （`cfg.gate_mode="rotation"` 分派）；`ai_market_brief` 高风险档闸门改用真实板块轮动闸门状态；
+> ③ **风险偏好提高（暂不管最大回撤）**——`CFG.RISK_PARAMS["高风险"] = (atr_mult 6.0,
+> trail_trigger 1.15, trail_ratio 0.80, buy_th 1, cooldown 2)`：宽止损、浮盈 15% 后回落 20%
+> 才移动止盈、冷却缩短到 2；**整体删除 v6.1.8 的 500 日历史最大回撤止损机制**
+> （`_mdd_stop_dist` 与 `_bt_events`/`_bt_simulate`/`tier_latest_picks` 的 `dd_window` 分支）；
+> ④ **命名与定义清理**——旧档位名统一重命名为「高风险」（GUI 下拉/弹窗/设置、CLI、AI 提示词与
+> 自动选档、回测脚本/图表/仪表盘、README/ARCHITECTURE），删除已废弃的旧选型扫描脚本与留档产物，
+> CLI 由 `build_cli.py` 重新生成，`APP_VERSION=6.1.9`；
+> ⑤ **回测重跑**——全期/样本外/强势段/逐年/逐股全部重跑（`research/backtest_v6.1.9_*`、
+> `v61_report*.md`、`dashboard.html`、`tiers_yearly.json`），全A 全期总收益
+> **+117.5%（年化 +21.2%）vs 激进 +56.2%（+11.7%）**、最大回撤 -16.8% 反而更低；
+> README 报告/四档策略/风险参数表、ARCHITECTURE 3.6/3.7/3.8/4.1/4.4/七节同步。
+
 > ㊺ **键盘精灵默认清空搜索栏 + 设置界面适配 dock/任务栏（v6.1.8 热修①，2026-09-30）**：
 > ① **搜索栏行为（同花顺式键盘精灵）**——按下可打印字符自动聚焦搜索框：**新一次搜索先清空搜索栏**再
 > 从该字符开始（搜索框自身有焦点时同样生效，如启动预填/上次分析残留的 `002241`，此前会被拼成
@@ -21,26 +45,25 @@
 > 仍强制全屏）。其他对话框（信号胜率/工具/关于 等较小窗口）同步受益。
 > `APP_VERSION=6.1.8` 不变；`stock_predict.py` 由 `build_cli.py` 重新生成。CHANGELOG/ARCHITECTURE 第七节同步。
 
-> ㊹ **v6.1.8：bata 档改「激进破甲版」（配置复制激进 + 允许打板 + 按历史最大回撤止损，2026-09-28）**：
-> ① **组合层**——`TIER_CFG`/`_MAIN`/`_ETF`/`_ALLETF` 的 `bata` 改为
+> ㊹ **v6.1.8：高风险 档改「激进破甲版」（配置复制激进 + 允许打板 + 按历史最大回撤止损，2026-09-28）**：
+> ① **组合层**——`TIER_CFG`/`_MAIN`/`_ETF`/`_ALLETF` 的 `高风险` 改为
 > `dict(同口径激进, allow_limit_up=True)`（全A=创业板高β Top5/10日/创业板指 MA60；
 > 主板/ETF/全A含ETF=blend_mom 0.7 Top20（ETF Top10）/10日/上证 MA20；仅额外解除
 > 「涨停不买」）；初版「blend_mom Top5/20日/科创50 MA60」高赔率低频实现废弃
-> （全A +31.3% 跑输激进 +56.2%），`backtests/sweep_bata.py` 与 `research/bata_sweep_*`
-> 转历史留档（脚本 docstring 标注废弃）。
-> ② **买卖点风险参数（按历史最大回撤止损）**——`CFG.RISK_PARAMS["bata"]` 入场与
+> （全A +31.3% 跑输激进 +56.2%），配套扫描脚本与留档产物已随 v6.1.9 档位重做删除。
+> ② **买卖点风险参数（按历史最大回撤止损）**——`CFG.RISK_PARAMS["高风险"]` 入场与
 > 激进完全一致（买点门槛 1 / 冷却 3），止损改用**入场前 500 日个股历史最大回撤**
 > （新增 `_mdd_stop_dist`，限幅 8%~50%；未盈利=入场价−MDD、盈利后=峰值−MDD），
 > `_bt_events`/`_bt_simulate` 双引擎支持，历史不足 60 根回退 ATR4.0/回落12%；
-> 生产端 `tier_latest_picks` 的 bata 参考止损同步为 MDD 口径。
-> ③ **消融选型**——`_ablation_weights`/`_pick_one_from_pool` 的 bata 目标由「偏 PF 赔率」
+> 生产端 `tier_latest_picks` 的 高风险 参考止损同步为 MDD 口径。
+> ③ **消融选型**——`_ablation_weights`/`_pick_one_from_pool` 的 高风险 目标由「偏 PF 赔率」
 > 改为与激进一致（偏年化+Calmar）；GUI 消融弹窗/设置页按钮说明/菜单版本号/AI 提示词
 > （`RISK_AI_GUIDE`、`ai_choose_tier`）同步「激进破甲」口径；`APP_VERSION=6.1.8`，
 > `stock_predict.py` 重新生成。
 > ④ **回测口径**——组合引擎不设止损（只按调仓/闸门进出），本次止损改动只影响
 > 单股买卖点/消融/逐股回测；按用户要求本轮**不重跑**回测，README 回测摘要沿用
 > v6.1.7 批次（`research/backtest_v6.1.7_20260928_220922_full/`、`v61_report*.md`、`tiers_yearly.json`）；
-> README 四档策略/bata 说明/风险参数表、ARCHITECTURE 3.6/3.7/3.8/4.4/七节与仪表盘文案同步。
+> README 四档策略/高风险 说明/风险参数表、ARCHITECTURE 3.6/3.7/3.8/4.4/七节与仪表盘文案同步。
 > ⑤ **性能与口径修复（P0/P1）**——P0：`_bt_simulate` 年化口径与 `_bt_events` 对齐
 > （用区间起点日期算年数、下限 0.25 年；首信号远晚于区间起点时年化不再虚高）；
 > P1：三大回测脚本多进程并行 + 跨档指标复用——① `backtest_v61.py` 4 口径改
@@ -53,18 +76,18 @@
 > 共用 1 次 ATR(14) 预计算 + composite 算法 4 档共用 1 次 `_composite_precompute`**
 > （ATR/pre 不依赖 rp/sigs，原 4×重复计算），**260s → 204s（-22%）**；③
 > `backtest_strategy_ablation.py` 改 `map+chunksize` + 默认 workers 8→16，
-> **509s → 373s（-27%）**。组合层 v61 数字与 v6.1.7 bata 改激进破甲版完全一致
+> **509s → 373s（-27%）**。组合层 v61 数字与 v6.1.7 高风险 改激进破甲版完全一致
 > （浮点 <0.01pp）。基线协议见 `research/baseline/BASELINE.md`。
 > ⑥ **P0 数据正确性二轮修复（2026-09-30）**：深度审查发现并修复——
-> ① **bata 档止损参数实际未生效（P0-12，v6.1.7 bata 改激进破甲版起即存在）**：
-> `tier_picks_from_ablation` / `stock_backtest_export` 的 bata 档直接取选型候选
-> `pk.get("params")`，若选型选中 `mode='激进'` 候选则 bata 档实际跑激进 ATR 止损
-> （ATR2.5x），500 日 MDD 止损形同虚设（perstock bata 与激进 total/ann/winrate/val
-> 全部完全一致）。修复后 bata 强制 `RISK_PARAMS["bata"]`，选型只决定 algo/信号源；
-> perstock bata 总收益中位 +63.22%→**+37.24%**（-25.98pp），胜率 50%→**56%**（+6pp），
+> ① **高风险 档止损参数实际未生效（P0-12，v6.1.7 高风险 改激进破甲版起即存在）**：
+> `tier_picks_from_ablation` / `stock_backtest_export` 的 高风险 档直接取选型候选
+> `pk.get("params")`，若选型选中 `mode='激进'` 候选则 高风险 档实际跑激进 ATR 止损
+> （ATR2.5x），500 日 MDD 止损形同虚设（perstock 高风险 与激进 total/ann/winrate/val
+> 全部完全一致）。修复后 高风险 强制 `RISK_PARAMS["高风险"]`，选型只决定 algo/信号源；
+> perstock 高风险 总收益中位 +63.22%→**+37.24%**（-25.98pp），胜率 50%→**56%**（+6pp），
 > 盈亏比 2.21→**1.48**（-0.73），呈现「高胜率·低赔率」真实画像，验证段 -2.62%
 > （样本外仍接近 0），其他档不受影响；
-> ② **生产端 bata 参考止损与回测口径差 1 根**：`tier_latest_picks` 用
+> ② **生产端 高风险 参考止损与回测口径差 1 根**：`tier_latest_picks` 用
 > `_mdd_stop_dist(C[k], d+1, ...)` 取 T 日之前 500 根，回测引擎用
 > `_mdd_stop_dist(c_a, i=执行日=T+1, ...)` 取 T+1 日之前；改 `d+2` 对齐；
 > ③ **过拟合相关 docstring 误导修复**：`_ablation_recent` / `pick_ablation_consistent`
@@ -105,62 +128,62 @@
 > **195 处平段，全部满足区间内闸门开 0/N**，且平段前闸门刚开过（如全A激进
 > 2026-07-24~09-24 平段 28/28 关闭）。结论：水平段 = 趋势闸门关闭 → 各相位在
 > 自己的调仓日依次清仓后持现金（相位平均下先分化后全平），非行情缺失或引擎
-> 故障；曲线横线越长代表该档空仓避险越久（如 bata 2023-06~11 科创50 MA60
+> 故障；曲线横线越长代表该档空仓避险越久（如 高风险 2023-06~11 科创50 MA60
 > 长关 5 个月）。
 > 为避免误读，`dashboard.html` 净值曲线页新增**横线说明**（各档闸门对照），
 > 且悬浮读数对处于平段的档自动标注「（空仓·闸门关）」。
 
-> ㊴ **v6.1.7 热修②：AI 提示词按风险偏好 + 所有风险偏好入口补 bata（2026-09-28）**：
-> ① **AI 提示词动态化**——新增 `RISK_AI_GUIDE`（档次 保守 < 稳健 < 激进 < bata）
+> ㊴ **v6.1.7 热修②：AI 提示词按风险偏好 + 所有风险偏好入口补 高风险（2026-09-28）**：
+> ① **AI 提示词动态化**——新增 `RISK_AI_GUIDE`（档次 保守 < 稳健 < 激进 < 高风险）
 > 与 `ai_system_prompt()`：保守=等确认/轻仓，稳健=兼顾但必须可执行，
-> 激进=突破即进攻、禁用「等企稳/等回踩/观望」搪塞，**bata（最高档，高于激进）=
+> 激进=突破即进攻、禁用「等企稳/等回踩/观望」搪塞，**高风险（最高档，高于激进）=
 > 高赔率敢下手、强势/涨停附近可直接给买入或打板（涨停价）建议、允许集中仓位、
 > 禁止等企稳措辞**；系统提示词与首条数据上下文都注入该约束，风险偏好变化后
 > 上下文 hash 随之变化 → 自动重新提问，不复用旧口径缓存回答；`ai_choose_tier`
 > 改用基础系统提示词避免偏置。
-> ② **所有风险偏好入口补 bata**——逐股回测导出 `stock_backtest_export.py`：
-> `--mode tiers` 分表加 bata（xlsx 四工作表）、`--mode 保守/稳健/激进/bata` 单档
+> ② **所有风险偏好入口补 高风险**——逐股回测导出 `stock_backtest_export.py`：
+> `--mode tiers` 分表加 高风险（xlsx 四工作表）、`--mode 保守/稳健/激进/高风险` 单档
 > 固定该档参数（修正单档此前实际落到稳健参数的问题）；`tier_picks_from_ablation.py`
-> 选型/推荐/高波动回退加 bata；GUI「数据工具→每只股回测」下拉改「四档(分表)」+
-> bata；图表「激进档多交易兜底」扩展至 bata（保证买卖点可见）。
+> 选型/推荐/高波动回退加 高风险；GUI「数据工具→每只股回测」下拉改「四档(分表)」+
+> 高风险；图表「激进档多交易兜底」扩展至 高风险（保证买卖点可见）。
 > ③ **文档**——README AI 功能/标签页、ARCHITECTURE 3.9/4.1/变更索引同步。
 
-> ㊳ **v6.1.7 热修①：买卖点风险偏好新增 bata 档（高赔率·低频，2026-09-28）**：
-> ① **参数**——`CFG.RISK_PARAMS` 增 `bata = (atr_mult 3.5, trail_trigger 1.05,
+> ㊳ **v6.1.7 热修①：买卖点风险偏好新增 高风险 档（高赔率·低频，2026-09-28）**：
+> ① **参数**——`CFG.RISK_PARAMS` 增 `高风险 = (atr_mult 3.5, trail_trigger 1.05,
 > trail_ratio 0.90, buy_th 2, cooldown 8)`：比稳健（ATR1.5/冷却5）止损更宽、
 > 止盈更慢（+5% 才启动移动止盈、回落 10% 才走）、交易更少；经 300 只 × 400 根
-> 同源对照选出（`_composite_signals` + `backtest_signals`）：bata 赔率中位 **1.73** /
+> 同源对照选出（`_composite_signals` + `backtest_signals`）：高风险 赔率中位 **1.73** /
 > 年化中位 **+2.0%** / 均笔 11.7，对照保守 1.50/-1.2%/10.2 笔、
 > 稳健 1.69/-1.0%/14.1 笔、激进 1.83/+1.5%/18.7 笔。
-> ② **消融集成**——`_ablation_weights` 新增 bata 目标（PF 0.45 / Calmar 0.25 /
+> ② **消融集成**——`_ablation_weights` 新增 高风险 目标（PF 0.45 / Calmar 0.25 /
 > 年化 0.20 / 胜率 0.10），`_pick_one_from_pool` 按其映射；`run_ablation` 候选
 > 30→**40**（10 算法 × 4 参数），输出四档 `mode_candidates`、日志与推荐，
-> 高波动股回退范围加 bata；策略弹窗 `order` 加 bata（可单选应用），
-> 设置页「风险偏好」下拉自动含 bata。
-> ③ **文档**——README「四档风险参数」表 + bata 对照段、ARCHITECTURE 3.6/3.8/变更索引、
+> 高波动股回退范围加 高风险；策略弹窗 `order` 加 高风险（可单选应用），
+> 设置页「风险偏好」下拉自动含 高风险。
+> ③ **文档**——README「四档风险参数」表 + 高风险 对照段、ARCHITECTURE 3.6/3.8/变更索引、
 > 消融脚本注释同步；`build_cli.py` 重新生成 `stock_predict.py`。
 > 注：逐股多维评分的绝对收益整体偏弱（与既有「样本外归零」结论一致），
-> bata 档定位为同族中「赔率优先、换手更低」的参数档，不代表组合层 bata 策略。
+> 高风险 档定位为同族中「赔率优先、换手更低」的参数档，不代表组合层 高风险 策略。
 
-> ㊲ **v6.1.7：新增第四档 bata（高赔率·低频·允许打板，四口径）**（2026-09-27）：
+> ㊲ **v6.1.7：新增第四档 高风险（高赔率·低频·允许打板，四口径）**（2026-09-27）：
 > ① **引擎支持**——`tier_build_features` 新增 `beta60_star`（对科创50 的 60 日 β），
 > `tier_make_score` 新增 `mom`（纯动量）/`beta_star`（扫描用，后证伪），
-> `tier_sim_phase` 识别 `cfg.allow_limit_up`（仅 bata 档解除「涨停不买」，回测实测
-> 1.3%~1.9% 的买入发生在涨停价，ETF 池约 0）；四口径 `TIER_CFG*` 各加 `bata`
+> `tier_sim_phase` 识别 `cfg.allow_limit_up`（仅 高风险 档解除「涨停不买」，回测实测
+> 1.3%~1.9% 的买入发生在涨停价，ETF 池约 0）；四口径 `TIER_CFG*` 各加 `高风险`
 > （`blend_mom`/Top5/20 日调仓/MA60 闸门：全A 与主板 mw0.7、ETF mw0.6、全A含ETF mw0.5；
-> 闸门全A/主板/全A含ETF 用科创50，ETF 用创业板指），`TIER_BENCH` 四口径 bata
-> 均对标科创50。② **选型**——新增 `backtests/sweep_bata.py` 扫描（≥100 组合，
-> 产物 `research/bata_sweep_*/`）：β 类四口径训练段全负、纯动量次差、
+> 闸门全A/主板/全A含ETF 用科创50，ETF 用创业板指），`TIER_BENCH` 四口径 高风险
+> 均对标科创50。② **选型**——新增 `backtests/sweep_高风险.py` 扫描（≥100 组合，
+> 产物 `research/高风险_sweep_*/`）：β 类四口径训练段全负、纯动量次差、
 > `reb30`/`top3` 训练段最优但样本外转负；按「训练段为正 + 样本外为正」定版
 > `blend_mom Top5 reb20`。③ **生产端**——`tier_latest_picks` 输出 `limit_up`
 > 标记，CLI/GUI 目标持仓对信号日封板标的标 `[涨停]` 并提示打板成交口径；
 > `ai_market_brief` 增科创50 与四档闸门，`ai_choose_tier` 提示词、GUI 每日荐股下拉、
-> 设置「荐股偏好」均加入 bata。④ **回测**——全期/样本外/强势段四口径重跑
-> （`research/backtest_v6.1.7_*`）：bata 全期年化 +5.2%（主板）~+8.6%（全A含ETF）、
+> 设置「荐股偏好」均加入 高风险。④ **回测**——全期/样本外/强势段四口径重跑
+> （`research/backtest_v6.1.7_*`）：高风险 全期年化 +5.2%（主板）~+8.6%（全A含ETF）、
 > 回撤 -8.4%~-13.4%、交易约 2100 笔（激进档的 1/5），荐股赔率 1.43~1.79；
 > 样本外 `val`/`bull` 为正但明显低于激进档（牛市中低换手档跑不过高β，README 有声明）。
 > ⑤ **文档/产物**——`APP_VERSION=6.1.7`、`build_cli.py` 重新生成 `stock_predict.py`、
-> `v61_charts`/`v61_dashboard` 档位列表加 bata、README/ARCHITECTURE/CHANGELOG 同步。
+> `v61_charts`/`v61_dashboard` 档位列表加 高风险、README/ARCHITECTURE/CHANGELOG 同步。
 
 > ㊱ **每只股回测加「事件股」检测 + 仪表盘默认剔除（2026-09-27）**：用户实测
 > `sz000578` 盐湖集团（原数码网络）激进档全期 +2564%，核查为 **2007-07-20 停牌 →

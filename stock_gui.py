@@ -108,7 +108,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-09-28 升 6.1.8）
-APP_VERSION = "6.1.8"
+APP_VERSION = "6.1.9"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -251,11 +251,11 @@ class CFG:
     # ---- 风险偏好（四级·网格寻优后参数）----
     # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
     # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
-    # bata=激进破甲版（v6.1.8）：入场同激进（评分1+冷却3，不小家子气），
-    #      止损不再用固定 ATR，改用**入场前 500 日历史最大回撤**作止损距离
-    #      （限幅 8%~50%；未盈利=入场价−MDD，盈利后=峰值−MDD），
-    #      容忍更大波动换赔率；历史不足 60 根自动回退 ATR4.0/回落12%。
-    #      风险偏好最高。前三级数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
+    # 高风险（v6.1.9 新开发的高风险策略）：进攻优先、暂不管最大回撤——
+    #      入场最积极（评分1+冷却2），止损放到 ATR6.0/回落20%，
+    #      移动止盈只在浮盈15%后回撤20%才触发，尽量持满吃趋势；
+    #      配合组合层板块轮动（闸门打开更久、强势板块来回切换）。
+    #      保守/稳健/激进数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
         "保守": {"atr_mult": 1.5, "trail_trigger": 1.01,
@@ -264,9 +264,8 @@ class CFG:
                  "trail_ratio": 0.94, "buy_th": 2, "cooldown": 5},
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
-        "bata": {"atr_mult": 4.0, "trail_trigger": 1.05,
-                 "trail_ratio": 0.88, "buy_th": 1, "cooldown": 3,
-                 "dd_window": 500},
+        "高风险": {"atr_mult": 6.0, "trail_trigger": 1.15,
+                   "trail_ratio": 0.80, "buy_th": 1, "cooldown": 2},
     }
 
     def risk_params():
@@ -3638,42 +3637,16 @@ def _exec_mode():
     return os.environ.get("EXEC_PX", "close").lower()
 
 
-def _mdd_stop_dist(closes, end, window, min_n=60):
-    """按历史最大回撤取止损距离（v6.1.8，bata 档用）。
-
-    取 `closes[0:end]` 内最近 `window` 根收盘价的最大回撤（正数，如 0.32=32%）；
-    只用 `end-1`（含）之前的数据（因果，不含成交日）。有效样本 < `min_n`
-    或数值异常时返回 0.0，调用方回退 ATR 止损。"""
-    lo = max(0, int(end) - int(window))
-    peak = None
-    mdd = 0.0
-    n = 0
-    for j in range(lo, int(end)):
-        c = closes[j]
-        if c is None or c != c or c <= 0:       # NaN 安全
-            continue
-        n += 1
-        if peak is None or c > peak:
-            peak = c
-        elif peak > 0:
-            dd = 1.0 - c / peak
-            if dd > mdd:
-                mdd = dd
-    return mdd if n >= min_n else 0.0
-
-
 def _bt_simulate(rows, signals, rp):
     """单段事件回测：BUY开仓/SELL平仓 + 动态止损/移动止盈。
 
     早盘信号：信号在 T 日收盘生成，T+1 日收盘成交；止损单用 T-1 日 ATR
-    设定（bata 档改用入场前 `dd_window` 根历史最大回撤作止损距离，
-    见 CFG.RISK_PARAMS["bata"]），T 日盘中止损触发才是可执行的挂单（防前视）。
+    设定（见 CFG.RISK_PARAMS，高风险档 ATR6.0/移动止盈放宽到浮盈15%），
+    T 日盘中止损触发才是可执行的挂单（防前视）。
     返回指标 dict（含净值曲线 curve 与逐笔收益 trades_list）。"""
     n = len(rows)
-    closes = [r.get("close") or 0.0 for r in rows]
     sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < n}
-    dd_win = int(rp.get("dd_window") or 0)
-    # 计算ATR(14)用于止损（无 dd_window 或历史不足时的口径）
+    # 计算ATR(14)用于止损
     atrs = [0.0] * n
     for i in range(14, n):
         atrs[i] = sum(max(rows[j]["high"] - rows[j]["low"],
@@ -3684,7 +3657,6 @@ def _bt_simulate(rows, signals, rp):
     eq = 1.0
     entry = None
     highest = None  # 持仓期间最高价
-    mdd_dist = 0.0  # 本笔止损距离（历史最大回撤，0=用 ATR）
     trades = []
     curve = []
 
@@ -3697,18 +3669,12 @@ def _bt_simulate(rows, signals, rp):
         if entry is not None:
             prev_high = highest
             highest = max(highest, h) if highest else h
-            if dd_win and mdd_dist > 0:
-                # 历史最大回撤止损：未盈利=入场价−MDD，盈利后=峰值−MDD
-                atr_stop = entry * (1.0 - mdd_dist)
-                trail_stop = prev_high * (1.0 - mdd_dist) \
-                    if prev_high > entry * rp["trail_trigger"] else atr_stop
-            else:
-                # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
-                atr_prev = atrs[i - 1] if i > 0 else 0.0
-                atr_stop = entry - rp["atr_mult"] * atr_prev \
-                    if atr_prev > 0 else entry * 0.95
-                trail_stop = prev_high * rp["trail_ratio"] \
-                    if prev_high > entry * rp["trail_trigger"] else atr_stop
+            # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
+            atr_prev = atrs[i - 1] if i > 0 else 0.0
+            atr_stop = entry - rp["atr_mult"] * atr_prev \
+                if atr_prev > 0 else entry * 0.95
+            trail_stop = prev_high * rp["trail_ratio"] \
+                if prev_high > entry * rp["trail_trigger"] else atr_stop
 
             # 止损触发（日内最低触及止损价）
             if l <= trail_stop:
@@ -3718,7 +3684,6 @@ def _bt_simulate(rows, signals, rp):
                 eq *= exit_price / entry
                 entry = None
                 highest = None
-                mdd_dist = 0.0
                 curve.append(eq)
                 continue
 
@@ -3726,18 +3691,12 @@ def _bt_simulate(rows, signals, rp):
             px_fill = ((r.get("open") or c) if exec_open else c)
             entry = px_fill
             highest = px_fill     # 成交时点之前的盘中高点不计入
-            mdd_dist = 0.0
-            if dd_win:
-                mdd = _mdd_stop_dist(closes, i, dd_win)
-                if mdd > 0:
-                    mdd_dist = min(max(mdd, 0.08), 0.50)
         elif typ == "SELL" and entry:
             px_fill = ((r.get("open") or c) if exec_open else c)
             trades.append(px_fill / entry - 1)
             eq *= px_fill / entry
             entry = None
             highest = None
-            mdd_dist = 0.0
         curve.append(eq * (c / entry) if entry else eq)
 
     # 未平仓按最后收盘价计算
@@ -5429,7 +5388,7 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 # 每次分析对该股近1000交易日做一次多算法消融回测：
 #   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
 #          筹码峰 / 板块轮动 / 多维评分×4风险档（全部 × 4 档风险参数，
-#          v6.1.8 起含 bata=激进破甲版）
+#          v6.1.9 起含 高风险=新开发的高风险策略参数）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
 # 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
 # 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
@@ -6064,9 +6023,10 @@ def _ablation_pool(cands, min_trades):
 
 
 def _ablation_weights(objective):
-    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进/bata 偏年化+Calmar。
-    bata=激进破甲版（v6.1.8），选型目标与激进一致，差异在风险参数
-    （入场同激进、按 500 日历史最大回撤止损、允许打板）而非选股目标。"""
+    """目标权重：稳健/保守偏 Calmar+PF；均衡/激进/高风险 偏年化+Calmar。
+    高风险=新开发的高风险策略（v6.1.9），选型目标与激进一致，
+    差异在组合层（板块轮动闸门/评分、允许打板）与风险参数
+    （ATR6.0 宽止损、暂不管最大回撤）。"""
     return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
             if objective == "稳健" else
             {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
@@ -6164,16 +6124,16 @@ def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
 def _pick_one_from_pool(pool, key):
     """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
 
-    key: 保守/稳健/激进/bata；保守档限定「保守/稳健参数」候选；
-    目标权重：保守/稳健=偏 Calmar+PF，激进/bata=偏年化+Calmar
-    （bata=激进破甲版，同一目标；见 _ablation_weights）。
+    key: 保守/稳健/激进/高风险；保守档限定「保守/稳健参数」候选；
+    目标权重：保守/稳健=偏 Calmar+PF，激进/高风险=偏年化+Calmar
+    （高风险=新开发的高风险策略，同一目标；见 _ablation_weights）。
     返回 (picked, note)。"""
     p = pool
     if key == "保守":
         p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
         if p2:
             p = p2
-    obj = {"均衡": "激进", "激进": "激进", "bata": "激进"}.get(key, "稳健")
+    obj = {"均衡": "激进", "激进": "激进", "高风险": "激进"}.get(key, "稳健")
     picked, note = pick_ablation_consistent(
         p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
     if not picked:
@@ -6194,8 +6154,7 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
                arrays=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
     早盘信号：信号在 T 日收盘生成，T+1 日收盘执行；止损单用 T-1 日 ATR 设定
-    （bata 档改用入场前 `dd_window` 根历史最大回撤作止损距离，见
-    CFG.RISK_PARAMS["bata"]，历史不足自动回退 ATR）。
+    （见 CFG.RISK_PARAMS，高风险档 ATR6.0/移动止盈放宽到浮盈15%）。
     atrs 可外部预计算加速。
     arrays（v6.1.3，numpy 加速）：(o,h,l,c) 平行列表，已由调用方从 rows 抽出，
       供批量回测复用，避免每次回测重复做 4×N 次字典取值。
@@ -6221,10 +6180,8 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
     atr_mult = rp["atr_mult"]
     trail_ratio = rp["trail_ratio"]
     trail_trig = rp["trail_trigger"]
-    dd_win = int(rp.get("dd_window") or 0)
     entry = None
     highest = None
-    mdd_dist = 0.0      # 本笔止损距离（历史最大回撤，0=用 ATR）
     trades = []
     curve = []
     sig_get = sig_map.get
@@ -6237,18 +6194,12 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
         if entry is not None:
             prev_high = highest
             highest = max(highest, h) if highest else h
-            if dd_win and mdd_dist > 0:
-                # 历史最大回撤止损：未盈利=入场价−MDD，盈利后=峰值−MDD
-                atr_stop = entry * (1.0 - mdd_dist)
-                trail_stop = prev_high * (1.0 - mdd_dist) \
-                    if prev_high > entry * trail_trig else atr_stop
-            else:
-                atr_prev = atrs[i - 1] if i > 0 else 0.0
-                atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
-                    else entry * 0.95
-                trail_stop = (prev_high * trail_ratio
-                              if prev_high > entry * trail_trig
-                              else atr_stop)
+            atr_prev = atrs[i - 1] if i > 0 else 0.0
+            atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
+                else entry * 0.95
+            trail_stop = (prev_high * trail_ratio
+                          if prev_high > entry * trail_trig
+                          else atr_stop)
             if l <= trail_stop:
                 o_i = o_a[i]
                 exit_px = o_i if (o_i and o_i <= trail_stop) else trail_stop
@@ -6256,21 +6207,14 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
                 eq *= exit_px / entry
                 entry = None
                 highest = None
-                mdd_dist = 0.0
         if typ == "BUY" and entry is None and c:
             entry = px_fill
             highest = px_fill         # 成交时点之前的盘中高点不计入
-            mdd_dist = 0.0
-            if dd_win:
-                mdd = _mdd_stop_dist(c_a, i, dd_win)
-                if mdd > 0:
-                    mdd_dist = min(max(mdd, 0.08), 0.50)
         elif typ == "SELL" and entry:
             trades.append(px_fill / entry - 1)
             eq *= px_fill / entry
             entry = None
             highest = None
-            mdd_dist = 0.0
         curve.append(eq * (c / entry) if entry else eq)
     if len(trades) < 2:
         return None
@@ -6485,7 +6429,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
     v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
 
-    返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat, bata:strat},
+    返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat, 高风险:strat},
           "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
     strat = {"algo","mode","params","train","val","bull","bear","label"}"""
     rows = [r for r in rows if r.get("close") and r["close"] > 0]
@@ -6611,15 +6555,15 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         return picked
 
     mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
-                       "激进": _pick("激进"), "bata": _pick("bata")}
+                       "激进": _pick("激进"), "高风险": _pick("高风险")}
     # 四档可能选中同一候选（同一算法×参数在两个加权目标下都排第一，
     # 属训练集选型结果而非故障）；记录选型与一致性结论，便于日志核对。
     log.info("消融选型 %s: 保守=%s[%s] | 稳健=%s[%s] | 激进=%s[%s] | "
-             "bata=%s[%s]", full,
+             "高风险=%s[%s]", full,
              mode_candidates["保守"]["label"], _pick_notes.get("保守"),
              mode_candidates["稳健"]["label"], _pick_notes.get("稳健"),
              mode_candidates["激进"]["label"], _pick_notes.get("激进"),
-             mode_candidates["bata"]["label"], _pick_notes.get("bata"))
+             mode_candidates["高风险"]["label"], _pick_notes.get("高风险"))
 
     # ---- 风险档推荐：只用训练集 Calmar 选（验证集仅报告，不参与选择）----
     def _tc(t):
@@ -6627,15 +6571,15 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         if not tr or tr.get("trades", 0) < 3:
             return None
         return _calmar(tr)
-    scored = [(t, _tc(t)) for t in ("保守", "稳健", "激进", "bata")]
+    scored = [(t, _tc(t)) for t in ("保守", "稳健", "激进", "高风险")]
     scored = [(t, s) for t, s in scored if s is not None]
     recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
     vol = _annualized_vol(rows)
     high_vol = bool(vol is not None and vol > 0.45)
-    # 高波动股保守档紧止损易被反复触发：推荐改在 稳健/激进/bata 中取较优，
+    # 高波动股保守档紧止损易被反复触发：推荐改在 稳健/激进/高风险 中取较优，
     # 与弹窗提示保持一致（否则会出现"推荐保守但提示别选保守"的自相矛盾）
     if high_vol and recommend == "保守":
-        alt = [(t, s) for t, s in scored if t in ("稳健", "激进", "bata")]
+        alt = [(t, s) for t, s in scored if t in ("稳健", "激进", "高风险")]
         if alt:
             recommend = max(alt, key=lambda x: x[1])[0]
 
@@ -7408,12 +7352,12 @@ def analyze(full, progress=None, quick=False):
             band_algo = "趋势跟踪·MA20/60（无信号→回退多维）"
     # 连续同向信号压缩：同一轮机会只保留首个 B/S 标注（回测开平仓语义不变）
     signals = _dedup_signals(signals)
-    # ---- 激进/bata 档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
-    # （沿用该档风险参数：激进/bata 均为买点门槛1/冷却3），保证震荡区间
+    # ---- 激进/高风险 档「多交易」兜底：所选策略近250日信号过少时改用多维评分 ----
+    # （沿用该档风险参数：激进/高风险 均为买点门槛1），保证震荡区间
     # （如 5~6 元箱体）也能标出足够波段买卖点。只影响展示与样本内统计，不改动消融缓存。
     _win = max(1, len(disp_rows) - 250)
     _recent_n = len([s for s in signals if s[0] >= _win])
-    _min_need = 8 if sel_mode in ("激进", "bata") else 2
+    _min_need = 8 if sel_mode in ("激进", "高风险") else 2
     if _recent_n < _min_need:
         try:
             _fb = [s for s in _composite_signals(disp_rows, rp)
@@ -9230,26 +9174,42 @@ def _v4_print_report(r):
 
 
 # ============ v6.1.3 组合策略引擎（稳健/均衡/激进；全A/主板/ETF/全A含ETF） ============
-# v6.1.8 第四档 bata = 激进破甲版（四口径均直接复制激进配置，仅额外
-#   解除「涨停不买」allow_limit_up=True）：选股/调仓/闸门与激进完全一致，
-#   风险更高体现在 ① 可打板（信号日封板也按涨停价买入）；② 买卖点风险参数
-#   止损按 500 日历史最大回撤（见 CFG.RISK_PARAMS["bata"]）。
-#   原「动量+低波 Top5/20日调仓」高赔率低频实现（v6.1.7 初版）已废弃：
-#   训练段尚可、样本外跑输激进（v61_report 全A +31.3% vs 激进 +56.2%）。
+# v6.1.9 新开发的高风险策略 = 第四档「高风险」（进攻优先，暂不管最大回撤）：
+#   与前三档不同，它不靠大盘择时，而是以「板块轮动」为主参考：
+#   ① 选股评分 rotate：所属行业 20 日动量排名（sec_w=0.5）为主，
+#      叠加个股动量/低波基准（mom_w=0.7）——强势板块内的强势股优先；
+#   ② 闸门 rotation：大盘均线权重降到 40%（_ROT_MARKET_W，旧口径为 100%），
+#      板块广度（20 日动量为正的行业占比）占 60%，阈值 0.35 → 大盘在均线上
+#      阀门恒开，大盘走弱时约六成行业动量为正仍持仓：阀门开得更久
+#      （全期 1010/1636=62% vs 旧闸门 777/857），只在板块间来回切换，
+#      而不是空仓避险；
+#   ③ 个股池按口径（全A/主板/ETF/全A含ETF），Top5、每 10 日调仓；
+#   ④ 解除「涨停不买」allow_limit_up=True（信号日封板也按涨停价买入）；
+#   ⑤ 买卖点风险参数见 CFG.RISK_PARAMS["高风险"]（ATR6.0 宽止损、
+#      浮盈 15% 后回落 20% 才止盈、买点门槛 1/冷却 2）——风险偏好最高，
+#      当前版本刻意不控制最大回撤，回撤由使用者自行承受。
 #
-# 原理（详见 README 第二节）：
+# 原理（前三档详见 README 第二节）：
 #   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
 #          上证 MA20 闸门（T-1 收盘在均线上才持仓）
 #   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
 #   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
 #          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）
-#   激进档基准（v6.1.1）：两个口径统一对标科创50（sh000688），
+#   激进/高风险档基准（v6.1.1）：统一对标科创50（sh000688），
 #         不再按是否具备科创板权限区分（多数账户无科创板权限，但仍以科创50
 #         作为「高弹性成长」这一风格的统一参照）。
 # 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
 #         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
 # 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
 #         消除单一调仓日的运气；tier_backtest 报告相位年化区间。
+
+# 高风险档公共模板：板块轮动评分 + 板块轮动闸门 + 打板（各口径仅换 universe）
+# top5/reb10/sec_w0.5 与闸门 40/35 由全期+样本外+强势段扫参选定（CHANGELOG v6.1.9）：
+#   all 全期 +117.5%（激进 +56.2%）、val +31.4%、bull +66.7%；
+#   开闸天数 1010/1636（62%）> 旧闸门（全A 创业板指 MA60=777、上证 MA20=857）。
+_ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
+            gate="sh000001", ma=20, gate_mode="rotation",
+            allow_limit_up=True)
 
 TIER_CFG = {
     "稳健": dict(universe="all", score="blend", top=20, reb=20,
@@ -9258,9 +9218,8 @@ TIER_CFG = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
+    "高风险": dict(_ROT, universe="all"),
 }
-# bata = 激进破甲版：原样复制激进配置 + 允许打板（改激进时自动同步）
-TIER_CFG["bata"] = dict(TIER_CFG["激进"], allow_limit_up=True)
 # 主板口径（v6.1.1）：稳健/均衡在沪主板+深主板内运行；
 # 激进档改用 blend_mom（动量0.7/低波0.3）偏弹性 + 高换手（reb10/top20/上证MA20）。
 # 依据（2026-09-19 过拟合诊断，全量缓存）：
@@ -9278,12 +9237,12 @@ TIER_CFG_MAIN = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
                  gate="sh000001", ma=20),
+    "高风险": dict(_ROT, universe="main"),
 }
-# bata = 激进破甲版：原样复制 + 允许打板
-TIER_CFG_MAIN["bata"] = dict(TIER_CFG_MAIN["激进"], allow_limit_up=True)
 # ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
-# 故三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
-# 闸门统一上证 MA20（ETF 池跨沪深，用市场总闸门）。
+# 故前三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
+# 高风险档同样用 rotate（ETF 无行业时板块动量退化为自身动量，见
+# tier_sector_features）；闸门一律板块轮动口径。
 TIER_CFG_ETF = {
     "稳健": dict(universe="etf", score="blend", top=10, reb=20,
                  gate="sh000001", ma=20),
@@ -9291,9 +9250,8 @@ TIER_CFG_ETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
                  gate="sh000001", ma=20),
+    "高风险": dict(_ROT, universe="etf"),
 }
-# bata = 激进破甲版：原样复制 + 允许打板
-TIER_CFG_ETF["bata"] = dict(TIER_CFG_ETF["激进"], allow_limit_up=True)
 # 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
 # （池内混入 ETF 后，创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
@@ -9303,25 +9261,24 @@ TIER_CFG_ALLETF = {
                  gate="sh000001", ma=20),
     "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
+    "高风险": dict(_ROT, universe="all_etf"),
 }
-# bata = 激进破甲版：原样复制 + 允许打板
-TIER_CFG_ALLETF["bata"] = dict(TIER_CFG_ALLETF["激进"], allow_limit_up=True)
 TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
                   "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
 UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
                  "all_etf": "全A含ETF"}
-# 激进档与 bata 档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板高β，
-# 主板/ETF/全A含ETF 激进用 blend_mom 弹性档；bata=激进破甲版，主基准与激进一致。
+# 激进档与高风险档统一对标科创50（不分是否具备科创板权限）：全A 激进选创业板
+# 高β，主板/ETF/全A含ETF 激进用 blend_mom 弹性档；高风险档主基准与激进一致。
 # ETF 因池内无科创语义，主基准仍统一用科创50（闸门是另一回事，池内实测用上证 MA20）。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
-    ("all", "激进"): "sh000688", ("all", "bata"): "sh000688",
+    ("all", "激进"): "sh000688", ("all", "高风险"): "sh000688",
     ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
-    ("main", "激进"): "sh000688", ("main", "bata"): "sh000688",
+    ("main", "激进"): "sh000688", ("main", "高风险"): "sh000688",
     ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000001",
-    ("etf", "激进"): "sh000688", ("etf", "bata"): "sh000688",
+    ("etf", "激进"): "sh000688", ("etf", "高风险"): "sh000688",
     ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000001",
-    ("all_etf", "激进"): "sh000688", ("all_etf", "bata"): "sh000688",
+    ("all_etf", "激进"): "sh000688", ("all_etf", "高风险"): "sh000688",
 }
 # 基准指数中文名（报告/对照用）
 BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
@@ -9491,10 +9448,59 @@ def tier_build_features(cal, C, V):
 
     beta60 = _beta("sz399006")        # 对创业板指（全A 激进档用）
     beta60_sh = _beta("sh000001")     # 对上证（主板激进档用）
-    beta60_star = _beta("sh000688")   # 对科创50（研究/初版 bata 扫描用）
+    beta60_star = _beta("sh000688")   # 对科创50（历史研究对照，无档位使用）
     return dict(ret20=ret20, vol20=vol20, amt20=amt20, barcount=barcount,
                 beta60=beta60, beta60_sh=beta60_sh,
                 beta60_star=beta60_star)
+
+
+def tier_sector_features(feat):
+    """板块轮动特征（v6.1.9 高风险档；结果缓存 `_TIER_CACHE["sec"]`）。
+
+    · sector_ret20[stock, t]：所属行业成分股 20 日收益的等权均值
+      （因果，t 日收盘可得）；用于选股评分 rotate 的「板块动量」项；
+    · sec_breadth[t]：20 日收益为正的行业占比；用于闸门 rotation
+      （主参考板块轮动、大盘权重降低）。
+    行业口径来自 stocks.industry（仅个股）；ETF/行业缺失退化为自身 ret20
+    （各自视作独立板块），保证 etf / all_etf 口径仍可排序。"""
+    if _TIER_CACHE.get("sec") is not None:
+        return _TIER_CACHE["sec"]
+    codes = tier_load_panel()[0]
+    ret20 = feat["ret20"]
+    with db_conn() as conn:
+        rows = conn.execute("select code, industry from stocks").fetchall()
+    meta = {c: (ind or "").strip() for c, ind in rows}
+    groups = {}
+    for i, c in enumerate(codes):
+        if _is_etf(c):
+            continue
+        ind = meta.get(c, "")
+        if ind:
+            groups.setdefault(ind, []).append(i)
+    sec = np.full_like(ret20, np.nan)
+    sec_avgs = []
+    for idxs in groups.values():
+        sub = ret20[idxs]
+        m = np.isfinite(sub)
+        cnt = m.sum(axis=0)
+        s = np.where(m, sub, 0.0).sum(axis=0)
+        avg = np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
+        sec[idxs] = avg
+        sec_avgs.append(avg)
+    breadth = np.zeros(ret20.shape[1], np.float32)
+    if sec_avgs:
+        A = np.vstack(sec_avgs)
+        ok = np.isfinite(A)
+        n_ok = ok.sum(axis=0)
+        n_pos = ((A > 0) & ok).sum(axis=0)
+        breadth = np.where(n_ok > 0, n_pos / np.maximum(n_ok, 1),
+                           0.0).astype(np.float32)
+    miss = ~np.isfinite(sec)
+    sec[miss] = ret20[miss]     # ETF/无行业：退化为自身动量
+    out = {"sector_ret20": sec, "sec_breadth": breadth}
+    _TIER_CACHE["sec"] = out
+    log.info("tier sector features %d 个行业", len(groups))
+    return out
 
 
 def _tier_rank01(x):
@@ -9524,14 +9530,17 @@ def tier_rank_base(codes, universe):
     return ~etf
 
 
-def tier_make_score(feat, kind, mom_w=None, base=None):
+def tier_make_score(feat, kind, mom_w=None, base=None, sec_w=None):
     """合成打分：
       blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
-      mom        = 纯 20 日动量百分位（研究用，v6.1.7 初版 bata 候选）
+      rotate     = 板块轮动（高风险档）：板块 20 日动量排名 sec_w 为主，
+                   叠加个股动量/低波基准（1-sec_w）；板块动量见
+                   tier_sector_features 的 sector_ret20
+      mom        = 纯 20 日动量百分位（历史研究对照）
       beta       = 60日β（对创业板指）
       beta_sh    = 60日β（对上证，主板口径）
-      beta_star  = 60日β（对科创50，研究用，v6.1.7 初版 bata）
+      beta_star  = 60日β（对科创50，历史研究对照）
     base：横截面排名基数掩码（None=全面板）；见 tier_rank_base。
     注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
@@ -9541,25 +9550,39 @@ def tier_make_score(feat, kind, mom_w=None, base=None):
         return feat.get("beta60_sh", feat["beta60"])
     if kind == "beta_star":
         return feat.get("beta60_star", feat["beta60"])
-    if kind in ("blend", "blend_mom", "mom"):
+    if kind in ("blend", "blend_mom", "mom", "rotate"):
         if kind == "blend_mom":
             mw = 0.7 if mom_w is None else float(mom_w)
         elif kind == "mom":
             mw = 1.0
+        elif kind == "rotate":
+            mw = 0.7 if mom_w is None else float(mom_w)
         else:
             mw = 0.5
         ret = feat["ret20"]
         vol = feat["vol20"]
+        sec = None
+        if kind == "rotate":
+            sec = tier_sector_features(feat)["sector_ret20"]
         if base is not None and not bool(base.all()):
             b2 = base[:, None]
             ret = np.where(b2, ret, np.nan)
             vol = np.where(b2, vol, np.nan)
+            if sec is not None:
+                sec = np.where(b2, sec, np.nan)
         r1 = np.zeros_like(feat["vol20"])
         r2 = np.zeros_like(feat["vol20"])
+        r3 = np.zeros_like(feat["vol20"]) if sec is not None else None
         for t in range(NDT):
             r1[:, t] = _tier_rank01(ret[:, t])
             r2[:, t] = _tier_rank01(vol[:, t])
-        return mw * r1 + (1.0 - mw) * (1.0 - r2)
+            if r3 is not None:
+                r3[:, t] = _tier_rank01(sec[:, t])
+        base_score = mw * r1 + (1.0 - mw) * (1.0 - r2)
+        if r3 is None:
+            return base_score
+        sw = 0.5 if sec_w is None else float(sec_w)
+        return sw * r3 + (1.0 - sw) * base_score
     raise ValueError("未知评分: " + kind)
 
 
@@ -9572,6 +9595,46 @@ def tier_make_gate(cal, code, ma_w):
     with np.errstate(invalid="ignore"):
         gate[1:] = (cl[:-1] > ma[:-1]) & np.isfinite(ma[:-1])
     return gate
+
+
+# 板块轮动闸门参数（v6.1.9 高风险档）：大盘均线权重 40%（较旧口径的 100% 大幅
+# 降低），板块广度 60%，阈值 0.35 → 大盘在均线上时阀门恒开；大盘走弱时约六成
+# 行业 20 日动量为正仍持仓。全期开闸 1010/1636（62%），明显长于旧闸门
+# （全A 创业板指 MA60=777、上证 MA20=857），只做板块轮动切换而非空仓避险。
+_ROT_MARKET_W = 0.40
+_ROT_GATE_TH = 0.35
+
+
+def tier_make_rotation_gate(cal, code, ma_w, sec_breadth,
+                            market_w=_ROT_MARKET_W, th=_ROT_GATE_TH):
+    """板块轮动闸门（高风险档）：大盘权重降低，主参考板块广度。
+
+    第 t 日闸门 = (1-market_w)×板块广度(T-1) + market_w×大盘均线状态(T-1)
+    ≥ th；默认 0.6/0.4、阈值 0.35（见 _ROT_MARKET_W/_ROT_GATE_TH）——
+    大盘在均线上恒开、大盘走弱时约六成行业动量为正仍开，
+    阀门打开时间更长，只在板块间来回切换而非空仓避险。
+    market_w/th 可由 cfg（gate_market_w/gate_th）覆盖，供研究扫参。"""
+    mkt = tier_make_gate(cal, code, ma_w).astype(float)
+    br = np.zeros(len(cal), float)
+    if sec_breadth is not None:
+        br[1:] = np.nan_to_num(
+            np.asarray(sec_breadth, float)[:-1], nan=0.0)
+    score = (1.0 - market_w) * br + market_w * mkt
+    return score >= th
+
+
+def tier_build_gate(cal, cfg, feat=None):
+    """按 cfg 构建闸门（gate_mode=rotation → 板块轮动闸门，否则指数均线）。"""
+    if not cfg.get("gate"):
+        return None
+    if cfg.get("gate_mode") == "rotation":
+        sec = tier_sector_features(feat).get("sec_breadth") \
+            if feat is not None else None
+        return tier_make_rotation_gate(
+            cal, cfg["gate"], cfg["ma"], sec,
+            market_w=float(cfg.get("gate_market_w", _ROT_MARKET_W)),
+            th=float(cfg.get("gate_th", _ROT_GATE_TH)))
+    return tier_make_gate(cal, cfg["gate"], cfg["ma"])
 
 
 def _tier_limit_pct(code):
@@ -9706,7 +9769,7 @@ def _tier_metrics(eq, dates, trades=None):
 
 def tier_eval(segment="full", tiers=None, phases=None, progress=None,
               overrides=None, universe="all"):
-    """组合档回测（相位平均主口径；稳健/均衡/激进/bata）。overrides 可覆盖 cfg（研究用）。
+    """组合档回测（相位平均主口径；稳健/均衡/激进/高风险）。overrides 可覆盖 cfg（研究用）。
     universe: all=全A / main=沪深主板。返回 {tier: metrics}。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
@@ -9734,9 +9797,8 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
             cfg.update(overrides)
         _base = tier_rank_base(codes, universe)
         score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
-                                base=_base)
-        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
-            if cfg.get("gate") else None
+                                base=_base, sec_w=cfg.get("sec_w"))
+        gate = tier_build_gate(cal, cfg, feat)
         n_ph = min(phases or cfg["reb"], cfg["reb"])
         norms, dates, all_trades = [], None, []
         for p in range(n_ph):
@@ -9844,9 +9906,8 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
             cfg.update(overrides)
         _base = tier_rank_base(codes, universe)
         score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
-                                base=_base)
-        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
-            if cfg.get("gate") else None
+                                base=_base, sec_w=cfg.get("sec_w"))
+        gate = tier_build_gate(cal, cfg, feat)
         n_ph = min(phases or cfg["reb"], cfg["reb"])
         trades = []
         for p in range(n_ph):
@@ -9957,12 +10018,11 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
         if tier not in base:
             continue
         cfg = tier_cfg(tier, universe)
-        gate = tier_make_gate(cal, cfg["gate"], cfg["ma"]) \
-            if cfg.get("gate") else None
+        gate = tier_build_gate(cal, cfg, feat)
         on = bool(gate[d]) if gate is not None else True
         _base = tier_rank_base(codes, universe)
         score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
-                                base=_base)
+                                base=_base, sec_w=cfg.get("sec_w"))
         m = tier_universe_mask(codes, cfg.get("universe", "all"))
         if apply_perms:
             m = m & np.array([pick_allowed(c, info.get(c, ("", ""))[1])
@@ -9990,21 +10050,13 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
             v20 = float(feat["vol20"][k, d]) \
                 if np.isfinite(feat["vol20"][k, d]) else None
             bkey = "beta60_sh" if cfg["score"] == "beta_sh" else "beta60"
-            # 参考止损（仅提示）：bata 档与买卖点回测同口径用 500 日历史最大回撤，
-            # 其余档仍为 2×20日波动（回测未用）。
-            # v6.1.8 P0 修正：end = d + 2（=执行日 T+1），与回测引擎
-            # _bt_events 的 _mdd_stop_dist(c_a, i=执行日, dd_win) 严格一致——
-            # 此前用 d + 1（信号日 T）少算 1 根，与回测口径不一致，
-            # 实盘下单时仍会按当日最新 ATR/MDD 重算，此处只是提示值。
+            # 参考止损（仅提示，回测未用）：2×20日波动；
+            # 高风险档风险偏好最高，提示止损放宽到 3×20日波动。
             stop_ref = None
-            _ddw = int((CFG.RISK_PARAMS.get(tier) or {})
-                       .get("dd_window") or 0)
-            if _ddw:
-                _mdd = _mdd_stop_dist(C[k], d + 2, _ddw)
-                if _mdd > 0:
-                    stop_ref = px * (1 - min(max(_mdd, 0.08), 0.50))
-            if stop_ref is None and v20:
-                stop_ref = px * (1 - 2.0 * v20)
+            if v20:
+                _k_stop = 3.0 if CFG.RISK_PARAMS.get(tier, {}).get(
+                    "atr_mult", 0) >= 6.0 else 2.0
+                stop_ref = px * (1 - _k_stop * v20)
             picks.append({
                 "code": str(codes[k]), "name": names.get(codes[k], ""),
                 "industry": info.get(codes[k], ("", ""))[1],
@@ -10029,7 +10081,7 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
     p = tier_latest_picks(capital=capital, tiers=tiers, universe=universe)
     uni_name = UNIVERSE_NAME.get(universe, universe)
-    lines = [f"v6.1.8 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
+    lines = [f"v6.1.9 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
              "荐股权限（设置内配置，空=全部）：已按板块/行业过滤",
@@ -10064,9 +10116,12 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
             lines.append("  打板提示：本档解除「涨停不买」——次日若封涨停，"
                          "回测口径按涨停价成交；名后标 [涨停] = 信号日已封板，"
                          "追板风险自负。")
+        _k_stop = 3.0 if (CFG.RISK_PARAMS.get(tier) or {}).get(
+            "atr_mult", 0) >= 6.0 else 2.0
         lines.append(f"  出局规则（回测同口径）：跌出 Top{cfg['top']} / "
                      f"闸门关闭 / 退市；预计持有 ~{cfg['reb']} 个交易日；"
-                     f"参考止损=现价−2×20日波动（仅风险提示，回测未用）")
+                     f"参考止损=现价−{_k_stop:.0f}×20日波动"
+                     f"（仅风险提示，回测未用）")
         lines.append("")
     lines.append("注：历史统计研究，不构成投资建议。")
     return "\n".join(lines)
@@ -10131,7 +10186,7 @@ AI_SYSTEM_PROMPT = (
     "最后一行给风险提示。回答简洁，不写套话。")
 
 # 风险偏好 → AI 行为约束（v6.1.7 热修②）。
-# 档次排序：保守 < 稳健 < 激进 < bata（bata 风险偏好高于激进）。
+# 档次排序：保守 < 稳健 < 激进 < 高风险（高风险风险偏好最高）。
 # 目的：AI 结论必须随所选风险偏好变化，不再一律"等趋势企稳再观望"。
 RISK_AI_GUIDE = {
     "保守": "风险偏好=保守（最低档）：重确认、轻仓位；等待趋势企稳／突破确认"
@@ -10141,16 +10196,17 @@ RISK_AI_GUIDE = {
     "激进": "风险偏好=激进（进攻档）：趋势启动/放量突破即可给出买入或加仓，"
             "容忍更大波动与回撤；不要用『等待企稳/等待回踩/先观望』作为默认"
             "结论，仓位建议 4~6 成。",
-    "bata": "风险偏好=bata（最高档，激进破甲版）：选股与入场同激进，止损按个股"
-            "500 日历史最大回撤（8%~50%）、仓位可更集中，接受更大波动与回撤。"
-            "强势突破/加速/涨停附近可直接"
-            "给出买入或打板（涨停价）建议（6~8 成）；禁止用『等待趋势企稳/"
-            "等待确认/观望』搪塞，必须给出明确的进攻性动作与具体价位。",
+    "高风险": "风险偏好=高风险（最高档，新开发的高风险策略）：以板块轮动为进攻"
+              "主线——只做强势板块中的强势股，不因大盘走弱轻易空仓；"
+              "接受大波动与大幅回撤（当前版本不控制最大回撤）、仓位可更集中。"
+              "强势突破/加速/涨停附近可直接给出买入或打板（涨停价）建议"
+              "（6~8 成）；禁止用『等待趋势企稳/等待确认/观望』搪塞，"
+              "必须给出明确的进攻性动作与具体价位。",
 }
 
 
 def ai_risk_guide(mode=""):
-    """按风险偏好返回 AI 行为约束（bata 高于激进；未知/空回退稳健）。"""
+    """按风险偏好返回 AI 行为约束（高风险高于激进；未知/空回退稳健）。"""
     return RISK_AI_GUIDE.get(mode or CFG.RISK_MODE,
                              RISK_AI_GUIDE["稳健"])
 
@@ -10358,7 +10414,28 @@ def ai_market_brief():
             f"（{'上方' if last > a60 else '下方'}）；近20日{r20*100:+.1f}%、"
             f"近60日{r60*100:+.1f}%")
     gates = []
+    _rot_gate = None          # 旋转闸门共用（高风险档；板块广度需组合面板）
+    _rot_ok = None
     for tier, cfg in TIER_CFG.items():
+        if cfg.get("gate_mode") == "rotation":
+            if _rot_ok is None:
+                try:
+                    codes, cal, C, V = tier_load_panel()
+                    if _TIER_CACHE.get("feat") is None:
+                        _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
+                    _rot_gate = tier_build_gate(cal, cfg,
+                                                _TIER_CACHE["feat"])
+                    _rot_ok = True
+                except Exception:
+                    log.exception("板块轮动闸门计算失败")
+                    _rot_ok = False
+            if _rot_ok:
+                gates.append(f"{tier}"
+                             f"{'开(可持仓)' if _rot_gate[-1] else '关(空仓)'}"
+                             "(板块轮动闸门)")
+            else:
+                gates.append(f"{tier}=板块广度数据不足")
+            continue
         rows = series.get(cfg.get("gate")) or []
         ma_w = cfg.get("ma") or 20
         if len(rows) < ma_w + 1:
@@ -10385,12 +10462,14 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "· 稳健：全A动量+低波Top20，20日调仓，上证MA20闸门\n"
         "· 均衡：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
         "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n"
-        "· bata：激进破甲版（选股/调仓/闸门与激进完全一致），"
-        "额外允许涨停价买入（打板）、止损按 500 日历史最大回撤，波动更大\n\n"
+        "· 高风险（新开发的高风险策略）：板块轮动为主参考——选强势行业里的"
+        "强势股，闸门以行业广度为主（大盘权重仅30%，阀门开得更久），"
+        "Top5/5日调仓高频切换，允许涨停价买入（打板），宽止损、暂不控制回撤，"
+        "波动最大、进攻性最强\n\n"
         f"用户风险偏好：{pref}（作为默认与锚定）。\n"
         "请判断当前市场环境最适合哪一档；可以偏离偏好，但必须给出一句理由。\n"
         "只输出一行严格 JSON（不要代码块、不要多余文字）："
-        '{"tier": "稳健|均衡|激进|bata", "reason": "不超过40字"}')
+        '{"tier": "稳健|均衡|激进|高风险", "reason": "不超过40字"}')
     try:
         text = deepseek_chat(key, prompt, model=model or AI_MODEL,
                              timeout=timeout, system=AI_SYSTEM_PROMPT,
@@ -10960,11 +11039,11 @@ class App:
     # ---------- 折叠 ----------
 
     def _open_picks(self):
-        """每日荐股：AI自动选档 / 四档风险偏好 / 18 策略共振综合（v6.1.8）。"""
+        """每日荐股：AI自动选档 / 四档风险偏好 / 18 策略共振综合（v6.1.9）。"""
         pconf = picks_conf()
         uni_name = UNIVERSE_NAME.get(pconf["universe"], pconf["universe"])
         win = tk.Toplevel(self.root)
-        win.title(f"每日荐股 · {uni_name} · 四档 v6.1.8 / 综合 18 策略 v6.1.6")
+        win.title(f"每日荐股 · {uni_name} · 四档 v6.1.9 / 综合 18 策略 v6.1.6")
         win.configure(bg=DARK_BG)
         win.geometry("760x540" if not self.compact else
                      f"{self.root.winfo_screenwidth()}x"
@@ -10980,7 +11059,7 @@ class App:
                  font=("Microsoft YaHei", 10)).pack(side="left")
         ai_mode = "AI自动(按偏好)"
         MODES = ((ai_mode,) if pconf["ai_auto_tier"] else ()) + \
-            ("稳健", "均衡", "激进", "bata", "综合(18策略)")
+            ("稳健", "均衡", "激进", "高风险", "综合(18策略)")
         default_mode = ai_mode if pconf["ai_auto_tier"] else \
             (pconf["risk_pref"] if pconf["risk_pref"] in MODES else "稳健")
         mode = tk.StringVar(value=default_mode)
@@ -11205,23 +11284,23 @@ class App:
             m.add_command(label="v4.0 全A研究（三档风险+消融）",
                           command=self.run_v4_research_bg)
             m.add_separator()
-            m.add_command(label="v6.1.8 四档组合（当前目标持仓）",
+            m.add_command(label="v6.1.9 四档组合（当前目标持仓）",
                           command=self.run_tiers_bg)
-            m.add_command(label="v6.1.8 四档回测（全A，相位平均）",
+            m.add_command(label="v6.1.9 四档回测（全A，相位平均）",
                           command=self.run_tiers_backtest_bg)
-            m.add_command(label="v6.1.8 四档回测（主板）",
+            m.add_command(label="v6.1.9 四档回测（主板）",
                           command=lambda: self.run_tiers_backtest_bg("main"))
-            m.add_command(label="v6.1.8 四档回测（ETF）",
+            m.add_command(label="v6.1.9 四档回测（ETF）",
                           command=lambda: self.run_tiers_backtest_bg("etf"))
-            m.add_command(label="v6.1.8 四档回测（全A含ETF）",
+            m.add_command(label="v6.1.9 四档回测（全A含ETF）",
                           command=lambda: self.run_tiers_backtest_bg("all_etf"))
-            m.add_command(label="v6.1.8 荐股收益回测（全A）",
+            m.add_command(label="v6.1.9 荐股收益回测（全A）",
                           command=self.run_picks_bt_bg)
-            m.add_command(label="v6.1.8 荐股收益回测（主板）",
+            m.add_command(label="v6.1.9 荐股收益回测（主板）",
                           command=lambda: self.run_picks_bt_bg("main"))
-            m.add_command(label="v6.1.8 荐股收益回测（ETF）",
+            m.add_command(label="v6.1.9 荐股收益回测（ETF）",
                           command=lambda: self.run_picks_bt_bg("etf"))
-            m.add_command(label="v6.1.8 荐股收益回测（全A含ETF）",
+            m.add_command(label="v6.1.9 荐股收益回测（全A含ETF）",
                           command=lambda: self.run_picks_bt_bg("all_etf"))
             m.add_separator()
             m.add_command(label="一键全量回测（全期/分段/逐股，后台）",
@@ -11451,7 +11530,7 @@ class App:
         self._tiersbt_running = True
         uni = universe
         uni_name = UNIVERSE_NAME.get(uni, uni)
-        self.progress_var.set(f"v6.1.8 四档回测（{uni_name}）：加载面板（约1分钟）...")
+        self.progress_var.set(f"v6.1.9 四档回测（{uni_name}）：加载面板（约1分钟）...")
 
         def _job():
             return tier_eval(segment="full", progress=self._progress,
@@ -11919,7 +11998,7 @@ class App:
             f"验证集未参与选择）\n"
             f"每档按各自风险目标在候选中选优"
             f"（9算法+多维评分 × 4风险参数；保守档限定保守/稳健参数，"
-            f"bata=激进破甲：同激进选型+按500日最大回撤止损）\n"
+            f"高风险=新开发的高风险策略：同激进选型+宽止损/暂不控制回撤）\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
@@ -11931,7 +12010,7 @@ class App:
                     f"（验证集仅防过拟合参考，不参与选择）")
             if abl.get("high_vol"):
                 _msg += ("。高波动股保守档的紧止损易被反复触发，"
-                         "推荐已改在 稳健/激进/bata 中取较优。")
+                         "推荐已改在 稳健/激进/高风险 中取较优。")
             ttk.Label(win, text=_msg, foreground=AXIS_TXT, wraplength=560,
                       justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         # 可滚动容器 + 屏幕限高：小屏也不会把内容顶出可视区
@@ -11949,7 +12028,7 @@ class App:
                 lambda e: cv.itemconfigure("box", width=max(300, e.width)))
 
         sel_var = tk.StringVar(value=rec)
-        order = ("保守", "稳健", "激进", "bata")
+        order = ("保守", "稳健", "激进", "高风险")
         try:
             _st = ttk.Style(win)
             _st.configure("Strat.TRadiobutton",
@@ -13722,7 +13801,7 @@ class App:
             f"再用不超过3条依据支撑，最后一行风险提示。用中文，300字内。\n"
             f"当前风险偏好：{res.get('risk_mode') or CFG.RISK_MODE}｜"
             f"{ai_risk_guide(res.get('risk_mode') or CFG.RISK_MODE)}\n"
-            f"（必须按该风险偏好给结论：低档可等确认，激进/bata 禁止用"
+            f"（必须按该风险偏好给结论：低档可等确认，激进/高风险 禁止用"
             f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
             f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
             f"昨收{res['prev_close']:.2f} 今开{q['open']:.2f}"
@@ -14474,7 +14553,7 @@ class App:
         ttk.Label(e1, text="策略档:").pack(side="left")
         ex_mode = tk.StringVar(value="四档(分表)")
         ttk.Combobox(e1, textvariable=ex_mode, width=12, state="readonly",
-                     values=["四档(分表)", "保守", "稳健", "激进", "bata",
+                     values=["四档(分表)", "保守", "稳健", "激进", "高风险",
                              "当前缓存策略"]
                      ).pack(side="left", padx=(2, 10))
         e2 = ttk.Frame(ex)
@@ -14556,7 +14635,7 @@ class App:
             pool = {"全部(非北交所)": "all", "主板": "main",
                     "仅缓存≥目标根数": "deep"}.get(ex_pool.get(), "all")
             mode = {"四档(分表)": "tiers", "保守": "保守", "稳健": "稳健",
-                    "激进": "激进", "bata": "bata",
+                    "激进": "激进", "高风险": "高风险",
                     "当前缓存策略": "cached"}.get(ex_mode.get(), "tiers")
             cmd = [sys.executable,
                    os.path.join(here, "backtests",
@@ -14899,7 +14978,7 @@ class App:
                                 values=list(CFG.RISK_PARAMS.keys()))
         cmb_risk.grid(row=8, column=1, sticky="w", pady=2)
         ttk.Label(frm, text="保守=紧止损少交易 激进=宽止损多交易 "
-                            "bata=激进破甲（500日最大回撤止损/允许打板）").grid(
+                            "高风险=板块轮动/宽止损/暂不控制回撤").grid(
             row=8, column=2, sticky="w")
 
         def _int_var(attr, lo, hi):
@@ -15006,7 +15085,7 @@ class App:
         ttk.Label(frm, text="AI自动选档").grid(row=25, column=0, sticky="w",
                                                pady=4)
         auto_var = tk.BooleanVar(value=pconf["ai_auto_tier"])
-        ttk.Checkbutton(frm, text="荐股时由AI在稳健/均衡/激进/bata 内选一档"
+        ttk.Checkbutton(frm, text="荐股时由AI在稳健/均衡/激进/高风险 内选一档"
                                   "（按下方偏好锚定）",
                         variable=auto_var).grid(row=25, column=1, columnspan=2,
                                                 sticky="w", pady=4)
@@ -15014,7 +15093,7 @@ class App:
                                              pady=4)
         pref_var = tk.StringVar(value=pconf["risk_pref"])
         ttk.Combobox(frm, textvariable=pref_var, width=6, state="readonly",
-                     values=["稳健", "均衡", "激进", "bata"]).grid(
+                     values=["稳健", "均衡", "激进", "高风险"]).grid(
                          row=26, column=1, sticky="w", pady=4)
         ttk.Label(frm, text="荐股股票池").grid(row=27, column=0, sticky="w",
                                                pady=4)
