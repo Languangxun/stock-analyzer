@@ -340,7 +340,7 @@ tr:hover td{background:var(--panel2)}
     <div class="legend" id="c-legend"></div>
     <canvas id="cv-curve" style="height:420px"></canvas>
     <div class="hover" id="c-hover">鼠标移入查看每日净值</div>
-    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）、高风险＝板块轮动闸门（行业广度为主+大盘均线辅，开得更久）。悬浮读数中会标注「空仓」。</div>
+    <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健＝上证 MA20、均衡＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）、激进＝板块轮动闸门（行业广度为主+大盘均线辅，开得更久）。悬浮读数中会标注「空仓」。</div>
     <div id="c-sum"></div>
     <h3 style="margin:14px 0 4px;font-size:15px">组合指标（相位平均，含全部费用）</h3>
     <div id="c-metrics"></div>
@@ -421,7 +421,7 @@ function readTheme(){
       grid:g('--grid'),line:g('--line'),fg:g('--fg'),panel:g('--panel'),
       bg:g('--bg'),cross:g('--cross'),label:g('--label')};
 }
-const TIERS=["稳健","均衡","激进","高风险"];
+const TIERS=["稳健","均衡","激进"];
 const UNI_NAME={all:"全A",main:"沪深主板",etf:"ETF",all_etf:"全A含ETF"};
 const $=(q)=>document.querySelector(q);
 const $$=(q)=>Array.from(document.querySelectorAll(q));
@@ -768,7 +768,7 @@ function renderAblTable(){
   $("#abl-sub").textContent="　"+esc(abl.name)+" · 对象 "+
     num(abl.total,0)+"（个股 "+num(abl.stock_count,0)+" / ETF "+
     num(abl.etf_count,0)+"）· "+esc((abl.ts||"").slice(0,10));
-  const order=["稳健","均衡","激进","高风险"];
+  const order=["稳健","均衡","激进"];
   const modes=Object.keys(abl.modes||{}).sort((a,b)=>
     (order.indexOf(a)+1||99)-(order.indexOf(b)+1||99));
   let h='<table><tr><th>档位</th><th>对象数</th><th>主算法(Top1)</th>'+

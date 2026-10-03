@@ -176,6 +176,7 @@ def main():
             return ("ok", c, n)
         except Exception as e:
             msg = str(e)
+            sg._BF_RAW_HINT.pop(c, None)   # v6.2.3：失败路径清理 raw 提示
             if "501" in msg or "429" in msg or "503" in msg:
                 pause_level[0] = min(pause_level[0] + 1, 4)
                 wait = 120 if pause_level[0] < 3 else 300

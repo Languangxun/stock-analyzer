@@ -220,9 +220,11 @@ def _event_note(rows, code=""):
 def _signals_with_cache(rows, algo, rp, pre_cache):
     """v6.1.8 P1：生成信号；composite 算法按 algo 缓存 _composite_precompute 结果，
     同一只股票多档（composite×4）共用 1 次指标计算（MACD/KDJ/RSI/BOLL/ADX/MA20/
-    chip_snapshots），省 ~75% composite 算量（profile 显示其占 _row 时间 ~40%）。
+    chip_snapshots），省 ~75% composite 算量。
 
-    pre_cache: dict[algo] -> _composite_precompute 输出。"""
+    v6.2.3：非 composite 信号同样按 algo 缓存——指标型信号（MACD/KDJ/…/LGBM/
+    量比/板块轮动）不依赖风险参数 rp，4 档若选中同一算法可复用，避免逐档重生。
+    pre_cache: dict[algo] -> _composite_precompute 输出 / ("sig", algo) -> 信号表。"""
     if algo == "composite":
         pre = pre_cache.get("composite")
         if pre is None:
@@ -235,68 +237,67 @@ def _signals_with_cache(rows, algo, rp, pre_cache):
             return sg._composite_signals(rows, rp, pre=pre) if pre else []
         except Exception:
             return []
-    # 其他 algo：走 strategy_signals_full（消融统计中 composite 占 ~95%，
-    # 其他算法在 tiers 模式少用，单独缓存收益小）
+    key = ("sig", algo)
+    if key in pre_cache:
+        return pre_cache[key]
     try:
-        return sg.strategy_signals_full(
+        sigs = sg.strategy_signals_full(
             rows, {"algo": algo, "params": rp}, industry="")
     except Exception:
-        return []
+        sigs = []
+    pre_cache[key] = sigs
+    return sigs
 
 
 def export_one(code, mode, bars, picks=None):
     """返回结果行列表（每只 1 行；tiers 多档模式每只 4 行）或 []。
     v6.1.8 P1：tiers 模式下
       ① ATR(14) 只算 1 次（4 档共用）；
-      ② composite 算法的 `_composite_precompute` 算 1 次（4 档共用）；
-      ATR 不依赖 rp/sigs，pre 只依赖 rows+algo，均可安全跨档复用。"""
+      ② composite 算法的 `_composite_precompute` 算 1 次（4 档共用）。
+    v6.2.3：③ 删除「backtest_signals + _bt_segments」双跑——原来每档先
+    `backtest_signals`（_bt_simulate 全期+训练+验证）再 `_bt_segments`
+    覆盖（_bt_events 全期+训练+验证），同一档回测跑两遍；现只跑
+    `_bt_segments`（GUI 消融弹窗同引擎），IC 由 `_signal_ic` 直接算。"""
     rows = _load_rows(code, bars)
     if not rows or len(rows) < 60:
         return []
     base = {"code": code, "bars": len(rows), "start": rows[0]["date"],
             "end": rows[-1]["date"], "event": _event_note(rows, code)}
-    pre_cache = {}      # algo -> _composite_precompute 输出
+    pre_cache = {}      # algo -> _composite_precompute 输出 / ("sig", algo) -> 信号
 
     def _row(strat_algo, tier, label, rp, atrs=None):
         sigs = _signals_with_cache(rows, strat_algo, rp, pre_cache)
-        bt = sg.backtest_signals(rows, sigs, rp) if sigs else None
-        if bt:
-            # v6.1.6：与「策略消融」/GUI 信号胜率面板同引擎同切分
-            # （_bt_events，val=max(200,n/4)），指标与选型口径一致。
-            # v6.1.8 P1：tiers 模式预先算好 ATR，4 档共用，避免 4×重复计算。
-            ev_full, ev_tr, ev_va, _sp = sg._bt_segments(rows, sigs, rp,
-                                                         atrs=atrs)
-            if ev_full:
-                for _k in ("trades", "closed", "wins", "losses", "winrate",
-                           "total", "ann", "mdd", "floating", "avg_win",
-                           "avg_loss", "profit_loss"):
-                    bt[_k] = ev_full.get(_k)
-                bt["train"] = ev_tr
-                bt["val"] = ev_va
         n_buy = sum(1 for s in sigs if s[2] == "BUY")
         r = dict(base, algo=strat_algo, mode=tier, label=label,
                  n_sig=len(sigs), n_buy=n_buy, n_sell=len(sigs) - n_buy)
-        if bt:
-            tr = bt.get("train") or {}
-            va = bt.get("val") or {}
-            ic1 = bt.get("ic1") or (None, 0)
-            ic5 = bt.get("ic5") or (None, 0)
-            r.update({
-                "trades": bt.get("trades"),
-                "winrate": _pct(bt.get("winrate")),
-                "total": _pct(bt.get("total")),
-                "ann": _pct(bt.get("ann")), "mdd": _pct(bt.get("mdd")),
-                "pl": (round(bt["profit_loss"], 2)
-                       if bt.get("profit_loss") not in (None, float("inf"))
-                       else None),
-                "avg_win": _pct(bt.get("avg_win")),
-                "avg_loss": _pct(bt.get("avg_loss")),
-                "float": _pct(bt.get("floating")),
-                "train": _pct(tr.get("total")),
-                "val": _pct(va.get("total")),
-                "ic1": (round(ic1[0], 4) if ic1[0] is not None else None),
-                "ic5": (round(ic5[0], 4) if ic5[0] is not None else None),
-            })
+        if sigs:
+            # v6.1.6：与「策略消融」/GUI 信号胜率面板同引擎同切分
+            # （_bt_events，val=max(200,n/4)），指标与选型口径一致。
+            # v6.1.8 P1：tiers 模式预先算好 ATR，4 档共用。
+            ev_full, ev_tr, ev_va, _sp = sg._bt_segments(rows, sigs, rp,
+                                                         atrs=atrs)
+            if ev_full:
+                tr = ev_tr or {}
+                va = ev_va or {}
+                ic1 = sg._signal_ic(rows, sigs, 1)[0]
+                ic5 = sg._signal_ic(rows, sigs, 5)[0]
+                r.update({
+                    "trades": ev_full.get("trades"),
+                    "winrate": _pct(ev_full.get("winrate")),
+                    "total": _pct(ev_full.get("total")),
+                    "ann": _pct(ev_full.get("ann")),
+                    "mdd": _pct(ev_full.get("mdd")),
+                    "pl": (round(ev_full["profit_loss"], 2)
+                           if ev_full.get("profit_loss")
+                           not in (None, float("inf")) else None),
+                    "avg_win": _pct(ev_full.get("avg_win")),
+                    "avg_loss": _pct(ev_full.get("avg_loss")),
+                    "float": _pct(ev_full.get("floating")),
+                    "train": _pct(tr.get("total")),
+                    "val": _pct(va.get("total")),
+                    "ic1": (round(ic1, 4) if ic1 is not None else None),
+                    "ic5": (round(ic5, 4) if ic5 is not None else None),
+                })
         return r
 
     if mode == "tiers":
@@ -306,20 +307,15 @@ def export_one(code, mode, bars, picks=None):
         # v6.1.8 P1：4 档共用 1 次 ATR(14)（ATR 不依赖 rp/sigs，原 4× 重算）
         atrs_shared = sg._precompute_atr(rows, 0, len(rows))
         rows_out = []
-        for tier in ("保守", "稳健", "激进", "高风险"):
+        for tier in ("保守", "稳健", "激进"):
             pk = src.get(tier) if isinstance(src, dict) else None
             if pk is None and pool:      # 兼容全候选格式：就地按档选型
                 pk, _note = sg._pick_one_from_pool(pool, tier)
             if pk:
-                # v6.1.9：高风险档**强制用 RISK_PARAMS["高风险"]**（宽止损、暂不管
-                # 最大回撤），选型只决定 algo / 信号源（来自候选），不决定止损参数。
-                # 高风险=新开发的高风险策略（板块轮动为主参考），入场门槛 1/冷却 2；
-                # 若跟随候选 params 可能选中保守/稳健参数，与其定位不符。
-                if tier == "高风险":
-                    rp = sg.CFG.RISK_PARAMS["高风险"]
-                else:
-                    rp = pk.get("params") or sg.CFG.RISK_PARAMS.get(
-                        tier, sg.CFG.RISK_PARAMS["稳健"])
+                # v6.2.3：三档（保守/稳健/激进），选型决定 algo/信号源，
+                # 风控参数取候选自身 params（缺失回退该档固定参数）。
+                rp = pk.get("params") or sg.CFG.RISK_PARAMS.get(
+                    tier, sg.CFG.RISK_PARAMS["稳健"])
                 rows_out.append(_row(pk.get("algo", "composite"), tier,
                                      pk.get("label", ""), rp,
                                      atrs=atrs_shared))
@@ -397,10 +393,10 @@ def main():
     ap.add_argument("--pool", default="all",
                     choices=["all", "main", "deep"])
     ap.add_argument("--mode", default="tiers",
-                    choices=["tiers", "保守", "稳健", "激进", "高风险",
+                    choices=["tiers", "保守", "稳健", "激进",
                              "cached"],
                     help="tiers=四档（按消融选型，分表输出，默认）；"
-                         "保守/稳健/激进/高风险=单档固定风险参数；cached=当前缓存策略")
+                         "保守/稳健/激进=单档固定风险参数；cached=当前缓存策略")
     ap.add_argument("--picks", default=os.path.join(
         ROOT, "research", "perstock_tier_picks.json"),
         help="四档选型 JSON（tier_picks_from_ablation.py 产物；"
@@ -487,7 +483,7 @@ def main():
                       f"耗时{el:.0f}s ETA{eta:.0f}s", flush=True)
 
     header = [c[0] for c in COLS]
-    tiers = [t for t in ("保守", "稳健", "激进", "高风险")
+    tiers = [t for t in ("保守", "稳健", "激进")
              if any(r.get("mode") == t for r in rows_out)]
 
     def _table(rs):
@@ -506,9 +502,9 @@ def main():
             ["耗时(秒)", round(time.time() - t0)],
             ["口径", "T日收盘信号→T+1成交；ATR止损+移动止盈；"
                      "训练段=前75%，验证段=后25%；IC=信号方向与未来收益Spearman"],
-            ["四档选型", "保守/稳健/激进/高风险 = 消融候选池按该档目标（多指标"
-                     " rank + 训练段末尾近端一致性）逐股选优；高风险=新开发的"
-                     "高风险策略，目标与激进一致（偏年化+Calmar）"],
+            ["三档选型", "保守/稳健/激进 = 消融候选池按该档目标（多指标"
+                     " rank + 训练段末尾近端一致性）逐股选优；"
+                     "激进目标偏年化+Calmar，保守/稳健偏 Calmar+PF"],
             ["⚠ 口径提醒",
              "「总收益%/年化%/胜率%」是【全周期】回测，含用于选型的训练段，"
              "受“从~30个候选里挑最好”的赢家诅咒影响，数值严重偏乐观"

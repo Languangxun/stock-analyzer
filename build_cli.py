@@ -29,7 +29,7 @@ K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自�
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--refresh-etf] [--backfill]
                              [--clean] [--research] [--v4 [--v4-limit N]]
-                             [--tiers [--tier 稳健|均衡|激进|高风险] [--ai-tier]]
+                             [--tiers [--tier 稳健|均衡|激进] [--ai-tier]]
                              [--tiers-backtest] [--universe all|main|etf|all_etf]
                              [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）

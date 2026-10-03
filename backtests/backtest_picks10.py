@@ -35,7 +35,7 @@ import time
 
 import stock_gui as sg
 
-# 用户口径：三档各自节奏（高风险档为板块轮动口径，不在本回测默认范围）
+# 用户口径：三档各自节奏（v6.2.3：稳健/均衡/激进）
 TIERS3 = ("稳健", "均衡", "激进")
 SEGS = ("full", "train", "val", "val2025", "bull", "year", "yearly")
 
@@ -44,7 +44,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--segment", default="full", choices=SEGS)
     ap.add_argument("--tier", default="all",
-                    choices=list(TIERS3) + ["高风险", "all"])
+                    choices=list(TIERS3) + ["all"])
     ap.add_argument("--year", type=int, default=None)
     ap.add_argument("--capital", type=float, default=100000.0,
                     help="组合总本金（默认 10 万，非每只）")

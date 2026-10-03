@@ -8,7 +8,7 @@
   etf      仅 ETF/LOF
   all_etf  全A个股 + ETF
 产品：
-  稳健 / 均衡 / 激进 / 高风险（组合收益，相位平均）+ 荐股（逐笔收益口径）
+  稳健 / 均衡 / 激进（组合收益，相位平均）+ 荐股（逐笔收益口径）
 输出（每次回测新建时间戳文件夹，报告/明细/图表全在里面）：
   research/backtest_v{版本}_{YYYYMMDD_HHMMSS}_{区间}[_tag]/
     report.json / report.md      原始指标 + 可嵌入 README 的表格
@@ -67,10 +67,7 @@ def _db_stats():
 
 
 def _run_universe(universe, segment):
-    """子进程 worker：跑一个口径的组合+荐股回测。
-    v6.1.8 P1：top-level 函数（picklable），供 ProcessPoolExecutor 并行 4 口径。
-    原顺序版每次调 sg.tier_eval / sg.tier_picks_stats（按 4 档 × 10 相位 串行），
-    多进程下 4 口径同时跑，理论上限 ≈ 4× 加速（受库大小/CPU 核数约束）。
+    """子进程 worker：跑一个口径的组合+荐股回测（顺序回退用）。
     progress 改用 sys.stdout.write + flush，避免 print 子进程缓冲导致日志失序。"""
     import sys as _s
     def _p(msg):
@@ -82,6 +79,24 @@ def _run_universe(universe, segment):
     picks = sg.tier_picks_stats(segment=segment, universe=universe,
                                 progress=_p)
     return {"universe": universe, "tiers": tiers, "picks": picks}
+
+
+def _run_uni_tier(uni, tier, segment):
+    """v6.2.3：并行粒度 = 口径 × 档位（组合回测单档）。"""
+    import sys as _s
+    _s.stdout.write(f"[{UNI_NAME[uni]}·{tier}] 组合回测 ...\n")
+    _s.stdout.flush()
+    m = sg.tier_eval(segment=segment, tiers=[tier], universe=uni)
+    return m.get(tier)
+
+
+def _run_uni_tier_picks(uni, tier, segment):
+    """v6.2.3：并行粒度 = 口径 × 档位（荐股逐笔单档）。"""
+    import sys as _s
+    _s.stdout.write(f"[{UNI_NAME[uni]}·{tier}] 荐股逐笔回测 ...\n")
+    _s.stdout.flush()
+    s = sg.tier_picks_stats(segment=segment, tiers=[tier], universe=uni)
+    return s.get(tier)
 
 
 def _run_universes_serial(unis, segment, progress):
@@ -98,16 +113,17 @@ def _run_universes_serial(unis, segment, progress):
 
 
 def _run_universes_parallel(unis, segment, workers):
-    """多进程并行跑多口径（v6.1.8 P1）：workers 默认 min(len(unis), cpu_count, 4)。
+    """多进程并行跑（v6.1.8 P1 → v6.2.3 粒度升级：口径 × 档位）。
+
+    旧版按口径拆 4 个任务（每任务内部 4 档串行）→ 最多用 4 核；
+    现按 (口径, 档位) 拆 4×3=12 个组合任务 + 12 个荐股任务，
+    workers 默认取满 CPU（min(任务数, cpu_count)），8 核机器把 CPU 打满。
 
     父进程先预热 `tier_load_panel` + `tier_build_features`，再强制 **fork**
-    启动子进程——面板/特征通过 COW 继承，子进程零重复加载（原实现每进程独立
-    加载 1.6G 库 + 重建特征，4 进程互相争 IO，实测反而比串行慢，见
-    `research/baseline/BASELINE.md`）。fork 不可用时回退默认上下文（子进程自加载）。"""
+    启动子进程——面板/特征通过 COW 继承，子进程零重复加载。"""
     import multiprocessing as _mp
     if workers <= 1 or len(unis) <= 1:
         return _run_universes_serial(unis, segment, print)
-    workers = min(workers, len(unis))
     ctx = None
     try:
         codes, cal, C, V = sg.tier_load_panel()
@@ -117,19 +133,31 @@ def _run_universes_parallel(unis, segment, workers):
         print("  已预热面板/特征，fork 继承（子进程零重复加载）")
     except Exception as e:
         print(f"  父进程预热失败（回退默认 start method）：{e}")
-    out = {}
+    tasks = [(uni, t) for uni in unis
+             for t in (sg.TIER_UNIVERSES.get(uni) or sg.TIER_CFG)]
+    workers = max(1, min(workers, len(tasks) * 2,
+                         _mp.cpu_count() or 4))
+    tier_res = {uni: {} for uni in unis}
+    picks_res = {uni: {} for uni in unis}
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-        futs = {ex.submit(_run_universe, uni, segment): uni for uni in unis}
+        futs = {}
+        for uni, t in tasks:
+            futs[ex.submit(_run_uni_tier, uni, t, segment)] = ("t", uni, t)
+            futs[ex.submit(_run_uni_tier_picks, uni, t, segment)] = \
+                ("p", uni, t)
         for fut in as_completed(futs):
-            uni = futs[fut]
+            kind, uni, t = futs[fut]
             try:
-                out[uni] = fut.result()
-                print(f"  ✓ {UNI_NAME[uni]} 完成")
+                r = fut.result()
             except Exception as e:
-                print(f"  ✗ {UNI_NAME[uni]} 失败：{e}")
+                print(f"  ✗ {UNI_NAME[uni]}·{t} "
+                      f"{'组合' if kind == 't' else '荐股'} 失败：{e}")
                 raise
-    # 报告按 UNIS 顺序输出
-    return {uni: out[uni] for uni in unis if uni in out}
+            (tier_res if kind == "t" else picks_res)[uni][t] = r
+            print(f"  ✓ {UNI_NAME[uni]}·{t} "
+                  f"{'组合' if kind == 't' else '荐股'} 完成")
+    return {uni: {"universe": uni, "tiers": tier_res[uni],
+                  "picks": picks_res[uni]} for uni in unis if tier_res[uni]}
 
 
 def _tier_table(rep, tier):
@@ -241,7 +269,7 @@ def build_md(report):
     lines.append("- ETF 池：东财 ETF/LOF 代码表（1491 只，剔除货币/现金类），"
                  "回填历史后 1202 只有 K 线、1145 只 ≥250 根；"
                  "ETF 三档用 blend/blend_mom + 上证 MA20 闸门（ETF 无创业板语义）；"
-                 "高风险档为新开发的高风险策略（板块轮动选股/闸门、允许打板、"
+                 "激进档为板块轮动策略（选股/闸门、允许打板、"
                  "宽止损且暂不控制回撤）。")
     lines.append("- 基准：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
                  "（不分是否具备科创板权限），另附创业板指/上证对照，"
@@ -487,10 +515,12 @@ def main():
     # v6.1.8 P1：4 口径默认并行（4 进程），单口径自动回退串行
     if args.workers == 0:
         import multiprocessing as _mp
-        args.workers = min(len(unis), _mp.cpu_count() or 4, 4)
+        # v6.2.3：默认拉满 CPU（任务粒度=口径×档位，见 _run_universes_parallel）
+        args.workers = _mp.cpu_count() or 4
     t0 = time.time()                    # v6.1.8：计时含全部口径回测
     if args.workers > 1 and len(unis) > 1:
-        print(f"v6.1.8 P1：{len(unis)} 口径并行 ({args.workers} workers)")
+        print(f"v6.2.3：口径×档位并行（workers={args.workers}，"
+              f"共 {len(unis)} 口径 × {len(sg.TIER_CFG)} 档）")
         results = _run_universes_parallel(unis, args.segment, args.workers)
     else:
         results = _run_universes_serial(unis, args.segment, print)

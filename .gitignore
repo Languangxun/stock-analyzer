@@ -71,3 +71,6 @@ research/legacy/logs/
 # 超跌 GUI（本地私用，不入库/不随发布）
 stock_chaodi.ini
 stock_chaodi_gui.py
+
+# 旧四档批次归档（v6.2.3 档位重定名时移入；可重跑，不入仓）
+research/legacy_batches/

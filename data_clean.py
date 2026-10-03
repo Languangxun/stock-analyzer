@@ -544,32 +544,36 @@ def migrate_all(db, workers=2, limit=None, force=False, log=print,
 
 
 def scan(conn):
-    """全库扫描，返回 {code: {...问题列表}} 与全局统计。"""
+    """全库扫描，返回 {code: {...问题列表}} 与全局统计。
+
+    v6.2.3：按股流式处理（itertools.groupby 游标）——旧实现
+    `fetchall()` 把全库 1200+ 万根日K 一次性载入内存再分组，
+    峰值内存数 GB；流式后内存只保留单只，统计结果完全一致。"""
+    from itertools import groupby
     names = {r[0]: (r[1] or "") for r in
              conn.execute("SELECT code, name FROM stocks").fetchall()}
-    rows = conn.execute(
-        "SELECT code,date,open,high,low,close,vol FROM daily_bars "
-        "ORDER BY code,date").fetchall()
-    by = {}
-    for c, d, o, h, l, cl, v in rows:
-        by.setdefault(c, []).append((d, o, h, l, cl, v or 0.0))
-
     today = date.today()
     recent_cut = (today - timedelta(days=365)).isoformat()
+    market_last = conn.execute(
+        "SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
     issues = {}
-    stats = {"codes": len(by), "bars": len(rows), "bad_bars": 0,
+    stats = {"codes": 0, "bars": 0, "bad_bars": 0,
              "refetch": 0, "refetch_bars": 0, "refetch_bj": 0,
              "suspicious": 0, "delisted": 0, "zero_vol": 0, "stale": 0,
              "low_price": 0, "neg_price": 0, "stale_vs_market": 0,
              "stale_bj": 0, "orphan": 0}
-    market_last = max((b[-1][0] for b in by.values()), default="")
 
     def add(c, kind, detail):
         issues.setdefault(c, []).append((kind, detail))
 
-    for c, bars in by.items():
+    cur = conn.execute(
+        "SELECT code,date,open,high,low,close,vol FROM daily_bars "
+        "ORDER BY code,date")
+    for c, grp in groupby(cur, key=lambda r: r[0]):
+        bars = [(r[1], r[2], r[3], r[4], r[5], r[6] or 0.0) for r in grp]
+        stats["codes"] += 1
+        stats["bars"] += len(bars)
         name = names.get(c, "")
-        n = len(bars)
         # ---- 1) 结构异常 ----
         bad = [b for b in bars if not _bar_valid(b)]
         if bad:
@@ -632,12 +636,12 @@ def scan(conn):
                 add(c, "stale", f"连续{run}日收盘不变(至 {b[0]})")
                 stats["stale"] += 1
                 break
-    # ---- 6) 孤立代码（daily_bars 有、stocks 无；指数/北交所除外）----
-    for c, bars in by.items():
-        if c in names or _is_index(c) or c.startswith("bj"):
-            continue
-        add(c, "orphan", f"{len(bars)}根不在代码表(疑似错误前缀/已退市)")
-        stats["orphan"] += 1
+        # ---- 6) 孤立代码（daily_bars 有、stocks 无；指数/北交所除外）----
+        # （保持旧实现顺序：孤儿标注追加在该股其它问题之后）
+        if c not in names and not _is_index(c) and not c.startswith("bj"):
+            add(c, "orphan",
+                f"{len(bars)}根不在代码表(疑似错误前缀/已退市)")
+            stats["orphan"] += 1
     return issues, stats, names
 
 
