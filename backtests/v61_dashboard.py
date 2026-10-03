@@ -980,6 +980,10 @@ function renderPerstock(){
   const mdds=rows.map(r=>parseFloat(r[iMdd])).filter(isFinite);
   const iVal=H.indexOf("验证段收益%");
   const vals=iVal>=0?rows.map(r=>parseFloat(r[iVal])).filter(isFinite):[];
+  // v6.2.4：IC 中位（与收益中位分开，独立统计）
+  const iIc1=H.indexOf("IC(T+1)"), iIc5=H.indexOf("IC(T+5)");
+  const ic1s=iIc1>=0?rows.map(r=>parseFloat(r[iIc1])).filter(isFinite):[];
+  const ic5s=iIc5>=0?rows.map(r=>parseFloat(r[iIc5])).filter(isFinite):[];
   const mean=tots.length?tots.reduce((a,b)=>a+b,0)/tots.length:null;
   const evCodes=new Set((iEv>=0?d.rows.filter(r=>r[iEv]):[])
     .map(r=>r[0])).size;
@@ -996,6 +1000,9 @@ function renderPerstock(){
       (100*vals.filter(v=>v>0).length/vals.length).toFixed(0)+"%":"-")],
     ["胜率中位",p1(median(wrs))],
     ["回撤中位",p1(median(mdds))],
+    ["IC 中位（T+1 / T+5）",
+      (ic1s.length?median(ic1s).toFixed(3):"-")+" / "+
+      (ic5s.length?median(ic5s).toFixed(3):"-")],
     [exEv?"事件股（已剔除）":"事件股（含在统计）",evCodes+" 只"]
   ].map(([k,v])=>`<div class="card"><div class="k">${k}</div>`+
     `<div class="v">${v}</div></div>`).join("");

@@ -86,6 +86,10 @@
 `_DOMESTIC_SUFFIX`（eastmoney/gtimg/qq/sina/163/sse/szse/cninfo/csindex）。
 这修复了「VPN 一挂全部源报 `[Errno 111] Connection refused`」的全局故障。
 
+**估值/交易快照（v6.2.4）**：`stocks` 表 `turnover`（换手率%）/`pe`（动态PE）/`pb` ——
+东财 clist 主源（`refresh_all_codes` 字段 f8/f9/f23）+ **腾讯批量行情备用通道**
+（`refresh_valuation_tx`，q[38]/[39]/[46]，60 只/批，push2 整域故障时可独立刷新）。
+
 **行情快照 `fetch_quote`**：**腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`（带 Referer、GBK）→ 东财 `ulist.np`**，
 任一成功即返回；自选池名称与五大指数走 `fetch_batch_quotes`（腾讯→新浪），不再是腾讯单源。
 
@@ -387,7 +391,9 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 - **成交与费用**：T-1 决策 → T 日收盘成交；滑点 0.1%/边、佣金万 2.5（最低 5 元）、印花税千 1（卖出）、过户费万 0.1；
   100 股整手、涨停不买、跌停不卖、停牌顺延、连续 20 日无 K 线按最后收盘价了结；
   **激进 档例外**：`cfg.allow_limit_up=True` 跳过涨停不买判定（回测约 1.3%~1.9% 买在涨停价，
-  生产端 `tier_latest_picks` 输出 `limit_up` 标记供提示）；
+  生产端 `tier_latest_picks` 输出 `limit_up` 标记供提示；
+  **v6.2.4 起生产端默认剔除动态 PE≤0（亏损）候选**（`picks_exclude_loss`，
+  ini `[picks] exclude_loss=0` 可关；PE 缺失不过滤；不参与历史回测））；
 - **荐股确认层（v6.2.0，`tier_ic_confirm`）**：个股历史信号 IC——滚动 120 日窗计算
   「近5日收益（信号强度）→ 未来5日收益」Pearson IC（cumsum 向量化、行分块控内存，
   缓存 `_TIER_CACHE["ic"]`）；确认条件（全截至 T-1，防前视）：**IC>0 且 t≥2 且样本对≥60
@@ -704,6 +710,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.2.4**<br>（2026-10-03） | **换手率/动态PE/PB 入库 + 生产端亏损过滤 + IC 中位卡片**：①`stocks` 表加 `turnover/pe/pb`（启动迁移），东财 clist 扩字段 f8/f9/f23，新增腾讯行情备用通道 `refresh_valuation_tx`（60只/批，7285 只实测全部入库），代码表刷新尾部自动 only_missing 补缺；②`tier_latest_picks` 默认剔除动态 PE≤0（`picks_exclude_loss`，ini `[picks] exclude_loss=0` 可关；缺失不过滤），picks 增 `pe/turnover`，实测剔除 1765 只亏损股；**不参与历史回测**（无时点估值数据）；基本面工具加估值快照行；③仪表盘每只股回测页新增「IC 中位（T+1/T+5）」卡片（与收益中位分开）；`APP_VERSION=6.2.4`，`stock_predict.py` 重新生成；README/CHANGELOG 同步 |
 | **v6.2.3**<br>（2026-10-03） | **档位重定名（四档 → 三档，全库去除「高风险」名）+ 三工具性能优化**：①组合档 `TIER_CFG*` 四键改三键——原「稳健」（blend_mom 0.6）策略淘汰；原「均衡」→ 稳健（blend 等权/10 日）、原「激进」→ 均衡（全A β / 其余 blend_mom0.7）、原「高风险」→ 激进（rotate + 轮动闸门 + 打板，策略逐字段未改）；`TIER_BENCH`/GUI 每日荐股 MODES/设置偏好/AI 引导与选档提示/弹窗/导出下拉/菜单标签全部三档化；`CFG.RISK_PARAMS` 删第四组「高风险」(6.0,1.15,0.80,1,2)，买卖点/消融/逐股回测改三档（保守/稳健/激进），消融候选 12 算法 × 3 档 = 39；`_ablation_weights`/`_pick_one_from_pool`/推荐档/高波动回退同步；研究脚本与仪表盘档位列表三档化，旧四档批次归档 `research/legacy_batches/`；全量产物重跑（消融 7183 只/1404s、tier_picks+GUI 缓存 7183 只、逐股导出 3 档 20703 行/223s、标准回测 full/val/bull 三档批次、10 万组合三档）；②三工具性能——`stock_backtest_export.py` 删双跑+信号缓存（**2.4 倍**，400 行对拍零差异）、回填每股请求 **5→3**（`_BF_RAW_HINT`，约省 100 分钟）、`data_clean.scan` 游标流式（stats/问题清单与旧实现逐字节一致）、`backtest_v61.py` 并行粒度升为口径×档位（默认拉满 CPU）；`APP_VERSION=6.2.3`，`stock_predict.py` 重新生成；CHANGELOG/README 同步 |
 | **v6.2.2**<br>（2026-10-03） | **GUI 打通研究消融（四档批量缓存 + 弹窗优先读研究结果）**：`tier_picks_from_ablation.py` 新增写 `research/ablation_gui_cache.json`（四档全量，与 `run_ablation` 返回同构：mode_candidates/recommend/bars/train_n/val_n/vol_ann，train/val 精简 ann/mdd/winrate/trades/pf；7184 只 14.5MB）；`stock_gui.py` 新增 `load_research_ablation`（mtime 自动重载、5 日 TTL、缺失回退），`_ensure_strategy` 无策略缓存时优先读它弹窗免本地重算（读不到才本地消融 3~5 分钟/只），「策略消融」手动重选同样秒开研究四档；`APP_VERSION=6.2.2`，`stock_predict.py` 重新生成；ARCHITECTURE 4.1 与 README 同步 |
 | **v6.2.1**<br>（2026-10-03） | **基本面信息工具 + 仪表盘 IC 中位数/指标表格 + 消融重跑（量比/LGBM 入研究池）**：①工具窗新增「基本面」页签——`fetch_f10_metrics`（东财 datacenter F10 主要指标 `RPT_F10_FINANCE_MAINFINADATA`，12 期报告期倒序，双 host 容灾 + `em_f10` 熔断 + 6h 缓存）+ `fundamentals_summary` 本地规则分析（成长/增收不增利/扣非背离/ROE 分级/现金流覆盖/负债率、评分制结论），GUI 表格 + 分析文本 + 小屏菜单入口；②`v61_dashboard.py` 组合净值曲线下方新增组合指标表与消融汇总表（`collect_ablation` 读最新 `ablation_v*/summary.json`，含 **IC1/IC5 中位数**、IC5 为正占比、训练/验证年化中位、牛熊中位）；③`backtest_strategy_ablation.py` 研究池 `gens` 补齐 v6.1.10 只加了 GUI 的 量比/LGBM（9→12 信号），每候选新增描述性 `ic1`/`ic5`（不参与选型），summary 聚合 IC 中位数；**安装 lightgbm 4.7.0 + scikit-learn 1.9.1**（此前 sklearn 缺失致 LGBM fit 静默失败、lgbm 候选恒空）；**全量消融重跑**（7236 对象、有效 7184、1382s）：稳健档 lgbm 入选 784 只（10.9%）、IC1 中位 +0.018 / IC5 中位 +0.081（75.3% 为正），`tier_picks.json` 与 GUI 策略缓存刷新、dashboard 重建；④`APP_VERSION=6.2.1`，`stock_predict.py` 由 `build_cli.py` 重新生成。2.1/3.13/4.1 节与 README/CHANGELOG 同步。**热修①**：v61_dashboard 模板 JS 注释内 `v*/` 提前闭合块注释致整页语法错误（批次/图表全空，node --check 把关）；`_style_ttk` 补 Treeview/Heading 深色样式（修复基本面表格白底白字不可读） |

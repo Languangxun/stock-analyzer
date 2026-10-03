@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.3）
-APP_VERSION = "6.2.3"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
+APP_VERSION = "6.2.4"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -383,7 +383,8 @@ def init_db() -> None:
                     ON daily_bars(code, date);
                 CREATE TABLE IF NOT EXISTS stocks(
                     code TEXT PRIMARY KEY, name TEXT, industry TEXT,
-                    mktcap REAL, tier TEXT, updated TEXT);
+                    mktcap REAL, tier TEXT, updated TEXT,
+                    turnover REAL, pe REAL, pb REAL);
                 CREATE INDEX IF NOT EXISTS idx_stocks_industry
                     ON stocks(industry);
                 CREATE INDEX IF NOT EXISTS idx_stocks_tier
@@ -401,6 +402,17 @@ def init_db() -> None:
                     conn.execute("ALTER TABLE failed ADD COLUMN reason TEXT")
             except Exception:
                 log.exception("failed 表迁移失败(忽略)")
+            # 迁移（v6.2.4）：stocks 表补 换手率/动态PE/PB 列
+            try:
+                scols = [r[1] for r in conn.execute(
+                    "PRAGMA table_info(stocks)").fetchall()]
+                for _c, _t in (("turnover", "REAL"), ("pe", "REAL"),
+                               ("pb", "REAL")):
+                    if scols and _c not in scols:
+                        conn.execute(
+                            f"ALTER TABLE stocks ADD COLUMN {_c} {_t}")
+            except Exception:
+                log.exception("stocks 表迁移失败(忽略)")
 
 
 init_db()
@@ -584,6 +596,15 @@ def picks_conf() -> dict:
         in ("all", "main", "etf", "all_etf")
         else "all",
     }
+
+
+def picks_exclude_loss() -> bool:
+    """v6.2.4：生产端荐股/目标持仓是否剔除亏损股（动态 PE≤0）。
+    默认开；ini [picks] exclude_loss=0 关闭；PE 缺失的标的不受影响。"""
+    try:
+        return _ai_ini_get("picks", "exclude_loss", "1") != "0"
+    except Exception:
+        return True
 
 
 def pick_allowed(code: str, industry: str = "") -> bool:
@@ -2278,10 +2299,11 @@ def stocks_age() -> float:
             return 1e18
 
 
-def refresh_all_codes(progress=None):
-    """拉取全A代码表（代码/名称/总市值/东财行业），按市值三分位分层。"""
+def refresh_all_codes(progress=None, force=False):
+    """拉取全A代码表（代码/名称/总市值/东财行业/换手率/动态PE/PB，v6.2.4），
+    按市值三分位分层。force=True 忽略新鲜度强制刷新（新列补数据用）。"""
     with REFRESH_LOCK:
-        if stocks_age() < STOCKS_TTL:
+        if stocks_age() < STOCKS_TTL and not force:
             if progress:
                 progress("代码表仍新鲜，跳过")
             return False
@@ -2295,7 +2317,7 @@ def refresh_all_codes(progress=None):
         while pn <= 90:
             u = (f"{hosts[(pn - 1) % len(hosts)]}/api/qt/clist/get"
                  f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invariant=0"
-                 f"&fields=f12,f14,f20,f100&fs={fs}&ut={UT}")
+                 f"&fields=f12,f14,f8,f9,f20,f23,f100&fs={fs}&ut={UT}")
             got = False
             for host in hosts:
                 uu = u.replace(u.split("/api/")[0], host)
@@ -2329,8 +2351,14 @@ def refresh_all_codes(progress=None):
                     full = "sh" + code
                 else:
                     full = "sz" + code
-                items.append((full, name or "", ind if isinstance(ind, str) else None,
-                              float(cap)))
+
+                def _fv(x):     # v6.2.4：换手率/动态PE/PB（缺失为 "-" → None）
+                    return float(x) if isinstance(x, (int, float)) else None
+
+                items.append((full, name or "",
+                              ind if isinstance(ind, str) else None,
+                              float(cap), _fv(it.get("f8")),
+                              _fv(it.get("f9")), _fv(it.get("f23"))))
             if progress:
                 progress(f"代码表 {len(items)} 只 (第{pn}页)")
             pn += 1
@@ -2357,14 +2385,20 @@ def refresh_all_codes(progress=None):
                 "NOT IN ('51','56','58','15','16','18')")
             conn.executemany(
                 "INSERT OR REPLACE INTO stocks"
-                "(code,name,industry,mktcap,tier,updated) "
-                "VALUES(?,?,?,?,?,?)",
-                [(c, n, i, cap, tier_of(cap), today)
-                 for c, n, i, cap in items])
+                "(code,name,industry,mktcap,tier,updated,turnover,pe,pb) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                [(c, n, i, cap, tier_of(cap), today, tu, pe, pb)
+                 for c, n, i, cap, tu, pe, pb in items])
             _set_meta(conn, "stocks_updated", repr(time.time()))
         if progress:
             progress(f"代码表完成: {len(items)}只, 分界 "
                      f"{q1/1e8:.0f}/{q2/1e8:.0f}亿")
+        # v6.2.4：估值快照补缺（EM 已带 f8/f9/f23；push2 故障或字段缺失时
+        # 由腾讯行情通道兜底补 换手率/动态PE/PB）
+        try:
+            refresh_valuation_tx(progress=progress, only_missing=True)
+        except Exception:
+            log.exception("估值快照补缺失败(忽略)")
         return True
 
 
@@ -2602,12 +2636,17 @@ def backfill_etf_history(codes=None, progress=None, workers=6,
 
 
 def get_stock_info(full: str):
+    """股票基础信息（含 v6.2.4 起的换手率/动态PE/PB 快照；缺失为 None）。"""
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT name,industry,mktcap,tier FROM stocks WHERE code=?",
+            "SELECT name,industry,mktcap,tier,turnover,pe,pb "
+            "FROM stocks WHERE code=?",
             (full,)).fetchone()
-        return {"name": row[0], "industry": row[1],
-                "mktcap": row[2], "tier": row[3]} if row else None
+        if not row:
+            return None
+        return {"name": row[0], "industry": row[1], "mktcap": row[2],
+                "tier": row[3], "turnover": row[4], "pe": row[5],
+                "pb": row[6]}
 
 
 def industry_peers(full: str, limit: int = L2_DEFAULT_N):
@@ -2728,8 +2767,18 @@ def fundamentals_summary(full, rows):
     （ROE/毛利率/净利率/现金流）、财务风险（负债率，金融地产不评）、
     综合结论（偏多/中性/偏空 + 依据）。仅财报数据参考，非投资建议。"""
     n = len(rows)
-    name = (get_stock_info(full) or {}).get("name") or full
+    info = get_stock_info(full) or {}
+    name = info.get("name") or full
     out = [f"【{name} {full}】近 {n} 期财报关键数据分析", ""]
+    _val = []
+    if info.get("pe") is not None:
+        _val.append(f"动态PE {info['pe']:.1f}")
+    if info.get("pb") is not None:
+        _val.append(f"PB {info['pb']:.2f}")
+    if info.get("turnover") is not None:
+        _val.append(f"换手率 {info['turnover']:.2f}%")
+    if _val:
+        out.append("估值/交易快照（代码表刷新日）：" + " · ".join(_val))
 
     def f2(v, suf=""):
         return f"{v:.2f}{suf}" if isinstance(v, (int, float)) else "-"
@@ -3470,8 +3519,17 @@ def fetch_quote(full):
 
 
 def _batch_tencent(codes):
+    """腾讯批量行情。v6.2.4：附带 换手率(38)/动态PE(39)/PB(46) 快照字段。"""
     raw = http_get(QT_URL + ",".join(codes))
     out = {}
+
+    def _fv(f, i):
+        try:
+            v = f[i].strip()
+            return float(v) if v and v != "-" else None
+        except (ValueError, IndexError):
+            return None
+
     for seg in raw.split(";"):
         seg = seg.strip()
         if "=" not in seg or "~" not in seg:
@@ -3482,7 +3540,9 @@ def _batch_tencent(codes):
             continue
         try:
             out[code] = {"name": f[1], "price": float(f[3]),
-                         "chg": float(f[32]), "time": f[30]}
+                         "chg": float(f[32]), "time": f[30],
+                         "turnover": _fv(f, 38), "pe": _fv(f, 39),
+                         "pb": _fv(f, 46)}
         except ValueError:
             continue
     return out
@@ -3516,6 +3576,41 @@ def _batch_sina(codes):
                      "chg": (price / prev * 100 - 100) if prev else 0.0,
                      "time": tstr}
     return out
+
+
+def refresh_valuation_tx(progress=None, batch=60, only_missing=False):
+    """v6.2.4：用腾讯行情批量刷新 stocks 表 换手率/动态PE/PB 快照。
+
+    EM push2 clist 的备用通道（整域故障时估值快照仍可更新）；
+    only_missing=True 只补 pe 为空的代码（EM 刷新后自动补缺用）。
+    返回更新只数。"""
+    sql = "SELECT code FROM stocks WHERE code NOT LIKE 'bj%'"
+    if only_missing:
+        sql += " AND pe IS NULL"
+    with db_conn() as conn:
+        codes = [r[0] for r in conn.execute(sql).fetchall()]
+    n_ok = 0
+    for i in range(0, len(codes), batch):
+        chunk = codes[i:i + batch]
+        try:
+            d = fetch_batch_quotes(chunk)
+        except Exception:
+            d = {}
+        rows = [(q.get("turnover"), q.get("pe"), q.get("pb"), c)
+                for c, q in d.items()
+                if q.get("pe") is not None or q.get("turnover") is not None]
+        if rows:
+            with db_conn(commit=True) as conn:
+                conn.executemany(
+                    "UPDATE stocks SET turnover=?, pe=?, pb=? WHERE code=?",
+                    rows)
+            n_ok += len(rows)
+        if progress and (i // batch) % 10 == 0:
+            progress(f"估值快照 {min(i + batch, len(codes))}/{len(codes)} "
+                     f"(更新 {n_ok})")
+    if progress:
+        progress(f"估值快照完成：更新 {n_ok}/{len(codes)} 只")
+    return n_ok
 
 
 def fetch_batch_quotes(codes):
@@ -10472,7 +10567,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     「历史信号 IC 显著为正 + 指标在场」确认（T-1 口径），确认不足宁缺毋滥；
     top_n 覆盖档位 top（荐股页 IC 确认后综合分 Top10）；picks 增加 ic 字段
     （该股 T-1 信号 IC，仅供展示）。资金按 top 均分（10 万 = 10 只 × 约1万，
-    组合口径而非每只 10 万）。"""
+    组合口径而非每只 10 万）。
+    v6.2.4：生产端默认剔除亏损股——动态 PE≤0 的候选不入选（PE 缺失不过滤；
+    设置 ini [picks] exclude_loss=0 可关）；picks 增加 pe/turnover 字段。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
@@ -10489,9 +10586,10 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     d = int(good[-1])
     signal_date = cal[d]
     with db_conn() as conn:
-        info = {c: (n or c, ind or "")
-                for c, n, ind in
-                conn.execute("select code,name,industry from stocks")}
+        info = {c: (n or c, ind or "", pe, tu)
+                for c, n, ind, pe, tu in
+                conn.execute("select code,name,industry,pe,turnover "
+                             "from stocks")}
     names = {c: v[0] for c, v in info.items()}
     risky = np.array([("ST" in names.get(c, "").upper()
                        or "退" in names.get(c, "")) for c in codes])
@@ -10519,6 +10617,11 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
               & np.isfinite(score[:, d]) & ~risky)
         if icp is not None:
             ok = ok & icp["ok"][:, d]
+        if picks_exclude_loss():
+            # v6.2.4：动态 PE≤0（亏损）剔除；PE 缺失（NaN）视为未知不过滤
+            _pe = np.array([(info.get(c) or (None, None, None, None))[2]
+                            for c in codes], float)
+            ok = ok & (~np.isfinite(_pe) | (_pe > 0))
         cand = np.nonzero(ok)[0]
         order = cand[np.argsort(-score[cand, d], kind="stable")]
         r1d = np.full(NST, np.nan)
@@ -10544,9 +10647,11 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
             if v20:
                 _k_stop = 3.0 if tier == "激进" else 2.0
                 stop_ref = px * (1 - _k_stop * v20)
+            _inf = info.get(codes[k]) or ("", "", None, None)
             picks.append({
                 "code": str(codes[k]), "name": names.get(codes[k], ""),
-                "industry": info.get(codes[k], ("", ""))[1],
+                "industry": _inf[1],
+                "pe": _inf[2], "turnover": _inf[3],
                 "price": px, "score": float(score[k, d]),
                 "ic": (float(icp["ic"][k, d])
                        if icp is not None
@@ -11699,6 +11804,9 @@ class App:
                          "参考止损仅风险提示（回测未用）")
         lb.insert("end", "IC=该股历史信号IC（120日窗，IC>0且t≥2且指标在场"
                          "才入选；确认不足宁缺毋滥，可能少于10只）")
+        if picks_exclude_loss():
+            lb.insert("end", "生产端过滤：动态PE≤0（亏损）已剔除"
+                             "（ini [picks] exclude_loss=0 可关；PE 缺失不过滤）")
         if d.get("allow_limit_up"):
             lb.insert("end", "打板提示：本档解除「涨停不买」，次日封板按涨停价"
                              "成交（回测口径）；[涨停]=信号日已封板。")
