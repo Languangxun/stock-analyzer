@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-09-28 升 6.1.8）
-APP_VERSION = "6.1.9"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.2）
+APP_VERSION = "6.2.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -2616,6 +2616,204 @@ def industry_peers(full: str, limit: int = L2_DEFAULT_N):
     return [r[0] for r in rows[:limit]], info["industry"]
 
 
+# ================= 基本面信息（v6.2.1：东财 F10 历史财报关键数据） =================
+
+_F10_CACHE = {}                 # code -> (ts, rows)；财报低频，6h 缓存
+_F10_TTL = 6 * 3600.0
+
+# RPT_F10_FINANCE_MAINFINADATA 关键字段（东财 F10 主要指标，单位见注释）
+_F10_FIELDS = {
+    "date_name": "REPORT_DATE_NAME",      # 2026中报
+    "rtype": "REPORT_TYPE",               # 中报/年报
+    "notice": "NOTICE_DATE",              # 公告日
+    "rev": "TOTALOPERATEREVE",            # 营业总收入（元）
+    "rev_yoy": "TOTALOPERATEREVETZ",      # 营收同比（%）
+    "np": "PARENTNETPROFIT",              # 归母净利（元）
+    "np_yoy": "PARENTNETPROFITTZ",        # 归母净利同比（%）
+    "kf_yoy": "KCFJCXSYJLRTZ",            # 扣非净利同比（%）
+    "eps": "EPSJB",                       # 基本每股收益（元）
+    "eps_yoy": "EPSJBTZ",                 # EPS 同比（%）
+    "bps": "BPS",                         # 每股净资产（元）
+    "roe": "ROEJQ",                       # 加权净资产收益率（%）
+    "gm": "XSMLL",                        # 销售毛利率（%）
+    "nm": "XSJLL",                        # 销售净利率（%）
+    "debt": "ZCFZL",                      # 资产负债率（%）
+    "ocf_ps": "MGJYXJJE",                 # 每股经营现金流（元）
+}
+
+
+def _secucode(full):
+    """sh600519 -> 600519.SH（东财 F10 接口口径）。"""
+    c = (full or "").lower()
+    suf = ".SH" if c.startswith("sh") else ".BJ" if c.startswith("bj") \
+        else ".SZ"
+    return c[-6:] + suf
+
+
+def fetch_f10_metrics(full, periods=12):
+    """抓取历史财报关键数据（东财 F10 主要指标，最多 periods 期，报告期倒序）。
+
+    复用 _http_get（限流退避）+ 数据源熔断器（src_name=em_f10）+ 代理路由
+    （eastmoney.com 已在 _DOMESTIC_SUFFIX，直连优先）；双 host 容灾。
+    返回 dict 列表（新→旧），字段见 _F10_FIELDS；缺字段/停牌期容忍缺失。
+    抛 RuntimeError 表示两 host 均失败（GUI 捕获后展示原因）。"""
+    full = (full or "").strip().lower()
+    cached = _F10_CACHE.get(full)
+    if cached and time.time() - cached[0] <= _F10_TTL:
+        return cached[1]
+    sec = _secucode(full)
+    q = urllib.parse.quote(f'(SECUCODE="{sec}")')
+    hosts = ("https://datacenter.eastmoney.com",
+             "https://datacenter-web.eastmoney.com")
+    path = ("/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA"
+            f"&columns=ALL&filter={q}&pageNumber=1&pageSize={periods}"
+            "&sortTypes=-1&sortColumns=REPORT_DATE&source=HSF10&client=PC")
+    data, last = None, None
+    for i, host in enumerate(hosts):
+        try:
+            txt = _http_get(host + path, retries=3, timeout=20,
+                            headers={"Referer":
+                                     "https://emweb.securities.eastmoney.com/"},
+                            src_name="em_f10")
+            d = json.loads(txt)
+            data = ((d.get("result") or {}).get("data")
+                    or d.get("data") or [])
+            break
+        except Exception as e:
+            last = e
+            if _cb_ok("em_f10") and i + 1 < len(hosts):
+                continue
+    if data is None:
+        raise RuntimeError(f"财报数据源失败: {last}")
+    rows = []
+    for it in data:
+        row = {}
+        for k, f in _F10_FIELDS.items():
+            v = it.get(f)
+            if isinstance(v, (int, float)):
+                row[k] = float(v)
+            elif isinstance(v, str):
+                row[k] = v.strip() or None
+            else:
+                row[k] = None
+        if row.get("date_name") or row.get("rtype"):
+            rows.append(row)
+    if not rows:
+        raise RuntimeError("财报接口返回空（可能非上市公司/新上市无历史）")
+    _F10_CACHE[full] = (time.time(), rows)
+    return rows
+
+
+def fundamentals_summary(full, rows):
+    """财报关键数据分析（规则引擎，直接脚本输出，不联网不调AI）。
+
+    输入 fetch_f10_metrics 结果（报告期倒序），返回文本行列表：
+    成长性（营收/净利同比序列 + 增收不增利 + 扣非背离）、盈利质量
+    （ROE/毛利率/净利率/现金流）、财务风险（负债率，金融地产不评）、
+    综合结论（偏多/中性/偏空 + 依据）。仅财报数据参考，非投资建议。"""
+    n = len(rows)
+    name = (get_stock_info(full) or {}).get("name") or full
+    out = [f"【{name} {full}】近 {n} 期财报关键数据分析", ""]
+
+    def f2(v, suf=""):
+        return f"{v:.2f}{suf}" if isinstance(v, (int, float)) else "-"
+
+    r0 = rows[0]
+    out.append(f"最新报告期：{r0.get('date_name') or r0.get('rtype') or '-'}"
+               f"（公告 {str(r0.get('notice') or '-')[:10]}）")
+    out.append(f"  营收 {f2((r0.get('rev') or 0) / 1e8)}亿 "
+               f"(同比 {f2(r0.get('rev_yoy'), '%')})  "
+               f"归母净利 {f2((r0.get('np') or 0) / 1e8)}亿 "
+               f"(同比 {f2(r0.get('np_yoy'), '%')})")
+    out.append(f"  扣非同比 {f2(r0.get('kf_yoy'), '%')}  EPS "
+               f"{f2(r0.get('eps'))}元  ROE {f2(r0.get('roe'), '%')}  "
+               f"毛利率 {f2(r0.get('gm'), '%')}  净利率 {f2(r0.get('nm'), '%')}")
+    out.append(f"  负债率 {f2(r0.get('debt'), '%')}  每股经营现金流 "
+               f"{f2(r0.get('ocf_ps'))}元")
+    out.append("")
+
+    # ---- 成长性：最近4期同比序列 ----
+    def yoy_series(key, k=4):
+        vals = [r.get(key) for r in rows[:k] if isinstance(r.get(key),
+                                                           (int, float))]
+        return vals
+
+    score = 0
+    out.append("▍成长性")
+    for key, label in (("rev_yoy", "营收"), ("np_yoy", "归母净利")):
+        vs = yoy_series(key)
+        if not vs:
+            out.append(f"  {label}同比：数据缺失")
+            continue
+        seq = "、".join(f"{v:+.1f}%" for v in vs)
+        pos = sum(1 for v in vs if v > 0)
+        avg = sum(vs) / len(vs)
+        trend = "连续为正" if pos == len(vs) else \
+            "转正" if vs[0] > 0 and len(vs) > 1 and all(v <= 0 for v in vs[1:]) \
+            else "连续为负" if pos == 0 else "波动"
+        out.append(f"  {label}同比（新→旧）：{seq}  近{len(vs)}期均值 "
+                   f"{avg:+.1f}%，{trend}（{pos}/{len(vs)} 期为正）")
+        score += 1 if avg > 5 else (-1 if avg < -5 else 0)
+    ry, ny = (r0.get("rev_yoy"), r0.get("np_yoy"))
+    if isinstance(ry, (int, float)) and isinstance(ny, (int, float)) \
+            and ry > 10 and ny < 0:
+        out.append("  ⚠ 增收不增利：营收双位数增长但净利同比为负（盈利质量存疑）")
+        score -= 1
+    ky, ny2 = r0.get("kf_yoy"), r0.get("np_yoy")
+    if isinstance(ky, (int, float)) and isinstance(ny2, (int, float)) \
+            and ny2 - ky > 10:
+        out.append(f"  ⚠ 净利同比({ny2:+.1f}%)显著高于扣非同比({ky:+.1f}%)："
+                   "利润含非经常性损益较多")
+    out.append("")
+
+    # ---- 盈利质量 ----
+    out.append("▍盈利质量")
+    roe = r0.get("roe")
+    if isinstance(roe, (int, float)):
+        grade = "优秀" if roe >= 15 else "良好" if roe >= 8 else \
+            "一般" if roe >= 4 else "偏弱"
+        out.append(f"  ROE {roe:.2f}%（{grade}）")
+        score += 1 if roe >= 15 else (0 if roe >= 8 else -1)
+    else:
+        out.append("  ROE：数据缺失")
+    gm, nm_ = r0.get("gm"), r0.get("nm")
+    if isinstance(gm, (int, float)):
+        out.append(f"  毛利率 {gm:.2f}%  净利率 "
+                   f"{f2(nm_, '%')}（净利/毛利 = "
+                   f"{f2(nm_ / gm * 100 if gm else None, '%')}）")
+    ocf, eps = r0.get("ocf_ps"), r0.get("eps")
+    if isinstance(ocf, (int, float)) and isinstance(eps, (int, float)) \
+            and eps > 0:
+        ratio = ocf / eps
+        note = "现金流充沛" if ratio >= 0.8 else \
+            "偏弱，留意应收/存货" if ratio < 0.4 else "正常"
+        out.append(f"  每股经营现金流/EPS = {ratio:.2f}（{note}）")
+        if ratio < 0.4:
+            score -= 1
+    out.append("")
+
+    # ---- 财务风险 ----
+    out.append("▍财务风险")
+    ind = (get_stock_info(full) or {}).get("industry") or ""
+    debt = r0.get("debt")
+    if ind and any(w in ind for w in ("银行", "证券", "保险", "房地产")):
+        out.append(f"  负债率 {f2(debt, '%')}（{ind}行业高负债为常态，不评）")
+    elif isinstance(debt, (int, float)):
+        lvl = "偏高，留意利息压力" if debt > 70 else \
+            "中等" if debt > 40 else "较低"
+        out.append(f"  资产负债率 {debt:.2f}%（{lvl}）")
+        if debt > 70:
+            score -= 1
+    else:
+        out.append("  负债率：数据缺失")
+    out.append("")
+
+    verdict = "偏多" if score >= 2 else "中性" if score >= -1 else "偏空"
+    out.append(f"▍综合结论：基本面{verdict}（评分 {score:+d}，"
+               "规则汇总自上列数据，仅供参考，不构成投资建议）")
+    return out
+
+
 _TIER_POOL_CACHE = {}       # (tier, 日期) -> L3样本代码列表（同日共享，避免重复拉取）
 _TIER_POOL_TS = {}
 
@@ -2793,13 +2991,52 @@ THEMES = {
 }
 
 
-def apply_theme(theme, updown):
-    """按设置重写模块级颜色常量；绘图函数读取全局值。"""
+def apply_theme(theme, updown, ma_colors=None, boll_colors=None):
+    """按设置重写模块级颜色常量；绘图函数读取全局值。
+    ma_colors / boll_colors 提供时覆盖主题默认（设置→自定义颜色）。"""
     t = dict(THEMES.get(theme, THEMES["dark"]))
     if updown == "green_up":
         t["UP"], t["DOWN"] = t["DOWN"], t["UP"]
     for k, v in t.items():
         globals()[k] = v
+    if ma_colors:
+        mc = dict(MA_COLORS)
+        mc.update({int(k): v for k, v in ma_colors.items()})
+        globals()["MA_COLORS"] = mc
+    if boll_colors:
+        bc = {"up": globals().get("C_GOLD", "#e8c14a"),
+              "mid": globals().get("C_PURPLE", "#d0a9f5"),
+              "low": globals().get("C_GOLD", "#e8c14a")}
+        bc.update(boll_colors)
+        globals()["IND_BOLL_COLORS"] = bc
+    else:
+        globals()["IND_BOLL_COLORS"] = {
+            "up": globals().get("C_GOLD", "#e8c14a"),
+            "mid": globals().get("C_PURPLE", "#d0a9f5"),
+            "low": globals().get("C_GOLD", "#e8c14a"),
+        }
+
+
+# 指标线宽（默认 1，比旧的 width=2 稍细；设置页允许调整 1~3）
+IND_LINE_W = 1
+IND_BOLL_COLORS = {"up": "#e8c14a", "mid": "#d0a9f5", "low": "#e8c14a"}
+
+
+def ind_w():
+    """当前指标线宽（主图 MA / BOLL / 副图 MACD/KDJ/RSI/ADX/量比）。"""
+    return max(1, min(3, int(IND_LINE_W)))
+
+
+def ma_color(nn):
+    """MA 颜色读取（设置页允许覆盖；fallback 灰）。"""
+    m = globals().get("MA_COLORS") or {}
+    return m.get(int(nn), "#cccccc")
+
+
+def boll_color(key):
+    """BOLL 三轨颜色读取（设置页允许覆盖）。"""
+    bc = globals().get("IND_BOLL_COLORS") or IND_BOLL_COLORS
+    return bc.get(key, "#e8c14a")
 
 
 # ================= 数据获取 =================
@@ -3859,7 +4096,9 @@ def strategy_signals_full(rows, strat, industry=""):
         gen = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                "boll": _sig_boll, "ma_trend": _sig_ma_trend,
                "l1_pattern": _sig_l1_pattern,
-               "chip_peak": _sig_chip_peak}.get(algo)
+               "chip_peak": _sig_chip_peak,
+               "vol_ratio": _sig_vol_ratio,
+               "lgbm": _sig_lgbm}.get(algo)
         return gen(rows) if gen else []
     except Exception:
         log.exception("策略信号生成失败 %s", algo)
@@ -5429,6 +5668,36 @@ def save_strategy(full, strat):
         log.exception("save_strategy 失败(忽略)")
 
 
+# v6.2.2：研究消融批量结果（tier_picks_from_ablation.py 产物），
+# GUI 消融弹窗优先读它（四档全量），读不到才本地重跑（近1000日，3~5分钟/只）。
+_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "codes": {}}
+
+
+def load_research_ablation(full):
+    """读 research/ablation_gui_cache.json 中该股的四档消融结果（与 run_ablation
+    返回同构）。文件变更自动重载；超过 STRAT_TTL（5日）视为过期返回 None；
+    文件缺失/该股不在批量覆盖内返回 None（调用方回退本地消融）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "research", "ablation_gui_cache.json")
+    try:
+        mt = os.path.getmtime(path)
+        if mt != _RESEARCH_ABL["mtime"]:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            _RESEARCH_ABL.update(mtime=mt, ts=float(d.get("ts") or 0.0),
+                                 codes=d.get("codes") or {})
+        if time.time() - _RESEARCH_ABL["ts"] > STRAT_TTL:
+            return None
+        c = _RESEARCH_ABL["codes"].get(full)
+        if not c:
+            return None
+        c = dict(c)
+        c.setdefault("ts", _RESEARCH_ABL["ts"])
+        return c
+    except Exception:
+        return None
+
+
 # ---- 各算法信号发生器（只用 T 日及以前数据，杜绝前视）----
 
 def _sig_macd(rows):
@@ -5612,6 +5881,8 @@ ALGO_LABEL = {
     "ma_trend": "MA20/60趋势",
     "chip_peak": "筹码峰支撑",
     "sector_rot": "板块轮动",
+    "vol_ratio": "量比放量",
+    "lgbm": "LGBM预测",
     "composite": "多维评分",
 }
 
@@ -5993,6 +6264,128 @@ def _sig_sector_rot(rows, industry="", step=3, **_kw):
             out.append((i, rows[i]["date"], "BUY", "板块动量领先"))
         elif arr[j] < med5[j] and sr5 < 0:
             out.append((i, rows[i]["date"], "SELL", "板块动量落后"))
+    return out
+
+
+def _sig_vol_ratio(rows, **_kw):
+    """量比信号：近5日均量/前15日均量。
+
+    放量（≥1.5）首次跨越 1.2 阈值且收阳 → BUY；
+    缩量（≤0.5）或 放量（≥2.0）收阴 → SELL。仅用截至当日的 vol_ratio_at（因果）。"""
+    vols = [r.get("vol") or 0.0 for r in rows]
+    out = []
+    for i in range(19, len(rows)):
+        vr = vol_ratio_at(vols, i)
+        prev = vol_ratio_at(vols, i - 1)
+        if vr is None or prev is None:
+            continue
+        c, pc = rows[i]["close"], rows[i - 1]["close"]
+        if vr >= 1.5 and prev < 1.2 and c > pc:
+            out.append((i, rows[i]["date"], "BUY", f"量比放量{vr:.2f}"))
+        elif (vr <= 0.5 or (vr >= 2.0 and c < pc)) and c < pc:
+            out.append((i, rows[i]["date"], "SELL", f"量能异动{vr:.2f}"))
+    return out
+
+
+# LightGBM 信号（消融候选）：因果——每 50 根在「当日及以前」数据上重训
+# LGBMRegressor 预测次日收益；缺库静默回退（不刷错误日志，避免重复触发提示）
+_V4_LGBM_ABLATION = {"objective": "regression", "num_leaves": 15,
+                     "max_depth": 4, "learning_rate": 0.05,
+                     "n_estimators": 100, "min_child_samples": 40,
+                     "subsample": 0.8, "subsample_freq": 1,
+                     "colsample_bytree": 0.8, "reg_lambda": 1.0,
+                     "reg_alpha": 0.0, "random_state": 42, "n_jobs": 1,
+                     "verbose": -1}
+
+
+def _sig_lgbm(rows, **_kw):
+    """LightGBM 信号：LGBMRegressor 预测次日收益（因果滚动训练）。
+    每 50 根重训一次（仅用当日及以前数据），BUY/SELL 阈值 ±0.5%。
+    缺 lightgbm 库静默返回 []，回退到其他候选。"""
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError:
+        return []
+    n = len(rows)
+    if n < 220:
+        return []
+    closes = [r["close"] for r in rows]
+    vols = [r.get("vol") or 0.0 for r in rows]
+    dif_, dea_, _ = calc_macd(closes)
+    k_, d_, _ = calc_kdj(rows)
+    r6 = calc_rsi(closes, 6)
+    _, b_up, b_low = calc_boll(closes)
+    vr_arr = [vol_ratio_at(vols, k) for k in range(n)]
+
+    def _feats(i):
+        if i < 60 or i + 1 >= n:
+            return None
+        if closes[i] <= 0 or closes[i-5] <= 0 or closes[i-10] <= 0 \
+                or closes[i-20] <= 0:
+            return None
+        ret5 = closes[i] / closes[i-5] - 1
+        ret10 = closes[i] / closes[i-10] - 1
+        ret20 = closes[i] / closes[i-20] - 1
+        if None in (r6[i], dif_[i], dea_[i], k_[i], d_[i],
+                    b_up[i], b_low[i]):
+            return None
+        boll_pct = ((closes[i] - b_low[i]) / (b_up[i] - b_low[i])
+                    if b_up[i] > b_low[i] else 0.5)
+        return [ret5, ret10, ret20, (r6[i] or 0) / 100, vr_arr[i] or 0,
+                boll_pct, (dif_[i] or 0) - (dea_[i] or 0),
+                (k_[i] or 0) - (d_[i] or 0)]
+
+    preds = [None] * n
+    model = None
+    last_train_i = -100
+    RETRAIN_EVERY = 50
+    for i in range(60, n - 1):
+        f = _feats(i)
+        if f is None:
+            continue
+        if model is None or i - last_train_i >= RETRAIN_EVERY:
+            X, Y = [], []
+            for j in range(60, i):
+                fj = _feats(j)
+                if fj is None or j + 1 >= n or closes[j] <= 0 \
+                        or closes[j + 1] <= 0:
+                    continue
+                X.append(fj)
+                Y.append(closes[j + 1] / closes[j] - 1)
+            if len(X) < 100:
+                continue
+            try:
+                model = LGBMRegressor(**_V4_LGBM_ABLATION)
+                model.fit(X, Y)
+                last_train_i = i
+            except Exception:
+                log.debug("LGBM 训练失败 %d", i, exc_info=True)
+                continue
+        try:
+            preds[i + 1] = float(model.predict([f])[0])
+        except Exception:
+            pass
+
+    th_buy, th_sell = 0.005, -0.005
+    cooldown = 0
+    out = []
+    last_dir = 0
+    for i in range(60, n):
+        p = preds[i]
+        if p is None or cooldown > 0:
+            if cooldown > 0:
+                cooldown -= 1
+            continue
+        if p > th_buy and last_dir <= 0:
+            out.append((i, rows[i]["date"], "BUY",
+                        f"LGBM预测{p*100:+.2f}%"))
+            last_dir = 1
+            cooldown = 3
+        elif p < th_sell and last_dir >= 0:
+            out.append((i, rows[i]["date"], "SELL",
+                        f"LGBM预测{p*100:+.2f}%"))
+            last_dir = -1
+            cooldown = 3
     return out
 
 
@@ -6468,6 +6861,8 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "l2_ind": lambda: _sig_l2_industry(rows, industry=industry),
         "chip_peak": lambda: _sig_chip_peak(rows),
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
+        "vol_ratio": lambda: _sig_vol_ratio(rows),
+        "lgbm": lambda: _sig_lgbm(rows),
     }
     for algo, gen in gens.items():
         try:
@@ -7171,7 +7566,7 @@ def analyze(full, progress=None, quick=False):
     signals = []
     # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
     if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
-                    "chip_peak", "sector_rot"):
+                    "chip_peak", "sector_rot", "vol_ratio", "lgbm"):
         try:
             if sel_algo == "chip_peak":
                 raw = _sig_chip_peak(disp_rows)
@@ -7181,7 +7576,9 @@ def analyze(full, progress=None, quick=False):
             else:
                 raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                        "boll": _sig_boll, "ma_trend": _sig_ma_trend,
-                       "l1_pattern": _sig_l1_pattern}[sel_algo](disp_rows)
+                       "l1_pattern": _sig_l1_pattern,
+                       "vol_ratio": _sig_vol_ratio,
+                       "lgbm": _sig_lgbm}[sel_algo](disp_rows)
             cut = max(1, len(disp_rows) - 250)
             signals = [s for s in raw if s[0] >= cut]
         except Exception:
@@ -7558,7 +7955,8 @@ def analyze(full, progress=None, quick=False):
         "sector_name": sec_name, "sector_chg_today": sec_chg_today,
         "ind": {"ma": mas, "dif": dif, "dea": dea, "mhist": mhist,
                 "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12,
-                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low, "pdi": pdi_a, "mdi": mdi_a, "adx": adx_a},
+                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low, "pdi": pdi_a, "mdi": mdi_a, "adx": adx_a,
+                "vr_arr": vr_arr},
         "vols": vols,
         "chips": chips,
         "action": action,
@@ -9190,7 +9588,10 @@ def _v4_print_report(r):
 #      当前版本刻意不控制最大回撤，回撤由使用者自行承受。
 #
 # 原理（前三档详见 README 第二节）：
-#   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
+#   稳健 = 「20日动量 + 20日低波」横截面合成排名 Top20（v6.1.11 起偏动量：
+#          blend_mom 动量0.6/低波0.4——等权低波会系统性挤出医药/科技等高波动
+#          成长股，动量权重 0.5→0.6 后四口径全期/样本外/强势段全面更优且回撤
+#          基本不变；动量短名单/纯60日动量方案经回测证伪），每20日调仓，
 #          上证 MA20 闸门（T-1 收盘在均线上才持仓）
 #   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
 #   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
@@ -9212,8 +9613,8 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
             allow_limit_up=True)
 
 TIER_CFG = {
-    "稳健": dict(universe="all", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="all", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
@@ -9231,8 +9632,8 @@ TIER_CFG = {
 #   · 动量权重邻域 0.6/0.7 稳健（+7.0%/+6.6%），0.9/1.0 崩坏（-10.5%/-28.2%）
 #     → 取 0.7 并保留低波 0.3 作为防守项。
 TIER_CFG_MAIN = {
-    "稳健": dict(universe="main", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="main", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="main", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
@@ -9240,12 +9641,13 @@ TIER_CFG_MAIN = {
     "高风险": dict(_ROT, universe="main"),
 }
 # ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
-# 故前三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
+# 故前三档都用「动量+低波」族：稳健偏动量（0.6/0.4，v6.1.11 起）、
+# 均衡等权 blend、激进偏动量 blend_mom。
 # 高风险档同样用 rotate（ETF 无行业时板块动量退化为自身动量，见
 # tier_sector_features）；闸门一律板块轮动口径。
 TIER_CFG_ETF = {
-    "稳健": dict(universe="etf", score="blend", top=10, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="etf", score="blend_mom", mom_w=0.6, top=10,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="etf", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
@@ -9255,8 +9657,8 @@ TIER_CFG_ETF = {
 # 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
 # （池内混入 ETF 后，创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
-    "稳健": dict(universe="all_etf", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all_etf", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="all_etf", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
@@ -9454,6 +9856,77 @@ def tier_build_features(cal, C, V):
                 beta60_star=beta60_star)
 
 
+def tier_ic_confirm(C):
+    """个股历史信号 IC 确认层（v6.2.0 荐股逻辑；结果缓存 `_TIER_CACHE["ic"]`）。
+
+    每只股票滚动计算「动量信号强度 → 未来收益」的历史预测力（Spearman 思路
+    用 Pearson 实现，滚动窗口 cumsum 向量化，按行分块控制峰值内存）：
+      a_i = C_i/C_{i-5} − 1（近5日收益 = 信号强度）
+      b_i = C_{i+5}/C_i − 1（未来5日收益 = 结果）
+      窗口 120 日：ic（相关系数）、n（有效样本对数）、t = r·√((n−2)/(1−r²))
+    确认掩码 ok[:, t]（T 日决策用 T-1 及以前，防前视）：
+      ic(T-1) > 0 且 t(T-1) ≥ 2 且 n(T-1) ≥ 60 且 信号在场
+    信号在场 = T-1 日 MA20/60 多头趋势（c>ma20>ma60 且 ma20 上行；
+      全A 实证 IC 0.228 最强规则维度）——IC 与指标综合考量、
+      窗宽/阈值全取自然数（120/5/60/2）不做寻优，防过拟合。
+    返回 dict(ok=bool[NST,NDT], ic=float32[NST,NDT])，ic 供荐股展示。"""
+    if _TIER_CACHE.get("ic") is not None:
+        return _TIER_CACHE["ic"]
+    NST, NDT = C.shape
+    W, H, NMIN, TMIN = 120, 5, 60, 2.0
+    ok = np.zeros((NST, NDT), bool)
+    ic_out = np.full((NST, NDT), np.nan, dtype=np.float32)
+
+    def _roll(x):
+        cs = np.cumsum(x, axis=1)
+        out = np.full_like(x, np.nan)
+        out[:, W:] = cs[:, W:] - cs[:, :-W]
+        return out
+
+    CH = 1024                            # 行分块：峰值内存 ~15MB/中间量
+    for s in range(0, NST, CH):
+        e = min(s + CH, NST)
+        Cc = C[s:e]
+        a = np.full_like(Cc, np.nan)     # 近5日收益（信号强度）
+        a[:, 5:] = Cc[:, 5:] / Cc[:, :-5] - 1.0
+        b = np.full_like(Cc, np.nan)     # 未来5日收益（结果）
+        b[:, :-H] = Cc[:, H:] / Cc[:, :-H] - 1.0
+        v = np.isfinite(a) & np.isfinite(b)
+        av = np.where(v, np.nan_to_num(a), 0.0)
+        bv = np.where(v, np.nan_to_num(b), 0.0)
+        S1, S2 = _roll(av), _roll(av * av)
+        S3, S4 = _roll(bv), _roll(bv * bv)
+        S5, N = _roll(av * bv), _roll(v.astype(np.float64))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = (S5 - S1 * S3 / N) / np.sqrt(
+                np.maximum((S2 - S1 * S1 / N) * (S4 - S3 * S3 / N), 0.0))
+            r = np.where((S2 - S1 * S1 / N > 1e-12)
+                         & (S4 - S3 * S3 / N > 1e-12) & (N >= NMIN),
+                         r, np.nan)
+            t = r * np.sqrt((N - 2.0) / np.maximum(1.0 - r * r, 1e-12))
+        # 信号在场：MA20/60 多头趋势（c>ma20>ma60 且 ma20 上行）
+        def _ma(n):
+            cs = np.cumsum(np.insert(np.nan_to_num(Cc, nan=0.0),
+                                     0, 0.0, axis=1), axis=1)
+            cn = np.cumsum(np.insert(np.isfinite(Cc).astype(float),
+                                     0, 0.0, axis=1), axis=1)
+            m = np.full_like(Cc, np.nan)
+            m[:, n - 1:] = ((cs[:, n:] - cs[:, :-n])
+                            / np.maximum(cn[:, n:] - cn[:, :-n], 1.0))
+            return m
+        ma20, ma60 = _ma(20), _ma(60)
+        ma20p = np.full_like(Cc, np.nan)
+        ma20p[:, 1:] = ma20[:, :-1]
+        ins = ((Cc > ma20) & (ma20 > ma60) & (ma20 > ma20p)
+               & np.isfinite(ma20) & np.isfinite(ma60))
+        conf = (r > 0) & (t >= TMIN) & (N >= NMIN) & ins
+        ok[s:e, 1:] = conf[:, :-1]       # T 日用 T-1 确认
+        ic_out[s:e] = r.astype(np.float32)
+    out = {"ok": ok, "ic": ic_out}
+    _TIER_CACHE["ic"] = out
+    return out
+
+
 def tier_sector_features(feat):
     """板块轮动特征（v6.1.9 高风险档；结果缓存 `_TIER_CACHE["sec"]`）。
 
@@ -9532,7 +10005,8 @@ def tier_rank_base(codes, universe):
 
 def tier_make_score(feat, kind, mom_w=None, base=None, sec_w=None):
     """合成打分：
-      blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
+      blend      = 动量20 与 低波20 百分位等权（v6.1.10 前稳健/均衡口径，
+                   现仅均衡档与研究对照用）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
       rotate     = 板块轮动（高风险档）：板块 20 日动量排名 sec_w 为主，
                    叠加个股动量/低波基准（1-sec_w）；板块动量见
@@ -9642,8 +10116,11 @@ def _tier_limit_pct(code):
 
 
 def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
-                   capital=1e6):
-    """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。"""
+                   capital=1e6, ic_ok=None):
+    """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。
+    ic_ok：v6.2.0 荐股确认层（tier_ic_confirm 的 ok 掩码）——非 None 时
+    调仓候选须先过「历史信号 IC 显著为正 + 指标在场」确认，再按评分取 TopN；
+    确认数不足时宁可少持仓/持现金，不降低门槛凑数。"""
     NST = C.shape[0]
     top, reb = cfg["top"], cfg["reb"]
     uni = tier_universe_mask(codes, cfg.get("universe", "all"))
@@ -9702,6 +10179,9 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
             s = score[cand, d]
             m = np.isfinite(s)
             cand, s = cand[m], s[m]
+            if ic_ok is not None:
+                keep = ic_ok[cand, d]
+                cand, s = cand[keep], s[keep]
             order = cand[np.argsort(-s, kind="stable")]
             target = set(order[:top].tolist()) if on else set()
         for k in np.nonzero(holding)[0]:
@@ -9768,9 +10248,12 @@ def _tier_metrics(eq, dates, trades=None):
 
 
 def tier_eval(segment="full", tiers=None, phases=None, progress=None,
-              overrides=None, universe="all"):
+              overrides=None, universe="all", ic_filter=False, capital=None):
     """组合档回测（相位平均主口径；稳健/均衡/激进/高风险）。overrides 可覆盖 cfg（研究用）。
-    universe: all=全A / main=沪深主板。返回 {tier: metrics}。"""
+    universe: all=全A / main=沪深主板。返回 {tier: metrics}。
+    v6.2.0：ic_filter=True 启用荐股确认层（tier_ic_confirm：历史信号 IC 显著
+    为正 + 指标在场，候选不足时宁缺毋滥）；capital 覆盖本金（10 万组合荐股
+    回测用，整手约束随本金变化），None=默认 100 万口径不变。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
         progress("组合引擎：构建特征 ...")
@@ -9788,6 +10271,8 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         raise ValueError("未知区间: " + segment)
     i0 = int(np.searchsorted(cal, a))
     i1 = int(np.searchsorted(cal, b, side="right"))
+    ic_ok = tier_ic_confirm(C)["ok"] if ic_filter else None
+    cap = float(capital) if capital else 1e6
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
     tiers = list(base) if not tiers else [t for t in tiers if t in base]
     out = {}
@@ -9803,7 +10288,8 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         norms, dates, all_trades = [], None, []
         for p in range(n_ph):
             eq, ec, tr = tier_sim_phase(codes, cal, C, feat, score, gate,
-                                        i0, i1, cfg, phase=p, capital=1e6)
+                                        i0, i1, cfg, phase=p, capital=cap,
+                                        ic_ok=ic_ok)
             j0 = cfg["reb"] - 1 - p
             if j0 >= len(eq) or eq[j0] <= 0:
                 continue
@@ -9815,7 +10301,7 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         if not norms:
             continue
         L = min(len(e) for e in norms)
-        E = np.mean([e[:L] for e in norms], axis=0) * 1e6
+        E = np.mean([e[:L] for e in norms], axis=0) * cap
         dates = dates[:L]
         m = _tier_metrics(E, dates, all_trades)
         anns = [_tier_metrics(e[:L], dates)["ann"] for e in norms]
@@ -9987,13 +10473,20 @@ def tier_picks_report_text(segment="full", tiers=None, capital=0.0,
 
 
 def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
-                      universe="all", apply_perms=True):
+                      universe="all", apply_perms=True, ic_filter=False,
+                      top_n=None):
     """生产端：按最新可用交易日给出目标持仓（含闸门状态/板块权限过滤）。
-    universe: all=全A / main=沪深主板。apply_perms 开启时套用设置里的荐股权限。"""
+    universe: all=全A / main=沪深主板。apply_perms 开启时套用设置里的荐股权限。
+    v6.2.0：ic_filter=True 启用荐股确认层——候选须过 tier_ic_confirm 的
+    「历史信号 IC 显著为正 + 指标在场」确认（T-1 口径），确认不足宁缺毋滥；
+    top_n 覆盖档位 top（荐股页 IC 确认后综合分 Top10）；picks 增加 ic 字段
+    （该股 T-1 信号 IC，仅供展示）。资金按 top 均分（10 万 = 10 只 × 约1万，
+    组合口径而非每只 10 万）。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
     feat = _TIER_CACHE["feat"]
+    icp = tier_ic_confirm(C) if ic_filter else None
     NST, NDT = C.shape
     # 最后一个「足够多股票有数据」的交易日作为信号日
     elig_n = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
@@ -10017,7 +10510,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     for tier in (tiers or list(base)):
         if tier not in base:
             continue
-        cfg = tier_cfg(tier, universe)
+        cfg = dict(tier_cfg(tier, universe))
+        if top_n:
+            cfg["top"] = int(top_n)
         gate = tier_build_gate(cal, cfg, feat)
         on = bool(gate[d]) if gate is not None else True
         _base = tier_rank_base(codes, universe)
@@ -10031,6 +10526,8 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
               & (feat["barcount"][:, d] >= _TIER_MIN_BARS)
               & (feat["amt20"][:, d] >= _TIER_MIN_AMOUNT) & m
               & np.isfinite(score[:, d]) & ~risky)
+        if icp is not None:
+            ok = ok & icp["ok"][:, d]
         cand = np.nonzero(ok)[0]
         order = cand[np.argsort(-score[cand, d], kind="stable")]
         r1d = np.full(NST, np.nan)
@@ -10061,6 +10558,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
                 "code": str(codes[k]), "name": names.get(codes[k], ""),
                 "industry": info.get(codes[k], ("", ""))[1],
                 "price": px, "score": float(score[k, d]),
+                "ic": (float(icp["ic"][k, d])
+                       if icp is not None
+                       and np.isfinite(icp["ic"][k, d]) else None),
                 "vol20": v20,
                 "stop_ref": stop_ref,
                 "beta60": float(feat[bkey][k, d])
@@ -10081,7 +10581,7 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
     p = tier_latest_picks(capital=capital, tiers=tiers, universe=universe)
     uni_name = UNIVERSE_NAME.get(universe, universe)
-    lines = [f"v6.1.9 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
+    lines = [f"v6.2 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
              "荐股权限（设置内配置，空=全部）：已按板块/行业过滤",
@@ -10162,6 +10662,7 @@ def slice_view(res, show_n, pan=0):
         "boll_mid": res["ind"]["boll_mid"][off:end],
         "boll_up": res["ind"]["boll_up"][off:end],
         "boll_low": res["ind"]["boll_low"][off:end], "pdi": res["ind"]["pdi"][off:end], "mdi": res["ind"]["mdi"][off:end], "adx": res["ind"]["adx"][off:end],
+        "vr_arr": (res["ind"].get("vr_arr") or [None] * len(vis))[off:end],
         "vols": res["vols"][off:end] + [None] * len(extras),
         "signals": [(i - off, dt, t, txt) for i, dt, t, txt in res["signals"]
                     if off <= i < end],
@@ -10459,7 +10960,7 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "你是量化组合风控官。下面是当前市场环境与各档策略定义：\n"
         f"{ai_market_brief()}\n\n"
         "策略档位：\n"
-        "· 稳健：全A动量+低波Top20，20日调仓，上证MA20闸门\n"
+        "· 稳健：全A偏动量(动量0.6/低波0.4)Top20，20日调仓，上证MA20闸门\n"
         "· 均衡：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
         "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n"
         "· 高风险（新开发的高风险策略）：板块轮动为主参考——选强势行业里的"
@@ -10527,7 +11028,8 @@ class App:
         self._wf_width = max(160, min(230, sw // 10))
         self._bottom_lines = (5 if self.compact
                               else max(6, min(12, sh // 130)))
-        self.settings = {"theme": "dark", "updown": "red_up"}
+        self.settings = {"theme": "dark", "updown": "red_up",
+                       "ma_colors": {}, "boll_colors": {}, "ind_w": 1}
         self.api_key = ""
         self.watchlist = []
         self.ai_text = ""
@@ -10536,7 +11038,14 @@ class App:
         self._ai_msgs = []          # LLM 多轮对话历史 [{role,content},...]
         self._ai_sessions = {}      # (code,model) -> {hash, msgs} 会话缓存
         self._load_config()
-        apply_theme(self.settings["theme"], self.settings["updown"])
+        apply_theme(self.settings["theme"], self.settings["updown"],
+                  ma_colors=self.settings.get("ma_colors") or {},
+                  boll_colors=self.settings.get("boll_colors") or {})
+        try:
+            globals()["IND_LINE_W"] = max(1, min(3,
+                int(self.settings.get("ind_w", 1))))
+        except Exception:
+            globals()["IND_LINE_W"] = 1
         root.configure(bg=DARK_BG)
         self._style_ttk()
         self.res = None
@@ -10553,6 +11062,10 @@ class App:
         self._fold_manual = False      # 用户手动切换后不再自动干预
         self.view_pan = 0       # 平移偏移：0=最新，正=往左看更早
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
+        self.show_boll = tk.BooleanVar(value=True)    # BOLL 独立打勾（与 MA 同位）
+        self.boll_on = {"up": tk.BooleanVar(value=True),
+                        "mid": tk.BooleanVar(value=True),
+                        "low": tk.BooleanVar(value=True)}  # BOLL 三轨分别开关
 
         # ---- 插件加载（失败不影响主程序）----
         self._plugins = []
@@ -10697,6 +11210,19 @@ class App:
         style.configure("TSeparator", background=BORDER)
         style.configure("TProgressbar", background=ACCENT,
                         troughcolor=FIELD_BG, bordercolor=BORDER)
+        # Treeview（基本面财报表等）：不显式配置会继承 clam 白底 + 全局白字
+        # → 白底白字整表不可读（v6.2.1 热修）；随主题切换重跑自动换色。
+        style.configure("Treeview", background=PANEL_BG, foreground=FG_MAIN,
+                        fieldbackground=PANEL_BG, bordercolor=BORDER,
+                        lightcolor=PANEL_BG, darkcolor=PANEL_BG, rowheight=24)
+        style.configure("Treeview.Heading", background=FIELD_BG,
+                        foreground=TITLE_TXT, bordercolor=BORDER,
+                        relief="flat")
+        style.map("Treeview",
+                  background=[("selected", SEL_BG)],
+                  foreground=[("selected", FG_MAIN)])
+        style.map("Treeview.Heading",
+                  background=[("active", BTN_HOVER)])
         # 单选/复选：clam 主题悬停时背景默认近白(#eeebe7)，导致整块按钮变白、
         # 白字不可见。这里显式映射 active/selected/disabled，随主题换色。
         for _sub in ("TRadiobutton", "TCheckbutton"):
@@ -10765,10 +11291,12 @@ class App:
             cb.pack(side="left", padx=2)
             cb.bind("<<ComboboxSelected>>", lambda e: self._rerender())
             ttk.Label(top2, text="副图:").pack(side="left")
-            ci = ttk.Combobox(top2, textvariable=self.ind_name, width=5,
-                              state="readonly", values=["MACD", "KDJ", "RSI", "BOLL", "ADX"])
+            ci = ttk.Combobox(top2, textvariable=self.ind_name, width=6,
+                              state="readonly", values=["MACD", "KDJ", "RSI", "ADX", "量比"])
             ci.pack(side="left", padx=2)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
+            ttk.Checkbutton(top2, text="BOLL", width=5, variable=self.show_boll,
+                            command=self._rerender).pack(side="left", padx=2)
             ttk.Checkbutton(top2, text="折叠", width=4, variable=self.fold_sub,
                             command=self._toggle_sub).pack(side="left", padx=2)
             # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
@@ -10788,9 +11316,14 @@ class App:
             ttk.Label(top, text="副图指标:").pack(side="left")
             ci = ttk.Combobox(top, textvariable=self.ind_name, width=6,
                               state="readonly",
-                              values=["MACD", "KDJ", "RSI", "BOLL", "ADX"])
+                              values=["MACD", "KDJ", "RSI", "ADX", "量比"])
             ci.pack(side="left", padx=3)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
+            tk.Checkbutton(top, text="BOLL", variable=self.show_boll,
+                           command=self._rerender, font=("Consolas", 8),
+                           bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
+                           activeforeground=FG_MAIN,
+                           selectcolor=FIELD_BG).pack(side="left")
 
         if self.compact:
             pass
@@ -11043,7 +11576,8 @@ class App:
         pconf = picks_conf()
         uni_name = UNIVERSE_NAME.get(pconf["universe"], pconf["universe"])
         win = tk.Toplevel(self.root)
-        win.title(f"每日荐股 · {uni_name} · 四档 v6.1.9 / 综合 18 策略 v6.1.6")
+        win.title(f"每日荐股 · {uni_name} · 四档 v6.2 IC确认Top10 / "
+                  f"综合 18 策略 v6.1.6")
         win.configure(bg=DARK_BG)
         win.geometry("760x540" if not self.compact else
                      f"{self.root.winfo_screenwidth()}x"
@@ -11090,7 +11624,8 @@ class App:
                         win, lb, data))
                 threading.Thread(target=worker, daemon=True).start()
             else:
-                lb.insert("end", f"{m}：加载 v6.1 四档引擎（首次约1分钟）…")
+                lb.insert("end", f"{m}：加载 v6.2 四档引擎"
+                                 f"（IC确认·Top10，首次约1分钟）…")
 
                 def worker2():
                     note = None
@@ -11103,7 +11638,8 @@ class App:
                     try:
                         data = tier_latest_picks(
                             capital=self._picks_capital(), tiers=[m2],
-                            universe=pconf["universe"])
+                            universe=pconf["universe"],
+                            ic_filter=True, top_n=10)
                     except Exception as e:
                         self._safe_after(0, lambda: lb.delete(0, "end") or
                                          lb.insert("end", f"失败: {e}"))
@@ -11159,13 +11695,15 @@ class App:
             lb.insert("end", "双击此处无操作；可切换其它风险档查看。")
             return
         lb.insert("end", f"{'代码':<10}{'名称':<9}{'现价':>8}{'手数':>5}"
-                         f"{'金额':>8}{'分数':>7}{'波动':>7}{'参考止损':>9}")
+                         f"{'金额':>8}{'分数':>7}{'IC':>6}{'波动':>7}"
+                         f"{'参考止损':>9}")
         row0 = lb.size()
         for i, x in enumerate(d["picks"]):
             nm = x["name"][:7] + ("[涨停]" if x.get("limit_up") else "")
             lb.insert("end",
                       f"{x['code']:<10}{nm:<9}{x['price']:>8.2f}"
                       f"{x['lots']:>5}{x['cost']:>8.0f}{x['score']:>7.3f}"
+                      f"{(x['ic'] if x.get('ic') is not None else 0):>6.2f}"
                       f"{(x['vol20']*100 if x['vol20'] is not None else 0):>6.1f}%"
                       f"{(x['stop_ref'] or 0):>9.2f}")
             self._picks_rows[row0 + i] = x["code"]
@@ -11174,6 +11712,8 @@ class App:
         lb.insert("end", f"合计约 {d.get('suggested_cost', 0):,.0f} 元；"
                          "出局规则：跌出 Top / 闸门关闭 / 退市；"
                          "参考止损仅风险提示（回测未用）")
+        lb.insert("end", "IC=该股历史信号IC（120日窗，IC>0且t≥2且指标在场"
+                         "才入选；确认不足宁缺毋滥，可能少于10只）")
         if d.get("allow_limit_up"):
             lb.insert("end", "打板提示：本档解除「涨停不买」，次日封板按涨停价"
                              "成交（回测口径）；[涨停]=信号日已封板。")
@@ -11278,6 +11818,8 @@ class App:
         m.add_command(label="导出报告", command=self.export_report)
         m.add_command(label="样本明细", command=self.show_samples)
         m.add_command(label="五大指数", command=self._open_idx_window)
+        m.add_command(label="基本面信息（历史财报）",
+                      command=self.open_fundamentals)
         if CACHE_OK:
             m.add_separator()
             m.add_command(label="更新缓存", command=self.refresh_cache)
@@ -11951,6 +12493,15 @@ class App:
                 f"当前策略: {st.get('label', '?')} "
                 f"(策略缓存{5 - (time.time() - st.get('ts', 0)) // 86400:.0f}日内有效)")
             return
+        full0 = res["full_code"]
+        # v6.2.2：优先读研究消融批量结果（全市场一次跑完后免本地重算），
+        # 读不到（未跑批量/已过期/该股不在覆盖内）才后台本地消融。
+        abl = load_research_ablation(full0)
+        if abl:
+            self._last_ablation = abl
+            self.progress_var.set("已载入研究消融结果（批量缓存，免本地重算）")
+            self._show_strategy_popup(res, abl)
+            return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
                               "MA/筹码峰/板块轮动/多维×4风险档, 近1000交易日)...")
         full = res["full_code"]
@@ -11997,7 +12548,7 @@ class App:
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
             f"每档按各自风险目标在候选中选优"
-            f"（9算法+多维评分 × 4风险参数；保守档限定保守/稳健参数，"
+            f"（11算法+多维评分 × 4风险参数；保守档限定保守/稳健参数，"
             f"高风险=新开发的高风险策略：同激进选型+宽止损/暂不控制回撤）\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
@@ -12406,10 +12957,10 @@ class App:
                 self._draw_kdj()
             elif name == "RSI":
                 self._draw_rsi()
-            elif name == "BOLL":
-                self._draw_bollpct()
             elif name == "ADX":
                 self._draw_adx()
+            elif name == "量比":
+                self._draw_vol_ratio()
         if getattr(self, "side_txt", None):
             self._write_side()
         self._write_report()
@@ -12579,7 +13130,11 @@ class App:
                            font=("Consolas", 8), fill=AXIS_TXT)
         return ymap
 
-    def _line(self, cv, xs_fn, vals, ymap, color, width=2):
+    def _line(self, cv, xs_fn, vals, ymap, color, width=None):
+        """整条折线一次绘制（None 断开），item 数从 N 段降为少数几条。
+        width 默认 ind_w()（设置可调 1~3；旧版固定 2 改为更细的 1）。"""
+        if width is None:
+            width = ind_w()
         """整条折线一次绘制（None 断开），item 数从 N 段降为少数几条。"""
         pts = []
         segs = []
@@ -12641,8 +13196,8 @@ class App:
         if v.get("tpred"):
             los.append(v["tpred"]["low"])
             his.append(v["tpred"]["high"])
-        # 布林带叠加：副图指标选 BOLL 时轨道纳入纵轴范围
-        show_boll = (self.ind_name.get() == "BOLL"
+        # 布林带叠加：独立打勾开关（v6.2 起不再占用副图）
+        show_boll = (self.show_boll.get()
                      and v.get("boll_up") is not None)
         if show_boll:
             for arr in (v["boll_up"], v["boll_low"]):
@@ -12675,16 +13230,22 @@ class App:
 
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
-                self._line(cv, xs, v["ma"][nn], ymap, MA_COLORS[nn])
+                self._line(cv, xs, v["ma"][nn], ymap, ma_color(nn),
+                           width=ind_w())
 
         if show_boll:
-            self._line(cv, xs, v["boll_up"], ymap, C_GOLD, width=1)
-            self._line(cv, xs, v["boll_low"], ymap, C_GOLD, width=1)
-            self._line(cv, xs, v["boll_mid"], ymap, C_PURPLE)
-            cv.create_text(g["w"] - g["R"] - 4, g["T"] - 3,
-                           text="BOLL(20,2)",
-                           fill=C_GOLD, font=("Consolas", 8, "bold"),
-                           anchor="e")
+            if self.boll_on["up"].get():
+                self._line(cv, xs, v["boll_up"], ymap, boll_color("up"),
+                           width=ind_w())
+            if self.boll_on["low"].get():
+                self._line(cv, xs, v["boll_low"], ymap, boll_color("low"),
+                           width=ind_w())
+            if self.boll_on["mid"].get():
+                self._line(cv, xs, v["boll_mid"], ymap, boll_color("mid"),
+                           width=ind_w())
+            # v6.2.2 热修：BOLL 图例不再画在右上角——与「现价 C:」标签、
+            # 幽灵/预测标签同排重叠成乱码（截图 CRB.P(20,2) 即 C: + BOLL 叠加）；
+            # 改并入左上角 MA 图例行（见下方 MA 图例后追加）。
 
         # 筹码峰（同花顺式）：全历史口径（与右栏一致），右列横向楔形；
         # 每个 bin 画在 ymap(价格) 位置、实心矩形连片（间距 dy 由价格映射决定），
@@ -12802,7 +13363,7 @@ class App:
                     continue
                 yy = ymap(pv)
                 cv.create_line(g["L"], yy, limit_x, yy, fill=colr,
-                               dash=(6, 4), width=2)
+                               dash=(6, 4), width=ind_w())
                 txt = f"{lab} {pv:.2f}"
                 tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
                 tx = max(limit_x - 4, g["L"] + 6 + tw)
@@ -12838,12 +13399,20 @@ class App:
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
                 it = cv.create_text(lx, 3, text=f"MA{nn}",
-                                    fill=MA_COLORS[nn],
+                                    fill=ma_color(nn),
                                     font=("Consolas", 8, "bold"), anchor="nw")
                 try:                    # 按实际字宽推进（HiDPI/字体缩放不重叠）
                     lx = cv.bbox(it)[2] + 8
                 except Exception:
                     lx += 36
+        if show_boll:               # v6.2.2 热修：BOLL 图例并排接在 MA 之后
+            it = cv.create_text(lx, 3, text="BOLL(20,2)",
+                                fill=boll_color("up"),
+                                font=("Consolas", 8, "bold"), anchor="nw")
+            try:
+                lx = cv.bbox(it)[2] + 8
+            except Exception:
+                lx += 70
         step = max(1, len(bars) // 10)
         for i in range(0, len(bars), step):
             cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
@@ -12879,7 +13448,7 @@ class App:
         if len(vols) >= 5:
             mv = sum(vols[-5:]) / 5
             cv.create_line(g["L"], ymap(mv), g["w"] - g["R"], ymap(mv),
-                           fill=C_ORANGE, dash=(5, 3), width=2)
+                           fill=C_ORANGE, dash=(5, 3), width=ind_w())
             cv.create_text(g["w"] - g["R"] - 4, ymap(mv) - 7,
                            text=f"5日均量 {mv/10000:.0f}万手",
                            anchor="e", font=("Consolas", 8), fill=C_ORANGE)
@@ -12894,51 +13463,45 @@ class App:
 
     # ---------- 可选指标 ----------
 
-    def _draw_bollpct(self):
-        """布林带 %B：收盘在带内的位置（0=下轨 100=上轨），20/80 为阈值。"""
+    def _draw_vol_ratio(self):
+        """量比副图：近5日均量/前15日均量 折线 + 0.8/1.0/1.2 阈值线。
+        0.8~1.2 为平量带，>1.2 放量 / <0.8 缩量。"""
         cv, v = self.cv_ind, self.view
         cv.delete("all")
-        up, low, mid = v["boll_up"], v["boll_low"], v["boll_mid"]
-        bars = v["bars"]
-        n = len(bars)
+        vr = v.get("vr_arr") or []
+        n = len(v["bars"])
         g = self._geom(cv, n, chips=bool(self.show_chips.get()
                                          and v.get("chips")),
                        lpad=getattr(self, "_axis_lpad", 0))
-        pct = []
-        for i, b in enumerate(bars):
-            if i >= len(up) or None in (up[i], low[i]) or up[i] <= low[i]:
-                pct.append(None)
-                continue
-                pct.append(None)
-                continue
-            pct.append(max(-20.0, min(120.0,
-                         (b["close"] - low[i]) / (up[i] - low[i]) * 100)))
+        vals = [x for x in vr if x is not None]
+        lo, hi = (0.0, 2.0) if not vals \
+            else (0.0, max(2.0, max(vals) * 1.1))
 
         def ymap(val):
-            return g["T"] + (100 - val) / 140 * g["ph"]
+            return g["T"] + (hi - val) / (hi - lo) * g["ph"]
 
         def xs(i):
             return g["L"] + g["bw"] * (i + 0.5)
-        lo, hi = -20, 120
-        for gv in (0, 20, 50, 80, 100):
-            col = GRID_C if gv in (0, 100) else GUIDE_C
+        for gv, sty in ((0.8, (4, 4)), (1.0, (2, 4)), (1.2, (4, 4))):
             cv.create_line(g["L"], ymap(gv), g["w"] - g["R"], ymap(gv),
-                           fill=col, dash=(2, 3) if gv in (20, 80) else ())
-            cv.create_text(g["L"] - 4, ymap(gv), text=str(gv),
+                           fill=GUIDE_C, dash=sty)
+            cv.create_text(g["L"] - 4, ymap(gv), text=f"{gv:.1f}",
                            font=("Consolas", 7), fill=AXIS_TXT, anchor="e")
-        self._line(cv, xs, pct, ymap, C_GOLD)
-        lastv = next((x for x in reversed(pct) if x is not None), None)
-        info = f"%B={lastv:.0f}" if lastv is not None else ""
+        self._axes(cv, g, lo, hi, "{:.1f}", 2)
+        self._line(cv, xs, vr, ymap, C_ORANGE)
+        lastv = next((x for x in reversed(vr) if x is not None), None)
+        info = (f"量比={lastv:.2f}（{vol_regime(lastv)}）"
+                if lastv is not None else "")
         cv.create_text(g["L"] + 2, g["T"] - 3,
-                       text=f"BOLL %B  橙线(0下轨/100上轨)    {info}",
+                       text=f"量比(近5/前15)  橙线    {info}",
                        anchor="w", font=("Microsoft YaHei", 8),
                        fill=TITLE_TXT)
         step = max(1, n // 10)
         for i in range(0, n, step):
             cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
                            font=("Consolas", 7), fill=AXIS_TXT)
-        self._finish_panel(cv, g, "ind", -20, 120, v["dates"],
-                           fmt=lambda x: f"{x:.0f}")
+        self._finish_panel(cv, g, "ind", lo, hi, v["dates"],
+                           fmt=lambda x: f"{x:.2f}")
 
     def _draw_adx(self):
         """DMI/ADX 副图：+DI(橙) / -DI(绿) / ADX(蓝粗)。"""
@@ -12965,7 +13528,7 @@ class App:
         self._axes(cv, g, lo, hi, "{:.0f}", 2)
         self._line(cv, xs, pdi, ymap, C_ORANGE)
         self._line(cv, xs, mdi, ymap, C_BLUE)
-        self._line(cv, xs, adx, ymap, C_PURPLE, width=2)
+        self._line(cv, xs, adx, ymap, C_PURPLE, width=ind_w())
         lv = lambda arr: [x for x in arr if x is not None]
         lp_, lm_, la_ = lv(pdi), lv(mdi), lv(adx)
         info = (f"+DI:{lp_[-1]:.0f} -DI:{lm_[-1]:.0f} ADX:{la_[-1]:.0f}"
@@ -13154,11 +13717,11 @@ class App:
             elif name == "KDJ":
                 ind_txt = (f"  K:{v['k'][idx]:.1f} D:{v['d'][idx]:.1f} "
                            f"J:{v['j'][idx]:.1f}")
-            elif name == "BOLL":
-                if None not in (v["boll_up"][idx], v["boll_low"][idx]):
-                    ind_txt = (f"  上轨:{v['boll_up'][idx]:.2f} "
-                               f"中轨:{v['boll_mid'][idx]:.2f} "
-                               f"下轨:{v['boll_low'][idx]:.2f}")
+            elif name == "量比":
+                vr_v = v.get("vr_arr", [None] * n)[idx] \
+                    if idx < len(v.get("vr_arr", [])) else None
+                ind_txt = (f"  量比:{vr_v:.2f}"
+                           if vr_v is not None else "  量比:-")
             else:
                 r6 = v["rsi6"][idx]
                 r12 = v["rsi12"][idx]
@@ -13518,6 +14081,29 @@ class App:
                                                 fallback="dark")
                 self.settings["updown"] = cp.get("ui", "updown",
                                                  fallback="red_up")
+                # 指标线颜色 / 粗细（设置→自定义；缺则用主题默认）
+                ma_raw = cp.get("ui", "ma_colors", fallback="").strip()
+                if ma_raw:
+                    try:
+                        self.settings["ma_colors"] = {
+                            int(k.split("#")[0]): v
+                            for k, v in (p.split("=") for p in ma_raw.split(";")
+                                         if "=" in p)}
+                    except Exception:
+                        log.debug("ma_colors 解析失败", exc_info=True)
+                bl_raw = cp.get("ui", "boll_colors", fallback="").strip()
+                if bl_raw:
+                    try:
+                        self.settings["boll_colors"] = dict(
+                            p.split("=") for p in bl_raw.split(";")
+                            if "=" in p)
+                    except Exception:
+                        log.debug("boll_colors 解析失败", exc_info=True)
+                try:
+                    self.settings["ind_w"] = max(1, min(3,
+                        int(cp.get("ui", "ind_w", fallback="1"))))
+                except Exception:
+                    pass
                 # 环境变量优先；若无再从 ini 读取（兼容旧版，建议迁移到环境变量）
                 self.api_key = ENV_API_KEY or cp.get(
                     "deepseek", "api_key", fallback="")
@@ -13541,6 +14127,23 @@ class App:
         cp.set("ui", "last", self.code_var.get())
         cp.set("ui", "theme", self.settings["theme"])
         cp.set("ui", "updown", self.settings["updown"])
+        # 指标线：颜色 / 粗细
+        try:
+            ma_str = ";".join(f"{k}={v}" for k, v in
+                              (self.settings.get("ma_colors") or {}).items())
+            cp.set("ui", "ma_colors", ma_str)
+        except Exception:
+            cp.set("ui", "ma_colors", "")
+        try:
+            bl_str = ";".join(f"{k}={v}" for k, v in
+                              (self.settings.get("boll_colors") or {}).items())
+            cp.set("ui", "boll_colors", bl_str)
+        except Exception:
+            cp.set("ui", "boll_colors", "")
+        try:
+            cp.set("ui", "ind_w", str(int(self.settings.get("ind_w", 1))))
+        except Exception:
+            cp.set("ui", "ind_w", "1")
         if not cp.has_section("deepseek"):
             cp.add_section("deepseek")
         if ENV_API_KEY:
@@ -13854,6 +14457,129 @@ class App:
             txt += (f"多维综合评估：合计{act['score']:+d}，{act['verdict']}"
                     f" [{det}]\n")
         return txt
+
+    # ---------- 基本面（v6.2.1：历史财报关键数据 + 规则分析） ----------
+
+    def _build_fundamentals_tab(self, parent):
+        """基本面信息页：历史财报关键数据表 + 规则引擎分析（线程抓取）。
+
+        数据层 fetch_f10_metrics（东财 F10 主要指标，6h 缓存 + 熔断容灾），
+        分析 fundamentals_summary（纯本地规则，不联网不调 AI）。"""
+        top = ttk.Frame(parent)
+        top.pack(fill="x", pady=(0, 6))
+        ttk.Label(top, text="代码:").pack(side="left")
+        code_var = tk.StringVar(value=(self.code_var.get() or "").strip())
+        ent = ttk.Entry(top, textvariable=code_var, width=12)
+        ent.pack(side="left", padx=(2, 6))
+        btn = ttk.Button(top, text="抓取财报并分析")
+        btn.pack(side="left", padx=(0, 8))
+        ttk.Label(top, text="东财 F10 主要指标 · 最多 12 期 · 6 小时缓存 · "
+                            "多源容灾+熔断", foreground=AXIS_TXT).pack(
+                                side="left")
+
+        cols = ("报告期", "公告日", "营收(亿)", "营收同比", "净利(亿)",
+                "净利同比", "扣非同比", "EPS", "EPS同比", "ROE",
+                "毛利率", "净利率", "负债率")
+        tvw = ttk.Frame(parent)
+        tvw.pack(fill="x")
+        tv = ttk.Treeview(tvw, columns=cols, show="headings", height=7)
+        for c, w in zip(cols, (88, 80, 76, 76, 74, 76, 76, 66, 70, 64,
+                               64, 64, 64)):
+            tv.heading(c, text=c)
+            tv.column(c, width=w, anchor="w" if c in ("报告期", "公告日")
+                      else "e", stretch=False)
+        vs = ttk.Scrollbar(tvw, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+
+        txt = tk.Text(parent, height=10, bg=PANEL_BG, fg=FG_MAIN,
+                      font=("Microsoft YaHei", 10), relief="flat",
+                      wrap="word", state="disabled",
+                      insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                      padx=8, pady=5)
+        ts = ttk.Scrollbar(parent, command=txt.yview)
+        ts.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, pady=(8, 0))
+        txt.configure(yscrollcommand=ts.set)
+
+        def _set_text(s):
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", s)
+            txt.configure(state="disabled")
+
+        def _fmt(v, div=1.0, pct=False):
+            if not isinstance(v, (int, float)):
+                return "-"
+            return f"{v:+.1f}%" if pct else f"{v / div:,.2f}"
+
+        def render(rows, lines):
+            tv.delete(*tv.get_children())
+            if rows:
+                for r in rows:
+                    tv.insert("", "end", values=(
+                        r.get("date_name") or r.get("rtype") or "-",
+                        str(r.get("notice") or "-")[:10],
+                        _fmt(r.get("rev"), 1e8),
+                        _fmt(r.get("rev_yoy"), pct=True),
+                        _fmt(r.get("np"), 1e8),
+                        _fmt(r.get("np_yoy"), pct=True),
+                        _fmt(r.get("kf_yoy"), pct=True),
+                        _fmt(r.get("eps")),
+                        _fmt(r.get("eps_yoy"), pct=True),
+                        _fmt(r.get("roe"), pct=True),
+                        _fmt(r.get("gm"), pct=True),
+                        _fmt(r.get("nm"), pct=True),
+                        _fmt(r.get("debt"), pct=True)))
+            _set_text("\n".join(lines))
+
+        running = [False]
+
+        def do_fetch():
+            if running[0]:
+                return
+            try:
+                code = normalize_code(code_var.get())
+            except Exception as e:
+                messagebox.showinfo("基本面", str(e))
+                return
+            running[0] = True
+            btn.configure(state="disabled")
+            _set_text(f"正在抓取 {code} 历史财报关键数据（东财 F10）...")
+            self.progress_var.set(f"基本面：抓取 {code} 财报 ...")
+
+            def worker():
+                try:
+                    rows = fetch_f10_metrics(code)
+                    lines = fundamentals_summary(code, rows)
+                except Exception as e:
+                    rows, lines = None, [
+                        f"抓取失败：{e}",
+                        "（数据源失败会自动熔断，稍后可重试；",
+                        "新上市/非上市公司可能没有历史财报）"]
+                self._safe_after(
+                    0, lambda: (render(rows, lines),
+                                btn.configure(state="normal"),
+                                running.__setitem__(0, False),
+                                self.progress_var.set("")))
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn.configure(command=do_fetch)
+        ent.bind("<Return>", lambda e: do_fetch())
+        if code_var.get():
+            do_fetch()                  # 已有代码：进入页面自动抓取
+
+    def open_fundamentals(self):
+        """小屏入口：独立窗口展示基本面信息页。"""
+        win = tk.Toplevel(self.root)
+        win.title("基本面信息（历史财报）")
+        win.configure(bg=DARK_BG)
+        win.transient(self.root)
+        win.grab_set()
+        self._center_win(win, min(900, self.root.winfo_screenwidth() - 40),
+                         720)
+        self._build_fundamentals_tab(win)
 
     def open_tools(self):
         res_ok = bool(self.res)
@@ -14431,12 +15157,17 @@ class App:
                       side="left", padx=(6, 0), ipadx=10, ipady=4)
         _render()
 
+        # ── 基本面（v6.2.1：历史财报关键数据 + 规则分析）──
+        f_fund = ttk.Frame(nb, padding=10)
+        nb.add(f_fund, text=" 基本面 ")
+        self._build_fundamentals_tab(f_fund)
+
         # ── 数据工具（清洗/复权迁移 + 全库回填 + 每只股回测导出）──
         f_data = ttk.Frame(nb, padding=10)
         nb.add(f_data, text=" 数据工具 ")
         self._tools_data_tab = f_data
         self._build_data_tools(f_data, win)
-        if not res_ok:                   # 未分析股票时只开放数据工具页
+        if not res_ok:                   # 未分析股票时只开放 基本面/数据工具
             nb.tab(0, state="disabled")
             nb.tab(1, state="disabled")
             nb.select(2)
@@ -14902,6 +15633,114 @@ class App:
         ttk.Radiobutton(frm, text="绿涨红跌", variable=ud_var,
                         value="green_up").grid(row=1, column=2, sticky="w")
 
+        # ---- 指标线：颜色 / 粗细（自定义）----
+        # 用 LabelFrame 把整段包起来：标题在最上、内部表格化（左名字右色块）、
+        # grid_columnconfigure 自动调列宽，避免手算 px（v6.1.10 反馈）。
+        # 放在 row=30 起（关于/关于说明之下），不和上方 AI Key 等 row 冲突。
+        from tkinter import colorchooser
+        ma_store = dict(self.settings.get("ma_colors") or {})
+        boll_store = dict(self.settings.get("boll_colors") or {})
+        try:
+            ind_w_init = max(1, min(3, int(self.settings.get("ind_w", 1))))
+        except Exception:
+            ind_w_init = 1
+        ind_w_var = tk.StringVar(value=str(ind_w_init))
+        color_buttons = {}
+
+        def _reset_colors():
+            """重置指标线颜色到当前主题默认；不销毁窗口，只刷新按钮色。"""
+            from copy import deepcopy
+            defaults = deepcopy(THEMES.get(
+                self.settings["theme"], THEMES["dark"]))
+            for nn, c in defaults.get("MA_COLORS", {}).items():
+                ma_store[nn] = c
+                btn = color_buttons.get(("ma", nn))
+                if btn:
+                    btn.configure(bg=c, activebackground=c)
+            for k in ("up", "mid", "low"):
+                c = (defaults.get("C_PURPLE", "#d0a9f5") if k == "mid"
+                     else defaults.get("C_GOLD", "#e8c14a"))
+                boll_store[k] = c
+                btn = color_buttons.get(("boll", k))
+                if btn:
+                    btn.configure(bg=c, activebackground=c)
+
+        def _pick_color(target_dict, key, btn):
+            """打开颜色选择器；返回 (hex, '#rrggbb') 或 (None, None)。"""
+            init = target_dict.get(key, "#cccccc")
+            try:
+                _, hex_ = colorchooser.askcolor(
+                    color=init, title=f"选择 {key} 颜色", parent=win)
+            except Exception:
+                return None, None
+            if not hex_:
+                return None, None
+            target_dict[key] = hex_
+            btn.configure(bg=hex_, activebackground=hex_)
+            return hex_, hex_
+
+        # ---- LabelFrame 包整段，标题自动在最上 ----
+        color_lf = ttk.LabelFrame(frm, text="指标线：颜色 / 粗细（自定义）",
+                                  padding=(8, 4))
+        color_lf.grid(row=30, column=0, columnspan=3, sticky="we",
+                      pady=(10, 6))
+        # 列宽自适应：列 0（名字）拉宽、列 1（色块）固定、列 2（恢复默认）拉宽
+        color_lf.grid_columnconfigure(0, weight=1, uniform="name")
+        color_lf.grid_columnconfigure(2, weight=1, uniform="name")
+        # 行 0：线粗度（label + Spinbox + 恢复默认按钮）
+        ttk.Label(color_lf, text="线粗度(1-3)",
+                  font=("Microsoft YaHei", 8)
+                  ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Spinbox(color_lf, from_=1, to=3, width=3,
+                    textvariable=ind_w_var
+                    ).grid(row=0, column=1, sticky="w", pady=2)
+        ttk.Button(color_lf, text="指标线颜色 恢复默认",
+                   command=_reset_colors
+                   ).grid(row=0, column=2, sticky="e", pady=2)
+        # 行 1：MA 颜色子标题（跨整行）
+        ttk.Separator(color_lf, orient="horizontal").grid(
+            row=1, column=0, columnspan=3, pady=(4, 2))
+        ttk.Label(color_lf, text="MA 颜色",
+                  font=("Microsoft YaHei", 8, "bold")
+                  ).grid(row=2, column=0, sticky="w", padx=(0, 6), pady=1)
+        # 行 3-7：5 个 MA（左名字右色块）
+        def _make_btn(key, init_color, target, row):
+                ttk.Label(color_lf, text=f"{key}",
+                          font=("Microsoft YaHei", 8)
+                          ).grid(row=row, column=0, sticky="w",
+                                 padx=(12, 6), pady=1)
+                btn = tk.Button(color_lf, width=3, height=1,
+                                bg=init_color, activebackground=init_color,
+                                relief="flat", bd=0, highlightthickness=1,
+                                highlightbackground="#666666",
+                                cursor="hand2")
+                btn.configure(command=lambda k=key, b=btn, t=target:
+                              _pick_color(t, k, b))
+                btn.grid(row=row, column=1, sticky="w", pady=1)
+                return btn
+        for i, nn in enumerate(sorted(MA_COLORS)):
+            ma_store.setdefault(nn, MA_COLORS.get(nn, "#cccccc"))
+            btn = _make_btn(f"MA{nn}", ma_store[nn], ma_store, 3 + i)
+            color_buttons[("ma", nn)] = btn
+        # BOLL 颜色子标题
+        boll_sep_row = 3 + len(MA_COLORS)
+        boll_lbl_row = boll_sep_row + 1
+        ttk.Separator(color_lf, orient="horizontal").grid(
+            row=boll_sep_row, column=0, columnspan=3, pady=(4, 2))
+        ttk.Label(color_lf, text="BOLL 颜色",
+                  font=("Microsoft YaHei", 8, "bold")
+                  ).grid(row=boll_lbl_row, column=0, sticky="w",
+                         padx=(0, 6), pady=1)
+        # 行 boll_lbl_row+1 起：3 个 BOLL（左名字右色块）
+        labels = {"up": "BOLL 上轨", "mid": "BOLL 中轨",
+                  "low": "BOLL 下轨"}
+        for i, key in enumerate(("up", "mid", "low")):
+            boll_store.setdefault(key,
+                                  "#d0a9f5" if key == "mid" else "#e8c14a")
+            btn = _make_btn(labels[key], boll_store[key], boll_store,
+                            boll_lbl_row + 1 + i)
+            color_buttons[("boll", key)] = btn
+
         ttk.Label(frm, text="AI Key").grid(row=2, column=0, sticky="w",
                                            pady=(8, 4))
         key_var = tk.StringVar(value=("" if ENV_API_KEY else self.api_key))
@@ -15108,6 +15947,14 @@ class App:
         def save():
             self.settings["theme"] = theme_var.get()
             self.settings["updown"] = ud_var.get()
+            self.settings["ma_colors"] = dict(ma_store)
+            self.settings["boll_colors"] = dict(boll_store)
+            try:
+                self.settings["ind_w"] = max(1, min(3,
+                    int(ind_w_var.get())))
+            except Exception:
+                self.settings["ind_w"] = 1
+            globals()["IND_LINE_W"] = self.settings["ind_w"]
             new_key = key_var.get().strip()
             if ENV_API_KEY:
                 # 环境变量优先级最高；设置页输入框仅作提示，不覆盖
@@ -15122,7 +15969,8 @@ class App:
                 set_ai_model(model_var.get().strip())
                 set_ai_base(base_var.get().strip())
                 self._save_ini()
-            apply_theme(self.settings["theme"], self.settings["updown"])
+            apply_theme(self.settings["theme"], self.settings["updown"],
+                       ma_colors=ma_store, boll_colors=boll_store)
             # 应用并持久化预测参数（非法输入自动回退默认）
             pnotes = []
             try:

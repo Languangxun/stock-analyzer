@@ -186,16 +186,37 @@ def collect_perstock(research_dir, max_files=3):
     return out
 
 
+def collect_ablation(research_dir, max_n=2):
+    """最新消融汇总（v6.2.1：仪表盘展示 IC 中位数等）：research/ablation_v*/summary.json。"""
+    out = []
+    for d in sorted(glob.glob(os.path.join(research_dir, "ablation_v*")),
+                    reverse=True)[:max_n]:
+        s = _load_json(os.path.join(d, "summary.json"))
+        if not s:
+            continue
+        out.append({
+            "name": os.path.basename(d),
+            "ts": s.get("timestamp"),
+            "total": s.get("total_objects"),
+            "stock_count": s.get("stock_count"),
+            "etf_count": s.get("etf_count"),
+            "modes": s.get("modes") or {},
+        })
+    return out
+
+
 def build_dashboard(research_dir, out=None, max_runs=6):
     runs = collect_runs(research_dir, max_runs=max_runs)
     gui = collect_gui(research_dir)
     perstock = collect_perstock(research_dir)
+    ablations = collect_ablation(research_dir)
     data = {
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "research_dir": os.path.abspath(research_dir),
         "runs": runs,
         "gui": gui,
         "perstock": perstock,
+        "ablations": ablations,
         "tables": list(TABLE_FILES),
         "charts": list(CHART_FILES),
     }
@@ -321,6 +342,10 @@ tr:hover td{background:var(--panel2)}
     <div class="hover" id="c-hover">鼠标移入查看每日净值</div>
     <div class="hover" id="c-cash" style="opacity:.75">横线说明：水平段＝趋势闸门关闭 → 空仓持现金（相位平均下各相位按各自调仓日依次清仓），非「无数据/无交易」；各档闸门：稳健/均衡＝上证 MA20、激进＝按口径（全A=创业板指 MA60；主板/ETF/全A含ETF=上证 MA20）、高风险＝板块轮动闸门（行业广度为主+大盘均线辅，开得更久）。悬浮读数中会标注「空仓」。</div>
     <div id="c-sum"></div>
+    <h3 style="margin:14px 0 4px;font-size:15px">组合指标（相位平均，含全部费用）</h3>
+    <div id="c-metrics"></div>
+    <h3 style="margin:14px 0 4px;font-size:15px">消融汇总 · 全市场逐股（含 IC 中位数）<span class="sub" id="abl-sub"></span></h3>
+    <div id="c-abl"></div>
   </section>
   <section id="tab-metrics" class="tab">
     <div class="ctl">
@@ -366,6 +391,8 @@ tr:hover td{background:var(--panel2)}
         </select></label>
       <label><input type="checkbox" id="p-pos"> 只看正收益</label>
       <label><input type="checkbox" id="p-ev" checked> 排除事件股</label>
+      <label><input type="checkbox" id="p-trim" checked
+             title="统计与列表去掉总收益%最大/最小各20只（极端值不可复制）">去±20收益极值</label>
       <label>排序 <select id="p-sort"></select></label>
       <label>每页 <select id="p-size">
         <option>100</option><option selected>200</option>
@@ -707,6 +734,65 @@ function renderCurve(){
   $("#c-legend").innerHTML=series.map(s=>
     `<span><b style="background:${s.color}"></b>${esc(s.name)}</span>`).join("");
   $("#c-sum").innerHTML=cards?('<div class="cards">'+cards+'</div>'):"";
+  renderMetricsTable(run,u,tiers);
+  renderAblTable();
+}
+/* 组合指标表（净值曲线下方，v6.2.1 可读性：一张表看全档关键数字） */
+function renderMetricsTable(run,u,tiers){
+  const picks=(run.results[u]||{}).picks||{};
+  let h='<table><tr><th>档位</th><th>总收益</th><th>年化</th><th>最大回撤</th>'+
+    '<th>Sharpe</th><th>超额(总)</th><th>交易</th><th>相位年化区间</th>'+
+    '<th>荐股笔数</th><th>荐股均收益(去±20极值)</th><th>荐股胜率</th><th>基准年化</th></tr>';
+  tiers.forEach(t=>{
+    const m=tierOf(run,u,t); if(!m)return;
+    const s=picks[t]||{};
+    const ph=(m.phase_ann_min!=null&&m.phase_ann_max!=null)?
+      pct(m.phase_ann_min,1,true)+' ~ '+pct(m.phase_ann_max,1,true):'-';
+    h+=`<tr><td>${esc(t)}</td><td>${pct(m.total,1,true)}</td>`+
+       `<td>${pct(m.ann,1,true)}</td><td>${pct(m.mdd,1)}</td>`+
+       `<td>${num(m.sharpe,2)}</td><td>${pct(m.excess_total,1,true)}</td>`+
+        `<td>${num(m.trades,0)}</td><td>${ph}</td>`+
+       `<td>${s.n!=null?num(s.n,0):'-'}</td>`+
+       `<td>${pct(trimMean(s.rets)!=null?trimMean(s.rets):s.avg_ret,2,true)}</td>`+
+       `<td>${pct(s.winrate,1)}</td>`+
+       `<td>${pct(m.bench&&m.bench.ann,1,true)}</td></tr>`;
+  });
+  $("#c-metrics").innerHTML=h+'</table>';
+}
+/* 消融汇总表：IC 中位数等（v6.2.1，读最新 ablation 目录的 summary.json） */
+function renderAblTable(){
+  const abl=(DATA.ablations||[])[0];
+  if(!abl){$("#c-abl").innerHTML=
+    '<div class="note">暂无消融汇总：跑 backtests/backtest_strategy_ablation.py 后刷新。</div>';
+    $("#abl-sub").textContent="";return;}
+  $("#abl-sub").textContent="　"+esc(abl.name)+" · 对象 "+
+    num(abl.total,0)+"（个股 "+num(abl.stock_count,0)+" / ETF "+
+    num(abl.etf_count,0)+"）· "+esc((abl.ts||"").slice(0,10));
+  const order=["稳健","均衡","激进","高风险"];
+  const modes=Object.keys(abl.modes||{}).sort((a,b)=>
+    (order.indexOf(a)+1||99)-(order.indexOf(b)+1||99));
+  let h='<table><tr><th>档位</th><th>对象数</th><th>主算法(Top1)</th>'+
+    '<th>训练年化中位</th><th>验证年化中位</th><th>验证回撤中位</th>'+
+    '<th>验证胜率中位</th><th>IC1中位</th><th>IC5中位</th>'+
+    '<th>IC5为正占比</th><th>牛市年化中位</th><th>熊市年化中位</th></tr>';
+  modes.forEach(md=>{
+    const d=abl.modes[md]||{};
+    const ad=d.algo_distribution||{};
+    const top=Object.entries(ad).sort((a,b)=>b[1].count-a[1].count)[0];
+    const tr=d.train||{},va=d.val||{},ic=d.ic||{},rg=d.regime||{};
+    const f3=x=>x==null?'-':(+x).toFixed(3);
+    h+=`<tr><td>${esc(md)}</td><td>${num(d.count,0)}</td>`+
+       `<td>${top?esc(top[0])+' '+num(top[1].pct,0)+'%':'-'}</td>`+
+       `<td>${pct(tr.ann_median,1,true)}</td><td>${pct(va.ann_median,1,true)}</td>`+
+       `<td>${pct(va.mdd_median,1)}</td><td>${pct(va.winrate_median,1)}</td>`+
+       `<td>${f3(ic.ic1_median)}</td><td>${f3(ic.ic5_median)}</td>`+
+       `<td>${num(ic.ic5_positive_pct,1)+'%'}</td>`+
+       `<td>${pct(rg.bull_ann_median,1,true)}</td>`+
+       `<td>${pct(rg.bear_ann_median,1,true)}</td></tr>`;
+  });
+  $("#c-abl").innerHTML=h+'</table>'+
+    '<div class="note">IC=选中策略信号方向 vs 未来1/5日收益的 Spearman 相关系数'+
+    '（全样本描述性统计，不参与选型）；年化/胜率中位=逐股消融选中策略的中位数。</div>';
 }
 function renderMetrics(){
   const run=curRun(); if(!run)return;
@@ -810,6 +896,12 @@ function renderGui(){
 /* ---------- 每只股回测（reports/每只股回测_*.csv） ---------- */
 function median(a){if(!a.length)return null;a=a.slice().sort((x,y)=>x-y);
   const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+/* 去极值均值：去掉最大/最小各 k 笔（默认20）后取平均——
+   荐股右尾无上限（妖股连板），普通均值被极端值拉偏 */
+function trimMean(arr,k){k=k==null?20:k;
+  if(!arr||arr.length<=2*k)return null;
+  const s=arr.slice().sort((x,y)=>x-y);
+  return s.slice(k,s.length-k).reduce((a,b)=>a+b,0)/(s.length-2*k);}
 function p1(v){return v==null||!isFinite(v)?"-":(+v).toFixed(1)+"%";}
 let PS={page:1,sortCol:null,sortDesc:true};
 function renderPerstock(){
@@ -856,12 +948,32 @@ function renderPerstock(){
     ["交易数","胜率%","盈亏比","信号数","BUY","SELL","K线根数","年化%"]
       .indexOf(H[i])>=0));
   rows.sort((a,b)=>{
-    const x=a[sc],y=b[sc]; let c;
-    if(numCols.has(sc)){const nx=parseFloat(x),ny=parseFloat(y);
-      c=(isFinite(nx)?nx:1e18)-(isFinite(ny)?ny:1e18);}
-    else{const sx=x==null?"":String(x),sy=y==null?"":String(y);
-      c=sx<sy?-1:sx>sy?1:0;}
-    return PS.sortDesc?-c:c;});
+    const x=a[sc],y=b[sc];
+    if(numCols.has(sc)){
+      // v6.2.1 热修③：空值（零交易股的年化/收益等）恒沉底，不再因降序
+      // 翻转排到最前（旧逻辑空值→1e18，desc 时 -c 把空值顶到第一屏）
+      const nx=parseFloat(x),ny=parseFloat(y);
+      const fx=isFinite(nx),fy=isFinite(ny);
+      if(!fx&&!fy)return 0;
+      if(!fx)return 1;
+      if(!fy)return -1;
+      return PS.sortDesc?ny-nx:nx-ny;
+    }
+    const sx=x==null?"":String(x),sy=y==null?"":String(y);
+    return PS.sortDesc?(sx<sy?1:sx>sy?-1:0):(sx<sy?-1:sx>sy?1:0);});
+  // v6.2.1 热修⑤：全样本去极值——去掉总收益%最大/最小各 20 只后再统计/展示
+  //（按 总收益% 排序挑极值；空值（零交易）不参与极值剔除，仅不计入收益统计）
+  let trimNote="";
+  if($("#p-trim").prop("checked") && iTotal>=0){
+    const fin=rows.map((r,i)=>i)
+      .filter(i=>isFinite(parseFloat(rows[i][iTotal])))
+      .sort((a,b)=>parseFloat(rows[a][iTotal])-parseFloat(rows[b][iTotal]));
+    if(fin.length>40){
+      const drop=new Set(fin.slice(0,20).concat(fin.slice(-20)));
+      rows=rows.filter((r,i)=>!drop.has(i));
+      trimNote="（已去±20收益极值）";
+    }
+  }
   PS.rows=rows; PS.header=H; PS.dname=d.name||""; PS.mtime=d.mtime||"";
   const tots=rows.map(r=>parseFloat(r[iTotal])).filter(isFinite);
   const wrs=rows.map(r=>parseFloat(r[iWr])).filter(isFinite);
@@ -875,7 +987,7 @@ function renderPerstock(){
     (d.legacy?`<div class="warn" style="grid-column:1/-1">⚠ 本批次导出于 `+
       `2026-09-27 复权口径切换前，数值已作废；请在 GUI「数据工具→`+
       `每只股回测导出」用新口径重跑。</div>`:"")+
-    [    ["筛选后只数",rows.length+" / "+d.rows.length],
+    [    ["筛选后只数",rows.length+trimNote+" / "+d.rows.length],
     ["总收益中位（全期·偏乐观）",p1(median(tots))],
     ["正收益占比（全期）",(tots.length?
       (100*tots.filter(v=>v>0).length/tots.length).toFixed(0)+"%":"-")],
@@ -928,8 +1040,9 @@ function renderPerstock(){
     +'跨股比较请优先看「验证段收益%」（选型之外的留出段）；已默认筛「稳健」':
     '　· 固定参数回测（无消融选型），样本内口径，绝对值偏乐观，'
     +'横向比较相对强弱可用');
-  if(iEv>=0)links+='　· 事件股=单日复权|涨跌|>44% 或 停牌>90天（重组复牌/'
-    +'退市整理等，收益不可交易、不可复制）→ 勾选「排除事件股」从统计剔除';
+  if(iEv>=0)links+='　· 事件股=单日复权|涨跌|>44% 或 停牌>90天 或 数据停更>90天/退市'
+    +'（重组复牌/退市整理/退市残留序列，收益不可交易、不可复制）→ 勾选「排除事件股」'
+    +'从统计剔除';
   $("#p-note").innerHTML=links;
 }
 function renderFiles(){
@@ -1155,8 +1268,8 @@ function init(){
   $("#c-tiers").onchange=renderCurve;
   ["#m-metric","#m-run"].forEach(s=>$(s).onchange=renderMetrics);
   $("#d-kind").onchange=renderDist; $("#d-uni").onchange=renderDist;
-  ["#p-q","#p-mode","#p-pos","#p-size","#p-ev"].forEach(s=>
-    $(s).onchange=()=>{PS.page=1;renderPerstock();});
+  ["#p-q","#p-mode","#p-pos","#p-size","#p-ev","#p-trim"].forEach(s=>
+     $(s).onchange=()=>{PS.page=1;renderPerstock();});
   $("#p-q").oninput=()=>{PS.page=1;renderPerstock();};
   $("#p-sel").onchange=()=>{$("#p-mode").innerHTML="";PS.page=1;
     PS.sortCol=null;renderPerstock();};

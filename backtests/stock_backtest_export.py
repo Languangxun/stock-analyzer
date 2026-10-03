@@ -176,15 +176,27 @@ def _load_rows(code, bars):
              "close": r[4], "vol": r[5]} for r in rs]
 
 
-def _event_note(rows):
+def _event_note(rows, code=""):
     """事件股检测：返回说明串（'' = 正常）。
 
     命中任一即视为事件股（收益不可交易/不可复制）：
       ① 单日复权涨跌 |ret| > 44%：超任意板块涨跌停（复牌无涨跌幅限制日）；
-      ② 相邻K线日历间隔 > 90 天（≈ 停牌超过 60 个交易日）。
+      ② 相邻K线日历间隔 > 90 天（≈ 停牌超过 60 个交易日）；
+      ③ 数据停更 > 90 天 / 退市登记（v6.2.1 热修④）——退市股残留在缓存，
+        「近N根」窗口内没有跳变/长停不触发①②，整段幽灵行情会被当正常
+        回测（如 2005~2007 的包头铝业 +1443%），必须显式标注。
     典型：sz000578 盐湖集团 2007-07-20 停牌 → 2008-03-11 借壳复牌 +603%。"""
     import datetime as _d
     notes = []
+    if _JOB_GMAX and rows:
+        try:
+            gap = (_d.date.fromisoformat(_JOB_GMAX)
+                   - _d.date.fromisoformat(rows[-1]["date"])).days
+        except (TypeError, ValueError):
+            gap = 0
+        if gap > 90:
+            notes.append(f"数据停更{gap}天至{rows[-1]['date']}"
+                         + ("（退市登记）" if code in _JOB_DELISTED else ""))
     for i in range(1, len(rows)):
         c0, c1 = rows[i - 1]["close"], rows[i]["close"]
         try:
@@ -242,7 +254,7 @@ def export_one(code, mode, bars, picks=None):
     if not rows or len(rows) < 60:
         return []
     base = {"code": code, "bars": len(rows), "start": rows[0]["date"],
-            "end": rows[-1]["date"], "event": _event_note(rows)}
+            "end": rows[-1]["date"], "event": _event_note(rows, code)}
     pre_cache = {}      # algo -> _composite_precompute 输出
 
     def _row(strat_algo, tier, label, rp, atrs=None):
@@ -335,12 +347,16 @@ def export_one(code, mode, bars, picks=None):
 
 _JOB_MODE = "tiers"
 _JOB_BARS = 1000
+_JOB_GMAX = ""                  # 全库最新交易日（判断数据停更）
+_JOB_DELISTED = frozenset()     # delisted 表登记的退市代码
 
 
-def _init_worker(mode, bars, db):
-    """子进程初始化：注入回测参数并锁定库路径（覆盖 forkserver/fork 差异）。"""
-    global _JOB_MODE, _JOB_BARS
+def _init_worker(mode, bars, db, gmax="", delisted=()):
+    """子进程初始化：注入回测参数并锁定库路径（覆盖 forkserver/fork 差异）。
+    gmax/delisted：v6.2.1 热修④——数据停更/退市股事件标注所需。"""
+    global _JOB_MODE, _JOB_BARS, _JOB_GMAX, _JOB_DELISTED
     _JOB_MODE, _JOB_BARS = mode, bars
+    _JOB_GMAX, _JOB_DELISTED = gmax or "", frozenset(delisted or ())
     if db:
         sg.DB_PATH = db
 
@@ -433,6 +449,17 @@ def main():
         return
 
     t0 = time.time()
+    # v6.2.1 热修④：全库最新交易日 + 退市登记，供事件检测判「数据停更」
+    import sqlite3 as _sq
+    _conn = _sq.connect(args.db, timeout=60)
+    try:
+        gmax = _conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
+        try:
+            delisted = [r[0] for r in _conn.execute("SELECT code FROM delisted")]
+        except _sq.OperationalError:
+            delisted = []
+    finally:
+        _conn.close()
     rows_out = []
     done = 0
     src_map = picks if isinstance(picks, dict) else {}
@@ -447,7 +474,8 @@ def main():
     # 同时各 worker 一次吃 20 只股票也避免小任务切换（实测 ~25% 提速）。
     with ProcessPoolExecutor(max_workers=workers,
                              initializer=_init_worker,
-                             initargs=(args.mode, bars, args.db)) as exp:
+                             initargs=(args.mode, bars, args.db,
+                                       gmax, delisted)) as exp:
         for got in exp.map(_work_one, tasks, chunksize=chunksize):
             rows_out.extend(got)
             done += 1
@@ -488,7 +516,8 @@ def main():
              "-0.7%、正收益仅 46-47%）。跨股/跨档比较请优先看「训练段收益%」"
              "与「验证段收益%」两列，验证段是选型之外的留出数据"],
             ["事件股口径", "单日复权|涨跌|>44% 或 相邻K线间隔>90天(≈停牌>60个交易日)"
-                       " → 「事件」列标注；此类收益来自重组复牌/退市整理等公司行动，"
+                       " 或 数据停更>90天/退市登记 → 「事件」列标注；此类收益来自"
+                       "重组复牌/退市整理等公司行动，"
                        "不可交易、不可复制，仪表盘默认从统计中剔除（可在页内勾选查看）"],
             ["注意", "全表为历史统计，含样本内选型偏差，不构成投资建议"]]
 

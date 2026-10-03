@@ -40,6 +40,7 @@ from stock_gui import (
     db_conn, _is_etf,
     _sig_macd, _sig_kdj, _sig_rsi, _sig_boll, _sig_ma_trend, _sig_l1_pattern,
     _sig_chip_peak, _sig_sector_rot, _sig_l2_industry,
+    _sig_vol_ratio, _sig_lgbm, _signal_ic,
     _composite_signals, _composite_precompute,
     _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
     _ablation_pf, _ablation_recent, pick_ablation_consistent,
@@ -146,7 +147,8 @@ def run_ablation_for_stock(args):
               [r["close"] for r in rows])
     dates = [r["date"] for r in rows]
 
-    # 各基础算法信号发生器（v6.1 增：筹码峰 / 板块轮动；v6.1.3 增：L2 同行业+行业ETF）
+    # 各基础算法信号发生器（v6.1 增：筹码峰 / 板块轮动；v6.1.3 增：L2 同行业+行业ETF；
+    # v6.2.1 研究脚本补齐 v6.1.10 的 量比 / LGBM——此前只在 GUI 消融池里）
     gens = {
         "macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
@@ -157,6 +159,8 @@ def run_ablation_for_stock(args):
         "l2_ind": lambda: _sig_l2_industry(rows, industry=industry),
         "chip_peak": lambda: _sig_chip_peak(rows),
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
+        "vol_ratio": lambda: _sig_vol_ratio(rows),
+        "lgbm": lambda: _sig_lgbm(rows),
     }
 
     cands = []
@@ -167,6 +171,10 @@ def run_ablation_for_stock(args):
             continue
         if not sigs:
             continue
+        # 描述性统计：全样本信号方向 vs 未来1/5日收益 Spearman IC（仅展示用，
+        # 不参与选型——选型只看训练段，IC 含验证段属"事后描述"）
+        ic1 = _signal_ic(rows, sigs, 1)[0]
+        ic5 = _signal_ic(rows, sigs, 5)[0]
         for mode, rp in CFG.RISK_PARAMS.items():
             tr_tr, va_tr = [], []
             tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs,
@@ -193,6 +201,8 @@ def run_ablation_for_stock(args):
                 "train": train,
                 "val": val,
                 "recent": rc,
+                "ic1": ic1,
+                "ic5": ic5,
                 "bull": bull,
                 "bear": bear,
             })
@@ -207,6 +217,8 @@ def run_ablation_for_stock(args):
             continue
         if not sigs:
             continue
+        ic1 = _signal_ic(rows, sigs, 1)[0]
+        ic5 = _signal_ic(rows, sigs, 5)[0]
         tr_tr, va_tr = [], []
         tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs, trade_out=tr_tr,
                         arrays=arrays)
@@ -231,6 +243,8 @@ def run_ablation_for_stock(args):
             "train": train,
             "val": val,
             "recent": rc,
+            "ic1": ic1,
+            "ic5": ic5,
             "bull": bull,
             "bear": bear,
         })
@@ -311,6 +325,8 @@ def build_summary(per_stock, coverage=None):
         val_trades = [c["val"]["trades"] for c in selections if c.get("val")]
         bull = [c["bull"] for c in selections if c.get("bull") is not None]
         bear = [c["bear"] for c in selections if c.get("bear") is not None]
+        ic1s = [c["ic1"] for c in selections if c.get("ic1") is not None]
+        ic5s = [c["ic5"] for c in selections if c.get("ic5") is not None]
 
         summary["modes"][mode] = {
             "count": n_sel,
@@ -333,6 +349,13 @@ def build_summary(per_stock, coverage=None):
             "regime": {
                 "bull_ann_median": _median_or_none(bull),
                 "bear_ann_median": _median_or_none(bear),
+            },
+            "ic": {
+                "ic1_median": _median_or_none(ic1s),
+                "ic5_median": _median_or_none(ic5s),
+                "ic5_positive_pct": (round(sum(1 for v in ic5s if v > 0)
+                                           / len(ic5s) * 100, 1)
+                                     if ic5s else None),
             },
         }
     return summary
@@ -471,8 +494,13 @@ def main(limit=None, max_workers=None, tag=""):
         print(f"  算法分布: {data.get('algo_distribution', {})}")
         t = data.get("train", {})
         v = data.get("val", {})
+        ic = data.get("ic", {})
         print(f"  训练集: 年化中位={t.get('ann_median'):.1%} 回撤中位={t.get('mdd_median'):.1%} 胜率中位={t.get('winrate_median'):.1%} 交易中位={t.get('trades_median')}")
         print(f"  验证集: 年化中位={v.get('ann_median'):.1%} 回撤中位={v.get('mdd_median'):.1%} 胜率中位={v.get('winrate_median'):.1%} 交易中位={v.get('trades_median')}")
+        ic1m, ic5m = ic.get("ic1_median"), ic.get("ic5_median")
+        print(f"  IC中位: IC1={ic1m if ic1m is None else f'{ic1m:+.3f}'} "
+              f"IC5={ic5m if ic5m is None else f'{ic5m:+.3f}'} "
+              f"(IC5为正占比 {ic.get('ic5_positive_pct')}%)")
 
     print(f"\n全部完成，总耗时 {time.time()-t0:.0f}s")
 

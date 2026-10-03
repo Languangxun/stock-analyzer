@@ -117,8 +117,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-09-28 升 6.1.8）
-APP_VERSION = "6.1.9"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.2）
+APP_VERSION = "6.2.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -2626,6 +2626,204 @@ def industry_peers(full: str, limit: int = L2_DEFAULT_N):
     return [r[0] for r in rows[:limit]], info["industry"]
 
 
+# ================= 基本面信息（v6.2.1：东财 F10 历史财报关键数据） =================
+
+_F10_CACHE = {}                 # code -> (ts, rows)；财报低频，6h 缓存
+_F10_TTL = 6 * 3600.0
+
+# RPT_F10_FINANCE_MAINFINADATA 关键字段（东财 F10 主要指标，单位见注释）
+_F10_FIELDS = {
+    "date_name": "REPORT_DATE_NAME",      # 2026中报
+    "rtype": "REPORT_TYPE",               # 中报/年报
+    "notice": "NOTICE_DATE",              # 公告日
+    "rev": "TOTALOPERATEREVE",            # 营业总收入（元）
+    "rev_yoy": "TOTALOPERATEREVETZ",      # 营收同比（%）
+    "np": "PARENTNETPROFIT",              # 归母净利（元）
+    "np_yoy": "PARENTNETPROFITTZ",        # 归母净利同比（%）
+    "kf_yoy": "KCFJCXSYJLRTZ",            # 扣非净利同比（%）
+    "eps": "EPSJB",                       # 基本每股收益（元）
+    "eps_yoy": "EPSJBTZ",                 # EPS 同比（%）
+    "bps": "BPS",                         # 每股净资产（元）
+    "roe": "ROEJQ",                       # 加权净资产收益率（%）
+    "gm": "XSMLL",                        # 销售毛利率（%）
+    "nm": "XSJLL",                        # 销售净利率（%）
+    "debt": "ZCFZL",                      # 资产负债率（%）
+    "ocf_ps": "MGJYXJJE",                 # 每股经营现金流（元）
+}
+
+
+def _secucode(full):
+    """sh600519 -> 600519.SH（东财 F10 接口口径）。"""
+    c = (full or "").lower()
+    suf = ".SH" if c.startswith("sh") else ".BJ" if c.startswith("bj") \
+        else ".SZ"
+    return c[-6:] + suf
+
+
+def fetch_f10_metrics(full, periods=12):
+    """抓取历史财报关键数据（东财 F10 主要指标，最多 periods 期，报告期倒序）。
+
+    复用 _http_get（限流退避）+ 数据源熔断器（src_name=em_f10）+ 代理路由
+    （eastmoney.com 已在 _DOMESTIC_SUFFIX，直连优先）；双 host 容灾。
+    返回 dict 列表（新→旧），字段见 _F10_FIELDS；缺字段/停牌期容忍缺失。
+    抛 RuntimeError 表示两 host 均失败（GUI 捕获后展示原因）。"""
+    full = (full or "").strip().lower()
+    cached = _F10_CACHE.get(full)
+    if cached and time.time() - cached[0] <= _F10_TTL:
+        return cached[1]
+    sec = _secucode(full)
+    q = urllib.parse.quote(f'(SECUCODE="{sec}")')
+    hosts = ("https://datacenter.eastmoney.com",
+             "https://datacenter-web.eastmoney.com")
+    path = ("/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA"
+            f"&columns=ALL&filter={q}&pageNumber=1&pageSize={periods}"
+            "&sortTypes=-1&sortColumns=REPORT_DATE&source=HSF10&client=PC")
+    data, last = None, None
+    for i, host in enumerate(hosts):
+        try:
+            txt = _http_get(host + path, retries=3, timeout=20,
+                            headers={"Referer":
+                                     "https://emweb.securities.eastmoney.com/"},
+                            src_name="em_f10")
+            d = json.loads(txt)
+            data = ((d.get("result") or {}).get("data")
+                    or d.get("data") or [])
+            break
+        except Exception as e:
+            last = e
+            if _cb_ok("em_f10") and i + 1 < len(hosts):
+                continue
+    if data is None:
+        raise RuntimeError(f"财报数据源失败: {last}")
+    rows = []
+    for it in data:
+        row = {}
+        for k, f in _F10_FIELDS.items():
+            v = it.get(f)
+            if isinstance(v, (int, float)):
+                row[k] = float(v)
+            elif isinstance(v, str):
+                row[k] = v.strip() or None
+            else:
+                row[k] = None
+        if row.get("date_name") or row.get("rtype"):
+            rows.append(row)
+    if not rows:
+        raise RuntimeError("财报接口返回空（可能非上市公司/新上市无历史）")
+    _F10_CACHE[full] = (time.time(), rows)
+    return rows
+
+
+def fundamentals_summary(full, rows):
+    """财报关键数据分析（规则引擎，直接脚本输出，不联网不调AI）。
+
+    输入 fetch_f10_metrics 结果（报告期倒序），返回文本行列表：
+    成长性（营收/净利同比序列 + 增收不增利 + 扣非背离）、盈利质量
+    （ROE/毛利率/净利率/现金流）、财务风险（负债率，金融地产不评）、
+    综合结论（偏多/中性/偏空 + 依据）。仅财报数据参考，非投资建议。"""
+    n = len(rows)
+    name = (get_stock_info(full) or {}).get("name") or full
+    out = [f"【{name} {full}】近 {n} 期财报关键数据分析", ""]
+
+    def f2(v, suf=""):
+        return f"{v:.2f}{suf}" if isinstance(v, (int, float)) else "-"
+
+    r0 = rows[0]
+    out.append(f"最新报告期：{r0.get('date_name') or r0.get('rtype') or '-'}"
+               f"（公告 {str(r0.get('notice') or '-')[:10]}）")
+    out.append(f"  营收 {f2((r0.get('rev') or 0) / 1e8)}亿 "
+               f"(同比 {f2(r0.get('rev_yoy'), '%')})  "
+               f"归母净利 {f2((r0.get('np') or 0) / 1e8)}亿 "
+               f"(同比 {f2(r0.get('np_yoy'), '%')})")
+    out.append(f"  扣非同比 {f2(r0.get('kf_yoy'), '%')}  EPS "
+               f"{f2(r0.get('eps'))}元  ROE {f2(r0.get('roe'), '%')}  "
+               f"毛利率 {f2(r0.get('gm'), '%')}  净利率 {f2(r0.get('nm'), '%')}")
+    out.append(f"  负债率 {f2(r0.get('debt'), '%')}  每股经营现金流 "
+               f"{f2(r0.get('ocf_ps'))}元")
+    out.append("")
+
+    # ---- 成长性：最近4期同比序列 ----
+    def yoy_series(key, k=4):
+        vals = [r.get(key) for r in rows[:k] if isinstance(r.get(key),
+                                                           (int, float))]
+        return vals
+
+    score = 0
+    out.append("▍成长性")
+    for key, label in (("rev_yoy", "营收"), ("np_yoy", "归母净利")):
+        vs = yoy_series(key)
+        if not vs:
+            out.append(f"  {label}同比：数据缺失")
+            continue
+        seq = "、".join(f"{v:+.1f}%" for v in vs)
+        pos = sum(1 for v in vs if v > 0)
+        avg = sum(vs) / len(vs)
+        trend = "连续为正" if pos == len(vs) else \
+            "转正" if vs[0] > 0 and len(vs) > 1 and all(v <= 0 for v in vs[1:]) \
+            else "连续为负" if pos == 0 else "波动"
+        out.append(f"  {label}同比（新→旧）：{seq}  近{len(vs)}期均值 "
+                   f"{avg:+.1f}%，{trend}（{pos}/{len(vs)} 期为正）")
+        score += 1 if avg > 5 else (-1 if avg < -5 else 0)
+    ry, ny = (r0.get("rev_yoy"), r0.get("np_yoy"))
+    if isinstance(ry, (int, float)) and isinstance(ny, (int, float)) \
+            and ry > 10 and ny < 0:
+        out.append("  ⚠ 增收不增利：营收双位数增长但净利同比为负（盈利质量存疑）")
+        score -= 1
+    ky, ny2 = r0.get("kf_yoy"), r0.get("np_yoy")
+    if isinstance(ky, (int, float)) and isinstance(ny2, (int, float)) \
+            and ny2 - ky > 10:
+        out.append(f"  ⚠ 净利同比({ny2:+.1f}%)显著高于扣非同比({ky:+.1f}%)："
+                   "利润含非经常性损益较多")
+    out.append("")
+
+    # ---- 盈利质量 ----
+    out.append("▍盈利质量")
+    roe = r0.get("roe")
+    if isinstance(roe, (int, float)):
+        grade = "优秀" if roe >= 15 else "良好" if roe >= 8 else \
+            "一般" if roe >= 4 else "偏弱"
+        out.append(f"  ROE {roe:.2f}%（{grade}）")
+        score += 1 if roe >= 15 else (0 if roe >= 8 else -1)
+    else:
+        out.append("  ROE：数据缺失")
+    gm, nm_ = r0.get("gm"), r0.get("nm")
+    if isinstance(gm, (int, float)):
+        out.append(f"  毛利率 {gm:.2f}%  净利率 "
+                   f"{f2(nm_, '%')}（净利/毛利 = "
+                   f"{f2(nm_ / gm * 100 if gm else None, '%')}）")
+    ocf, eps = r0.get("ocf_ps"), r0.get("eps")
+    if isinstance(ocf, (int, float)) and isinstance(eps, (int, float)) \
+            and eps > 0:
+        ratio = ocf / eps
+        note = "现金流充沛" if ratio >= 0.8 else \
+            "偏弱，留意应收/存货" if ratio < 0.4 else "正常"
+        out.append(f"  每股经营现金流/EPS = {ratio:.2f}（{note}）")
+        if ratio < 0.4:
+            score -= 1
+    out.append("")
+
+    # ---- 财务风险 ----
+    out.append("▍财务风险")
+    ind = (get_stock_info(full) or {}).get("industry") or ""
+    debt = r0.get("debt")
+    if ind and any(w in ind for w in ("银行", "证券", "保险", "房地产")):
+        out.append(f"  负债率 {f2(debt, '%')}（{ind}行业高负债为常态，不评）")
+    elif isinstance(debt, (int, float)):
+        lvl = "偏高，留意利息压力" if debt > 70 else \
+            "中等" if debt > 40 else "较低"
+        out.append(f"  资产负债率 {debt:.2f}%（{lvl}）")
+        if debt > 70:
+            score -= 1
+    else:
+        out.append("  负债率：数据缺失")
+    out.append("")
+
+    verdict = "偏多" if score >= 2 else "中性" if score >= -1 else "偏空"
+    out.append(f"▍综合结论：基本面{verdict}（评分 {score:+d}，"
+               "规则汇总自上列数据，仅供参考，不构成投资建议）")
+    return out
+
+
 _TIER_POOL_CACHE = {}       # (tier, 日期) -> L3样本代码列表（同日共享，避免重复拉取）
 _TIER_POOL_TS = {}
 
@@ -2805,13 +3003,52 @@ THEMES = {
 }
 
 
-def apply_theme(theme, updown):
-    """按设置重写模块级颜色常量；绘图函数读取全局值。"""
+def apply_theme(theme, updown, ma_colors=None, boll_colors=None):
+    """按设置重写模块级颜色常量；绘图函数读取全局值。
+    ma_colors / boll_colors 提供时覆盖主题默认（设置→自定义颜色）。"""
     t = dict(THEMES.get(theme, THEMES["dark"]))
     if updown == "green_up":
         t["UP"], t["DOWN"] = t["DOWN"], t["UP"]
     for k, v in t.items():
         globals()[k] = v
+    if ma_colors:
+        mc = dict(MA_COLORS)
+        mc.update({int(k): v for k, v in ma_colors.items()})
+        globals()["MA_COLORS"] = mc
+    if boll_colors:
+        bc = {"up": globals().get("C_GOLD", "#e8c14a"),
+              "mid": globals().get("C_PURPLE", "#d0a9f5"),
+              "low": globals().get("C_GOLD", "#e8c14a")}
+        bc.update(boll_colors)
+        globals()["IND_BOLL_COLORS"] = bc
+    else:
+        globals()["IND_BOLL_COLORS"] = {
+            "up": globals().get("C_GOLD", "#e8c14a"),
+            "mid": globals().get("C_PURPLE", "#d0a9f5"),
+            "low": globals().get("C_GOLD", "#e8c14a"),
+        }
+
+
+# 指标线宽（默认 1，比旧的 width=2 稍细；设置页允许调整 1~3）
+IND_LINE_W = 1
+IND_BOLL_COLORS = {"up": "#e8c14a", "mid": "#d0a9f5", "low": "#e8c14a"}
+
+
+def ind_w():
+    """当前指标线宽（主图 MA / BOLL / 副图 MACD/KDJ/RSI/ADX/量比）。"""
+    return max(1, min(3, int(IND_LINE_W)))
+
+
+def ma_color(nn):
+    """MA 颜色读取（设置页允许覆盖；fallback 灰）。"""
+    m = globals().get("MA_COLORS") or {}
+    return m.get(int(nn), "#cccccc")
+
+
+def boll_color(key):
+    """BOLL 三轨颜色读取（设置页允许覆盖）。"""
+    bc = globals().get("IND_BOLL_COLORS") or IND_BOLL_COLORS
+    return bc.get(key, "#e8c14a")
 
 
 # ================= 数据获取 =================
@@ -3871,7 +4108,9 @@ def strategy_signals_full(rows, strat, industry=""):
         gen = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                "boll": _sig_boll, "ma_trend": _sig_ma_trend,
                "l1_pattern": _sig_l1_pattern,
-               "chip_peak": _sig_chip_peak}.get(algo)
+               "chip_peak": _sig_chip_peak,
+               "vol_ratio": _sig_vol_ratio,
+               "lgbm": _sig_lgbm}.get(algo)
         return gen(rows) if gen else []
     except Exception:
         log.exception("策略信号生成失败 %s", algo)
@@ -5441,6 +5680,36 @@ def save_strategy(full, strat):
         log.exception("save_strategy 失败(忽略)")
 
 
+# v6.2.2：研究消融批量结果（tier_picks_from_ablation.py 产物），
+# GUI 消融弹窗优先读它（四档全量），读不到才本地重跑（近1000日，3~5分钟/只）。
+_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "codes": {}}
+
+
+def load_research_ablation(full):
+    """读 research/ablation_gui_cache.json 中该股的四档消融结果（与 run_ablation
+    返回同构）。文件变更自动重载；超过 STRAT_TTL（5日）视为过期返回 None；
+    文件缺失/该股不在批量覆盖内返回 None（调用方回退本地消融）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "research", "ablation_gui_cache.json")
+    try:
+        mt = os.path.getmtime(path)
+        if mt != _RESEARCH_ABL["mtime"]:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            _RESEARCH_ABL.update(mtime=mt, ts=float(d.get("ts") or 0.0),
+                                 codes=d.get("codes") or {})
+        if time.time() - _RESEARCH_ABL["ts"] > STRAT_TTL:
+            return None
+        c = _RESEARCH_ABL["codes"].get(full)
+        if not c:
+            return None
+        c = dict(c)
+        c.setdefault("ts", _RESEARCH_ABL["ts"])
+        return c
+    except Exception:
+        return None
+
+
 # ---- 各算法信号发生器（只用 T 日及以前数据，杜绝前视）----
 
 def _sig_macd(rows):
@@ -5624,6 +5893,8 @@ ALGO_LABEL = {
     "ma_trend": "MA20/60趋势",
     "chip_peak": "筹码峰支撑",
     "sector_rot": "板块轮动",
+    "vol_ratio": "量比放量",
+    "lgbm": "LGBM预测",
     "composite": "多维评分",
 }
 
@@ -6005,6 +6276,128 @@ def _sig_sector_rot(rows, industry="", step=3, **_kw):
             out.append((i, rows[i]["date"], "BUY", "板块动量领先"))
         elif arr[j] < med5[j] and sr5 < 0:
             out.append((i, rows[i]["date"], "SELL", "板块动量落后"))
+    return out
+
+
+def _sig_vol_ratio(rows, **_kw):
+    """量比信号：近5日均量/前15日均量。
+
+    放量（≥1.5）首次跨越 1.2 阈值且收阳 → BUY；
+    缩量（≤0.5）或 放量（≥2.0）收阴 → SELL。仅用截至当日的 vol_ratio_at（因果）。"""
+    vols = [r.get("vol") or 0.0 for r in rows]
+    out = []
+    for i in range(19, len(rows)):
+        vr = vol_ratio_at(vols, i)
+        prev = vol_ratio_at(vols, i - 1)
+        if vr is None or prev is None:
+            continue
+        c, pc = rows[i]["close"], rows[i - 1]["close"]
+        if vr >= 1.5 and prev < 1.2 and c > pc:
+            out.append((i, rows[i]["date"], "BUY", f"量比放量{vr:.2f}"))
+        elif (vr <= 0.5 or (vr >= 2.0 and c < pc)) and c < pc:
+            out.append((i, rows[i]["date"], "SELL", f"量能异动{vr:.2f}"))
+    return out
+
+
+# LightGBM 信号（消融候选）：因果——每 50 根在「当日及以前」数据上重训
+# LGBMRegressor 预测次日收益；缺库静默回退（不刷错误日志，避免重复触发提示）
+_V4_LGBM_ABLATION = {"objective": "regression", "num_leaves": 15,
+                     "max_depth": 4, "learning_rate": 0.05,
+                     "n_estimators": 100, "min_child_samples": 40,
+                     "subsample": 0.8, "subsample_freq": 1,
+                     "colsample_bytree": 0.8, "reg_lambda": 1.0,
+                     "reg_alpha": 0.0, "random_state": 42, "n_jobs": 1,
+                     "verbose": -1}
+
+
+def _sig_lgbm(rows, **_kw):
+    """LightGBM 信号：LGBMRegressor 预测次日收益（因果滚动训练）。
+    每 50 根重训一次（仅用当日及以前数据），BUY/SELL 阈值 ±0.5%。
+    缺 lightgbm 库静默返回 []，回退到其他候选。"""
+    try:
+        from lightgbm import LGBMRegressor
+    except ImportError:
+        return []
+    n = len(rows)
+    if n < 220:
+        return []
+    closes = [r["close"] for r in rows]
+    vols = [r.get("vol") or 0.0 for r in rows]
+    dif_, dea_, _ = calc_macd(closes)
+    k_, d_, _ = calc_kdj(rows)
+    r6 = calc_rsi(closes, 6)
+    _, b_up, b_low = calc_boll(closes)
+    vr_arr = [vol_ratio_at(vols, k) for k in range(n)]
+
+    def _feats(i):
+        if i < 60 or i + 1 >= n:
+            return None
+        if closes[i] <= 0 or closes[i-5] <= 0 or closes[i-10] <= 0 \
+                or closes[i-20] <= 0:
+            return None
+        ret5 = closes[i] / closes[i-5] - 1
+        ret10 = closes[i] / closes[i-10] - 1
+        ret20 = closes[i] / closes[i-20] - 1
+        if None in (r6[i], dif_[i], dea_[i], k_[i], d_[i],
+                    b_up[i], b_low[i]):
+            return None
+        boll_pct = ((closes[i] - b_low[i]) / (b_up[i] - b_low[i])
+                    if b_up[i] > b_low[i] else 0.5)
+        return [ret5, ret10, ret20, (r6[i] or 0) / 100, vr_arr[i] or 0,
+                boll_pct, (dif_[i] or 0) - (dea_[i] or 0),
+                (k_[i] or 0) - (d_[i] or 0)]
+
+    preds = [None] * n
+    model = None
+    last_train_i = -100
+    RETRAIN_EVERY = 50
+    for i in range(60, n - 1):
+        f = _feats(i)
+        if f is None:
+            continue
+        if model is None or i - last_train_i >= RETRAIN_EVERY:
+            X, Y = [], []
+            for j in range(60, i):
+                fj = _feats(j)
+                if fj is None or j + 1 >= n or closes[j] <= 0 \
+                        or closes[j + 1] <= 0:
+                    continue
+                X.append(fj)
+                Y.append(closes[j + 1] / closes[j] - 1)
+            if len(X) < 100:
+                continue
+            try:
+                model = LGBMRegressor(**_V4_LGBM_ABLATION)
+                model.fit(X, Y)
+                last_train_i = i
+            except Exception:
+                log.debug("LGBM 训练失败 %d", i, exc_info=True)
+                continue
+        try:
+            preds[i + 1] = float(model.predict([f])[0])
+        except Exception:
+            pass
+
+    th_buy, th_sell = 0.005, -0.005
+    cooldown = 0
+    out = []
+    last_dir = 0
+    for i in range(60, n):
+        p = preds[i]
+        if p is None or cooldown > 0:
+            if cooldown > 0:
+                cooldown -= 1
+            continue
+        if p > th_buy and last_dir <= 0:
+            out.append((i, rows[i]["date"], "BUY",
+                        f"LGBM预测{p*100:+.2f}%"))
+            last_dir = 1
+            cooldown = 3
+        elif p < th_sell and last_dir >= 0:
+            out.append((i, rows[i]["date"], "SELL",
+                        f"LGBM预测{p*100:+.2f}%"))
+            last_dir = -1
+            cooldown = 3
     return out
 
 
@@ -6480,6 +6873,8 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "l2_ind": lambda: _sig_l2_industry(rows, industry=industry),
         "chip_peak": lambda: _sig_chip_peak(rows),
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
+        "vol_ratio": lambda: _sig_vol_ratio(rows),
+        "lgbm": lambda: _sig_lgbm(rows),
     }
     for algo, gen in gens.items():
         try:
@@ -7183,7 +7578,7 @@ def analyze(full, progress=None, quick=False):
     signals = []
     # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
     if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
-                    "chip_peak", "sector_rot"):
+                    "chip_peak", "sector_rot", "vol_ratio", "lgbm"):
         try:
             if sel_algo == "chip_peak":
                 raw = _sig_chip_peak(disp_rows)
@@ -7193,7 +7588,9 @@ def analyze(full, progress=None, quick=False):
             else:
                 raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                        "boll": _sig_boll, "ma_trend": _sig_ma_trend,
-                       "l1_pattern": _sig_l1_pattern}[sel_algo](disp_rows)
+                       "l1_pattern": _sig_l1_pattern,
+                       "vol_ratio": _sig_vol_ratio,
+                       "lgbm": _sig_lgbm}[sel_algo](disp_rows)
             cut = max(1, len(disp_rows) - 250)
             signals = [s for s in raw if s[0] >= cut]
         except Exception:
@@ -7570,7 +7967,8 @@ def analyze(full, progress=None, quick=False):
         "sector_name": sec_name, "sector_chg_today": sec_chg_today,
         "ind": {"ma": mas, "dif": dif, "dea": dea, "mhist": mhist,
                 "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12,
-                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low, "pdi": pdi_a, "mdi": mdi_a, "adx": adx_a},
+                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low, "pdi": pdi_a, "mdi": mdi_a, "adx": adx_a,
+                "vr_arr": vr_arr},
         "vols": vols,
         "chips": chips,
         "action": action,
@@ -9202,7 +9600,10 @@ def _v4_print_report(r):
 #      当前版本刻意不控制最大回撤，回撤由使用者自行承受。
 #
 # 原理（前三档详见 README 第二节）：
-#   稳健 = 全A「20日动量 + 20日低波」横截面合成排名 Top20，每20日调仓，
+#   稳健 = 「20日动量 + 20日低波」横截面合成排名 Top20（v6.1.11 起偏动量：
+#          blend_mom 动量0.6/低波0.4——等权低波会系统性挤出医药/科技等高波动
+#          成长股，动量权重 0.5→0.6 后四口径全期/样本外/强势段全面更优且回撤
+#          基本不变；动量短名单/纯60日动量方案经回测证伪），每20日调仓，
 #          上证 MA20 闸门（T-1 收盘在均线上才持仓）
 #   均衡 = 同选股 Top20，每10日调仓，其余同上（更高换手换更高弹性）
 #   激进 = 创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
@@ -9224,8 +9625,8 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
             allow_limit_up=True)
 
 TIER_CFG = {
-    "稳健": dict(universe="all", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="all", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="chinext", score="beta", top=5, reb=10,
@@ -9243,8 +9644,8 @@ TIER_CFG = {
 #   · 动量权重邻域 0.6/0.7 稳健（+7.0%/+6.6%），0.9/1.0 崩坏（-10.5%/-28.2%）
 #     → 取 0.7 并保留低波 0.3 作为防守项。
 TIER_CFG_MAIN = {
-    "稳健": dict(universe="main", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="main", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="main", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="main", score="blend_mom", mom_w=0.7, top=20, reb=10,
@@ -9252,12 +9653,13 @@ TIER_CFG_MAIN = {
     "高风险": dict(_ROT, universe="main"),
 }
 # ETF 口径（v6.1.2）：池子仅 ETF/LOF。ETF 无创业板/行业语义，
-# 故前三档都用「动量+低波」族：稳健/均衡等权 blend，激进偏动量 blend_mom。
+# 故前三档都用「动量+低波」族：稳健偏动量（0.6/0.4，v6.1.11 起）、
+# 均衡等权 blend、激进偏动量 blend_mom。
 # 高风险档同样用 rotate（ETF 无行业时板块动量退化为自身动量，见
 # tier_sector_features）；闸门一律板块轮动口径。
 TIER_CFG_ETF = {
-    "稳健": dict(universe="etf", score="blend", top=10, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="etf", score="blend_mom", mom_w=0.6, top=10,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="etf", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10, reb=10,
@@ -9267,8 +9669,8 @@ TIER_CFG_ETF = {
 # 全A含ETF 口径（v6.1.2）：个股 + ETF 同一池排序；激进用 blend_mom
 # （池内混入 ETF 后，创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
-    "稳健": dict(universe="all_etf", score="blend", top=20, reb=20,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all_etf", score="blend_mom", mom_w=0.6, top=20,
+                 reb=20, gate="sh000001", ma=20),
     "均衡": dict(universe="all_etf", score="blend", top=20, reb=10,
                  gate="sh000001", ma=20),
     "激进": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
@@ -9466,6 +9868,77 @@ def tier_build_features(cal, C, V):
                 beta60_star=beta60_star)
 
 
+def tier_ic_confirm(C):
+    """个股历史信号 IC 确认层（v6.2.0 荐股逻辑；结果缓存 `_TIER_CACHE["ic"]`）。
+
+    每只股票滚动计算「动量信号强度 → 未来收益」的历史预测力（Spearman 思路
+    用 Pearson 实现，滚动窗口 cumsum 向量化，按行分块控制峰值内存）：
+      a_i = C_i/C_{i-5} − 1（近5日收益 = 信号强度）
+      b_i = C_{i+5}/C_i − 1（未来5日收益 = 结果）
+      窗口 120 日：ic（相关系数）、n（有效样本对数）、t = r·√((n−2)/(1−r²))
+    确认掩码 ok[:, t]（T 日决策用 T-1 及以前，防前视）：
+      ic(T-1) > 0 且 t(T-1) ≥ 2 且 n(T-1) ≥ 60 且 信号在场
+    信号在场 = T-1 日 MA20/60 多头趋势（c>ma20>ma60 且 ma20 上行；
+      全A 实证 IC 0.228 最强规则维度）——IC 与指标综合考量、
+      窗宽/阈值全取自然数（120/5/60/2）不做寻优，防过拟合。
+    返回 dict(ok=bool[NST,NDT], ic=float32[NST,NDT])，ic 供荐股展示。"""
+    if _TIER_CACHE.get("ic") is not None:
+        return _TIER_CACHE["ic"]
+    NST, NDT = C.shape
+    W, H, NMIN, TMIN = 120, 5, 60, 2.0
+    ok = np.zeros((NST, NDT), bool)
+    ic_out = np.full((NST, NDT), np.nan, dtype=np.float32)
+
+    def _roll(x):
+        cs = np.cumsum(x, axis=1)
+        out = np.full_like(x, np.nan)
+        out[:, W:] = cs[:, W:] - cs[:, :-W]
+        return out
+
+    CH = 1024                            # 行分块：峰值内存 ~15MB/中间量
+    for s in range(0, NST, CH):
+        e = min(s + CH, NST)
+        Cc = C[s:e]
+        a = np.full_like(Cc, np.nan)     # 近5日收益（信号强度）
+        a[:, 5:] = Cc[:, 5:] / Cc[:, :-5] - 1.0
+        b = np.full_like(Cc, np.nan)     # 未来5日收益（结果）
+        b[:, :-H] = Cc[:, H:] / Cc[:, :-H] - 1.0
+        v = np.isfinite(a) & np.isfinite(b)
+        av = np.where(v, np.nan_to_num(a), 0.0)
+        bv = np.where(v, np.nan_to_num(b), 0.0)
+        S1, S2 = _roll(av), _roll(av * av)
+        S3, S4 = _roll(bv), _roll(bv * bv)
+        S5, N = _roll(av * bv), _roll(v.astype(np.float64))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = (S5 - S1 * S3 / N) / np.sqrt(
+                np.maximum((S2 - S1 * S1 / N) * (S4 - S3 * S3 / N), 0.0))
+            r = np.where((S2 - S1 * S1 / N > 1e-12)
+                         & (S4 - S3 * S3 / N > 1e-12) & (N >= NMIN),
+                         r, np.nan)
+            t = r * np.sqrt((N - 2.0) / np.maximum(1.0 - r * r, 1e-12))
+        # 信号在场：MA20/60 多头趋势（c>ma20>ma60 且 ma20 上行）
+        def _ma(n):
+            cs = np.cumsum(np.insert(np.nan_to_num(Cc, nan=0.0),
+                                     0, 0.0, axis=1), axis=1)
+            cn = np.cumsum(np.insert(np.isfinite(Cc).astype(float),
+                                     0, 0.0, axis=1), axis=1)
+            m = np.full_like(Cc, np.nan)
+            m[:, n - 1:] = ((cs[:, n:] - cs[:, :-n])
+                            / np.maximum(cn[:, n:] - cn[:, :-n], 1.0))
+            return m
+        ma20, ma60 = _ma(20), _ma(60)
+        ma20p = np.full_like(Cc, np.nan)
+        ma20p[:, 1:] = ma20[:, :-1]
+        ins = ((Cc > ma20) & (ma20 > ma60) & (ma20 > ma20p)
+               & np.isfinite(ma20) & np.isfinite(ma60))
+        conf = (r > 0) & (t >= TMIN) & (N >= NMIN) & ins
+        ok[s:e, 1:] = conf[:, :-1]       # T 日用 T-1 确认
+        ic_out[s:e] = r.astype(np.float32)
+    out = {"ok": ok, "ic": ic_out}
+    _TIER_CACHE["ic"] = out
+    return out
+
+
 def tier_sector_features(feat):
     """板块轮动特征（v6.1.9 高风险档；结果缓存 `_TIER_CACHE["sec"]`）。
 
@@ -9544,7 +10017,8 @@ def tier_rank_base(codes, universe):
 
 def tier_make_score(feat, kind, mom_w=None, base=None, sec_w=None):
     """合成打分：
-      blend      = 动量20 与 低波20 百分位等权（稳健/均衡）
+      blend      = 动量20 与 低波20 百分位等权（v6.1.10 前稳健/均衡口径，
+                   现仅均衡档与研究对照用）
       blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
       rotate     = 板块轮动（高风险档）：板块 20 日动量排名 sec_w 为主，
                    叠加个股动量/低波基准（1-sec_w）；板块动量见
@@ -9654,8 +10128,11 @@ def _tier_limit_pct(code):
 
 
 def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
-                   capital=1e6):
-    """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。"""
+                   capital=1e6, ic_ok=None):
+    """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。
+    ic_ok：v6.2.0 荐股确认层（tier_ic_confirm 的 ok 掩码）——非 None 时
+    调仓候选须先过「历史信号 IC 显著为正 + 指标在场」确认，再按评分取 TopN；
+    确认数不足时宁可少持仓/持现金，不降低门槛凑数。"""
     NST = C.shape[0]
     top, reb = cfg["top"], cfg["reb"]
     uni = tier_universe_mask(codes, cfg.get("universe", "all"))
@@ -9714,6 +10191,9 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
             s = score[cand, d]
             m = np.isfinite(s)
             cand, s = cand[m], s[m]
+            if ic_ok is not None:
+                keep = ic_ok[cand, d]
+                cand, s = cand[keep], s[keep]
             order = cand[np.argsort(-s, kind="stable")]
             target = set(order[:top].tolist()) if on else set()
         for k in np.nonzero(holding)[0]:
@@ -9780,9 +10260,12 @@ def _tier_metrics(eq, dates, trades=None):
 
 
 def tier_eval(segment="full", tiers=None, phases=None, progress=None,
-              overrides=None, universe="all"):
+              overrides=None, universe="all", ic_filter=False, capital=None):
     """组合档回测（相位平均主口径；稳健/均衡/激进/高风险）。overrides 可覆盖 cfg（研究用）。
-    universe: all=全A / main=沪深主板。返回 {tier: metrics}。"""
+    universe: all=全A / main=沪深主板。返回 {tier: metrics}。
+    v6.2.0：ic_filter=True 启用荐股确认层（tier_ic_confirm：历史信号 IC 显著
+    为正 + 指标在场，候选不足时宁缺毋滥）；capital 覆盖本金（10 万组合荐股
+    回测用，整手约束随本金变化），None=默认 100 万口径不变。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
         progress("组合引擎：构建特征 ...")
@@ -9800,6 +10283,8 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         raise ValueError("未知区间: " + segment)
     i0 = int(np.searchsorted(cal, a))
     i1 = int(np.searchsorted(cal, b, side="right"))
+    ic_ok = tier_ic_confirm(C)["ok"] if ic_filter else None
+    cap = float(capital) if capital else 1e6
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
     tiers = list(base) if not tiers else [t for t in tiers if t in base]
     out = {}
@@ -9815,7 +10300,8 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         norms, dates, all_trades = [], None, []
         for p in range(n_ph):
             eq, ec, tr = tier_sim_phase(codes, cal, C, feat, score, gate,
-                                        i0, i1, cfg, phase=p, capital=1e6)
+                                        i0, i1, cfg, phase=p, capital=cap,
+                                        ic_ok=ic_ok)
             j0 = cfg["reb"] - 1 - p
             if j0 >= len(eq) or eq[j0] <= 0:
                 continue
@@ -9827,7 +10313,7 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         if not norms:
             continue
         L = min(len(e) for e in norms)
-        E = np.mean([e[:L] for e in norms], axis=0) * 1e6
+        E = np.mean([e[:L] for e in norms], axis=0) * cap
         dates = dates[:L]
         m = _tier_metrics(E, dates, all_trades)
         anns = [_tier_metrics(e[:L], dates)["ann"] for e in norms]
@@ -9999,13 +10485,20 @@ def tier_picks_report_text(segment="full", tiers=None, capital=0.0,
 
 
 def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
-                      universe="all", apply_perms=True):
+                      universe="all", apply_perms=True, ic_filter=False,
+                      top_n=None):
     """生产端：按最新可用交易日给出目标持仓（含闸门状态/板块权限过滤）。
-    universe: all=全A / main=沪深主板。apply_perms 开启时套用设置里的荐股权限。"""
+    universe: all=全A / main=沪深主板。apply_perms 开启时套用设置里的荐股权限。
+    v6.2.0：ic_filter=True 启用荐股确认层——候选须过 tier_ic_confirm 的
+    「历史信号 IC 显著为正 + 指标在场」确认（T-1 口径），确认不足宁缺毋滥；
+    top_n 覆盖档位 top（荐股页 IC 确认后综合分 Top10）；picks 增加 ic 字段
+    （该股 T-1 信号 IC，仅供展示）。资金按 top 均分（10 万 = 10 只 × 约1万，
+    组合口径而非每只 10 万）。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
     feat = _TIER_CACHE["feat"]
+    icp = tier_ic_confirm(C) if ic_filter else None
     NST, NDT = C.shape
     # 最后一个「足够多股票有数据」的交易日作为信号日
     elig_n = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
@@ -10029,7 +10522,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     for tier in (tiers or list(base)):
         if tier not in base:
             continue
-        cfg = tier_cfg(tier, universe)
+        cfg = dict(tier_cfg(tier, universe))
+        if top_n:
+            cfg["top"] = int(top_n)
         gate = tier_build_gate(cal, cfg, feat)
         on = bool(gate[d]) if gate is not None else True
         _base = tier_rank_base(codes, universe)
@@ -10043,6 +10538,8 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
               & (feat["barcount"][:, d] >= _TIER_MIN_BARS)
               & (feat["amt20"][:, d] >= _TIER_MIN_AMOUNT) & m
               & np.isfinite(score[:, d]) & ~risky)
+        if icp is not None:
+            ok = ok & icp["ok"][:, d]
         cand = np.nonzero(ok)[0]
         order = cand[np.argsort(-score[cand, d], kind="stable")]
         r1d = np.full(NST, np.nan)
@@ -10073,6 +10570,9 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
                 "code": str(codes[k]), "name": names.get(codes[k], ""),
                 "industry": info.get(codes[k], ("", ""))[1],
                 "price": px, "score": float(score[k, d]),
+                "ic": (float(icp["ic"][k, d])
+                       if icp is not None
+                       and np.isfinite(icp["ic"][k, d]) else None),
                 "vol20": v20,
                 "stop_ref": stop_ref,
                 "beta60": float(feat[bkey][k, d])
@@ -10093,7 +10593,7 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
     """GUI/CLI 共用：最新目标持仓 + 闸门状态的文本报告。"""
     p = tier_latest_picks(capital=capital, tiers=tiers, universe=universe)
     uni_name = UNIVERSE_NAME.get(universe, universe)
-    lines = [f"v6.1.9 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
+    lines = [f"v6.2 四档组合 · {uni_name} · 信号日 {p['signal_date']} · "
              f"建议资金 {capital:,.0f}",
              "口径：T-1 信号 → 下一交易日收盘成交；整手/费用/涨跌停/退市已计入",
              "荐股权限（设置内配置，空=全部）：已按板块/行业过滤",
@@ -10423,7 +10923,7 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "你是量化组合风控官。下面是当前市场环境与各档策略定义：\n"
         f"{ai_market_brief()}\n\n"
         "策略档位：\n"
-        "· 稳健：全A动量+低波Top20，20日调仓，上证MA20闸门\n"
+        "· 稳健：全A偏动量(动量0.6/低波0.4)Top20，20日调仓，上证MA20闸门\n"
         "· 均衡：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
         "· 激进：创业板高βTop5，10日调仓，创业板指MA60闸门\n"
         "· 高风险（新开发的高风险策略）：板块轮动为主参考——选强势行业里的"

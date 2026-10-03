@@ -70,6 +70,7 @@
 | `backtests/backtest_v61.py` | **标准回测** | 4 口径 × 4 类产品（稳健/均衡/激进 + 荐股），产物 `research/v61_report*.json/md`；跑完自动出图，`--charts-only`/`--compare all` 做**跨版本对比**（`backtests/v61_charts.py`，纯标准库 SVG） |
 | `backtests/backtest_strategy_ablation.py` | **策略消融** | 全对象逐个消融（10 类信号 × 3 档风险），覆盖率清单 + 聚合统计 |
 | `backtests/backtest_tiers.py` / `backtest_picks_v6.py` | 分段/荐股回测 | `--segment full/val/bull/yearly`、`--universe`、参数敏感性 |
+| `backtests/backtest_picks10.py` | **10 万元荐股组合回测（v6.2.0）** | IC 确认层 + 综合分 Top10、组合总资金 10 万（每只约 1/10 仓）、`--capital/--top` 可调 |
 | `plugins/trade_log.py` | 插件 | 交易记录、账户资金联动（荐股按可用资金算手数） |
 | `~/ai-quant/` | 下游系统（独立仓库） | 常驻模拟盘，2026-09-25 起拆分至 [Languangxun/ai-quant](https://github.com/Languangxun/ai-quant)；接收 `--push` 推送的 `stock_<code>_<date>.json`（见第六节） |
 
@@ -87,6 +88,12 @@
 
 **行情快照 `fetch_quote`**：**腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`（带 Referer、GBK）→ 东财 `ulist.np`**，
 任一成功即返回；自选池名称与五大指数走 `fetch_batch_quotes`（腾讯→新浪），不再是腾讯单源。
+
+**基本面财报（v6.2.1 `fetch_f10_metrics`）**：东财 datacenter F10 主要指标
+`RPT_F10_FINANCE_MAINFINADATA`（报告期倒序最多 12 期），双 host 容灾
+（`datacenter.eastmoney.com` → `datacenter-web.eastmoney.com`），走 `_http_get`
+限流退避 + 熔断器（源名 `em_f10`）；域名属 `eastmoney.com` 已在 `_DOMESTIC_SUFFIX`
+（直连优先）。6 小时内存缓存 `_F10_CACHE`（财报低频更新）。
 
 **日K `_fetch_remote_rows`**：腾讯（配置域 `KLINE_URL`，默认 `proxy.finance.qq.com`）
 → `proxy` → `ifzq.gtimg.cn`(HTTPS) → `ifzq.gtimg.cn`(HTTP) → 东财 4 host 轮询
@@ -365,7 +372,7 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 
 | 档位 | 评分 | 持仓/调仓 | 闸门 |
 |---|---|---|---|
-| 稳健 | `blend` = 0.5·rank(ret20) + 0.5·(1−rank(vol20)) | Top20 / 20 日 | 上证 MA20 |
+| 稳健 | 四口径：`blend_mom` = 0.6·rank(ret20) + 0.4·(1−rank(vol20))（v6.1.11 起偏动量） | Top20（ETF Top10）/ 20 日 | 上证 MA20 |
 | 均衡 | 同上 | Top20 / 10 日 | 上证 MA20 |
 | 激进 | 全A：`beta`（对创业板指 60 日 β）Top5 / 创业板指 MA60；其余口径：`blend_mom`（动量0.7/低波0.3）Top20 / 上证 MA20 | — | — |
 | **高风险** | 四口径均为 `rotate` = `0.5·rank(sector_ret20) + 0.5·[0.7·rank(ret20) + 0.3·(1−rank(vol20))]`（板块轮动为主） | Top5 / 10 日 | **板块轮动闸门**：`0.6·sec_breadth + 0.4·(上证MA20) ≥ 0.35`（大盘权重 40%）；**允许涨停价买入（打板）** |
@@ -375,9 +382,27 @@ GUI 面板与 `stock_backtest_export.py` 共用），
   100 股整手、涨停不买、跌停不卖、停牌顺延、连续 20 日无 K 线按最后收盘价了结；
   **高风险 档例外**：`cfg.allow_limit_up=True` 跳过涨停不买判定（回测约 1.3%~1.9% 买在涨停价，
   生产端 `tier_latest_picks` 输出 `limit_up` 标记供提示）；
+- **荐股确认层（v6.2.0，`tier_ic_confirm`）**：个股历史信号 IC——滚动 120 日窗计算
+  「近5日收益（信号强度）→ 未来5日收益」Pearson IC（cumsum 向量化、行分块控内存，
+  缓存 `_TIER_CACHE["ic"]`）；确认条件（全截至 T-1，防前视）：**IC>0 且 t≥2 且样本对≥60
+  且 T-1 日 MA20/60 多头趋势在场**（IC 与指标综合考量；120/5/60/2 全为自然数、不做寻优，
+  防过拟合）。`tier_sim_phase(ic_ok=)`、`tier_eval(ic_filter=)`、`tier_latest_picks(ic_filter=, top_n=)`
+  三个入口共用；确认不足时宁缺毋滥（持仓可少于 TopN、余下持现金）。当期确认覆盖约
+  100/6317 只——IC 显著本身是高门槛；
+- **10 万元荐股组合回测（v6.2.0，`backtests/backtest_picks10.py`）**：**组合总资金 10 万**
+  （非每只 10 万）——每档 IC 确认后按综合分取 **Top10**、每只约 1/10 仓（约 1 万），
+  调仓频率按档位各自节奏（稳健 20 / 均衡 10 / 激进 10 日），其余约束同组合引擎；
+  **本金规模影响结果**（整手粒度 + 高价股预算买不进：10 万×Top20 时 >50 元股无法建仓），
+  与 100 万相位平均口径数字不可直接互比。全期/样本外/强势段三档结果见
+  `research/picks10_{full,val,bull}.json`；IC 层贡献对照（同本金同 Top10 无 IC）：
+  均衡全期 +18.8%→**+69.1%**、激进 +4.0%→**+33.9%**、样本外均衡 -3.3%→**+48.2%**；
 - **评分族（v6.1.9）**：`rotate`（板块轮动）为高风险档新增——行业 20 日动量（`sector_ret20`，
   取自 `stocks.industry` 成分股等权）排名 + 个股动量/低波基准；ETF/无行业退化为自身动量。
   `mom`/`beta_star` 保留仅作研究对照（已证伪）；
+- **稳健档偏动量（v6.1.11）**：等权 `blend`（0.5/0.5）会因低波分位差恒定而系统性挤出
+  高波动成长股（医药/科技动量分位 ~0.95、低波分位仅 ~0.1，合成永远进不了 Top20）；
+  改 `blend_mom` 0.6 后四口径全期 +2.0~+4.3pp、样本外/强势段全面更优、回撤基本不变。
+  动量短名单（Top50/80/120 内低波精选）与 60 日动量口径经回测证伪（全期 -51% / 年化减半）；
 - **闸门族（v6.1.9）**：`tier_make_gate`（指数 MA）用于前三档；`tier_make_rotation_gate`
   （板块轮动，大盘权重 40%）用于高风险档，`cfg.gate_mode="rotation"` 时由 `tier_build_gate` 分派；
   全期开闸 1010/1636（62%）> 旧闸门（全A 创指 MA60=777、上证 MA20=857）；
@@ -387,8 +412,16 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 ### 3.8 策略消融引擎（`backtest_strategy_ablation.py`，AI 不参与）
 - **覆盖所有对象**：个股 + ETF 逐个独立消融（≥200 根），输出**覆盖率清单**（纳入/有效/跳过原因/K线不足名单）
   写入 `summary.coverage`，可核验「确实全部跑过」；
-- **10 类信号**：MACD 金叉死叉 / KDJ 低位金叉高位死叉 / RSI 超买超卖 / 布林带回归 / MA20-60 趋势 /
-  L1 形态上行概率 / **L2 同行业+行业ETF** / 筹码峰支撑 / 板块轮动 / 多维评分；
+- **12 类信号**：MACD 金叉死叉 / KDJ 低位金叉高位死叉 / RSI 超买超卖 / 布林带回归 / MA20-60 趋势 /
+  L1 形态上行概率 / **L2 同行业+行业ETF** / 筹码峰支撑 / 板块轮动 /
+  **量比放量（v6.1.10 新增）** / **LGBM 预测（v6.1.10 新增，缺库静默回退）** /
+  多维评分；
+  - **量比（v6.1.10）**：复用 `vol_ratio_at`（近5/前15），BUY=首次放量
+    （prev<1.2, vr≥1.5, 收阳）/ SELL=缩量≤0.5 或放量≥2.0 收阴；
+  - **LGBM（v6.1.10）**：`LGBMRegressor` 滚动训练，每 50 根用「当日及
+    以前」8 维特征（ret5/10/20 + rsi6 + boll_pct + macd_diff + kdj_diff + vr）
+    重训一次预测次日收益；±0.5% 阈值 BUY/SELL，3 根冷却；`lightgbm` 包
+    缺时静默返回 `[]`——回退到其他候选，**不让缺库打断消融**；
 - **L2（v6.1.3 新增）**：每个行业构造「行业指数」——**优先同名行业ETF**收盘序列，无匹配则同行业个股等权收益累乘；
   行业指数 > MA20 且 5 日动量 > 0 → BUY，反向 SELL（时序行业趋势，与板块轮动的横截面强弱互补）；
 - **防过拟合**：前 ~75% 训练集选型，后 ~25% 验证集只报告；训练集上把 **Calmar/PF/胜率/年化**
@@ -485,6 +518,23 @@ GUI 面板与 `stock_backtest_export.py` 共用），
   （`data_clean.py`）与全库回填（`backfill_full.py`）参数表单 + 后台子进程 + 实时日志 +
   停止；回填新增 `--min-bars/--fresh-days/--bar-count` CLI 参数；「每只股回测导出 Excel」
   调用 `backtests/stock_backtest_export.py`（详见 4.1）。
+- **基本面信息页（v6.2.1）**：工具窗「基本面」页签（小屏工具菜单「基本面信息」独立窗口，
+  未分析股票也可用）——`fetch_f10_metrics` 抓东财 F10 主要指标（`datacenter.eastmoney.com`
+  `RPT_F10_FINANCE_MAINFINADATA`，报告期倒序最多 12 期，双 host 容灾 +
+  `em_f10` 熔断 + `_DOMESTIC_SUFFIX` 直连优先，6h 缓存 `_F10_CACHE`），
+  13 列表格（营收/净利及同比、扣非同比、EPS、ROE、毛利率/净利率、负债率…）+
+  `fundamentals_summary` 本地规则分析（成长性同比序列/增收不增利/扣非背离、ROE 分级、
+  每股现金流÷EPS、负债率（金融地产不评）、评分制综合结论，不联网不调 AI）；
+  代码框回车/按钮线程抓取，已有代码进页自动抓取。
+- **指标线颜色 / 粗细自定义（v6.1.10）**：设置→指标线分段——
+  线粗度 Spinbox `1~3`（默认 1，比旧版 `width=2` 细一档）+ MA5/10/20/30/60
+  与 BOLL 上/中/下轨共 8 个色块按钮（`tkinter.colorchooser.askcolor`）+ 「恢复默认」；
+  模块级助手 `ma_color(nn)` / `boll_color(key)` / `ind_w()`；`apply_theme`
+  新增 `ma_colors / boll_colors` 覆盖参数；`IND_LINE_W` / `IND_BOLL_COLORS`
+  两个模块级常量；ini `[ui]` 段加 `ma_colors / boll_colors / ind_w` 三键，
+  启动加载；BOLL 改独立 `show_boll` 打勾（与 MA 同位），不再占用副图——
+  副图 combobox 改为 `["MACD", "KDJ", "RSI", "ADX", "量比"]`（新增量比
+  `__draw_VOL_ratio`：近5/前15 量比 + 0.8/1.0/1.2 三道阈值 + `vol_regime` 标题尾标）。
 
 ### 3.14 18 策略共振综合荐股（v6.1.6）
 - **来源**：移植 `chaodi_strategies/et_engine`（通达信口径）进 `stock_gui.py` 算法区，
@@ -515,13 +565,14 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 |---|---|---|
 | `backtests/backtest_v61.py` | 标准回测（4 口径 × 4 档 × 组合/荐股；**v6.1.8 P1：多进程并行**，`--workers` 0=自动 min(4,CPU)/1=串行，父进程预热面板+特征后 fork 继承，实测全期 127.9s→**75.6s**） | **每次运行建版本化目录** `research/backtest_v6.1.8_<时间戳>_<区间>[_tag]/`：`report.json/md`、`run_meta.json`（`elapsed_s` 含全部口径回测）、`tables/*.csv`（组合/逐笔/相位/逐笔分布/基准/净值曲线）、`charts/*.svg`；另在 `research/` 根保留 `v61_report*.json/md` 最新副本 |
 | `backtests/v61_charts.py` | 图表模块（纯标准库 SVG） | 单报告：相位/逐笔箱线 + 收益柱状（写入回测目录 `charts/`）；`--compare`：跨版本对比图 |
-| `backtests/v61_dashboard.py` | **本地网页仪表盘生成器**（自包含 HTML，零外部依赖；**v6.1.7 热修④ 起支持导出完整回测数据**：全量 JSON / 指标 CSV / 曲线 CSV / 当前筛选逐股 CSV / 单股记录 JSON + 全量回测命令复制） | `research/dashboard.html`：研究净值曲线/指标对比/分布箱线 + GUI 单股回测（读 `research/gui_backtests/*.json`，旧口径记录标注作废）+ **每只股回测**（读 `research/perstock_backtest_v*/` 及旧 `reports/` CSV，搜索/筛选/排序/分页 + xlsx/CSV 链接 + 运行元数据；**默认勾选「排除事件股」**，卡片/表格剔除重组复牌/长停牌等不可交易收益）+ 明细文件链接；**默认展示最新「全期 + 新复权口径」批次**，`legacy`（2026-09-27 切换前）批次醒目提示；`backtest_v61.py` 跑完自动刷新 |
-| `backtests/backtest_strategy_ablation.py` | 全对象消融（10 信号 × 4 档，含高风险；**v6.1.8 P1**：`map+chunksize` 批量提交 + `--workers` 默认 8→16，实测 7181 只 **509s → 373s（-27%）**） | 版本化目录 `research/ablation_v<版本>_<时间戳>[_tag]/`：`per_stock.json`、`summary.json`、`run_meta.json`；根目录保留 `strategy_ablation_*.json` 最新副本（硬链接，兼容下游） |
+| `backtests/v61_dashboard.py` | **本地网页仪表盘生成器**（自包含 HTML，零外部依赖；**v6.1.7 热修④ 起支持导出完整回测数据**：全量 JSON / 指标 CSV / 曲线 CSV / 当前筛选逐股 CSV / 单股记录 JSON + 全量回测命令复制；**v6.2.1 组合净值曲线下方新增两张表**——组合指标表（每档总收益/年化/回撤/Sharpe/超额/交易/相位区间/荐股统计）与消融汇总表（最新 `ablation_v*/summary.json`：年化/胜率中位 + **IC1/IC5 中位数**、IC5 为正占比、牛熊中位，`collect_ablation` 收集）） | `research/dashboard.html`：研究净值曲线/指标对比/分布箱线 + GUI 单股回测（读 `research/gui_backtests/*.json`，旧口径记录标注作废）+ **每只股回测**（读 `research/perstock_backtest_v*/` 及旧 `reports/` CSV，搜索/筛选/排序/分页 + xlsx/CSV 链接 + 运行元数据；**默认勾选「排除事件股」**，卡片/表格剔除重组复牌/长停牌等不可交易收益）+ 明细文件链接；**默认展示最新「全期 + 新复权口径」批次**，`legacy`（2026-09-27 切换前）批次醒目提示；`backtest_v61.py` 跑完自动刷新 |
+| `backtests/backtest_strategy_ablation.py` | 全对象消融（**12 信号 × 4 档**——v6.2.1 起研究池补齐 量比/LGBM 与 GUI 一致；每候选新增描述性 `ic1`/`ic5`（全样本 Spearman，仅展示不参与选型），`summary.modes[*].ic` 聚合 IC1/IC5 中位数与 IC5 为正占比；**v6.1.8 P1**：`map+chunksize` 批量提交 + `--workers` 默认 8→16，实测 7181 只 **509s → 373s（-27%）**） | 版本化目录 `research/ablation_v<版本>_<时间戳>[_tag]/`：`per_stock.json`、`summary.json`、`run_meta.json`；根目录保留 `strategy_ablation_*.json` 最新副本（硬链接，兼容下游） |
 | `backtests/stock_backtest_export.py` | **每只股回测导出**（信号+事件回测逐只汇总；`--mode tiers` 默认按四档选型分表，另有 保守/稳健/激进/高风险（单档固定风险参数，v6.1.9 起高风险强制新风险参数）/cached；**v6.1.6 起与消融同引擎 `_bt_segments`**；回测主体为纯 Python 循环，**v6.1.6 ③ 起 `--workers`=多进程 `ProcessPoolExecutor` 并行进程数**，任务按股票拆分、参数/库路径 initializer 注入；**v6.1.8 P1**：`map+chunksize=20` 批量提交 + 默认 workers 4→8 + **4 档共用 1 次 ATR(14) 预计算** + **composite 算法 4 档共用 1 次 `_composite_precompute`**，实测 6898 只 4 档 **260s → 204s（-22%）**；**v6.1.9**：高风险档强制 `RISK_PARAMS["高风险"]`（宽止损、不设 MDD 止损），选型只决定 algo/信号源；**v6.1.6 ⑤ 起事件股检测**——单日复权|涨跌|>44% 或相邻K线间隔>90天（≈停牌>60交易日）记入「事件」列并计入 `run_meta.event_codes`；跑完自动刷新 `dashboard.html`） | 版本化目录 `research/perstock_backtest_v<版本>_<时间戳>/`：`每只股回测.xlsx`（**四档=4 个工作表** + 说明）、同名 UTF-8 CSV、`run_meta.json`（含 `adj` 口径标记）；`--out` 可指定；GUI「工具→数据工具」页同入口（留空=自动目录） |
-| `backtests/tier_picks_from_ablation.py` | 从消融 per-stock JSON 逐只选四档（与 GUI `_pick_one_from_pool` 同口径，含高风险） | 写进源消融运行目录 `tier_picks.json`（并合并 `run_meta.json`），根目录挂 `research/perstock_tier_picks.json` 最新副本；同时刷新 GUI 策略缓存（推荐档，meta `strategy:*`，5 日 TTL） |
+| `backtests/tier_picks_from_ablation.py` | 从消融 per-stock JSON 逐只选四档（与 GUI `_pick_one_from_pool` 同口径，含高风险）；**v6.2.2 起另写 GUI 消融批量缓存** `research/ablation_gui_cache.json`（四档全量，与 `run_ablation` 同构），GUI 弹窗优先读它、读不到才本地重算 | 写进源消融运行目录 `tier_picks.json`（并合并 `run_meta.json`），根目录挂 `research/perstock_tier_picks.json` 与 `research/ablation_gui_cache.json` 最新副本；同时刷新 GUI 策略缓存（推荐档，meta `strategy:*`，5 日 TTL） |
 | `backtests/bt_common.py` | **回测统一规范工具**：`new_run_dir` / `write_run_meta` / `link_latest` | 所有回测程序共用：`research/<kind>_v<版本>_<时间戳>[_<extra>][_<tag>]/` + `run_meta.json`（版本/时间/命令行/耗时/数据规模）+ 根目录最新副本（硬链接，跨盘回退复制） |
 | `backtests/backtest_tiers.py` | 四档分段/逐年/参数敏感性 | `research/tiers_*.json` |
 | `backtests/backtest_picks_v6.py` | 荐股逐笔（口径/区间/逐年） | `research/picks_v6_*.json` |
+| `backtests/backtest_picks10.py` | **10 万元荐股组合回测（v6.2.0）**：IC 确认层 + 综合分 Top10、每只约 1/top 仓、调仓按档位节奏（稳健20/均衡10/激进10 日）、相位平均；`--capital/--top/--tier/--universe/--yearly` | `research/picks10_*.json` |
 | `backtests/`（历史） | 因子/退出/横截面/激进双引擎等 | `research/legacy/results/*.json` |
 
 ### 4.2 报告流水线（单一权威链）
@@ -647,6 +698,11 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.2.2**<br>（2026-10-03） | **GUI 打通研究消融（四档批量缓存 + 弹窗优先读研究结果）**：`tier_picks_from_ablation.py` 新增写 `research/ablation_gui_cache.json`（四档全量，与 `run_ablation` 返回同构：mode_candidates/recommend/bars/train_n/val_n/vol_ann，train/val 精简 ann/mdd/winrate/trades/pf；7184 只 14.5MB）；`stock_gui.py` 新增 `load_research_ablation`（mtime 自动重载、5 日 TTL、缺失回退），`_ensure_strategy` 无策略缓存时优先读它弹窗免本地重算（读不到才本地消融 3~5 分钟/只），「策略消融」手动重选同样秒开研究四档；`APP_VERSION=6.2.2`，`stock_predict.py` 重新生成；ARCHITECTURE 4.1 与 README 同步 |
+| **v6.2.1**<br>（2026-10-03） | **基本面信息工具 + 仪表盘 IC 中位数/指标表格 + 消融重跑（量比/LGBM 入研究池）**：①工具窗新增「基本面」页签——`fetch_f10_metrics`（东财 datacenter F10 主要指标 `RPT_F10_FINANCE_MAINFINADATA`，12 期报告期倒序，双 host 容灾 + `em_f10` 熔断 + 6h 缓存）+ `fundamentals_summary` 本地规则分析（成长/增收不增利/扣非背离/ROE 分级/现金流覆盖/负债率、评分制结论），GUI 表格 + 分析文本 + 小屏菜单入口；②`v61_dashboard.py` 组合净值曲线下方新增组合指标表与消融汇总表（`collect_ablation` 读最新 `ablation_v*/summary.json`，含 **IC1/IC5 中位数**、IC5 为正占比、训练/验证年化中位、牛熊中位）；③`backtest_strategy_ablation.py` 研究池 `gens` 补齐 v6.1.10 只加了 GUI 的 量比/LGBM（9→12 信号），每候选新增描述性 `ic1`/`ic5`（不参与选型），summary 聚合 IC 中位数；**安装 lightgbm 4.7.0 + scikit-learn 1.9.1**（此前 sklearn 缺失致 LGBM fit 静默失败、lgbm 候选恒空）；**全量消融重跑**（7236 对象、有效 7184、1382s）：稳健档 lgbm 入选 784 只（10.9%）、IC1 中位 +0.018 / IC5 中位 +0.081（75.3% 为正），`tier_picks.json` 与 GUI 策略缓存刷新、dashboard 重建；④`APP_VERSION=6.2.1`，`stock_predict.py` 由 `build_cli.py` 重新生成。2.1/3.13/4.1 节与 README/CHANGELOG 同步。**热修①**：v61_dashboard 模板 JS 注释内 `v*/` 提前闭合块注释致整页语法错误（批次/图表全空，node --check 把关）；`_style_ttk` 补 Treeview/Heading 深色样式（修复基本面表格白底白字不可读） |
+| **v6.2.0**<br>（2026-10-03） | **荐股确认层 + 10 万元荐股组合回测**：①**荐股逻辑改造**——新增 `tier_ic_confirm`（个股历史信号 IC 确认层：滚动 120 日窗「近5日收益→未来5日收益」Pearson IC，cumsum 向量化 + 行分块控内存，缓存 `_TIER_CACHE["ic"]`；确认 = IC>0 且 t≥2 且样本对≥60 且 T-1 日 MA20/60 多头趋势在场——IC 与指标综合考量、自然数阈值防过拟合，当期覆盖约 100/6317 只）；`tier_sim_phase` 增 `ic_ok` 参数（调仓候选先过确认再按评分取 TopN，不足宁缺毋滥）、`tier_eval` 增 `ic_filter`/`capital`、`tier_latest_picks` 增 `ic_filter`/`top_n`（picks 输出 `ic` 字段）；GUI 每日荐股四档模式改走 IC 确认 + **Top10**（资金按 top 均分，10 万=10 只×约1万，组合口径而非每只 10 万）；②**新回测项目** `backtests/backtest_picks10.py`——10 万元组合总资金荐股回测（Top10、每档各自调仓节奏 稳健20/均衡10/激进10 日、相位平均、全部费用约束）；**本金规模影响结果**（整手粒度+高价股预算约束，与 100 万口径不可直接互比）；全期三档：稳健 +7.1%/均衡 **+69.1%**（超额+49pp）/激进 +33.9%，样本外 均衡 **+48.2%**（Sharpe 2.96）/激进 +28.1%/稳健 +9.1%，强势段 均衡 **+81.1%**/激进 +44.9%/稳健 +32.9%；IC 层贡献对照（同本金同 Top10 无 IC）：均衡 +18.8%→+69.1%、激进 +4.0%→+33.9%、稳健 full +14.6%→+7.1%（回撤变差但 val/bull 更优）；③`APP_VERSION=6.2.0`，`stock_predict.py` 由 `build_cli.py` 重新生成。3.7/4.1 节与 README/CHANGELOG 同步 |
+| **v6.1.11**<br>（2026-10-03） | **稳健档偏动量重做（四口径 blend 等权 → blend_mom 0.6/0.4）**：等权低波会系统性挤出医药/科技等高波动成长股（低波分位差恒定，动量再强也进不了 Top20，当期 Top20 长期被青岛港/煤炭/银行/电力类霸占）；四口径 `TIER_CFG*["稳健"]` 改 `score="blend_mom", mom_w=0.6`（top/reb/闸门不变）。回测依据（全A/主板/ETF/全A含ETF，相位平均含费用）：全期 +14.6→+18.4%、+18.8→+21.8%、+10.5→+14.8%、+25.9→+26.7%，样本外 +0.8→+3.1%、+2.7→+4.9%、+1.6→+2.4%、+1.4→+1.5%，强势段 +11.4→+15.7%、+11.2→+15.1%、+24.2→+30.7%、+21.9→+21.3%，回撤基本不变（ETF -10.7→-12.3%）；**动量短名单（Top50/80/120 内低波精选，全期 -51%~-17.7%）与 60 日动量口径（全期 +10.4%、样本外为负）经回测证伪**——A 股 20 日动量 Top 全为妖股/ST，低波项是崩盘过滤器，故仅做权重平移不做结构改动；`tier_make_score` docstring 与 GUI 荐股文案、`backtests/backtest_tiers.py` 注释同步，`blend` 评分保留（均衡档/研究对照用）。`APP_VERSION=6.1.11`，`stock_predict.py` 由 `build_cli.py` 重新生成；README 全期/分段表稳健行与策略原理同步（research/v61_report* 批次未重跑）。3.7 节与 README/CHANGELOG 同步 |
+| **v6.1.10**<br>（2026-10-02） | **消融增「量比 / LGBM」 + BOLL 独立打勾 + 指标线颜色 / 粗细自定义**：①`ALGO_LABEL` 加 `vol_ratio="量比放量"` 与 `lgbm="LGBM预测"`（新增 `_sig_vol_ratio` 复用 `vol_ratio_at` 阈值 ±1.5/0.5；新增 `_sig_lgbm` 用 `LGBMRegressor` 因果滚动训练，每 50 根用「当日及以前」8 维特征 ret5/10/20+rsi6+boll_pct+macd_diff+kdj_diff+vr 重训一次预测次日收益，±0.5% 阈值 BUY/SELL，**lightgbm 缺库静默返回 []**——当前环境未装亦能正常消融，仅这一个候选空集）；`gens` 池 11 算法 × 4 风险参数 + 4 多维评分 = 48 候选；`strategy_signals_full` 与主图策略信号重算两处同步；弹窗文案「9 算法」→「11 算法」；②BOLL 改独立 `self.show_boll = BooleanVar(True)`（工具栏 `MA5/10/20/30/60` 旁加 BOLL 复选框，**不再占用副图**），三轨分别 `boll_on[up/mid/low]`；副图 combobox 移除 BOLL，新增「量比」`__draw_vol_ratio`（近5/前15 量比折线 + 0.8/1.0/1.2 三道阈值 + `vol_regime` 标题尾标），`analyze.res["ind"]` 加 `vr_arr` 并切片入 view，十字光标 hover 加「量比:X.XX」；废弃的 `_draw_bollpct` 删除；③设置页新增「指标线：颜色 / 粗细（自定义）」——线粗度 Spinbox `1~3`（默认 1，比旧版 `width=2` 细一档）+ MA5/10/20/30/60 与 BOLL 上/中/下轨共 8 个色块按钮（`tkinter.colorchooser.askcolor`）+ 「恢复默认」按当前主题刷回；模块级助手 `ma_color(nn)`/`boll_color(key)`/`ind_w()`，`apply_theme` 新增 `ma_colors`/`boll_colors` 覆盖参数；模块级常量 `IND_LINE_W=1` 与 `IND_BOLL_COLORS={up/mid/low}`；ini `[ui]` 段加 `ma_colors`/`boll_colors`/`ind_w` 三键启动加载；`_line(width=2)` 改为默认 `ind_w()`，旧固定 `width=2` 的支撑/压力线、5日均量线、ADX 线统一收窄；`APP_VERSION=6.1.10`，`stock_predict.py` 由 `build_cli.py` 重新生成，**本轮按用户要求不重跑**回测（沿用 v6.1.9 批次）。3.8/3.13 节与 README/CHANGELOG 同步 |
 | **v6.1.9**<br>（2026-10-01） | **高风险档重做为「新开发的高风险策略」（板块轮动 + 大盘降权 + 高风险偏好）**：①组合层四口径 `TIER_CFG*["高风险"]` 改为 `rotate` 评分（`0.5·rank(sector_ret20)+0.5·[0.7·rank(ret20)+0.3·(1−rank(vol20))]`）+ 板块轮动闸门（`tier_make_rotation_gate`：`0.6·行业广度+0.4·上证MA20 ≥ 0.35`，大盘权重由 100% 降至 40%，全期开闸 1010/1636=62% > 旧闸门 777/857）+ Top5/10 日 + 打板；新增 `tier_sector_features`（行业等权 `ret20`、行业广度，缓存 `_TIER_CACHE["sec"]`）、`tier_build_gate` 分派、`cfg.gate_mode="rotation"`；②`CFG.RISK_PARAMS["高风险"] = (6.0, 1.15, 0.80, 1, 2)`——宽止损/慢止盈/快再入场，**删除 500 日 MDD 止损机制**（`_mdd_stop_dist` 及 `dd_window` 分支）与旧档位实现；③旧档位名统一重命名为「高风险」（GUI/CLI/AI 文案/回测脚本/仪表盘/文档），删除废弃的旧选型扫描脚本与留档产物，`stock_predict.py` 由 `build_cli.py` 重新生成，`APP_VERSION=6.1.9`；④全期/样本外/强势段/逐年/逐股回测重跑。3.6/3.7/3.8/4.1/4.4 节与 README/CHANGELOG 同步 |
 | **v6.1.8 热修①**<br>（2026-09-30） | **键盘精灵默认清空搜索栏 + 设置界面适配 dock/任务栏**：①**同花顺式键盘精灵**——按下可打印字符自动聚焦搜索框时，**新一次搜索先清空搜索栏**再从该字符开始（搜索框自身有焦点时同样生效，如启动预填/上次分析残留的 `002241`，此前会被拼成 `0022416`）；同一次会话内连续输入正常追加，Backspace/粘贴等手动编辑视为会话内继续；回车与小键盘回车（`<Return>`/`<KP_Enter>`）均可选中候选或开始分析；Esc/焦点离开/开始分析（`run()`）结束会话，下次输入重新清空。实现：新增 `_wiz_active` 会话标记与 `_search_end()`（关下拉+会话复位），`_global_key` 不再对搜索框自身直接跳过，`_search_key` 在文本非空时维持会话并排除 `KP_Enter`，同时过滤不可打印键（顺带修复非输入控件下 Backspace 会把 `\x08` 写进搜索框的隐患）；②设置界面布局——`open_settings` 的 `maxh` 从 `int(screenheight*0.88)` 改为基于 **`winfo.vrootheight`**（已扣除任务栏/菜单栏的可用区）×0.88 再扣 40px 给标题栏/阴影，`_center_win` 同步切换到 `vrootheight` 算 y，保证窗口底部不被 dock/任务栏遮挡（小屏分支仍强制全屏）；其他对话框（信号胜率/工具/关于 等较小窗口）同步受益。`APP_VERSION=6.1.8` 不变；`stock_predict.py` 由 `build_cli.py` 重新生成。CHANGELOG 顶部新增 ㊺条 |
 | **v6.1.8**<br>（2026-09-28/29/30） | **高风险 档改激进破甲版（配置复制激进 + 打板 + 按历史最大回撤止损）+ P0/P1 性能口径 + P0 二轮修复**：①组合层四口径 `TIER_CFG*["高风险"] = dict(TIER_CFG*["激进"], allow_limit_up=True)`（该实现于 v6.1.9 重做并删除）；②`CFG.RISK_PARAMS["高风险"]` 入场同激进（买点门槛1/冷却3），止损改**入场前 500 日个股历史最大回撤**（新增 `_mdd_stop_dist`，限幅 8%~50%；未盈利=入场价−MDD、盈利后=峰值−MDD；历史不足 60 根回退 ATR4.0/回落12%），`_bt_events`/`_bt_simulate` 双引擎支持，生产端 `tier_latest_picks` 的 高风险 参考止损同步为 MDD 口径；③`_ablation_weights`/`_pick_one_from_pool` 的 高风险 目标改与激进一致（偏年化+Calmar）；GUI/AI 文案（`RISK_AI_GUIDE`、`ai_choose_tier`、设置页/消融弹窗/菜单版本号）同步「激进破甲」并升 `APP_VERSION=6.1.8`；④P0：`_bt_simulate` 年化口径与 `_bt_events` 对齐（区间起点、下限 0.25 年）；⑤P1：三大回测脚本并行 + 跨档指标复用——`backtest_v61.py` 4 口径多进程并行（父进程预热面板+特征后 fork 继承，全期 **127.9s→74s**）+ `stock_backtest_export.py` 逐股 `map+chunksize=20` + 默认 workers 4→8 + 4 档共用 ATR(14) + composite 4 档共用 `_composite_precompute`（**260s→204s**）+ `backtest_strategy_ablation.py` `map+chunksize` + 默认 workers 8→16（**509s→373s**）；⑥P0 二轮修复（2026-09-30）：高风险 档强制 `RISK_PARAMS["高风险"]`（v6.1.7 高风险 改激进破甲版起 高风险 档实际可能跑激进 ATR 止损、500 日 MDD 形同虚设，perstock 高风险 与激进数字完全相等）+ 生产端 高风险 MDD 改用 `d+2` 与回测引擎口径对齐 + 过拟合相关 docstring 修复。组合引擎无止损，组合层数字与 v6.1.7 高风险 改激进破甲版完全一致（浮点 <0.01pp）；perstock 高风险 修复后总收益中位 +63.22%→+37.24%（-25.98pp），胜率 50%→56%（+6pp），盈亏比 2.21→1.48（-0.73），验证段 -1.87%→-2.62%，其他档不受影响。3.6/3.7/3.8/4.1/4.4 节与 README/CHANGELOG 同步 |

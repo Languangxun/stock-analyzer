@@ -97,6 +97,7 @@ def main():
 
     out, n_rec = {}, {"保守": 0, "稳健": 0, "激进": 0, "高风险": 0}
     n_cache = 0
+    gui_codes = {}              # v6.2.2：GUI 消融弹窗用（四档全量 + 推荐档）
     conn = sg._cx() if not args.no_cache else None
     items = per[:args.limit] if args.limit else per
     for i, s in enumerate(items, 1):
@@ -136,6 +137,26 @@ def main():
                                     "params": c["params"],
                                     "label": c["label"], "ts": time.time()})
             n_cache += 1
+        # GUI 弹窗数据结构（与 run_ablation 返回同构，精简 train/val 字段）
+        def _compact(c):
+            tr = c.get("train") or {}
+            va = c.get("val") or {}
+            keep = ("ann", "mdd", "winrate", "trades", "pf")
+            return {"algo": c.get("algo", "composite"),
+                    "mode": c.get("mode", ""),
+                    "params": c.get("params") or {},
+                    "label": c.get("label", ""),
+                    "train": {k: tr.get(k) for k in keep},
+                    "val": {k: va.get(k) for k in keep} if va else None,
+                    "bull": c.get("bull"), "bear": c.get("bear")}
+        gui_codes[code] = {
+            "mode_candidates": {t: _compact(full[t]) for t in picks},
+            "recommend": rec,
+            "bars": s.get("bars"), "train_n": s.get("train_n"),
+            "val_n": s.get("val_n"),
+            "vol_ann": vol, "high_vol": bool(vol is not None and vol > 0.45),
+            "source": os.path.basename(args.src),
+        }
         if i % 1000 == 0:
             print(f"  {i}/{len(items)} …", flush=True)
 
@@ -145,6 +166,14 @@ def main():
     print(f"写出 {out_file}（{len(out)} 只，{sz:.1f} MB）")
     bt_common.link_latest(out_file, latest)
     print(f"根目录最新副本: {latest}")
+    # v6.2.2：GUI 消融弹窗批量缓存（四档全量；GUI 读不到才本地重算）
+    gui_path = os.path.join(RESEARCH, "ablation_gui_cache.json")
+    with open(gui_path, "w", encoding="utf-8") as f:
+        json.dump({"ts": time.time(), "source": os.path.basename(args.src),
+                   "codes": gui_codes}, f, ensure_ascii=False,
+                  separators=(",", ":"))
+    print(f"写出 GUI 消融缓存 {gui_path}"
+          f"（{len(gui_codes)} 只，{os.path.getsize(gui_path)/1e6:.1f} MB）")
     info = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "count": len(out), "source": os.path.basename(args.src),
             "out": os.path.basename(out_file),

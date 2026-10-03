@@ -33,6 +33,8 @@ research/gui_backtests/
 research/strategy_ablation_per_stock*.json
 # 三档选型瘦身产物（tier_picks_from_ablation.py 生成，可由消融重跑）
 research/perstock_tier_picks.json
+# GUI 消融批量缓存（v6.2.2；四档全量 ~15MB，可由消融+选型脚本重跑）
+research/ablation_gui_cache.json
 
 # 回测统一规范运行目录（bt_common.py；消融/每只股导出等可重跑，
 # 根目录固定名「最新副本」按需入库，明细随研究包分发）
