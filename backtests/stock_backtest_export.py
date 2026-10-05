@@ -217,7 +217,7 @@ def _event_note(rows, code=""):
     return "；".join(notes)
 
 
-def _signals_with_cache(rows, algo, rp, pre_cache):
+def _signals_with_cache(rows, algo, rp, pre_cache, code=""):
     """v6.1.8 P1：生成信号；composite 算法按 algo 缓存 _composite_precompute 结果，
     同一只股票多档（composite×4）共用 1 次指标计算（MACD/KDJ/RSI/BOLL/ADX/MA20/
     chip_snapshots），省 ~75% composite 算量。
@@ -242,7 +242,7 @@ def _signals_with_cache(rows, algo, rp, pre_cache):
         return pre_cache[key]
     try:
         sigs = sg.strategy_signals_full(
-            rows, {"algo": algo, "params": rp}, industry="")
+            rows, {"algo": algo, "params": rp}, industry="", full=code)
     except Exception:
         sigs = []
     pre_cache[key] = sigs
@@ -266,7 +266,7 @@ def export_one(code, mode, bars, picks=None):
     pre_cache = {}      # algo -> _composite_precompute 输出 / ("sig", algo) -> 信号
 
     def _row(strat_algo, tier, label, rp, atrs=None):
-        sigs = _signals_with_cache(rows, strat_algo, rp, pre_cache)
+        sigs = _signals_with_cache(rows, strat_algo, rp, pre_cache, code=code)
         n_buy = sum(1 for s in sigs if s[2] == "BUY")
         r = dict(base, algo=strat_algo, mode=tier, label=label,
                  n_sig=len(sigs), n_buy=n_buy, n_sell=len(sigs) - n_buy)

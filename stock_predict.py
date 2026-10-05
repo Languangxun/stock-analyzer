@@ -118,7 +118,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.2.4"
+APP_VERSION = "6.3.0"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -209,6 +209,25 @@ class CFG:
     MAX_FETCH_BARS = 1000
     # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
     AUTO_PREFETCH = True
+    # ---- 异动·全市场相似历史（v6.3.0，激进/均衡专属，默认开启）----
+    # 触发（近 ANALOG_LOOKBACK 个交易日内出现过）：
+    #   单日|涨跌| ≥ max(自身历史99.5分位, 5%)  或
+    #   5日累计|涨跌| ≥ max(自身历史99.5分位, 10%)
+    # 触发后把该异动日与全市场历史异动事件按【K线形态+事件后路径+量比+
+    # 换手率+RSI+波动率】匹配，取最相似 ANALOG_TOPK 例，统计它们在
+    # 「事件后第 k 日」（k=目标股距异动日天数）的次日/3日/5日表现；
+    # 方向明确时覆盖原策略买卖点（激进档附打板提示）。
+    # ini [predict] analog_override=0 关闭。
+    ANALOG_OVERRIDE = True
+    ANALOG_LOOKBACK = 20        # 异动事件在近 N 个交易日内视为「异动状态」
+    ANALOG_PCT = 99.5           # 自身历史分位阈值（单日/5日各算）
+    ANALOG_MIN_HIST = 120       # 分位统计最少历史根数
+    ANALOG_PCT_STEP = 20        # 候选事件因果分位重算步长（交易日，块内沿用）
+    ANALOG_SIG_STEP = 2         # 历史信号状态检查步长（交易日）
+    ANALOG_SHAPE_W = 20         # K线形态匹配窗口（对数收益 z-normalize）
+    ANALOG_TOPK = 50            # 相似异动样本数（聚合统计）
+    ANALOG_MIN_SAMPLES = 12     # 相似样本少于该数不给结论（只提示触发）
+    ANALOG_LIMIT_P = 0.30       # 激进档：相似样本次日封板概率达此值提示打板
     # 筹码峰右列（同花顺式，v6.1.5 热修⑧）：显示宽度占画布比例（非紧凑屏生效）
     # + 右侧价格条宽度（留给十字光标价格标签，筹码柱向左生长不压住它）
     CHIP_W_RATIO = 0.17
@@ -341,6 +360,8 @@ def _load_predict_cfg():
                                 0, 1))
         CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
                                     1 if CFG.AUTO_PREFETCH else 0, 0, 1))
+        CFG.ANALOG_OVERRIDE = bool(gi("analog_override",
+                                      1 if CFG.ANALOG_OVERRIDE else 0, 0, 1))
         CFG.MAX_FETCH_BARS = gi("max_fetch_bars", CFG.MAX_FETCH_BARS,
                                 100, 3000)
     except Exception:
@@ -3461,9 +3482,17 @@ def _fetch_quote_tencent(full):
     f = http_get(QT_URL + full).split("~")
     if len(f) < 35 or not f[3]:
         raise ValueError("腾讯未查询到该股票")
+
+    def _fv(i):                 # v6.3.0：换手率/动态PE/PB（缺失为 "-"）
+        try:
+            v = f[i].strip()
+            return float(v) if v and v != "-" else None
+        except (ValueError, IndexError):
+            return None
+
     return {"name": f[1], "price": float(f[3]), "prev_close": float(f[4]),
             "open": float(f[5]), "high": float(f[33]), "low": float(f[34]),
-            "time": f[30]}
+            "time": f[30], "turnover": _fv(38), "pe": _fv(39), "pb": _fv(46)}
 
 
 def _fetch_quote_sina(full):
@@ -4200,12 +4229,13 @@ def backtest_signals(rows, signals, rp=None):
         return None
 
 
-def strategy_signals_full(rows, strat, industry=""):
+def strategy_signals_full(rows, strat, industry="", full=""):
     """按所选策略在传入 rows 上重算信号（工具→信号胜率回测用）。
 
     主图买卖点只展示近 250 根（性能/可读性），若直接拿展示信号做 75/25
     训练/验证切分，指标型策略信号会全部落在尾部；这里按消融选型同口径
-    重算 raw 信号（调用方传近1000根，与 run_ablation 同窗），不做展示端压缩。"""
+    重算 raw 信号（调用方传近1000根，与 run_ablation 同窗），不做展示端压缩。
+    `full` 供异动·全市场相似（analog）识别自身与取总股本。"""
     algo = (strat or {}).get("algo", "composite")
     rp = (strat or {}).get("params") or CFG.risk_params()
     try:
@@ -4216,6 +4246,8 @@ def strategy_signals_full(rows, strat, industry=""):
             return _sig_l2_industry(rows, industry=industry)
         if algo == "sector_rot":
             return _sig_sector_rot(rows, industry=industry)
+        if algo == "analog":
+            return _sig_analog(rows, full or None)
         gen = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                "boll": _sig_boll, "ma_trend": _sig_ma_trend,
                "l1_pattern": _sig_l1_pattern,
@@ -6006,6 +6038,7 @@ ALGO_LABEL = {
     "sector_rot": "板块轮动",
     "vol_ratio": "量比放量",
     "lgbm": "LGBM预测",
+    "analog": "异动·全市场相似",
     "composite": "多维评分",
 }
 
@@ -6983,6 +7016,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
         "vol_ratio": lambda: _sig_vol_ratio(rows),
         "lgbm": lambda: _sig_lgbm(rows),
+        "analog": lambda: _sig_analog(rows, full),
     }
     for algo, gen in gens.items():
         try:
@@ -7684,13 +7718,16 @@ def analyze(full, progress=None, quick=False):
     signals = []
     # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
     if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
-                    "chip_peak", "sector_rot", "vol_ratio", "lgbm"):
+                    "chip_peak", "sector_rot", "vol_ratio", "lgbm",
+                    "analog"):
         try:
             if sel_algo == "chip_peak":
                 raw = _sig_chip_peak(disp_rows)
             elif sel_algo == "sector_rot":
                 raw = _sig_sector_rot(
                     disp_rows, industry=(my_info.get("industry") or ""))
+            elif sel_algo == "analog":
+                raw = _sig_analog(disp_rows, full)
             else:
                 raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
                        "boll": _sig_boll, "ma_trend": _sig_ma_trend,
@@ -7887,6 +7924,47 @@ def analyze(full, progress=None, quick=False):
             band_algo += f"（{_why} → 兜底改用多维评分·{sel_mode}）"
     band_note = f"波段适合度 {band_score:.0f}/100 → {band_algo}"
 
+    # ---- v6.3.0 异动·全市场相似（激进/均衡专属，默认开启）----
+    # ①历史异动信号并入图表/回测（因果生成，可参与消融与单股 bt_stats）；
+    # ②最新一日方向明确时覆盖近端相反信号；分歧维持原策略。
+    analog = None
+    if (not quick and CFG.ANALOG_OVERRIDE and sel_mode != "保守"):
+        _asigs = []
+        if sel_algo != "analog":      # 策略本身就是 analog 时避免重复生成
+            try:
+                _asigs = _sig_analog(disp_rows, full, mode=sel_mode)
+            except Exception:
+                log.exception("异动历史信号生成失败(忽略)")
+        if _asigs:
+            signals = _dedup_signals(
+                sorted(signals + _asigs, key=lambda s: s[0]))
+            band_algo = f"异动·全市场相似（{sel_mode}）+ 原策略"
+        try:
+            analog = analog_scan(full, disp_rows, mode=sel_mode,
+                                 progress=progress)
+        except Exception:
+            log.exception("异动相似分析失败(忽略)")
+            analog = None
+    if analog and analog.get("trigger"):
+        _verdict = analog.get("verdict")
+        if _verdict in ("BUY", "SELL"):
+            _li = len(disp_rows) - 1
+            signals = [s for s in signals
+                       if not (s[0] >= _li - 2 and s[2] != _verdict)]
+            _same_recent = any(s[2] == _verdict for s in signals
+                               if s[0] >= _li - 2)
+            if not _same_recent:
+                signals.append((_li, disp_rows[_li]["date"], _verdict,
+                                analog["reason"]))
+            band_algo = f"异动·全市场相似（{sel_mode}）"
+            band_note = (f"异动触发 {analog['event_date']}（{analog['kind']}）"
+                         f"→ 全市场相似 {analog['n']} 例，覆盖原策略："
+                         f"{'买入' if _verdict == 'BUY' else '卖出'} "
+                         f"{analog.get('advice', '')}")
+        else:
+            band_note += (f" | 异动触发但相似样本分歧"
+                          f"（{analog.get('n', 0)}例），维持原策略")
+
     vols = [r["vol"] for r in disp_rows]
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
     chips = None
@@ -8048,6 +8126,10 @@ def analyze(full, progress=None, quick=False):
     return {
         "quote": q, "full_code": full, "disp_rows": disp_rows,
         "anchor": anchor, "pre_open": pre_open, "stale_snap": stale_snap,
+        "industry": (sec_name or (my_info.get("industry") or "")),
+        "turnover": (q.get("turnover") if q.get("turnover") is not None
+                     else my_info.get("turnover")),
+        "analog": analog,
         "t_pred_label": t_pred_label,
         "phase": phase, "next_label": next_label,
         "tpred_bar": tpred_bar,
@@ -9842,39 +9924,543 @@ def tier_segments(cal):
 
 
 def tier_load_panel():
-    """全A日K面板（hfq × adjust = 乘法前复权≈现价）。结果缓存。"""
+    """全A日K面板（hfq × adjust = 乘法前复权≈现价）。结果缓存。
+
+    v6.3.0：全库约 800 万行改**游标流式 + SQL 前缀过滤**填充——原
+    `fetchall()` 一次性构造数百万 Python 元组（单进程峰值 ~3.6GB），
+    消融多个 worker 各自建表会 OOM。输出与旧实现逐元素一致。"""
     if np is None:
         raise RuntimeError("组合引擎需要 numpy")
     if _TIER_CACHE.get("panel") is not None:
         return _TIER_CACHE["panel"]
     t0 = time.time()
+    like = " OR ".join(["code LIKE ?"] * len(_TIER_PREFIXES))
+    pres = [p + "%" for p in _TIER_PREFIXES]
     with db_conn() as conn:
         adj = {c: (k or 1.0) for c, k in
                conn.execute("select code,k from adjust")}
-        rows = conn.execute(
-            "select code,date,close,vol from daily_bars "
-            "where date>=? order by code,date", ("2020-01-01",)).fetchall()
-    data, dates = {}, set()
-    for c, d, cl, v in rows:
-        if not c.startswith(_TIER_PREFIXES):
-            continue
-        data.setdefault(c, []).append((d, cl, v or 0.0))
-        dates.add(d)
-    codes = sorted(data)
-    cal = sorted(dates)
-    didx = {d: i for i, d in enumerate(cal)}
-    n, nc = len(codes), len(cal)
-    C = np.full((n, nc), np.nan, np.float32)
-    V = np.zeros((n, nc), np.float32)
-    for r, c in enumerate(codes):
-        seq = data[c]
-        k = adj.get(c, 1.0)
-        cols = np.fromiter((didx[x[0]] for x in seq), np.int64, len(seq))
-        C[r, cols] = [(x[1] * k) if x[1] else np.nan for x in seq]
-        V[r, cols] = [x[2] for x in seq]
-    log.info("tier panel %d 只 × %d 日 (%.0fs)", n, nc, time.time() - t0)
+        codes = [c for (c,) in conn.execute(
+            f"select distinct code from daily_bars where date>=? "
+            f"and ({like}) order by code", ("2020-01-01", *pres))]
+        cal = [d for (d,) in conn.execute(
+            f"select distinct date from daily_bars where date>=? "
+            f"and ({like}) order by date", ("2020-01-01", *pres))]
+        didx = {d: i for i, d in enumerate(cal)}
+        n, nc = len(codes), len(cal)
+        C = np.full((n, nc), np.nan, np.float32)
+        V = np.zeros((n, nc), np.float32)
+        code_pos = {c: i for i, c in enumerate(codes)}
+        cur = conn.execute(
+            f"select code,date,close,vol from daily_bars where date>=? "
+            f"and ({like}) order by code,date", ("2020-01-01", *pres))
+        ci, cur_code = -1, None
+        for c, d, cl, v in cur:
+            if c != cur_code:
+                cur_code = c
+                ci = code_pos.get(c, -1)
+                if ci < 0:
+                    continue
+            elif ci < 0:
+                continue
+            k = adj.get(c, 1.0)
+            col = didx[d]
+            C[ci, col] = (cl * k) if cl else np.nan
+            V[ci, col] = v or 0.0
+    log.info("tier panel %d 只 × %d 日 (%.0fs)", len(codes), len(cal),
+             time.time() - t0)
     _TIER_CACHE["panel"] = (codes, cal, C, V)
     return codes, cal, C, V
+
+
+# ================= v6.3.0 异动·全市场相似历史（激进/均衡专属） =================
+# 逻辑：①目标股近端出现「超出自身历史波动范围」的异动事件（因果分位，无前视）；
+# ②把该异动与全市场历史异动事件按 K线形态/事件后路径/量比/换手率/RSI/波动率
+# 匹配；③统计相似事件在「事件后第 k 日」（k=目标股距异动日交易日数）的次日/
+# 3日/5日表现与封板率；④方向明确时覆盖原策略信号，激进档附打板提示。
+# 仅用于单股分析展示/决策提示，不参与消融选型与组合回测（见 ARCHITECTURE 3.15）。
+
+_ANALOG_CACHE = {"events": None}
+_ANALOG_LOCK = threading.Lock()
+
+
+def _analog_roll_stats(r1, C, n_rsi=14, n_vola=20):
+    """单股简单RSI / 近n_vola日收益波动率数组（向量化，NaN传播）。"""
+    T = C.size
+    rsi = np.full(T, np.nan, np.float32)
+    vol = np.full(T, np.nan, np.float32)
+    d = np.diff(C)
+    up = np.where(d > 0, d, 0.0)
+    dn = np.where(d < 0, -d, 0.0)
+    cu = np.concatenate(([0.0], np.cumsum(up)))
+    cd = np.concatenate(([0.0], np.cumsum(dn)))
+    g = cu[n_rsi:] - cu[:-n_rsi]
+    l = cd[n_rsi:] - cd[:-n_rsi]
+    den = g + l
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rsi[n_rsi:] = np.where(den > 0, 100.0 * g / den, np.nan)
+    x = np.nan_to_num(r1, nan=0.0)
+    fin = np.isfinite(r1).astype(float)
+    cx = np.concatenate(([0.0], np.cumsum(x)))
+    cxx = np.concatenate(([0.0], np.cumsum(x * x)))
+    cf = np.concatenate(([0.0], np.cumsum(fin)))
+    cnt = cf[n_vola:] - cf[:-n_vola]
+    sx = cx[n_vola:] - cx[:-n_vola]
+    sxx = cxx[n_vola:] - cxx[:-n_vola]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        m = sx / np.maximum(cnt, 1)
+        var = np.where(cnt >= 2, sxx / np.maximum(cnt, 1) - m * m, np.nan)
+    vol[n_vola - 1:] = np.sqrt(np.maximum(var, 0.0))
+    return rsi, vol
+
+
+def _analog_events():
+    """全市场A股异动事件表（进程内缓存，构建一次约数秒；多线程安全）。"""
+    if _ANALOG_CACHE.get("events") is not None:
+        return _ANALOG_CACHE["events"]
+    if np is None:
+        return None
+    with _ANALOG_LOCK:
+        if _ANALOG_CACHE.get("events") is None:
+            _ANALOG_CACHE["events"] = _analog_events_build()
+        return _ANALOG_CACHE["events"]
+
+
+def _analog_flag_panel(A1, A5):
+    """全市场因果异动标记（列=市场日历，分块跨股向量化，只返回 mask）。
+
+    每 ANALOG_PCT_STEP 列用该列以前的历史算 99.5 分位（块内沿用，因果近似）；
+    |单日| ≥ max(分位,5%) 或 |5日| ≥ max(分位,10%) 记事件。
+    分位用「NaN→inf 后按行排序 + 每行有限个数的 99.5% 索引」实现，
+    比 np.nanpercentile(axis=1)（内部 apply_along_axis 逐行 Python 循环）快 ~6 倍；
+    不落 th1/th5 全局面板以省内存（OOM 回归修复）。"""
+    N, T = A1.shape
+    mask = np.zeros((N, T), bool)
+    step = max(5, int(CFG.ANALOG_PCT_STEP))
+    frac = CFG.ANALOG_PCT / 100.0
+
+    def _pct(sub):
+        fin = np.isfinite(sub)
+        cnt = fin.sum(axis=1)
+        s = np.where(fin, sub, np.inf)
+        s.sort(axis=1)
+        k = np.clip((np.ceil(frac * cnt).astype(np.int64) - 1),
+                    0, np.maximum(cnt - 1, 0))
+        q = np.take_along_axis(s, k[:, None], axis=1)[:, 0]
+        return np.where(np.isfinite(q), q, np.nan), cnt
+
+    with np.errstate(invalid="ignore"):
+        for b in range(CFG.ANALOG_MIN_HIST, T, step):
+            e = min(b + step, T)
+            q1, cnt1 = _pct(A1[:, :b])
+            q5, cnt5 = _pct(A5[:, :b])
+            q1 = np.where(cnt1 >= CFG.ANALOG_MIN_HIST,
+                          np.maximum(q1, 0.05), np.nan)
+            q5 = np.where(cnt5 >= CFG.ANALOG_MIN_HIST,
+                          np.maximum(q5, 0.10), np.nan)
+            s1, s5 = A1[:, b:e], A5[:, b:e]
+            m1 = np.isfinite(s1) & (s1 >= q1[:, None])
+            m5 = np.isfinite(s5) & (s5 >= q5[:, None])
+            mask[:, b:e] = m1 | m5
+    return mask
+
+
+def _analog_events_build():
+    """事件定义（因果分位，见 `_analog_flag_panel`）：|单日收益| ≥
+    max(99.5分位, 5%) 或 |5日累计| ≥ max(99.5分位, 10%)。事件特征：
+    K线形态(W日对数收益 z-normalize)/量比/换手率/RSI14/20日波动/事件r5。"""
+    codes, cal, C, V = tier_load_panel()
+    keep = np.array([(str(c).startswith(("sh60", "sh68", "sz00", "sz30"))
+                      and not _is_etf(c)) for c in codes])
+    codes = [c for c, k2 in zip(codes, keep.tolist()) if k2]
+    C, V = C[keep], V[keep]
+    if C.shape[0] == 0:
+        _ANALOG_CACHE["events"] = {"empty": True}
+        return _ANALOG_CACHE["events"]
+    N, T = C.shape
+    W = CFG.ANALOG_SHAPE_W
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r1 = np.full_like(C, np.nan)
+        r1[:, 1:] = C[:, 1:] / C[:, :-1] - 1.0
+        r5 = np.full_like(C, np.nan)
+        r5[:, 5:] = C[:, 5:] / C[:, :-5] - 1.0
+        A1 = np.abs(r1).astype(np.float32)
+        A5 = np.abs(r5).astype(np.float32)
+    # 因果异动标记（跨股向量化）→ 立即释放大面板（OOM 回归修复）
+    mask = _analog_flag_panel(A1, A5)
+    del A1, A5, r1, r5
+    shares = {}
+    try:
+        with db_conn() as conn:
+            shares = {c: s for c, s in conn.execute(
+                "select code,shares from et_shares") if s and s > 0}
+    except Exception:
+        log.warning("异动相似: 读取总股本失败", exc_info=True)
+    s_list, j_list, shape_list = [], [], []
+    vr_list, to_list, rsi_list, vol_list, r5_list = [], [], [], [], []
+    arange_w = np.arange(W)
+    for s in range(N):
+        days = np.where(mask[s])[0]
+        days = days[days >= W]
+        if days.size == 0:
+            continue
+        # K线形态：事件日前 W 日对数收益（价格窗口现算，不落 L 面板）
+        col0 = days[:, None] - W + arange_w[None, :]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            win = np.log(C[s, col0 + 1] / C[s, col0])
+        ok = np.all(np.isfinite(win), axis=1)
+        if not ok.any():
+            continue
+        win_ok = win[ok]
+        mu = win_ok.mean(axis=1, keepdims=True)
+        sd = win_ok.std(axis=1, keepdims=True)
+        good = sd[:, 0] > 1e-9
+        if not good.any():
+            continue
+        days = days[ok][good]
+        zshape = (win_ok[good] - mu[good]) / sd[good]
+        # 量比（前20日均量，不含当日；逐股 cumsum 现算）
+        v0 = V[s, days]
+        cntd = np.minimum(days, 20)
+        cv = np.concatenate(([0.0], np.cumsum(V[s], dtype=np.float64)))
+        vsum = cv[days] - cv[days - cntd]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vb = vsum / np.maximum(cntd, 1)
+            vr = np.where(vb > 0, v0 / vb, np.nan)
+        sh = shares.get(codes[s])
+        to = (v0 * 10000.0 / sh) if sh else np.full(days.size, np.nan)
+        # 当日 r1/r5/RSI/波动 按需现算（省 r1/r5 全局面板）
+        rs1 = np.full(T, np.nan, np.float64)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rs1[1:] = C[s, 1:] / C[s, :-1] - 1.0
+        rsi_a, vol_a = _analog_roll_stats(rs1, C[s])
+        rs5 = np.full(T, np.nan, np.float64)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rs5[5:] = C[s, 5:] / C[s, :-5] - 1.0
+        s_list.extend([s] * days.size)
+        j_list.append(days)
+        shape_list.append(zshape.astype(np.float32))
+        vr_list.append(vr.astype(np.float32))
+        to_list.append(np.asarray(to, dtype=np.float32))
+        rsi_list.append(rsi_a[days])
+        vol_list.append(vol_a[days])
+        r5_list.append(rs5[days])
+    if not j_list:
+        _ANALOG_CACHE["events"] = {"empty": True}
+        return _ANALOG_CACHE["events"]
+    out = {
+        "cal": cal, "C": C,
+        "s": np.asarray(s_list, np.int32),
+        "j": np.concatenate(j_list).astype(np.int32),
+        "shape": np.vstack(shape_list),
+        "vr": np.concatenate(vr_list),
+        "to": np.concatenate(to_list),
+        "rsi": np.concatenate(rsi_list),
+        "vola": np.concatenate(vol_list),
+        "r5": np.concatenate(r5_list),
+    }
+    out["code"] = np.array([codes[k2] for k2 in out["s"]])
+    _ANALOG_CACHE["events"] = out
+    log.info("异动事件表 %d 例（A股 %d 只）", out["j"].size, len(codes))
+    return out
+
+
+def _analog_series(rows):
+    """rows → (closes, vols, r1, r5)；numpy 缺失/历史过短/数据非法返回 None。"""
+    n = len(rows)
+    if np is None or n < CFG.ANALOG_MIN_HIST + 10:
+        return None
+    try:
+        closes = np.asarray([float(r["close"]) for r in rows], float)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(closes)) or closes[-1] <= 0:
+        return None
+    vols = np.asarray([float(r.get("vol") or 0.0) for r in rows], float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r1 = np.full(n, np.nan)
+        r1[1:] = closes[1:] / closes[:-1] - 1.0
+        r5 = np.full(n, np.nan)
+        r5[5:] = closes[5:] / closes[:-5] - 1.0
+    return closes, vols, r1, r5
+
+
+def _analog_triggers(rows, closes, r1, r5, lo=None):
+    """目标股因果异动事件（阈值只用事件日以前数据，无前视）。
+
+    lo=None → 全历史（从 ANALOG_MIN_HIST 起）；否则从 lo 起扫。
+    返回事件 dict 列表（时间升序），与 `analog_scan` 判定完全同口径。"""
+    n = len(rows)
+    start = max(0, CFG.ANALOG_MIN_HIST if lo is None else lo)
+    out = []
+    for t in range(start, n):
+        if not np.isfinite(r1[t]):
+            continue
+        b1 = np.abs(r1[:t]); b1 = b1[np.isfinite(b1)]
+        if b1.size < CFG.ANALOG_MIN_HIST:
+            continue
+        b5 = np.abs(r5[:t]); b5 = b5[np.isfinite(b5)]
+        q1 = max(float(np.percentile(b1, CFG.ANALOG_PCT)), 0.05)
+        q5 = (max(float(np.percentile(b5, CFG.ANALOG_PCT)), 0.10)
+              if b5.size >= CFG.ANALOG_MIN_HIST else 1.0)
+        hit1 = abs(r1[t]) >= q1
+        hit5 = bool(np.isfinite(r5[t]) and abs(r5[t]) >= q5)
+        if hit1 or hit5:
+            out.append({"i": t, "date": rows[t]["date"],
+                        "r1": float(r1[t]),
+                        "r5": float(r5[t]) if np.isfinite(r5[t]) else 0.0,
+                        "th1": q1, "th5": q5,
+                        "kind": ("单日+5日" if hit1 and hit5
+                                 else "单日" if hit1 else "5日")})
+    return out
+
+
+def _analog_shares(full):
+    """目标股总股本（et_shares）；缺失返回 None。"""
+    if not full:
+        return None
+    try:
+        with db_conn() as conn:
+            row = conn.execute("select shares from et_shares where code=?",
+                               (full,)).fetchone()
+            return float(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _analog_query(closes, vols, e_i, rsi_a, vol_a, sh_q, r5ev):
+    """异动事件日查询特征（形态/量比/换手/RSI/波动/r5）。"""
+    W = CFG.ANALOG_SHAPE_W
+    lc = np.log(closes[e_i - W:e_i])
+    sd_q = float(lc.std())
+    qshape = ((lc - lc.mean()) / sd_q) if sd_q > 1e-9 else np.zeros(W)
+    vbase = vols[max(0, e_i - 20):e_i]
+    qvr = (vols[e_i] / float(vbase.mean())
+           if vbase.size and vbase.mean() > 0 else 1.0)
+    qto = (vols[e_i] * 10000.0 / sh_q) if sh_q else None
+    q_rsi = float(np.nan_to_num(rsi_a[e_i], nan=50.0))
+    q_vola = float(np.nan_to_num(vol_a[e_i], nan=0.0))
+    return qshape, qvr, qto, q_rsi, q_vola, float(r5ev)
+
+
+def _analog_match(ev, full, ti, k, qf, path_q, topk=None):
+    """在事件表中匹配并聚合（纯计算，无 I/O）。
+
+    qf=(qshape,qvr,qto,q_rsi,q_vola,q_r5)，path_q=事件后 k 日实际路径。
+    候选限制：事件后第 k 日 +5 日前瞻在面板索引 ti 前已实现（因果）。
+    返回统计 dict（n/up1/mean1/mean3/mean5/limit_p/verdict/reason/samples）
+    或 None（无有效候选）。"""
+    topk = topk or CFG.ANALOG_TOPK
+    qshape, qvr, qto, q_rsi, q_vola, q_r5 = qf
+    cal, C = ev["cal"], ev["C"]
+    ej, es = ev["j"], ev["s"]
+    valid = (ej + k + 5 <= ti) & (ev["code"] != full)
+    vidx = np.where(valid)[0]
+    if vidx.size < 5:
+        return None
+    d = np.sqrt(((ev["shape"][vidx] - qshape[None, :]) ** 2).sum(axis=1))
+    if k > 0:
+        ar = np.arange(1, k + 1)
+        cpath = (C[es[vidx][:, None], ej[vidx][:, None] + ar[None, :]]
+                 / C[es[vidx], ej[vidx]][:, None] - 1.0)
+        okp = np.all(np.isfinite(cpath), axis=1)
+        dp = np.full(vidx.size, 0.05)
+        if okp.any():
+            dp[okp] = np.mean(np.abs(cpath[okp] - path_q[None, :]), axis=1)
+        d = d + 3.0 * dp
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dvr = np.abs(np.log((ev["vr"][vidx] + 1e-6) / (qvr + 1e-6)))
+        d = d + 0.8 * np.nan_to_num(dvr, nan=0.3)
+        if qto is not None:
+            dto = np.abs(np.log((ev["to"][vidx] + 1e-9) / (qto + 1e-9)))
+            d = d + 0.8 * np.nan_to_num(dto, nan=0.3)
+        drsi = np.abs(np.nan_to_num(ev["rsi"][vidx], nan=50.0) - q_rsi) / 100.0
+        d = d + 1.5 * drsi
+        dvola = np.abs(np.nan_to_num(ev["vola"][vidx], nan=0.0) - q_vola)
+        d = d + 4.0 * dvola
+        dr5 = np.abs(np.nan_to_num(ev["r5"][vidx], nan=0.0) - q_r5)
+        d = d + 1.5 * dr5
+    order = np.argsort(d)[:topk]
+    sel = vidx[order]
+    b_idx = ej[sel] + k
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bpx = C[es[sel], b_idx]
+        f1 = C[es[sel], b_idx + 1] / bpx - 1.0
+        f3 = C[es[sel], b_idx + 3] / bpx - 1.0
+        f5 = C[es[sel], b_idx + 5] / bpx - 1.0
+    okf = np.isfinite(f1) & np.isfinite(f3) & np.isfinite(f5) & (bpx > 0)
+    f1f, f3f, f5f = f1[okf], f3[okf], f5[okf]
+    n_s = int(f1f.size)
+    if n_s == 0:
+        return None
+    up1 = float((f1f > 0).mean())
+    m1, m3, m5 = float(f1f.mean()), float(f3f.mean()), float(f5f.mean())
+    lims = np.array([_v4_limit_pct(c) for c in ev["code"][sel][okf]])
+    lim_p = float((f1f >= lims - 0.005).mean())
+    if up1 >= 0.55 and m1 > 0 and m3 > 0:
+        verdict = "BUY"
+    elif up1 <= 0.45 and m1 < 0 and m3 < 0:
+        verdict = "SELL"
+    else:
+        verdict = "观察"
+    reason = (f"异动相似 次日上行{up1*100:.0f}%(n={n_s}) "
+              f"3日{m3*100:+.1f}%")
+    samples = []
+    for oi in np.where(okf)[0][:5]:
+        samples.append({"code": str(ev["code"][sel[oi]]),
+                        "date": cal[int(ej[sel[oi]])],
+                        "elapsed_date": cal[int(b_idx[oi])],
+                        "f1": float(f1[oi]), "f3": float(f3[oi])})
+    return {"n": n_s, "up1": up1, "mean1": m1, "mean3": m3, "mean5": m5,
+            "limit_p": lim_p, "verdict": verdict, "reason": reason,
+            "samples": samples}
+
+
+def analog_scan(full, rows, mode="稳健", progress=None):
+    """目标股异动检测 + 全市场相似历史扫描（因果，只用当日及以前数据）。
+
+    返回 None（numpy缺失/历史过短）或 dict；trigger=False 表示近端无
+    「超出自身历史波动范围」事件。"""
+    n = len(rows)
+    ser = _analog_series(rows)
+    if ser is None:
+        return None
+    closes, vols_q, r1, r5 = ser
+    # ① 目标股：近 ANALOG_LOOKBACK 内最近一次因果异动（分位只用事件日以前）
+    lo = max(CFG.ANALOG_MIN_HIST, n - CFG.ANALOG_LOOKBACK)
+    trigs = _analog_triggers(rows, closes, r1, r5, lo=lo)
+    trig = trigs[-1] if trigs else None
+    if trig is None:
+        return {"trigger": False}
+    k = n - 1 - trig["i"]
+    base = {"trigger": True, "event_date": trig["date"], "kind": trig["kind"],
+            "r1": trig["r1"], "r5": trig["r5"], "th1": trig["th1"],
+            "th5": trig["th5"], "elapsed": k, "n": 0,
+            "verdict": "观察", "advice": "", "samples": []}
+    if progress:
+        progress("异动触发：匹配全市场相似历史…")
+    ev = _analog_events()
+    if not ev or ev.get("empty"):
+        base["advice"] = "全市场异动事件表不可用（数据不足）"
+        return base
+    W = CFG.ANALOG_SHAPE_W
+    t_i = trig["i"]
+    if t_i < W:
+        base["advice"] = "事件日历史过短，无法做形态匹配"
+        return base
+    # ② 目标事件特征
+    lc = np.log(closes[t_i - W:t_i])
+    sd_q = float(lc.std())
+    qshape = ((lc - lc.mean()) / sd_q) if sd_q > 1e-9 else np.zeros(W)
+    vbase = vols_q[max(0, t_i - 20):t_i]
+    qvr = (vols_q[t_i] / float(vbase.mean())
+           if vbase.size and vbase.mean() > 0 else 1.0)
+    sh_q = None
+    try:
+        with db_conn() as conn:
+            row = conn.execute("select shares from et_shares where code=?",
+                               (full,)).fetchone()
+            sh_q = float(row[0]) if row and row[0] else None
+    except Exception:
+        sh_q = None
+    qto = (vols_q[t_i] * 10000.0 / sh_q) if sh_q else None
+    rsi_q, vol_q = _analog_roll_stats(r1, closes)
+    q_rsi = float(np.nan_to_num(rsi_q[t_i], nan=50.0))
+    q_vola = float(np.nan_to_num(vol_q[t_i], nan=0.0))
+    path_q = (closes[t_i + 1:t_i + 1 + k] / closes[t_i] - 1.0
+              if k > 0 else np.zeros(0))
+    # ③ 候选匹配（因果：ti 限制事件后第 k 日+5 日前瞻已在目标最新bar前实现）
+    cal = ev["cal"]
+    ti = int(np.searchsorted(cal, str(rows[-1].get("date") or ""),
+                             side="right")) - 1
+    if ti < 0:
+        ti = len(cal) - 1
+    qf = (qshape, qvr, qto, q_rsi, q_vola, trig["r5"])
+    st = _analog_match(ev, full, ti, k, qf, path_q)
+    if not st:
+        base["advice"] = "全市场相似样本不足"
+        return base
+    base["n"] = st["n"]
+    if st["n"] < CFG.ANALOG_MIN_SAMPLES:
+        base["advice"] = (f"相似样本仅{st['n']}例"
+                          f"（<{CFG.ANALOG_MIN_SAMPLES}），不给结论")
+        return base
+    lp = None
+    if (st["verdict"] == "BUY" and mode == "激进"
+            and st["limit_p"] >= CFG.ANALOG_LIMIT_P):
+        lpc = _limit_pct(full, "", str(rows[-1].get("date") or ""))
+        if lpc:
+            lp = round(float(closes[-1]) * (1 + lpc / 100.0) + 1e-9, 2)
+    if st["verdict"] == "BUY":
+        advice = ("相似样本偏多"
+                  + (f"；激进可打板（涨停价约{lp:.2f}，样本次日封板率"
+                     f"{st['limit_p']*100:.0f}%）" if lp else ""))
+    elif st["verdict"] == "SELL":
+        advice = "相似样本偏空，回避/减仓"
+    else:
+        advice = "相似样本分歧，维持观察"
+    reason = st["reason"]
+    if lp:
+        reason += f" 打板{lp:.2f}"
+    base.update({"up1": st["up1"], "mean1": st["mean1"],
+                 "mean3": st["mean3"], "mean5": st["mean5"],
+                 "limit_p": st["limit_p"], "verdict": st["verdict"],
+                 "advice": advice, "reason": reason,
+                 "limit_price": lp, "samples": st["samples"]})
+    return base
+
+
+def _sig_analog(rows, full=None, mode="稳健", **_kw):
+    """异动·全市场相似历史信号（因果；供图表/单股回测/消融池）。
+
+    对每个异动事件日 e，在状态窗口 [e, e+ANALOG_LOOKBACK) 内按
+    ANALOG_SIG_STEP 步长全局逐日推进（重叠窗口不重复、时间有序），用
+    `_analog_match` 同口径给出方向，仅方向变化时产出信号
+    （与 _dedup_signals 同语义）。"""
+    ser = _analog_series(rows)
+    if ser is None:
+        return []
+    closes, vols, r1, r5 = ser
+    trigs = _analog_triggers(rows, closes, r1, r5, lo=None)
+    if not trigs:
+        return []
+    ev = _analog_events()
+    if not ev or ev.get("empty"):
+        return []
+    n = len(rows)
+    W = CFG.ANALOG_SHAPE_W
+    full = full or ""
+    rsi_a, vol_a = _analog_roll_stats(r1, closes)
+    sh_q = _analog_shares(full)
+    edays = [tr["i"] for tr in trigs if tr["i"] >= W]
+    if not edays:
+        return []
+    qmap = {e_i: _analog_query(closes, vols, e_i, rsi_a, vol_a, sh_q,
+                               r5[e_i]) for e_i in edays}
+    # 全局按状态日推进：cur=当前最近事件，超过 LOOKBACK 则状态结束
+    ptr, cur = 0, None
+    out, last_dir = [], 0
+    step = max(1, int(CFG.ANALOG_SIG_STEP))
+    for t in range(edays[0], n, step):
+        while ptr < len(edays) and edays[ptr] <= t:
+            cur = edays[ptr]
+            ptr += 1
+        if cur is None or t - cur >= CFG.ANALOG_LOOKBACK:
+            continue
+        k = t - cur
+        ti = int(np.searchsorted(
+            ev["cal"], str(rows[t].get("date") or ""), side="right")) - 1
+        if ti < 0:
+            continue
+        path_q = (closes[cur + 1:t + 1] / closes[cur] - 1.0
+                  if k > 0 else np.zeros(0))
+        st = _analog_match(ev, full, ti, k, qmap[cur], path_q)
+        if not st or st["n"] < CFG.ANALOG_MIN_SAMPLES:
+            continue
+        v = st["verdict"]
+        if v in ("BUY", "SELL") and v != last_dir:
+            out.append((t, rows[t]["date"], v, st["reason"]))
+            last_dir = v
+    return out
 
 
 def tier_idx_series(cal, code):

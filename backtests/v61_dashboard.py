@@ -772,6 +772,7 @@ function renderAblTable(){
   const modes=Object.keys(abl.modes||{}).sort((a,b)=>
     (order.indexOf(a)+1||99)-(order.indexOf(b)+1||99));
   let h='<table><tr><th>档位</th><th>对象数</th><th>主算法(Top1)</th>'+
+    '<th>异动相似入选</th>'+
     '<th>训练年化中位</th><th>验证年化中位</th><th>验证回撤中位</th>'+
     '<th>验证胜率中位</th><th>IC1中位</th><th>IC5中位</th>'+
     '<th>IC5为正占比</th><th>牛市年化中位</th><th>熊市年化中位</th></tr>';
@@ -779,10 +780,12 @@ function renderAblTable(){
     const d=abl.modes[md]||{};
     const ad=d.algo_distribution||{};
     const top=Object.entries(ad).sort((a,b)=>b[1].count-a[1].count)[0];
+    const an=ad["analog"]||{};
     const tr=d.train||{},va=d.val||{},ic=d.ic||{},rg=d.regime||{};
     const f3=x=>x==null?'-':(+x).toFixed(3);
     h+=`<tr><td>${esc(md)}</td><td>${num(d.count,0)}</td>`+
        `<td>${top?esc(top[0])+' '+num(top[1].pct,0)+'%':'-'}</td>`+
+       `<td>${an.count?num(an.count,0)+' 只 ('+num(an.pct,2)+'%)':'-'}</td>`+
        `<td>${pct(tr.ann_median,1,true)}</td><td>${pct(va.ann_median,1,true)}</td>`+
        `<td>${pct(va.mdd_median,1)}</td><td>${pct(va.winrate_median,1)}</td>`+
        `<td>${f3(ic.ic1_median)}</td><td>${f3(ic.ic5_median)}</td>`+

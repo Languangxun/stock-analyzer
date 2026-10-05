@@ -4,9 +4,9 @@
 
 对每个对象（个股 + ETF）逐个独立消融：
   1. 取近 1000 交易日（≥200 根才纳入，覆盖率清单写入 summary.coverage）；
-  2. 生成 10 类基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态/
-     **L2同行业+行业ETF**/筹码峰/板块轮动/量比/LGBM）+ 多维评分 × 3 档风险（保守/稳健/激进）；
-     消融全程本地计算，AI 不参与；
+  2. 生成 12 类基础算法信号（MACD/KDJ/RSI/布林带/MA趋势/L1形态/
+     **L2同行业+行业ETF**/筹码峰/板块轮动/量比/LGBM/**异动·全市场相似**）
+     + 多维评分 × 3 档风险（保守/稳健/激进）；消融全程本地计算，AI 不参与；
   3. 训练集（前 75%）选型，验证集（后 25%）只报告；
   4. 多指标结合选优：训练集 Calmar/盈亏比/胜率/年化 横截面 rank 加权，
      稳健偏 Calmar+PF，均衡/激进偏年化+Calmar；
@@ -40,7 +40,7 @@ from stock_gui import (
     db_conn, _is_etf,
     _sig_macd, _sig_kdj, _sig_rsi, _sig_boll, _sig_ma_trend, _sig_l1_pattern,
     _sig_chip_peak, _sig_sector_rot, _sig_l2_industry,
-    _sig_vol_ratio, _sig_lgbm, _signal_ic,
+    _sig_vol_ratio, _sig_lgbm, _sig_analog, _signal_ic,
     _composite_signals, _composite_precompute,
     _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
     _ablation_pf, _ablation_recent, pick_ablation_consistent,
@@ -161,6 +161,7 @@ def run_ablation_for_stock(args):
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
         "vol_ratio": lambda: _sig_vol_ratio(rows),
         "lgbm": lambda: _sig_lgbm(rows),
+        "analog": lambda: _sig_analog(rows, code),
     }
 
     cands = []
