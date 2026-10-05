@@ -5,11 +5,11 @@
 引擎权威实现内嵌在 stock_gui.py（`tier_*` 函数），本脚本只做命令行/产物封装，
 保证 GUI、CLI（stock_predict.py）与研究脚本共用同一套实现，不会出现口径分叉。
 
-策略（详见 README 与 stock_gui.py tier_* 注释）：
-  稳健  全A 偏动量（动量0.6/低波0.4，v6.1.11 起）合成Top20 / 20日调仓 / 上证MA20
-  均衡  同选股 Top20 / 10日调仓 / 上证MA20
-  激进  创业板 60日β Top5 / 10日调仓 / 创业板指MA60
-  主板口径（--universe main）：股票池仅沪深主板；激进档 β/闸门改用上证MA20
+策略（详见 README 与 stock_gui.py tier_* 注释，v6.3.1 三档）：
+  稳健  blend 合成 Top10 + IC确认层 + 换仓缓冲带10 / 10日调仓 / 上证MA20
+  均衡  全A 创业板60日β Top5（主板/ETF/全A含ETF 改偏动量 Top20）/ 10日调仓
+  激进  板块轮动 rotate Top5 / 10日调仓 / 板块轮动闸门 + 允许打板
+  基准：稳健=上证，均衡/激进=科创50
 
 用法：
   python backtest_tiers.py --tier all --segment full

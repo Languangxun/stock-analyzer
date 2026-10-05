@@ -108,7 +108,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.3.0"
+APP_VERSION = "6.3.1"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -269,15 +269,16 @@ class CFG:
 
     # ---- 风险偏好（v6.2.3 起三档；原「高风险」名与参数已删除）----
     # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
-    # 稳健=评分2+冷却5，ATR1.5/回落6%
+    # 稳健=信号严(评分3+冷却8，v6.3.1 由 2/5 收紧、交易数约-28%)
+    #      +止损同保守、止盈更宽(ATR1.5/回落6%)
     # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
-    # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
+    # 数据源：n=300/6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
         "保守": {"atr_mult": 1.5, "trail_trigger": 1.01,
                  "trail_ratio": 0.96, "buy_th": 3, "cooldown": 8},
         "稳健": {"atr_mult": 1.5, "trail_trigger": 1.02,
-                 "trail_ratio": 0.94, "buy_th": 2, "cooldown": 5},
+                 "trail_ratio": 0.94, "buy_th": 3, "cooldown": 8},
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
     }
@@ -9772,8 +9773,9 @@ def _v4_print_report(r):
 #   ④ 解除「涨停不买」allow_limit_up=True（信号日封板也按涨停价买入）。
 #
 # 原理（详见 README 第二节；v6.2.3 起三档，去「高风险」名）：
-#   稳健 = 「20日动量 + 20日低波」横截面等权 Top20，每10日调仓，
-#          上证 MA20 闸门（T-1 收盘在均线上才持仓）——原「均衡」档
+#   稳健 = 「20日动量 + 20日低波」横截面等权 Top10 + IC 确认层 +
+#          换仓缓冲带10，每10日调仓，上证 MA20 闸门（T-1 收盘在均线上才
+#          持仓）——原「均衡」档，v6.3.1 收紧指标要求/降换手
 #   均衡 = 全A：创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
 #          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）；
 #          主板/ETF/全A含ETF：blend_mom（动量0.7/低波0.3）Top20/10，
@@ -9797,9 +9799,12 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
 # v6.2.3 档位重定名（四档 → 三档）：原「稳健」（blend_mom 0.6/Top20/20日）
 # 策略淘汰；原「均衡」→ 稳健、原「激进」→ 均衡、原「高风险」→ 激进。
 # 自此不存在「高风险」这个名字。
+# v6.3.1 稳健档收紧：IC 确认层 + Top10 + 换仓缓冲带10（原 Top20、无确认），
+# 交易数约 -57%、样本外（val/bull）显著增强；候选须过 tier_ic_confirm
+# 「历史信号 IC 显著为正 + MA20/60 趋势在场」，确认不足宁缺毋滥。
 TIER_CFG = {
-    "稳健": dict(universe="all", score="blend", top=20, reb=10,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all", score="blend", top=10, reb=10,
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
     "均衡": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
     "激进": dict(_ROT, universe="all"),
@@ -9809,8 +9814,8 @@ TIER_CFG = {
 # β 选股在主板池全面失效（年化 -6.7%、回撤 -47.2%、参数邻域全负、安慰剂不差），
 # 改 blend_mom 后全期 +6.6%、样本外 +13.0%、交易 9564 笔、回撤 -12.3%。
 TIER_CFG_MAIN = {
-    "稳健": dict(universe="main", score="blend", top=20, reb=10,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="main", score="blend", top=10, reb=10,
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
     "均衡": dict(universe="main", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="main"),
@@ -9820,15 +9825,15 @@ TIER_CFG_MAIN = {
 # 见 tier_sector_features），闸门一律板块轮动口径。
 TIER_CFG_ETF = {
     "稳健": dict(universe="etf", score="blend", top=10, reb=10,
-                 gate="sh000001", ma=20),
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
     "均衡": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="etf"),
 }
 # 全A含ETF 口径：个股 + ETF 同一池排序（池内混入 ETF 后创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
-    "稳健": dict(universe="all_etf", score="blend", top=20, reb=10,
-                 gate="sh000001", ma=20),
+    "稳健": dict(universe="all_etf", score="blend", top=10, reb=10,
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
     "均衡": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="all_etf"),
@@ -10795,6 +10800,9 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
     确认数不足时宁可少持仓/持现金，不降低门槛凑数。"""
     NST = C.shape[0]
     top, reb = cfg["top"], cfg["reb"]
+    # 换仓缓冲带（hold_buffer）：在位股排名在 top+buffer 内即保留，
+    # 只有跌出缓冲带才被替换——v6.3.1 稳健档启用（提高换入门槛、压低换手）。
+    buf = int(cfg.get("hold_buffer", 0) or 0)
     uni = tier_universe_mask(codes, cfg.get("universe", "all"))
     elig = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
             & (feat["barcount"] >= _TIER_MIN_BARS)
@@ -10855,7 +10863,18 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
                 keep = ic_ok[cand, d]
                 cand, s = cand[keep], s[keep]
             order = cand[np.argsort(-s, kind="stable")]
-            target = set(order[:top].tolist()) if on else set()
+            if on and buf > 0:
+                rank_of = {int(k): r for r, k in enumerate(order)}
+                INF = 1 << 30
+                keep = [int(k) for k in np.nonzero(holding)[0]
+                        if rank_of.get(int(k), INF) < top + buf]
+                keep_set = set(keep)
+                room = max(0, top - len(keep))
+                add = [int(k) for k in order
+                       if int(k) not in keep_set][:room]
+                target = keep_set | set(add)
+            else:
+                target = set(order[:top].tolist()) if on else set()
         for k in np.nonzero(holding)[0]:
             if int(k) in target or not fin[k] or limit_dn[k, t]:
                 continue
@@ -10885,6 +10904,7 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
                 entry[k] = (amount + fee) / shares[k]
                 t_in[k] = t
                 holding[k] = True
+                target.add(int(k))      # 新买入纳入目标，防止次日被旧目标误卖
         eq.append(cash + float(np.nansum(np.where(holding,
                                                   shares * last, 0.0))))
         eq_cal.append(cal[t])
@@ -10925,7 +10945,9 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
     universe: all=全A / main=沪深主板。返回 {tier: metrics}。
     v6.2.0：ic_filter=True 启用荐股确认层（tier_ic_confirm：历史信号 IC 显著
     为正 + 指标在场，候选不足时宁缺毋滥）；capital 覆盖本金（10 万组合荐股
-    回测用，整手约束随本金变化），None=默认 100 万口径不变。"""
+    回测用，整手约束随本金变化），None=默认 100 万口径不变。
+    v6.3.1：确认层可由档位 cfg 的 ic_filter 开启（稳健档默认开启），
+    全局 ic_filter=True 仍对全部档生效。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
         progress("组合引擎：构建特征 ...")
@@ -10943,15 +10965,23 @@ def tier_eval(segment="full", tiers=None, phases=None, progress=None,
         raise ValueError("未知区间: " + segment)
     i0 = int(np.searchsorted(cal, a))
     i1 = int(np.searchsorted(cal, b, side="right"))
-    ic_ok = tier_ic_confirm(C)["ok"] if ic_filter else None
     cap = float(capital) if capital else 1e6
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
     tiers = list(base) if not tiers else [t for t in tiers if t in base]
-    out = {}
+    # v6.3.1：IC 确认层支持档位级配置（cfg.ic_filter），
+    # 全局 ic_filter=True（荐股10万回测）仍对全部档生效。
+    cfgs = {}
     for tier in tiers:
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
+        cfgs[tier] = cfg
+    need_ic = bool(ic_filter) or any(c.get("ic_filter") for c in cfgs.values())
+    ic_ok_all = tier_ic_confirm(C)["ok"] if need_ic else None
+    out = {}
+    for tier in tiers:
+        cfg = cfgs[tier]
+        ic_ok = ic_ok_all if (ic_filter or cfg.get("ic_filter")) else None
         _base = tier_rank_base(codes, universe)
         score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
                                 base=_base, sec_w=cfg.get("sec_w"))
@@ -11040,7 +11070,8 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
     """荐股收益回测：把各档策略的每一次「推荐→平仓」当一笔交易统计。
 
     与 tier_eval 同引擎（相位平均），区别是输出逐笔荐股口径：
-    推荐次数/平均收益/胜率/盈亏比/持有期/右尾占比/退出原因分布。"""
+    推荐次数/平均收益/胜率/盈亏比/持有期/右尾占比/退出原因分布。
+    v6.3.1：档位 cfg.ic_filter=True（稳健档）时同样过 IC 确认层。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
@@ -11057,11 +11088,19 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
     i1 = int(np.searchsorted(cal, b, side="right"))
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
     tiers = list(base) if not tiers else [t for t in tiers if t in base]
-    out = {}
+    # v6.3.1：与 tier_eval 同口径——档位 cfg.ic_filter 开启时逐笔荐股也过确认层
+    cfgs = {}
     for tier in tiers:
         cfg = tier_cfg(tier, universe)
         if overrides:
             cfg.update(overrides)
+        cfgs[tier] = cfg
+    need_ic = any(c.get("ic_filter") for c in cfgs.values())
+    ic_ok_all = tier_ic_confirm(C)["ok"] if need_ic else None
+    out = {}
+    for tier in tiers:
+        cfg = cfgs[tier]
+        ic_ok = ic_ok_all if cfg.get("ic_filter") else None
         _base = tier_rank_base(codes, universe)
         score = tier_make_score(feat, cfg["score"], cfg.get("mom_w"),
                                 base=_base, sec_w=cfg.get("sec_w"))
@@ -11070,7 +11109,8 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
         trades = []
         for p in range(n_ph):
             _, _, tr = tier_sim_phase(codes, cal, C, feat, score, gate,
-                                      i0, i1, cfg, phase=p, capital=1e6)
+                                      i0, i1, cfg, phase=p, capital=1e6,
+                                      ic_ok=ic_ok)
             trades.extend(tr)
             if progress and p == 0:
                 progress(f"[{tier}] 荐股回测 {cal[i0 + p]} ~ {cal[i1 - 1]} ...")
@@ -11155,12 +11195,13 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     （该股 T-1 信号 IC，仅供展示）。资金按 top 均分（10 万 = 10 只 × 约1万，
     组合口径而非每只 10 万）。
     v6.2.4：生产端默认剔除亏损股——动态 PE≤0 的候选不入选（PE 缺失不过滤；
-    设置 ini [picks] exclude_loss=0 可关）；picks 增加 pe/turnover 字段。"""
+    设置 ini [picks] exclude_loss=0 可关）；picks 增加 pe/turnover 字段。
+    v6.3.1：档位 cfg.ic_filter=True（稳健档）时即使调用方未开 ic_filter
+    也强制过确认层（档位定义内的严格指标要求）。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
     feat = _TIER_CACHE["feat"]
-    icp = tier_ic_confirm(C) if ic_filter else None
     NST, NDT = C.shape
     # 最后一个「足够多股票有数据」的交易日作为信号日
     elig_n = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
@@ -11180,11 +11221,13 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     risky = np.array([("ST" in names.get(c, "").upper()
                        or "退" in names.get(c, "")) for c in codes])
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
+    tiers_sel = [t for t in (tiers or list(base)) if t in base]
+    need_ic = bool(ic_filter) or any(
+        tier_cfg(t, universe).get("ic_filter") for t in tiers_sel)
+    icp = tier_ic_confirm(C) if need_ic else None
     out = {"signal_date": signal_date, "capital": capital,
            "universe": universe, "tiers": {}}
-    for tier in (tiers or list(base)):
-        if tier not in base:
-            continue
+    for tier in tiers_sel:
         cfg = dict(tier_cfg(tier, universe))
         if top_n:
             cfg["top"] = int(top_n)
@@ -11201,7 +11244,7 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
               & (feat["barcount"][:, d] >= _TIER_MIN_BARS)
               & (feat["amt20"][:, d] >= _TIER_MIN_AMOUNT) & m
               & np.isfinite(score[:, d]) & ~risky)
-        if icp is not None:
+        if icp is not None and (ic_filter or cfg.get("ic_filter")):
             ok = ok & icp["ok"][:, d]
         if picks_exclude_loss():
             # v6.2.4：动态 PE≤0（亏损）剔除；PE 缺失（NaN）视为未知不过滤
@@ -11637,7 +11680,8 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "你是量化组合风控官。下面是当前市场环境与各档策略定义：\n"
         f"{ai_market_brief()}\n\n"
         "策略档位：\n"
-        "· 稳健：全A动量+低波Top20，10日调仓，上证MA20闸门\n"
+        "· 稳健：全A动量+低波Top10（IC确认层+换仓缓冲带），10日调仓，"
+        "上证MA20闸门\n"
         "· 均衡：全A创业板高βTop5（其余口径偏动量Top20），10日调仓，"
         "创业板指MA60/上证MA20闸门\n"
         "· 激进：板块轮动为主参考——选强势行业里的强势股，闸门以行业广度为主"
@@ -16525,7 +16569,7 @@ class App:
         ttk.Label(frm, text="— 预测参数（改动后需重新分析生效）—").grid(
             row=7, column=0, columnspan=3, sticky="w")
 
-        # 风险偏好（四级：止损宽度/移动止盈/买入阈值/冷却）
+        # 风险偏好（三档：止损宽度/移动止盈/买入阈值/冷却）
         ttk.Label(frm, text="风险偏好").grid(row=8, column=0, sticky="w",
                                              pady=2)
         risk_var = tk.StringVar(value=CFG.RISK_MODE)
@@ -16533,8 +16577,8 @@ class App:
                                 state="readonly",
                                 values=list(CFG.RISK_PARAMS.keys()))
         cmb_risk.grid(row=8, column=1, sticky="w", pady=2)
-        ttk.Label(frm, text="保守=紧止损少交易 稳健=均衡 "
-                            "激进=宽止损多交易").grid(
+        ttk.Label(frm, text="保守=严进紧出 稳健=严进缓出 "
+                            "激进=宽进宽出").grid(
             row=8, column=2, sticky="w")
 
         def _int_var(attr, lo, hi):
