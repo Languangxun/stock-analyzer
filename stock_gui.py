@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.3.2"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-06 升 6.3.3）
+APP_VERSION = "6.3.3"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -5953,6 +5953,84 @@ def load_research_ablation(full):
         return None
 
 
+# v6.3.3：研究消融「全量候选」（research/strategy_ablation_per_stock.json，
+# 约 600MB，每只股含 all_candidates 全部算法×风险档）。整文件 json.load 会占
+# 数 GB 内存且卡顿，这里按行扫描建立 code→顶层对象起始偏移索引（进程内缓存，
+# 文件 mtime 变化自动重建），再按需 seek + raw_decode 单只对象，秒开。
+_FULL_ABL_IDX = {"path": "", "mtime": 0.0, "index": {}}
+_FULL_ABL_LOCK = threading.Lock()
+
+
+def _full_abl_index(path):
+    """返回 (index, mtime)；index = {code: 字节偏移}。文件缺失返回 ({}, 0)。"""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}, 0.0
+    with _FULL_ABL_LOCK:
+        if (_FULL_ABL_IDX.get("path") == path
+                and _FULL_ABL_IDX.get("mtime") == mt):
+            return _FULL_ABL_IDX["index"], mt
+        index = {}
+        expect_code = False
+        obj_pos = -1
+        pos = 0
+        try:
+            with open(path, "rb") as f:
+                for line in f:
+                    s = line.rstrip(b"\r\n")
+                    if s == b" {":
+                        expect_code = True
+                        obj_pos = pos
+                    elif expect_code and s.startswith(b'  "code":'):
+                        try:
+                            code = (s.split(b":", 1)[1].strip()
+                                    .rstrip(b",").strip(b'"').decode())
+                        except Exception:
+                            code = ""
+                        if code:
+                            index[code] = obj_pos
+                        expect_code = False
+                    elif s:
+                        expect_code = False
+                    pos += len(line)
+        except OSError:
+            return {}, 0.0
+        _FULL_ABL_IDX.update(path=path, mtime=mt, index=index)
+        return index, mt
+
+
+def load_full_ablation(full):
+    """读研究批量消融中该股的全部候选（与 run_ablation candidates 同构）。
+
+    文件缺失/该股不在覆盖内/解析失败返回 None（调用方回退本地消融）。
+    返回 {"candidates", "bars", "train_n", "val_n", "mtime", "source"}；
+    mtime 供界面标注数据日期，不做 TTL（研究批量结果是明确留档产物）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "research", "strategy_ablation_per_stock.json")
+    index, mt = _full_abl_index(path)
+    if not index or full not in index:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(index[full])
+            buf = f.read(8 << 20)
+        text = buf.decode("utf-8", "ignore")
+        # raw_decode 不跳前导空白：定位到对象起始的 "{"
+        start = len(text) - len(text.lstrip())
+        obj, _ = json.JSONDecoder().raw_decode(text, start)
+        cands = [c for c in (obj.get("all_candidates") or [])
+                 if c.get("mode") in CFG.RISK_PARAMS and c.get("train")]
+        if not cands:
+            return None
+        return {"candidates": cands, "bars": obj.get("bars"),
+                "train_n": obj.get("train_n"), "val_n": obj.get("val_n"),
+                "mtime": mt, "source": os.path.basename(path)}
+    except Exception:
+        log.exception("读取研究全量消融失败(忽略)")
+        return None
+
+
 # ---- 各算法信号发生器（只用 T 日及以前数据，杜绝前视）----
 
 def _sig_macd(rows):
@@ -6797,14 +6875,18 @@ def _ablation_pf(trades):
 # ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
 
 def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
-               arrays=None):
+               arrays=None, detail_out=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
     早盘信号：信号在 T 日收盘生成，T+1 日收盘执行；止损单用 T-1 日 ATR 设定
     （见 CFG.RISK_PARAMS，各档 ATR/移动止盈参数）。
     atrs 可外部预计算加速。
     arrays（v6.1.3，numpy 加速）：(o,h,l,c) 平行列表，已由调用方从 rows 抽出，
       供批量回测复用，避免每次回测重复做 4×N 次字典取值。
-    trade_out（可选 list）：追加逐笔收益率。"""
+    trade_out（可选 list）：追加逐笔收益率。
+    detail_out（可选 list，v6.3.3）：追加逐笔交易明细 dict——
+      {entry_i, entry_date, entry_px, exit_i, exit_date, exit_px, ret, reason}；
+      末笔未平仓也记一条（exit_i/exit_date 为 None，exit_px=期末收盘，
+      reason="持仓中"）。仅在有效回测（平仓≥2）时填充。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
@@ -6828,7 +6910,9 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
     trail_trig = rp["trail_trigger"]
     entry = None
     highest = None
+    entry_i = None
     trades = []
+    details = []
     curve = []
     sig_get = sig_map.get
     for i in range(i0, i1):
@@ -6843,24 +6927,40 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             atr_prev = atrs[i - 1] if i > 0 else 0.0
             atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
                 else entry * 0.95
-            trail_stop = (prev_high * trail_ratio
-                          if prev_high > entry * trail_trig
-                          else atr_stop)
+            trailing = prev_high > entry * trail_trig
+            trail_stop = prev_high * trail_ratio if trailing else atr_stop
             if l <= trail_stop:
                 o_i = o_a[i]
                 exit_px = o_i if (o_i and o_i <= trail_stop) else trail_stop
                 trades.append(exit_px / entry - 1)
                 eq *= exit_px / entry
+                if detail_out is not None:
+                    details.append({
+                        "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                        "entry_px": entry,
+                        "exit_i": i, "exit_date": rows[i]["date"],
+                        "exit_px": exit_px, "ret": exit_px / entry - 1,
+                        "reason": "移动止盈" if trailing else "ATR止损"})
                 entry = None
                 highest = None
+                entry_i = None
         if typ == "BUY" and entry is None and c:
             entry = px_fill
             highest = px_fill         # 成交时点之前的盘中高点不计入
+            entry_i = i
         elif typ == "SELL" and entry:
             trades.append(px_fill / entry - 1)
             eq *= px_fill / entry
+            if detail_out is not None:
+                details.append({
+                    "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                    "entry_px": entry,
+                    "exit_i": i, "exit_date": rows[i]["date"],
+                    "exit_px": px_fill, "ret": px_fill / entry - 1,
+                    "reason": "信号卖出"})
             entry = None
             highest = None
+            entry_i = None
         curve.append(eq * (c / entry) if entry else eq)
     if len(trades) < 2:
         return None
@@ -6899,6 +6999,16 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
     _loss = [t for t in trades if t <= 0]
     avg_win = (sum(_wins) / len(_wins)) if _wins else 0.0
     avg_loss = (sum(_loss) / len(_loss)) if _loss else 0.0
+    if detail_out is not None:
+        if entry is not None:
+            last_c = c_a[i1 - 1]
+            details.append({
+                "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                "entry_px": entry, "exit_i": None, "exit_date": None,
+                "exit_px": last_c,
+                "ret": (last_c / entry - 1.0) if entry else None,
+                "reason": "持仓中"})
+        detail_out.extend(details)
     return {"trades": closed, "closed": closed, "wins": wins,
             "losses": losses,
             "winrate": wins / closed if closed else None,
@@ -6915,21 +7025,29 @@ RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾�
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
 
 
-def _bt_segments(rows, signals, rp, atrs=None):
+def _bt_segments(rows, signals, rp, atrs=None, detail=False):
     """全期/训练/验证三段回测（v6.1.6）：与 `run_ablation` 同引擎（`_bt_events`）
     同切分（val=max(200, n/4)、预计算 ATR），供 GUI 面板与每只股导出复用，
     保证与「策略消融」弹窗的交易/胜率/年化/回撤逐项一致。
     返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。
-    v6.1.8 P1：可外部传入预计算的 atrs（perstock 多档共享，省 ~75% ATR 算量）。"""
+    v6.1.8 P1：可外部传入预计算的 atrs（perstock 多档共享，省 ~75% ATR 算量）。
+    v6.3.3：detail=True 时每段结果附带 "detail" 逐笔明细（GUI 交易明细子页用）；
+    默认 False，批量研究/导出口径与性能不变。"""
     nb = len(rows)
     split = nb - max(200, nb // 4)
     if atrs is None:
         atrs = _precompute_atr(rows, 0, nb)
-    full = _bt_events(rows, signals, rp, 0, nb, atrs=atrs)
-    tr = (_bt_events(rows, signals, rp, 0, split, atrs=atrs)
-          if split >= 30 else None)
-    va = (_bt_events(rows, signals, rp, split, nb, atrs=atrs)
-          if nb - split >= 30 else None)
+
+    def _seg(i0, i1):
+        d = [] if detail else None
+        m = _bt_events(rows, signals, rp, i0, i1, atrs=atrs, detail_out=d)
+        if m is not None and d is not None:
+            m["detail"] = d
+        return m
+
+    full = _seg(0, nb)
+    tr = _seg(0, split) if split >= 30 else None
+    va = _seg(split, nb) if nb - split >= 30 else None
     return full, tr, va, split
 
 
@@ -7235,6 +7353,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
            "pick_notes": dict(_pick_notes),
            "vol_ann": vol,
            "high_vol": high_vol,
+           "candidates": cands,
            "ts": time.time(), "bars": n, "train_n": split,
            "val_n": n - split}
     if progress:
@@ -11869,6 +11988,8 @@ class App:
         self._prog_running = False
         self._ai_msgs = []          # LLM 多轮对话历史 [{role,content},...]
         self._ai_sessions = {}      # (code,model) -> {hash, msgs} 会话缓存
+        self._last_ablation = None      # 最近一次消融结果（含全部候选）
+        self._last_ablation_for = ""    # 上面对应的股票代码（防跨股串用）
         self._load_config()
         apply_theme(self.settings["theme"], self.settings["updown"],
                   ma_colors=self.settings.get("ma_colors") or {},
@@ -13334,6 +13455,7 @@ class App:
         abl = load_research_ablation(full0)
         if abl:
             self._last_ablation = abl
+            self._last_ablation_for = full0
             self.progress_var.set("已载入研究消融结果（批量缓存，免本地重算）")
             self._show_strategy_popup(res, abl)
             return
@@ -13362,6 +13484,7 @@ class App:
                                   + "，使用默认多维·稳健")
             return
         self._last_ablation = abl
+        self._last_ablation_for = res["full_code"]
         self._show_strategy_popup(res, abl)
 
     def _show_strategy_popup(self, res, abl):
@@ -13499,6 +13622,10 @@ class App:
                    command=use_recommend).pack(side="left", padx=6)
         ttk.Button(btns, text="本次不选(默认多维·稳健)",
                    command=win.destroy).pack(side="left", padx=6)
+        ttk.Button(btns, text="全部组合…",
+                   command=lambda: (win.destroy(),
+                                    self._rerun_strategy())).pack(
+                       side="left", padx=6)
 
         # 布局完成后定位居中并抓取焦点；任何情况下都保证窗口可见
         try:
@@ -13517,17 +13644,383 @@ class App:
             log.exception("策略弹窗布局失败")
 
     def _rerun_strategy(self):
-        """手动重选：清除策略缓存并重新消融（工具菜单入口）。"""
+        """手动重选：打开「全部组合」策略窗口（v6.3.3）。
+
+        优先读研究批量消融全量候选（秒开，标注数据日期）；该股不在覆盖内才
+        后台本地消融后开窗。窗口内可切换排列方式并直接应用任一组合，
+        不再只列三档推荐。"""
         if not self.res:
             messagebox.showinfo("提示", "请先【分析预测】一只股票")
             return
+        res = self.res
+        full = res["full_code"]
+
+        def _cur():
+            """后台完成时取当前同代码结果（防分析重跑替换 res 对象导致丢弃）。"""
+            r = self.res
+            return r if (r and r.get("full_code") == full) else None
+
+        def _loaded(fd, err):
+            res2 = _cur()
+            if res2 is None:
+                return
+            abl = {}
+            if (self._last_ablation
+                    and self._last_ablation_for == full):
+                abl = self._last_ablation
+            if not abl.get("candidates"):
+                r2 = load_research_ablation(full)
+                if r2:
+                    abl = r2
+            if fd is not None or abl.get("candidates"):
+                self.progress_var.set("")
+                self._open_all_strategy_window(res2, abl=abl, full_data=fd)
+                return
+            self.progress_var.set("研究中无该股全量消融缓存...")
+
+            def _on_local(a):
+                res3 = _cur()
+                if a and res3 is not None:
+                    self._open_all_strategy_window(res3, abl=a)
+
+            self._start_local_ablation(res2, on_done=_on_local)
+
+        self.progress_var.set("读取研究批量消融全量候选...")
+        self._run_bg(lambda: load_full_ablation(full), _loaded)
+
+    def _start_local_ablation(self, res, on_done=None):
+        """后台本地消融（近1000日，全部候选），完成后回调 on_done(abl|None)。
+        v6.3.3：「全部组合」窗口的本地重算与无研究缓存兜底共用。"""
+        full = res["full_code"]
+        bars = res["disp_rows"][:-1] if res.get("has_live") \
+            else res["disp_rows"]
+
+        def work():
+            try:
+                idx_rows = get_daily("sh000001")
+            except Exception:
+                idx_rows = None
+            return run_ablation(full, bars, idx_rows=idx_rows,
+                                progress=self._progress)
+
+        def done(r, e):
+            cur = self.res
+            same = bool(cur and cur.get("full_code") == full)
+            if e or not r or not same:
+                self.progress_var.set(
+                    "策略消融未完成"
+                    + (f": {e}" if e else "（历史过短/已切换股票）"))
+                if on_done is not None:
+                    on_done(None)
+                else:
+                    messagebox.showwarning(
+                        "策略消融", "本地消融未产出候选"
+                        + (f"：{e}" if e else "（历史过短）"),
+                        parent=self.root)
+                return
+            self._last_ablation = r
+            self._last_ablation_for = full
+            if on_done is not None:
+                on_done(r)
+
+        self.progress_var.set(
+            "后台运行多算法消融回测（近1000交易日，全部组合）...")
+        self._run_bg(work, done)
+
+    def _open_all_strategy_window(self, res, abl=None, full_data=None):
+        """全部组合策略窗口（v6.3.3）：列出 算法×风险档 全部候选，
+        可切换排列方式、查看训练/验证指标并直接应用任一组合。"""
+        full = res["full_code"]
+        abl = abl or {}
+        cands = list((full_data or {}).get("candidates")
+                     or abl.get("candidates") or [])
+        if not cands:
+            messagebox.showinfo("策略组合", "没有可用候选，请先本地重算",
+                                parent=self.root)
+            return
+        rec = abl.get("recommend") or "稳健"
+        picks = {}
+        for tier, c in (abl.get("mode_candidates") or {}).items():
+            if c:
+                picks[(c.get("algo"), c.get("mode"))] = tier
+        if not picks:
+            # 研究缓存过期/缺失：按当前口径现算三档标记（数据仍来自批量消融）
+            try:
+                pool = _ablation_pool(cands, 8)
+                for tier in ("保守", "稳健", "激进"):
+                    p, _n = _pick_one_from_pool(pool, tier)
+                    if p:
+                        picks[(p.get("algo"), p.get("mode"))] = tier
+            except Exception:
+                log.exception("全组合窗口档位标记失败(忽略)")
+                picks = {}
+        fd = full_data or {}
+        bars = fd.get("bars") or abl.get("bars") or 0
+        train_n = fd.get("train_n") or abl.get("train_n") or 0
+        val_n = fd.get("val_n") or abl.get("val_n") or 0
+        src_txt = ""
+        if fd.get("mtime"):
+            src_txt = ("，数据源 " + (fd.get("source") or "")
+                       + time.strftime("（%Y-%m-%d %H:%M）",
+                                       time.localtime(fd["mtime"])))
+        elif abl.get("source"):
+            src_txt = f"，数据源 {abl['source']}"
+
+        win = tk.Toplevel(self.root)
+        win.title(f"全部策略组合 - {full}")
+        win.configure(bg=DARK_BG)
+        win.transient(self.root)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.minsize(980, 560)
+        win.geometry(f"{min(1400, max(980, int(sw * 0.82)))}x"
+                     f"{min(920, max(560, int(sh * 0.85)))}")
+        win.resizable(True, True)
+
+        ttk.Label(win, text=(
+            f"共 {len(cands)} 个组合（12算法+多维评分 × 风险档）{src_txt}\n"
+            f"回测近{bars}个交易日（训练{train_n}日选型 / 验证{val_n}日"
+            f"仅检验）；「排列方式」可切换，双击行或选中后点"
+            f"【应用所选策略】。"),
+                  justify="left").pack(anchor="w", padx=12, pady=(10, 2))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(4, 2))
+        ttk.Label(bar, text="排列方式").pack(side="left")
+        arrange = ttk.Combobox(bar, state="readonly", width=20, values=(
+            "推荐/档位优先", "按算法分组", "按风险档分组",
+            "训练综合评分 高→低", "验证综合评分 高→低",
+            "训练年化 高→低", "验证年化 高→低",
+            "训练胜率 高→低", "验证胜率 高→低",
+            "训练Calmar 高→低", "验证Calmar 高→低",
+            "训练回撤 小→大", "验证回撤 小→大",
+            "验证交易 多→少"))
+        arrange.current(0)
+        arrange.pack(side="left", padx=(4, 12))
+
+        def _recompute():
+            rec_btn.config(state="disabled")
+            stat.config(text="本地消融回测中（近1000日，全部组合）...")
+
+            def _done(a):
+                if not win.winfo_exists():
+                    return
+                if not a:
+                    rec_btn.config(state="normal")
+                    stat.config(text="本地消融未产出候选（历史过短/失败）")
+                    return
+                win.destroy()
+                cur = self.res
+                if cur and cur.get("full_code") == full:
+                    self._open_all_strategy_window(cur, abl=a)
+
+            self._start_local_ablation(res, on_done=_done)
+
+        rec_btn = ttk.Button(bar, text="本地重算(当前参数)",
+                             command=_recompute)
+        rec_btn.pack(side="left")
+        stat = ttk.Label(bar, text="")
+        stat.pack(side="right")
+
+        btns = ttk.Frame(win)
+        btns.pack(side="bottom", fill="x", pady=10)
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+
+        cols = ("mark", "algo", "mode", "t_ann", "t_mdd", "t_wr", "t_tr",
+                "v_ann", "v_mdd", "v_wr", "v_tr", "pf", "bull", "bear")
+        heads = ("选型", "算法", "风险档", "训年化", "训回撤", "训胜率",
+                 "训笔", "验年化", "验回撤", "验胜率", "验笔", "验盈亏比",
+                 "牛市", "熊市")
+        wids = (56, 138, 52, 66, 66, 62, 46, 66, 66, 62, 46, 68, 58, 58)
+        anch = ("center", "w", "center") + ("e",) * 11
+        tv = ttk.Treeview(body, columns=cols, show="headings", height=16)
+        vs = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+        for _c, _h, _w, _a in zip(cols, heads, wids, anch):
+            tv.heading(_c, text=_h)
+            tv.column(_c, width=_w, anchor=_a, stretch=(_c == "algo"))
+        tv.tag_configure("rec", foreground=C_GOLD)
+        tv.tag_configure("pick", foreground=TITLE_TXT)
+
+        _MODE_ORD = {"保守": 0, "稳健": 1, "激进": 2}
+        _ALGO_ORD = {a: i for i, a in enumerate((
+            "macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
+            "l2_ind", "chip_peak", "sector_rot", "vol_ratio", "lgbm",
+            "analog", "composite"))}
+        _rows = []
+        _score_cache = {}
+
+        def _fmt(v, pct=True):
+            if v is None:
+                return "-"
+            return f"{v * 100:+.1f}%" if pct else f"{v:.2f}"
+
+        def _calmar(m):
+            m = m or {}
+            return (m.get("ann") or 0) / max(abs(m.get("mdd") or 0.05), 0.05)
+
+        def _metric(c, seg, kind):
+            m = c.get(seg) or {}
+            return _calmar(m) if kind == "calmar" else m.get(kind)
+
+        def _algo_name(c):
+            return ALGO_LABEL.get(c.get("algo"), c.get("algo") or "?")
+
+        def _score_key(seg):
+            if seg not in _score_cache:
+                pool = [c for c in cands if c.get(seg)]
+                try:
+                    sc = _ablation_ranks(pool, "稳健", key=seg)
+                except Exception:
+                    pool, sc = [], []
+                _score_cache[seg] = dict(zip((id(c) for c in pool), sc))
+
+        def _skey(seg):
+            _score_key(seg)
+            m = _score_cache[seg]
+
+            def k(c):
+                v = m.get(id(c))
+                return float("-inf") if v is None else v
+            return k
+
+        def _mkey(seg, kind, asc=False):
+            def k(c):
+                v = _metric(c, seg, kind)
+                if v is None:
+                    return float("inf") if asc else float("-inf")
+                return v
+            return k
+
+        def _selected_rows():
+            opt = arrange.get()
+            rs = list(cands)
+            if opt == "推荐/档位优先":
+                rs.sort(key=lambda c: (
+                    0 if picks.get((c.get("algo"), c.get("mode"))) == rec
+                    else 1 if (c.get("algo"), c.get("mode")) in picks
+                    else 2,
+                    _MODE_ORD.get(c.get("mode"), 9),
+                    _ALGO_ORD.get(c.get("algo"), 99)))
+            elif opt == "按算法分组":
+                rs.sort(key=lambda c: (_ALGO_ORD.get(c.get("algo"), 99),
+                                       _MODE_ORD.get(c.get("mode"), 9)))
+            elif opt == "按风险档分组":
+                rs.sort(key=lambda c: (_MODE_ORD.get(c.get("mode"), 9),
+                                       _ALGO_ORD.get(c.get("algo"), 99)))
+            elif opt == "训练综合评分 高→低":
+                rs.sort(key=_skey("train"), reverse=True)
+            elif opt == "验证综合评分 高→低":
+                rs.sort(key=_skey("val"), reverse=True)
+            elif opt == "训练年化 高→低":
+                rs.sort(key=_mkey("train", "ann"), reverse=True)
+            elif opt == "验证年化 高→低":
+                rs.sort(key=_mkey("val", "ann"), reverse=True)
+            elif opt == "训练胜率 高→低":
+                rs.sort(key=_mkey("train", "winrate"), reverse=True)
+            elif opt == "验证胜率 高→低":
+                rs.sort(key=_mkey("val", "winrate"), reverse=True)
+            elif opt == "训练Calmar 高→低":
+                rs.sort(key=_mkey("train", "calmar"), reverse=True)
+            elif opt == "验证Calmar 高→低":
+                rs.sort(key=_mkey("val", "calmar"), reverse=True)
+            elif opt == "训练回撤 小→大":
+                rs.sort(key=_mkey("train", "mdd", asc=True))
+            elif opt == "验证回撤 小→大":
+                rs.sort(key=_mkey("val", "mdd", asc=True))
+            elif opt == "验证交易 多→少":
+                rs.sort(key=_mkey("val", "trades"), reverse=True)
+            return rs
+
+        def _render():
+            rs = _selected_rows()
+            _rows[:] = rs
+            tv.delete(*tv.get_children())
+            for i, c in enumerate(rs):
+                tr, va = c.get("train") or {}, c.get("val") or {}
+                tier = picks.get((c.get("algo"), c.get("mode")))
+                mark = ("★推荐" if tier == rec else f"·{tier}") if tier else ""
+                tv.insert("", "end", iid=str(i), values=(
+                    mark, _algo_name(c), c.get("mode") or "-",
+                    _fmt(tr.get("ann")), _fmt(tr.get("mdd")),
+                    _fmt(tr.get("winrate")), tr.get("trades", 0),
+                    _fmt(va.get("ann")), _fmt(va.get("mdd")),
+                    _fmt(va.get("winrate")), va.get("trades", 0),
+                    _fmt(va.get("pf"), pct=False),
+                    _fmt(c.get("bull")), _fmt(c.get("bear"))),
+                    tags=("rec",) if tier == rec else
+                    (("pick",) if tier else ()))
+            stat.config(text=f"共 {len(rs)} 个组合｜推荐档 {rec}")
+
+        def _on_sel(_e=None):
+            sel = tv.selection()
+            if not sel:
+                return
+            c = _rows[int(sel[0])]
+            p = c.get("params") or {}
+            stat.config(text=(
+                f"{c.get('label') or _algo_name(c)}｜ATR×{p.get('atr_mult')} "
+                f"回撤{p.get('trail_ratio')} 触发{p.get('trail_trigger')} "
+                f"买阈{p.get('buy_th')} 冷却{p.get('cooldown')}"))
+
+        def _apply(c):
+            label = c.get("label") or _algo_name(c)
+            mode = c.get("mode") or "稳健"
+            save_strategy(full, {
+                "algo": c.get("algo") or "composite", "mode": mode,
+                "params": c.get("params") or CFG.RISK_PARAMS.get(mode)
+                or CFG.risk_params(),
+                "label": label, "ts": time.time()})
+            win.destroy()
+            self.progress_var.set(
+                f"已选策略: {label}（缓存5日，到期自动重新消融）")
+            try:
+                full2 = normalize_code(self.code_var.get())
+                self._run_bg(lambda: analyze(full2), self._refresh_done)
+            except ValueError:
+                pass
+
+        def _apply_sel(_e=None):
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo("策略组合", "请先选中一个组合", parent=win)
+                return
+            _apply(_rows[int(sel[0])])
+
+        def _use_rec():
+            for c in cands:
+                if picks.get((c.get("algo"), c.get("mode"))) == rec:
+                    _apply(c)
+                    return
+            messagebox.showinfo("策略组合", f"未找到推荐档 {rec} 的候选",
+                                parent=win)
+
+        arrange.bind("<<ComboboxSelected>>", lambda e: _render())
+        tv.bind("<<TreeviewSelect>>", _on_sel)
+        tv.bind("<Double-1>", _apply_sel)
+        ttk.Button(btns, text="应用所选策略", command=_apply_sel).pack(
+            side="left", padx=(12, 6))
+        ttk.Button(btns, text=f"用推荐档({rec})", command=_use_rec).pack(
+            side="left", padx=6)
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(
+            side="right", padx=12)
+
+        _render()
         try:
-            with db_conn(commit=True) as conn:
-                conn.execute("DELETE FROM meta WHERE key=?",
-                             (_strat_key(self.res["full_code"]),))
+            win.update_idletasks()
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 4)
+            win.geometry(f"+{x}+{y}")
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            win.grab_set()
         except Exception:
-            log.exception("清除策略缓存失败")
-        self._ensure_strategy(self.res)
+            log.exception("全组合策略窗口布局失败")
 
     # ---------- 数据维护：全市场回填 / 数据清洗（后台执行） ----------
 
@@ -15484,21 +15977,118 @@ class App:
         bt_bar = ttk.Frame(f_bt)
         bt_bar.pack(side="bottom", fill="x")     # 先占底部，避免被 Text 挤没
 
-        bt_canvas = tk.Canvas(f_bt, height=340, bg=BG, highlightthickness=1,
+        bt_nb = ttk.Notebook(f_bt)
+        bt_nb.pack(fill="both", expand=True)
+        f_sum = ttk.Frame(bt_nb, padding=6)
+        bt_nb.add(f_sum, text=" 汇总 ")
+        f_det = ttk.Frame(bt_nb, padding=6)
+        bt_nb.add(f_det, text=" 交易明细 ")
+
+        bt_canvas = tk.Canvas(f_sum, height=340, bg=BG, highlightthickness=1,
                               highlightbackground=BORDER, bd=0)
         bt_canvas.pack(side="top", fill="x", pady=(0, 8))
 
-        bt_result = tk.Text(f_bt, height=12, bg=PANEL_BG, fg=FG_MAIN,
+        bt_result = tk.Text(f_sum, height=12, bg=PANEL_BG, fg=FG_MAIN,
                             font=("Microsoft YaHei", 10), relief="flat",
                             wrap="word", state="disabled",
                             insertbackground=FG_MAIN, selectbackground=SEL_BG,
                             padx=8, pady=5, spacing1=1, spacing3=2)
-        bt_scroll = ttk.Scrollbar(f_bt, command=bt_result.yview)
+        bt_scroll = ttk.Scrollbar(f_sum, command=bt_result.yview)
         bt_result.configure(yscrollcommand=bt_scroll.set)
         bt_scroll.pack(side="right", fill="y")
         bt_result.pack(fill="both", expand=True)
 
+        # ── 交易明细子页（v6.3.3）：全期/训练/验证三段逐笔买卖点 ──
+        det_top = ttk.Frame(f_det)
+        det_top.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Label(det_top, text="筛选").pack(side="left")
+        det_seg = ttk.Combobox(det_top, state="readonly", width=8,
+                               values=("全部", "全期", "训练集", "验证集"))
+        det_seg.current(0)
+        det_seg.pack(side="left", padx=(4, 12))
+        det_stat = ttk.Label(det_top,
+                             text="先点【计算胜率/收益曲线】生成交易明细")
+        det_stat.pack(side="left")
+
+        det_cols = ("seg", "n", "ed", "ep", "xd", "xp", "ret", "reason")
+        det_heads = ("段", "#", "买入日", "买入价", "卖出日", "卖出价",
+                     "收益", "原因")
+        det_wids = (56, 40, 92, 72, 92, 72, 74, 110)
+        det_anch = ("center", "center", "center", "e", "center", "e",
+                    "e", "w")
+        det_tv = ttk.Treeview(f_det, columns=det_cols, show="headings",
+                              height=14)
+        det_vs = ttk.Scrollbar(f_det, orient="vertical",
+                               command=det_tv.yview)
+        det_tv.configure(yscrollcommand=det_vs.set)
+        det_vs.pack(side="right", fill="y")
+        det_tv.pack(side="left", fill="both", expand=True)
+        for _c, _h, _w, _a in zip(det_cols, det_heads, det_wids, det_anch):
+            det_tv.heading(_c, text=_h)
+            det_tv.column(_c, width=_w, anchor=_a, stretch=False)
+        det_tv.tag_configure("win", foreground=UP)
+        det_tv.tag_configure("loss", foreground=DOWN)
+        det_tv.tag_configure("open", foreground=C_GOLD)
+
         _bt_last = [None]
+        _det_rows = []                  # 三段明细扁平缓存
+        _det_sort = [None, False]       # [列, 降序?]
+
+        def _fmt_px(v):
+            return "-" if v is None else f"{v:.2f}"
+
+        def _render_detail():
+            segf = det_seg.get()
+            rows = [r for r in _det_rows
+                    if segf == "全部" or r["seg"] == segf]
+            col = _det_sort[0]
+            if col:
+                def _key(r):
+                    v = r.get(col)
+                    return (1, "") if v is None else (0, v)
+                try:
+                    rows = sorted(rows, key=_key, reverse=_det_sort[1])
+                except TypeError:
+                    pass
+            det_tv.delete(*det_tv.get_children())
+            for r in rows:
+                det_tv.insert("", "end", values=(
+                    r["seg"], r["n"], r["ed"], _fmt_px(r["ep"]),
+                    r["xd"] or "—", _fmt_px(r["xp"]),
+                    "-" if r["ret"] is None else f"{r['ret'] * 100:+.2f}%",
+                    r["reason"]), tags=(r["tag"],))
+            n_win = len([r for r in rows if (r["ret"] or 0) > 0])
+            n_cl = len([r for r in rows if r["reason"] != "持仓中"])
+            det_stat.config(
+                text=f"{segf}: {len(rows)} 笔（已平 {n_cl}，胜 {n_win}）"
+                     f"｜点列头排序")
+
+        def _det_sort_by(col):
+            if _det_sort[0] == col:
+                _det_sort[1] = not _det_sort[1]
+            else:
+                _det_sort[0], _det_sort[1] = col, False
+            _render_detail()
+
+        for _c in det_cols:
+            det_tv.heading(_c, command=lambda cc=_c: _det_sort_by(cc))
+        det_seg.bind("<<ComboboxSelected>>", lambda e: _render_detail())
+
+        def _fill_detail(bt):
+            _det_rows[:] = []
+            for seg, m in (("全期", bt), ("训练集", (bt or {}).get("train")),
+                           ("验证集", (bt or {}).get("val"))):
+                for i, d in enumerate(((m or {}).get("detail") or []), 1):
+                    tag = ("open" if d.get("reason") == "持仓中"
+                           else ("win" if (d.get("ret") or 0) > 0
+                                 else "loss"))
+                    _det_rows.append({
+                        "seg": seg, "n": i,
+                        "ed": d.get("entry_date") or "-",
+                        "ep": d.get("entry_px"), "xd": d.get("exit_date"),
+                        "xp": d.get("exit_px"), "ret": d.get("ret"),
+                        "reason": d.get("reason") or "", "tag": tag})
+            _render_detail()
 
         def _fmt_pct(v, sign=False):
             if v is None:
@@ -15637,12 +16227,12 @@ class App:
                 # v6.1.6：训练/验证/全期改用消融同引擎（_bt_events）与同切分
                 # （val=max(200,n/4)），保证与「策略消融」弹窗逐项一致。
                 ev_full, ev_tr, ev_va, split = _bt_segments(
-                    rows_bt, sig_use, rp)
+                    rows_bt, sig_use, rp, detail=True)
                 if ev_full:
                     for _k in ("trades", "closed", "wins", "losses",
                                "winrate", "total", "ann", "mdd", "floating",
                                "avg_win", "avg_loss", "profit_loss",
-                               "curve"):
+                               "curve", "detail"):
                         bt[_k] = ev_full.get(_k)
                     bt["train"] = ev_tr
                     bt["val"] = ev_va
@@ -15721,6 +16311,7 @@ class App:
                     f"  用所选策略信号，T日收盘信号/T+1成交，带ATR止损+移动止盈；\n"
                     f"  训练/验证按 val=max(200,n/4) 切分，验证集不参与选型。\n")
             bt_result.config(state="disabled")
+            _fill_detail(bt)            # 交易明细子页同步刷新
             bt_result.yview_moveto(0)   # 每次计算后回到顶部，先看全期/训练/验证
             _draw_curve(bt)
 
@@ -15778,9 +16369,13 @@ class App:
                 "exec": ("open" if _exec_mode() == "open" else "close"),
                 "full": {k: v for k, v in bt.items()
                          if k not in ("curve", "trades_list", "train", "val",
-                                      "_signals")},
+                                      "_signals", "_rows", "detail")},
                 "train": bt.get("train"),
                 "val": bt.get("val"),
+                "trades_detail": {
+                    "full": bt.get("detail") or [],
+                    "train": (bt.get("train") or {}).get("detail") or [],
+                    "val": (bt.get("val") or {}).get("detail") or []},
                 "ic1": bt.get("ic1"), "ic5": bt.get("ic5"),
                 "fwd": bt.get("fwd"),
                 "curve_dates": [x["date"] for x in rows_],
@@ -15820,6 +16415,22 @@ class App:
                     out.append(f"{d},{v:.6f},{dds[i]:.6f}\n")
                 return out
 
+            def _detail_lines():
+                out = []
+                for seg, m in (("全期", bt),
+                               ("训练集", bt.get("train")),
+                               ("验证集", bt.get("val"))):
+                    for i, d in enumerate((m or {}).get("detail") or [], 1):
+                        px = ("" if d.get("exit_px") is None
+                              else format(d["exit_px"], ".4f"))
+                        out.append(
+                            f"{seg},{i},{d.get('entry_date') or ''},"
+                            f"{format(d.get('entry_px') or 0, '.4f')},"
+                            f"{d.get('exit_date') or ''},{px},"
+                            f"{format(d.get('ret') or 0, '.6f')},"
+                            f"{d.get('reason') or ''}\n")
+                return out
+
             try:
                 if fn.lower().endswith(".csv"):
                     with open(fn, "w", encoding="utf-8-sig",
@@ -15846,6 +16457,9 @@ class App:
                     with open(fn, "w", encoding="utf-8") as f:
                         f.write(head)
                         f.write(bt_result.get("1.0", "end").rstrip() + "\n")
+                        f.write("\n-- 交易明细(段,序,买入日,买入价,卖出日,"
+                                "卖出价,收益,原因) --\n")
+                        f.writelines(_detail_lines())
                         f.write("\n-- 净值曲线数据(日期,净值,回撤) --\n")
                         f.writelines(_curve_lines())
                         f.write(f"\n作者：{AUTHOR}  邮箱：{AUTHOR_EMAIL}  "
@@ -15870,7 +16484,7 @@ class App:
                   relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 10, "bold")).pack(
                       side="left", padx=6, ipadx=16, ipady=4)
-        tk.Button(btn_row, text="重选策略(消融回测)", command=self._rerun_strategy,
+        tk.Button(btn_row, text="重选策略(全部组合)", command=self._rerun_strategy,
                   bg=BTN_BG, fg=BTN_FG,
                   activebackground=BTN_HOVER, activeforeground=BTN_FG,
                   relief="flat", cursor="hand2",

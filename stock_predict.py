@@ -117,8 +117,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.3.2"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-06 升 6.3.3）
+APP_VERSION = "6.3.3"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -5965,6 +5965,84 @@ def load_research_ablation(full):
         return None
 
 
+# v6.3.3：研究消融「全量候选」（research/strategy_ablation_per_stock.json，
+# 约 600MB，每只股含 all_candidates 全部算法×风险档）。整文件 json.load 会占
+# 数 GB 内存且卡顿，这里按行扫描建立 code→顶层对象起始偏移索引（进程内缓存，
+# 文件 mtime 变化自动重建），再按需 seek + raw_decode 单只对象，秒开。
+_FULL_ABL_IDX = {"path": "", "mtime": 0.0, "index": {}}
+_FULL_ABL_LOCK = threading.Lock()
+
+
+def _full_abl_index(path):
+    """返回 (index, mtime)；index = {code: 字节偏移}。文件缺失返回 ({}, 0)。"""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}, 0.0
+    with _FULL_ABL_LOCK:
+        if (_FULL_ABL_IDX.get("path") == path
+                and _FULL_ABL_IDX.get("mtime") == mt):
+            return _FULL_ABL_IDX["index"], mt
+        index = {}
+        expect_code = False
+        obj_pos = -1
+        pos = 0
+        try:
+            with open(path, "rb") as f:
+                for line in f:
+                    s = line.rstrip(b"\r\n")
+                    if s == b" {":
+                        expect_code = True
+                        obj_pos = pos
+                    elif expect_code and s.startswith(b'  "code":'):
+                        try:
+                            code = (s.split(b":", 1)[1].strip()
+                                    .rstrip(b",").strip(b'"').decode())
+                        except Exception:
+                            code = ""
+                        if code:
+                            index[code] = obj_pos
+                        expect_code = False
+                    elif s:
+                        expect_code = False
+                    pos += len(line)
+        except OSError:
+            return {}, 0.0
+        _FULL_ABL_IDX.update(path=path, mtime=mt, index=index)
+        return index, mt
+
+
+def load_full_ablation(full):
+    """读研究批量消融中该股的全部候选（与 run_ablation candidates 同构）。
+
+    文件缺失/该股不在覆盖内/解析失败返回 None（调用方回退本地消融）。
+    返回 {"candidates", "bars", "train_n", "val_n", "mtime", "source"}；
+    mtime 供界面标注数据日期，不做 TTL（研究批量结果是明确留档产物）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "research", "strategy_ablation_per_stock.json")
+    index, mt = _full_abl_index(path)
+    if not index or full not in index:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(index[full])
+            buf = f.read(8 << 20)
+        text = buf.decode("utf-8", "ignore")
+        # raw_decode 不跳前导空白：定位到对象起始的 "{"
+        start = len(text) - len(text.lstrip())
+        obj, _ = json.JSONDecoder().raw_decode(text, start)
+        cands = [c for c in (obj.get("all_candidates") or [])
+                 if c.get("mode") in CFG.RISK_PARAMS and c.get("train")]
+        if not cands:
+            return None
+        return {"candidates": cands, "bars": obj.get("bars"),
+                "train_n": obj.get("train_n"), "val_n": obj.get("val_n"),
+                "mtime": mt, "source": os.path.basename(path)}
+    except Exception:
+        log.exception("读取研究全量消融失败(忽略)")
+        return None
+
+
 # ---- 各算法信号发生器（只用 T 日及以前数据，杜绝前视）----
 
 def _sig_macd(rows):
@@ -6809,14 +6887,18 @@ def _ablation_pf(trades):
 # ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
 
 def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
-               arrays=None):
+               arrays=None, detail_out=None):
     """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
     早盘信号：信号在 T 日收盘生成，T+1 日收盘执行；止损单用 T-1 日 ATR 设定
     （见 CFG.RISK_PARAMS，各档 ATR/移动止盈参数）。
     atrs 可外部预计算加速。
     arrays（v6.1.3，numpy 加速）：(o,h,l,c) 平行列表，已由调用方从 rows 抽出，
       供批量回测复用，避免每次回测重复做 4×N 次字典取值。
-    trade_out（可选 list）：追加逐笔收益率。"""
+    trade_out（可选 list）：追加逐笔收益率。
+    detail_out（可选 list，v6.3.3）：追加逐笔交易明细 dict——
+      {entry_i, entry_date, entry_px, exit_i, exit_date, exit_px, ret, reason}；
+      末笔未平仓也记一条（exit_i/exit_date 为 None，exit_px=期末收盘，
+      reason="持仓中"）。仅在有效回测（平仓≥2）时填充。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
@@ -6840,7 +6922,9 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
     trail_trig = rp["trail_trigger"]
     entry = None
     highest = None
+    entry_i = None
     trades = []
+    details = []
     curve = []
     sig_get = sig_map.get
     for i in range(i0, i1):
@@ -6855,24 +6939,40 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             atr_prev = atrs[i - 1] if i > 0 else 0.0
             atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
                 else entry * 0.95
-            trail_stop = (prev_high * trail_ratio
-                          if prev_high > entry * trail_trig
-                          else atr_stop)
+            trailing = prev_high > entry * trail_trig
+            trail_stop = prev_high * trail_ratio if trailing else atr_stop
             if l <= trail_stop:
                 o_i = o_a[i]
                 exit_px = o_i if (o_i and o_i <= trail_stop) else trail_stop
                 trades.append(exit_px / entry - 1)
                 eq *= exit_px / entry
+                if detail_out is not None:
+                    details.append({
+                        "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                        "entry_px": entry,
+                        "exit_i": i, "exit_date": rows[i]["date"],
+                        "exit_px": exit_px, "ret": exit_px / entry - 1,
+                        "reason": "移动止盈" if trailing else "ATR止损"})
                 entry = None
                 highest = None
+                entry_i = None
         if typ == "BUY" and entry is None and c:
             entry = px_fill
             highest = px_fill         # 成交时点之前的盘中高点不计入
+            entry_i = i
         elif typ == "SELL" and entry:
             trades.append(px_fill / entry - 1)
             eq *= px_fill / entry
+            if detail_out is not None:
+                details.append({
+                    "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                    "entry_px": entry,
+                    "exit_i": i, "exit_date": rows[i]["date"],
+                    "exit_px": px_fill, "ret": px_fill / entry - 1,
+                    "reason": "信号卖出"})
             entry = None
             highest = None
+            entry_i = None
         curve.append(eq * (c / entry) if entry else eq)
     if len(trades) < 2:
         return None
@@ -6911,6 +7011,16 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
     _loss = [t for t in trades if t <= 0]
     avg_win = (sum(_wins) / len(_wins)) if _wins else 0.0
     avg_loss = (sum(_loss) / len(_loss)) if _loss else 0.0
+    if detail_out is not None:
+        if entry is not None:
+            last_c = c_a[i1 - 1]
+            details.append({
+                "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+                "entry_px": entry, "exit_i": None, "exit_date": None,
+                "exit_px": last_c,
+                "ret": (last_c / entry - 1.0) if entry else None,
+                "reason": "持仓中"})
+        detail_out.extend(details)
     return {"trades": closed, "closed": closed, "wins": wins,
             "losses": losses,
             "winrate": wins / closed if closed else None,
@@ -6927,21 +7037,29 @@ RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾�
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
 
 
-def _bt_segments(rows, signals, rp, atrs=None):
+def _bt_segments(rows, signals, rp, atrs=None, detail=False):
     """全期/训练/验证三段回测（v6.1.6）：与 `run_ablation` 同引擎（`_bt_events`）
     同切分（val=max(200, n/4)、预计算 ATR），供 GUI 面板与每只股导出复用，
     保证与「策略消融」弹窗的交易/胜率/年化/回撤逐项一致。
     返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。
-    v6.1.8 P1：可外部传入预计算的 atrs（perstock 多档共享，省 ~75% ATR 算量）。"""
+    v6.1.8 P1：可外部传入预计算的 atrs（perstock 多档共享，省 ~75% ATR 算量）。
+    v6.3.3：detail=True 时每段结果附带 "detail" 逐笔明细（GUI 交易明细子页用）；
+    默认 False，批量研究/导出口径与性能不变。"""
     nb = len(rows)
     split = nb - max(200, nb // 4)
     if atrs is None:
         atrs = _precompute_atr(rows, 0, nb)
-    full = _bt_events(rows, signals, rp, 0, nb, atrs=atrs)
-    tr = (_bt_events(rows, signals, rp, 0, split, atrs=atrs)
-          if split >= 30 else None)
-    va = (_bt_events(rows, signals, rp, split, nb, atrs=atrs)
-          if nb - split >= 30 else None)
+
+    def _seg(i0, i1):
+        d = [] if detail else None
+        m = _bt_events(rows, signals, rp, i0, i1, atrs=atrs, detail_out=d)
+        if m is not None and d is not None:
+            m["detail"] = d
+        return m
+
+    full = _seg(0, nb)
+    tr = _seg(0, split) if split >= 30 else None
+    va = _seg(split, nb) if nb - split >= 30 else None
     return full, tr, va, split
 
 
@@ -7247,6 +7365,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
            "pick_notes": dict(_pick_notes),
            "vol_ann": vol,
            "high_vol": high_vol,
+           "candidates": cands,
            "ts": time.time(), "bars": n, "train_n": split,
            "val_n": n - split}
     if progress:
