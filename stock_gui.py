@@ -108,7 +108,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.3.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -192,6 +192,23 @@ class CFG:
     SIGNAL_COOLDOWN = 5                 # 相邻信号最小间隔(交易日)
     WEAK_IDX_TH = -1.5                  # 大盘弱势阈值(%)
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
+    # ---- 指标计算参数（v6.3.2 起可调；ini [inds] 持久化，设置→指标参数）----
+    # 作用于分析页指标/买卖点打分/消融/逐股回测；改动后需重新分析生效。
+    # 范围：快线2-60 / 慢线3-120 / 信号2-60；KDJ 2-60/2-20/2-20；
+    # RSI 2-60；BOLL 5-120/0.5-4.0；ADX 2-60/2-60/10-60。
+    MACD_FAST = 12                      # MACD 快线 EMA 周期
+    MACD_SLOW = 26                      # MACD 慢线 EMA 周期
+    MACD_SIGNAL = 9                     # MACD DEA 信号线周期
+    KDJ_N = 9                           # KDJ RSV 回看周期
+    KDJ_M1 = 3                          # K 值平滑（k=(m1-1)/m1·k+rsv/m1）
+    KDJ_M2 = 3                          # D 值平滑
+    RSI_SHORT = 6                       # 短 RSI（信号打分/图表用）
+    RSI_LONG = 12                       # 长 RSI（图表用）
+    BOLL_N = 20                         # 布林带周期
+    BOLL_K = 2.0                        # 布林带标准差倍数
+    ADX_N = 14                          # DMI/ADX 周期（TR/±DM Wilder 平滑）
+    ADX_SMOOTH = 14                     # ADX 平滑周期（DX 平均；默认=ADX_N）
+    ADX_TH = 20                         # ADX 趋势阈值（≥此值算趋势形成）
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
     # 单只股票K线联网拉取根数（默认1000；只限制联网拉取，不限制读库/分析，
@@ -359,7 +376,84 @@ def _load_predict_cfg():
         log.exception("读取预测参数失败(使用默认)")
 
 
+def _load_ind_cfg():
+    """从 stock_gui.ini [inds] 读取指标参数（带范围钳制，v6.3.2）。"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("inds"):
+            cp.add_section("inds")
+
+        def gi(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, int(cp.get("inds", key,
+                                                  fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        def gf(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, float(cp.get("inds", key,
+                                                    fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        CFG.MACD_FAST = gi("macd_fast", CFG.MACD_FAST, 2, 60)
+        CFG.MACD_SLOW = gi("macd_slow", CFG.MACD_SLOW, 3, 120)
+        if CFG.MACD_SLOW <= CFG.MACD_FAST:      # 慢线须大于快线
+            CFG.MACD_SLOW = CFG.MACD_FAST + 1
+        CFG.MACD_SIGNAL = gi("macd_signal", CFG.MACD_SIGNAL, 2, 60)
+        CFG.KDJ_N = gi("kdj_n", CFG.KDJ_N, 2, 60)
+        CFG.KDJ_M1 = gi("kdj_m1", CFG.KDJ_M1, 2, 20)
+        CFG.KDJ_M2 = gi("kdj_m2", CFG.KDJ_M2, 2, 20)
+        CFG.RSI_SHORT = gi("rsi_short", CFG.RSI_SHORT, 2, 60)
+        CFG.RSI_LONG = gi("rsi_long", CFG.RSI_LONG, 2, 60)
+        CFG.BOLL_N = gi("boll_n", CFG.BOLL_N, 5, 120)
+        CFG.BOLL_K = gf("boll_k", CFG.BOLL_K, 0.5, 4.0)
+        CFG.ADX_N = gi("adx_n", CFG.ADX_N, 2, 60)
+        CFG.ADX_SMOOTH = gi("adx_smooth", CFG.ADX_SMOOTH, 2, 60)
+        CFG.ADX_TH = gi("adx_th", CFG.ADX_TH, 10, 60)
+    except Exception:
+        log.exception("读取指标参数失败(使用默认)")
+
+
+# 指标参数范围/类型（设置→指标参数 与 ini [inds] 共用）
+IND_RANGES = {
+    "MACD_FAST": (2, 60), "MACD_SLOW": (3, 120), "MACD_SIGNAL": (2, 60),
+    "KDJ_N": (2, 60), "KDJ_M1": (2, 20), "KDJ_M2": (2, 20),
+    "RSI_SHORT": (2, 60), "RSI_LONG": (2, 60),
+    "BOLL_N": (5, 120), "BOLL_K": (0.5, 4.0),
+    "ADX_N": (2, 60), "ADX_SMOOTH": (2, 60), "ADX_TH": (10, 60),
+}
+# 出厂默认（「恢复默认指标参数」按钮用）
+IND_DEFAULTS = {
+    "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+    "KDJ_N": 9, "KDJ_M1": 3, "KDJ_M2": 3,
+    "RSI_SHORT": 6, "RSI_LONG": 12,
+    "BOLL_N": 20, "BOLL_K": 2.0,
+    "ADX_N": 14, "ADX_SMOOTH": 14, "ADX_TH": 20,
+}
+
+
+def set_ind_param(attr, value):
+    """钳制并写入单个指标参数；返回生效值（非法输入返回 None）。
+    MACD 自动保证 慢线 > 快线（v6.3.2）。"""
+    if attr not in IND_RANGES:
+        return None
+    lo, hi = IND_RANGES[attr]
+    try:
+        v = float(value) if attr == "BOLL_K" else int(float(value))
+    except (ValueError, TypeError):
+        return None
+    v = max(lo, min(hi, v))
+    setattr(CFG, attr, v)
+    if attr == "MACD_FAST" and CFG.MACD_SLOW <= v:
+        CFG.MACD_SLOW = min(120, v + 1)
+    return v
+
+
 _load_predict_cfg()
+_load_ind_cfg()
 
 
 W_WINDOW: int = CFG.W_WINDOW
@@ -3712,15 +3806,24 @@ def ema(vals, n):
     return out
 
 
-def calc_macd(closes):
-    dif = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
-    dea_raw = ema(dif, 9)
-    dea = [None] * 8 + dea_raw[8:]
+def calc_macd(closes, fast=None, slow=None, signal=None):
+    """MACD：EMA(快)-EMA(慢)=DIF、DEA=EMA(DIF,信号)、柱=2(DIF-DEA)。
+    周期默认取 CFG（v6.3.2 可调，设置→指标参数）。"""
+    fast = int(fast or CFG.MACD_FAST)
+    slow = int(slow or CFG.MACD_SLOW)
+    signal = int(signal or CFG.MACD_SIGNAL)
+    dif = [a - b for a, b in zip(ema(closes, fast), ema(closes, slow))]
+    dea_raw = ema(dif, signal)
+    dea = [None] * (signal - 1) + dea_raw[signal - 1:]
     hist = [None if dd is None else 2 * (a - dd) for a, dd in zip(dif, dea)]
     return dif, dea, hist
 
 
-def calc_kdj(rows, n=9):
+def calc_kdj(rows, n=None, m1=None, m2=None):
+    """KDJ：RSV(n) 回看，K/D 分别按 m1/m2 平滑（默认 9/3/3，CFG 可调）。"""
+    n = int(n or CFG.KDJ_N)
+    m1 = int(m1 or CFG.KDJ_M1)
+    m2 = int(m2 or CFG.KDJ_M2)
     ks, ds = [], []
     k = d = 50.0
     for i in range(len(rows)):
@@ -3728,14 +3831,16 @@ def calc_kdj(rows, n=9):
         lo = min(r["low"] for r in seg)
         hi = max(r["high"] for r in seg)
         rsv = (rows[i]["close"] - lo) / (hi - lo) * 100 if hi > lo else 50.0
-        k = k * 2 / 3 + rsv / 3
-        d = d * 2 / 3 + k / 3
+        k = k * (m1 - 1) / m1 + rsv / m1
+        d = d * (m2 - 1) / m2 + k / m2
         ks.append(k)
         ds.append(d)
     return ks, ds, [3 * a - 2 * b for a, b in zip(ks, ds)]
 
 
-def calc_rsi(closes, n):
+def calc_rsi(closes, n=None):
+    """RSI（Wilder 平滑）；n 缺省取 CFG.RSI_SHORT（短周期，信号打分用）。"""
+    n = int(n or CFG.RSI_SHORT)
     out = [None] * len(closes)
     if len(closes) <= n:
         return out
@@ -3829,14 +3934,18 @@ def calc_chips(rows, cur_price=None, nbin=None, shares=None):
             "cur": cur_price}
 
 
-def calc_adx(rows, n=14):
-    """DMI/ADX：+DI、-DI、ADX(n=14)。
-    返回 (pdi, mdi, adx) 三条序列，预热期(2n左右)为 None。"""
+def calc_adx(rows, n=None, smooth=None):
+    """DMI/ADX：+DI、-DI、ADX。
+    n = TR/±DM 的 Wilder 平滑周期，smooth = ADX（DX 平均）平滑周期；
+    两者缺省取 CFG.ADX_N / CFG.ADX_SMOOTH（v6.3.2 可调）。
+    返回 (pdi, mdi, adx) 三条序列，预热期为 None。"""
+    n = int(n or CFG.ADX_N)
+    sm = int(smooth or CFG.ADX_SMOOTH)
     m = len(rows)
     pdi = [None] * m
     mdi = [None] * m
     adx = [None] * m
-    if m < 2 * n + 1:
+    if m < n + sm + 1:
         return pdi, mdi, adx
     tr_s = pdm_s = ndm_s = 0.0
     dxs = []
@@ -3863,17 +3972,19 @@ def calc_adx(rows, n=14):
             mdi[i] = 100.0 * ndm_s / tr_s
             s = pdi[i] + mdi[i]
             dxs.append(100.0 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0)
-            if len(dxs) >= n:
+            if len(dxs) >= sm:
                 if adx[i - 1] is None:
-                    adx[i] = sum(dxs[-n:]) / n
+                    adx[i] = sum(dxs[-sm:]) / sm
                 else:
-                    adx[i] = (adx[i - 1] * (n - 1) + dxs[-1]) / n
+                    adx[i] = (adx[i - 1] * (sm - 1) + dxs[-1]) / sm
     return pdi, mdi, adx
 
 
-def calc_boll(closes, n=20, k=2.0):
-    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差。
+def calc_boll(closes, n=None, k=None):
+    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差（默认/范围取 CFG）。
     返回 (mid, up, low) 三条序列，预热期为 None。"""
+    n = int(n or CFG.BOLL_N)
+    k = float(CFG.BOLL_K if k is None else k)
     mid = sma_period(closes, n)
     up = [None] * len(closes)
     low = [None] * len(closes)
@@ -4332,7 +4443,7 @@ def daily_pick_score(rows, ind_ctx=None):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     b_mid, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     mas = {20: sma_period(closes, 20), 60: sma_period(closes, 60)}
@@ -4437,7 +4548,7 @@ def daily_pick_score(rows, ind_ctx=None):
         elif c > b_up[i]:
             _wadd("布林带", -1, "布林上轨超买")
     a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-    if None not in (a_i, p_i, m_i) and a_i >= 20:
+    if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
         if p_i > m_i:
             _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
         elif m_i > p_i:
@@ -5873,7 +5984,7 @@ def _sig_kdj(rows):
 
 def _sig_rsi(rows):
     closes = [r["close"] for r in rows]
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     out = []
     for i in range(1, len(rows)):
         if r6[i] is None or r6[i - 1] is None:
@@ -5924,7 +6035,7 @@ def _composite_precompute(rows, chip_tail=400, use_chips=True):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     _, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     ma20 = sma_period(closes, 20)
@@ -5999,7 +6110,7 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
             sc += _wadd("布林带", 1 if c < b_low[i]
                         else -1 if c > b_up[i] else 0)
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
             sc += _wadd("ADX", 1 if p_i > m_i else -1)
         day_weak = (weak.get(rows[i]["date"]) is not None
                     and weak[rows[i]["date"]] < CFG.WEAK_IDX_TH)
@@ -6458,7 +6569,7 @@ def _sig_lgbm(rows, **_kw):
     vols = [r.get("vol") or 0.0 for r in rows]
     dif_, dea_, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     _, b_up, b_low = calc_boll(closes)
     vr_arr = [vol_ratio_at(vols, k) for k in range(n)]
 
@@ -7690,7 +7801,8 @@ def analyze(full, progress=None, quick=False):
     closes_i = [r["close"] for r in disp_rows]
     dif, dea, mhist = calc_macd(closes_i)
     k_, d_, j_ = calc_kdj(disp_rows)
-    r6, r12 = calc_rsi(closes_i, 6), calc_rsi(closes_i, 12)
+    r6, r12 = (calc_rsi(closes_i, CFG.RSI_SHORT),
+               calc_rsi(closes_i, CFG.RSI_LONG))
     b_mid, b_up, b_low = calc_boll(closes_i)
     pdi_a, mdi_a, adx_a = calc_adx(disp_rows)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
@@ -7821,7 +7933,7 @@ def analyze(full, progress=None, quick=False):
         # ADX（权重0.8：趋势强度过滤——只有 ADX≥20 趋势成立时，
         # DI 方向才计分；横盘时不贡献分数）
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
             if p_i > m_i:
                 _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
             elif m_i > p_i:
@@ -8001,11 +8113,11 @@ def analyze(full, progress=None, quick=False):
         r6_i = r6[i]
         if r6_i is not None:
             if r6_i < 30:
-                items.append(("RSI", 1, f"RSI6={r6_i:.0f} 超卖"))
+                items.append(("RSI", 1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超卖"))
             elif r6_i > 70:
-                items.append(("RSI", -1, f"RSI6={r6_i:.0f} 超买"))
+                items.append(("RSI", -1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超买"))
             else:
-                items.append(("RSI", 0, f"RSI6={r6_i:.0f} 中性"))
+                items.append(("RSI", 0, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 中性"))
         v_i = vols_d[i] if disp_rows[i].get("vol") else 0.0
         v5 = (sum(vols_d[max(0, i - 5):i]) / 5) if i >= 5 else 0.0
         if v_i and v5 and v_i > v5 * 1.2:
@@ -8050,7 +8162,7 @@ def analyze(full, progress=None, quick=False):
                 items.append(("ADX", 1 if p_i > m_i else -1,
                               f"ADX={a_i:.0f} 强趋势"
                               f"{'偏多' if p_i > m_i else '偏空'}"))
-            elif a_i >= 20:
+            elif a_i >= CFG.ADX_TH:
                 items.append(("ADX", 1 if p_i > m_i else -1 if p_i != m_i else 0,
                               f"ADX={a_i:.0f} 趋势形成中"))
             else:
@@ -14365,7 +14477,8 @@ class App:
         self._line(cv, xs, v["rsi12"], ymap, C_BLUE)
         last6 = [x for x in v["rsi6"] if x is not None]
         last12 = [x for x in v["rsi12"] if x is not None]
-        label = f"RSI  橙RSI6:{last6[-1]:.1f} / 蓝RSI12:{last12[-1]:.1f}" \
+        label = (f"RSI  橙RSI{CFG.RSI_SHORT}:{last6[-1]:.1f} / "
+                 f"蓝RSI{CFG.RSI_LONG}:{last12[-1]:.1f}") \
             if last6 and last12 else "RSI"
         cv.create_text(g["L"] + 2, g["T"] - 3, text=label, anchor="w",
                        font=("Microsoft YaHei", 8), fill=TITLE_TXT)
@@ -14454,7 +14567,7 @@ class App:
             else:
                 r6 = v["rsi6"][idx]
                 r12 = v["rsi12"][idx]
-                ind_txt = ("  RSI6:%.1f RSI12:%s"
+                ind_txt = (f"  RSI{CFG.RSI_SHORT}:%.1f RSI{CFG.RSI_LONG}:%s"
                            % (r6, f"{r12:.1f}" if r12 is not None else "-"))
         if b["date"] in ("T+1预测", "T日预测", "T+5预测", "T+10预测"):
             tag = {"T+1预测": "预测T+1", "T日预测": "预测T日",
@@ -14577,7 +14690,7 @@ class App:
             pos = ("上轨上方·超买" if q["price"] > bl_up
                    else "下轨下方·超卖" if q["price"] < bl_low
                    else "带内")
-            L.append(f"-- 布林带(20,2) --")
+            L.append(f"-- 布林带({CFG.BOLL_N},{CFG.BOLL_K:g}) --")
             L.append(f"上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | "
                      f"下轨 {bl_low:.2f} | 现价 {q['price']:.2f} 位于{pos}")
         _adx = next((x for x in reversed(res["ind"]["adx"])
@@ -14587,10 +14700,11 @@ class App:
         _mdi = next((x for x in reversed(res["ind"]["mdi"])
                      if x is not None), None)
         if None not in (_adx, _pdi, _mdi):
-            L.append("-- ADX/DMI(14) --")
+            L.append(f"-- ADX/DMI({CFG.ADX_N}) --")
             L.append(f"ADX {_adx:.0f}"
                      + ("（强趋势）" if _adx >= 25
-                        else "（趋势形成）" if _adx >= 20 else "（无趋势·震荡）")
+                        else "（趋势形成）" if _adx >= CFG.ADX_TH
+                        else "（无趋势·震荡）")
                      + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
                      + (" 多头占优" if _pdi > _mdi else " 空头占优"))
         sigs = res["signals"]
@@ -14725,7 +14839,7 @@ class App:
         bl_low = next((x for x in reversed(res["ind"]["boll_low"])
                        if x is not None), None)
         if None not in (bl_up, bl_mid, bl_low):
-            p("■ 布林带(20,2)")
+            p(f"■ 布林带({CFG.BOLL_N},{CFG.BOLL_K:g})")
             p(f"  上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | 下轨 {bl_low:.2f}")
             cur_px = res["quote"]["price"]
             pos = ("上轨上方·超买" if cur_px > bl_up
@@ -14740,10 +14854,11 @@ class App:
         _mdi = next((x for x in reversed(res["ind"]["mdi"])
                      if x is not None), None)
         if None not in (_adx, _pdi, _mdi):
-            p("■ ADX/DMI(14)")
+            p(f"■ ADX/DMI({CFG.ADX_N})")
             p(f"  ADX {_adx:.0f}"
               + ("（强趋势）" if _adx >= 25
-                 else "（趋势形成）" if _adx >= 20 else "（无趋势·震荡）")
+                 else "（趋势形成）" if _adx >= CFG.ADX_TH
+                 else "（无趋势·震荡）")
               + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
               + (" 多头占优" if _pdi > _mdi else " 空头占优"))
         act = res.get("action")
@@ -15184,13 +15299,14 @@ class App:
             f"DIF={f3(last(ind['dif']))} DEA={f3(last(ind['dea']))} "
             f"MACD柱={f3(last(ind['mhist']))}\n"
             f"K={f1(last(ind['k']))} D={f1(last(ind['d']))} J={f1(last(ind['j']))}\n"
-            f"RSI6={f1(last(ind['rsi6']))} RSI12={f1(last(ind['rsi12']))}\n"
-            f"布林带(20,2): 上轨={f3(last(ind['boll_up']))} "
+            f"RSI{CFG.RSI_SHORT}={f1(last(ind['rsi6']))} "
+            f"RSI{CFG.RSI_LONG}={f1(last(ind['rsi12']))}\n"
+            f"布林带({CFG.BOLL_N},{CFG.BOLL_K:g}): 上轨={f3(last(ind['boll_up']))} "
             f"中轨={f3(last(ind['boll_mid']))} 下轨={f3(last(ind['boll_low']))}"
             f" 现价位于{'上轨上方' if cur_px > (last(ind['boll_up']) or 1e18) else ('下轨下方' if cur_px < (last(ind['boll_low']) or -1) else '带内')}\n"
-            f"ADX/DMI(14): ADX={f1(last(ind['adx']))} "
+            f"ADX/DMI({CFG.ADX_N}): ADX={f1(last(ind['adx']))} "
             f"+DI={f1(last(ind['pdi']))} -DI={f1(last(ind['mdi']))}"
-            "（ADX≥25强趋势 / <20震荡，DI方向即趋势方向）\n\n"
+            f"（ADX≥25强趋势 / <{CFG.ADX_TH}震荡，DI方向即趋势方向）\n\n"
             f"历史形态统计预测(锚定{res.get('anchor', '今开')})：\n"
             f"今日收盘 P50={tp['cl'][50]:.2f}(P10 {tp['cl'][10]:.2f}/"
             f"P90 {tp['cl'][90]:.2f}) 上行概率{tp['up_prob']*100:.0f}%\n"
@@ -16316,41 +16432,82 @@ class App:
             win.attributes("-fullscreen", True)
             win.bind("<Escape>",
                      lambda e: win.attributes("-fullscreen", False))
-        # 可滚动容器：设置内容多，小屏限高+滚轮滚动；
-        # v6.1.5 热修⑨：按钮栏固定在窗口底部（不随内容滚动），滚轮绑到全部子控件。
+        # ---- 布局：左分区导航（PyCharm 式）+ 右内容页（可滚动）----
+        # v6.3.2：设置按「外观/预测参数/指标参数/荐股/AI/关于」分区，点左侧切页；
+        # 底部按钮栏固定（不随内容滚动，滚轮绑到全部子控件）。
+        btns = ttk.Frame(win)          # 底部固定按钮栏（先创建，供 _fs_fit 计量）
+        body = ttk.Frame(win)
+        body.pack(side="top", fill="both", expand=True)
+        nav_w = 104 if getattr(self, "compact", False) else 132
+        nav = tk.Frame(body, bg=PANEL_BG, width=nav_w)
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        try:
+            _st = ttk.Style()
+            _st.configure("SettingsNav.Treeview", background=PANEL_BG,
+                          fieldbackground=PANEL_BG, borderwidth=0,
+                          rowheight=30, font=("Microsoft YaHei", 10))
+            _st.layout("SettingsNav.Treeview",
+                       [("Treeview.treearea", {"sticky": "nswe"})])
+        except Exception:
+            pass
+        nav_tree = ttk.Treeview(nav, show="tree", selectmode="browse",
+                                style="SettingsNav.Treeview")
+        nav_tree.pack(fill="both", expand=True, padx=(4, 0), pady=8)
+        sections = (("ui", "外观"), ("pred", "预测参数"),
+                    ("ind", "指标参数"), ("pick", "荐股"),
+                    ("ai", "AI 接口"), ("about", "关于"))
+        for _key, _lab in sections:
+            nav_tree.insert("", "end", iid=_key, text="  " + _lab)
+
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        cv = tk.Canvas(right, bg=DARK_BG, highlightthickness=0)
+        sb = ttk.Scrollbar(right, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        host = ttk.Frame(cv)
+        cv.create_window((0, 0), window=host, anchor="nw", tags="host")
+        secs = {}
+        for _key, _lab in sections:
+            _f = ttk.Frame(host, padding=14)
+            _f.grid(row=0, column=0, sticky="nsew")
+            _f.grid_remove()
+            secs[_key] = _f
+        sec_ui, sec_pred, sec_ind, sec_pick, sec_ai, sec_about = (
+            secs["ui"], secs["pred"], secs["ind"], secs["pick"],
+            secs["ai"], secs["about"])
+        frm = sec_ui                 # 下方既有构建代码按区切换父容器
+
         try:
             avail_h = int(self.root.winfo_vrootheight())
         except Exception:
             avail_h = int(self.root.winfo_screenheight())
         maxh = max(360, int(avail_h * 0.88) - 40)
-        cv = tk.Canvas(win, bg=DARK_BG, highlightthickness=0)
-        sb = ttk.Scrollbar(win, orient="vertical", command=cv.yview)
-        frm = ttk.Frame(cv, padding=14)
-        cv.create_window((0, 0), window=frm, anchor="nw", tags="frm")
-        cv.configure(yscrollcommand=sb.set)
-        btns = ttk.Frame(win)          # 底部固定按钮栏（先 pack 占位）
 
         def _fs_fit(_e=None):
             cv.configure(scrollregion=cv.bbox("all"))
-            # 下限 320：立即调用时 frm 尚未布局（reqheight=0）会把窗口缩成一条
-            # （热修⑨ 一度出现 580x34 的“迷你设置窗”），布局完成后再按真实高度收缩
-            h = max(320, min(frm.winfo_reqheight() + 20, maxh))
+            # 下限 320：立即调用时 host 尚未布局（reqheight=0）会把窗口缩成一条
+            h = max(320, min(host.winfo_reqheight() + 20, maxh))
             try:
                 cv.configure(height=max(200, h))
-                wwidth = max(580, min(frm.winfo_reqwidth() + 40,
-                                      self.root.winfo_screenwidth() - 20))
+                wcontent = max(600, min(host.winfo_reqwidth() + 20,
+                                        self.root.winfo_screenwidth()
+                                        - nav_w - 40))
                 bh = 12
                 try:
                     bh += btns.winfo_reqheight()
                 except Exception:
                     pass
+                ww = nav_w + wcontent + 30
                 if getattr(self, "compact", False):
-                    win.geometry(f"{wwidth}x{h + bh}")
+                    win.geometry(f"{ww}x{h + bh}")
                 else:
-                    self._center_win(win, wwidth, h + bh)
+                    self._center_win(win, ww, h + bh)
             except Exception:
                 pass
-        frm.bind("<Configure>", _fs_fit)
+        host.bind("<Configure>", _fs_fit)
 
         def _wheel(e):
             try:
@@ -16374,9 +16531,22 @@ class App:
             for ch in w.winfo_children():
                 _bind_wheel_all(ch)
 
+        def _show(key):
+            for k, f in secs.items():
+                if k == key:
+                    f.grid()
+                else:
+                    f.grid_remove()
+            cv.yview_moveto(0)
+            win.after(30, _fs_fit)
+
+        def _on_nav(_e=None):
+            sel = nav_tree.selection()
+            if sel:
+                _show(sel[0])
+        nav_tree.bind("<<TreeviewSelect>>", _on_nav)
+
         btns.pack(side="bottom", fill="x", padx=14, pady=(0, 10))
-        cv.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
 
         ttk.Label(frm, text="界面主题").grid(row=0, column=0, sticky="w", pady=4)
         theme_var = tk.StringVar(value=self.settings["theme"])
@@ -16502,6 +16672,7 @@ class App:
                             boll_lbl_row + 1 + i)
             color_buttons[("boll", key)] = btn
 
+        frm = sec_ai
         ttk.Label(frm, text="AI Key").grid(row=2, column=0, sticky="w",
                                            pady=(8, 4))
         key_var = tk.StringVar(value=("" if ENV_API_KEY else self.api_key))
@@ -16564,6 +16735,7 @@ class App:
         ent_px.grid(row=5, column=1, columnspan=2, sticky="we", pady=4)
 
         # ---- 预测参数（存 ini [predict]，下次启动生效）----
+        frm = sec_pred
         ttk.Separator(frm, orient="horizontal").grid(
             row=6, column=0, columnspan=3, sticky="we", pady=10)
         ttk.Label(frm, text="— 预测参数（改动后需重新分析生效）—").grid(
@@ -16645,7 +16817,52 @@ class App:
             row=10 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(12, 0))
 
+        # ---- 指标参数（v6.3.2 新增；存 ini [inds]，保存后立即生效）----
+        frm = sec_ind
+        ttk.Label(frm, text="— 指标计算参数（保存后重新分析生效）—").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(4, 6))
+        ind_defs = [
+            ("MACD 快线", "MACD_FAST", "EMA 快线周期 (2-60)"),
+            ("MACD 慢线", "MACD_SLOW", "EMA 慢线周期 (3-120，须>快线)"),
+            ("MACD 信号", "MACD_SIGNAL", "DEA 信号线周期 (2-60)"),
+            ("KDJ N", "KDJ_N", "RSV 回看周期 (2-60)"),
+            ("KDJ M1", "KDJ_M1", "K 值平滑参数 (2-20)"),
+            ("KDJ M2", "KDJ_M2", "D 值平滑参数 (2-20)"),
+            ("RSI 短周期", "RSI_SHORT", "信号打分/图例用 (2-60)"),
+            ("RSI 长周期", "RSI_LONG", "图表对照用 (2-60)"),
+            ("BOLL 周期", "BOLL_N", "中轨 SMA 周期 (5-120)"),
+            ("BOLL 倍数", "BOLL_K", "标准差倍数 (0.5-4.0)"),
+            ("ADX 周期", "ADX_N", "TR/±DM Wilder 平滑 (2-60)"),
+            ("ADX 平滑", "ADX_SMOOTH", "DX 平均周期（ADX 平滑，2-60）"),
+            ("ADX 阈值", "ADX_TH", "≥此值算趋势形成 (10-60)"),
+        ]
+        ind_vars = {}
+        for _i, (_lab, _attr, _hint) in enumerate(ind_defs):
+            _r = 1 + _i
+            ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
+                                           pady=2)
+            _var = tk.StringVar(value=str(getattr(CFG, _attr)))
+            ind_vars[_attr] = _var
+            ttk.Entry(frm, textvariable=_var, width=8).grid(
+                row=_r, column=1, sticky="w", pady=2)
+            ttk.Label(frm, text=_hint, foreground=AXIS_TXT).grid(
+                row=_r, column=2, sticky="w", padx=(6, 0))
+
+        def _reset_inds():
+            for _a, _v in IND_DEFAULTS.items():
+                ind_vars[_a].set(str(_v))
+
+        ttk.Button(frm, text="恢复默认指标参数", command=_reset_inds).grid(
+            row=1 + len(ind_defs), column=2, sticky="e", pady=(10, 0))
+        ttk.Label(frm, text="说明：指标参数同时作用于分析页指标/买卖点打分/"
+                            "消融/逐股回测；\n改动后需重新分析生效，"
+                            "历史回测结果按新参数重算。",
+                  justify="left", foreground=AXIS_TXT).grid(
+            row=2 + len(ind_defs), column=0, columnspan=3, sticky="w",
+            pady=(8, 0))
+
         # ---- 荐股权限 / AI自动选档（存 ini [picks]）----
+        frm = sec_pick
         pconf = picks_conf()
         ttk.Separator(frm, orient="horizontal").grid(
             row=11 + len(prows), column=0, columnspan=3, sticky="we", pady=10)
@@ -16798,6 +17015,19 @@ class App:
                     CFG.RISK_MODE = risk_var.get()
                     cp.set("predict", "risk_mode", CFG.RISK_MODE)
                     pnotes.append(f"风险={CFG.RISK_MODE}")
+                # 指标参数（存 [inds]；非法输入保留原值，写入钳制后的生效值）
+                if not cp.has_section("inds"):
+                    cp.add_section("inds")
+                _bad = []
+                for _attr, _var in ind_vars.items():
+                    if set_ind_param(_attr, _var.get()) is None:
+                        _bad.append(_attr)
+                for _attr in IND_RANGES:
+                    _v = getattr(CFG, _attr)
+                    cp.set("inds", _attr.lower(),
+                           f"{_v:g}" if isinstance(_v, float) else str(_v))
+                pnotes.append(f"指标x{len(ind_vars)}"
+                              + (f"(跳过非法:{','.join(_bad)})" if _bad else ""))
                 # 荐股权限 / AI自动选档 / 股票池（存 [picks]）
                 if not cp.has_section("picks"):
                     cp.add_section("picks")
@@ -16863,18 +17093,16 @@ class App:
             ttk.Button(btns, text="关机", command=self._shutdown_confirm).pack(
                 side="left", padx=4)
 
-        # ---- 关于 / 免责声明 ----
+        # ---- 关于 / 免责声明（作者信息按 v6.3.2 要求移到最下方）----
+        frm = sec_about
         sep = ttk.Separator(frm, orient="horizontal")
         sep.grid(row=29, column=0, columnspan=3, sticky="we", pady=(14, 8))
         about = tk.Text(frm, width=40 if self.compact else 52,
-                        height=6 if self.compact else 11, relief="flat",
+                        height=6 if self.compact else 12, relief="flat",
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=30, column=0, columnspan=3, sticky="we")
         about.insert("end", f"版本：v{APP_VERSION}（2026-10）\n")
-        about.insert("end", "作者：獨白\n")
-        about.insert("end", "邮箱：kingrux106@gmail.com\n")
-        about.insert("end", "QQ：2180287399\n")
         about.insert("end", "\n【免责声明】\n")
         about.insert(
             "end",
@@ -16882,13 +17110,19 @@ class App:
             "AI分析）仅为历史数据的技术统计与个人学习研究用途，"
             "不构成任何投资建议或收益承诺。股票有风险，"
             "据此操作产生的盈亏与后果由使用者自行承担。"
-            "请遵守所在地区法律法规，理性投资。")
+            "请遵守所在地区法律法规，理性投资。\n")
+        about.insert("end", "\n————————————\n")
+        about.insert("end", "作者：獨白\n")
+        about.insert("end", "邮箱：kingrux106@gmail.com\n")
+        about.insert("end", "QQ：2180287399\n")
         about.config(state="disabled")
 
-        # 内容区全部子控件绑定滚轮（含后建的关于/权限控件）；
-        # 定位放到布局完成之后（立即调用 reqheight 还是 0 → 迷你窗口）
-        _bind_wheel_all(frm)
+        # 内容区全部子控件绑定滚轮（含各区与关于控件）；
+        # 默认显示「外观」页，定位放到布局完成之后
+        _bind_wheel_all(host)
         _bind_wheel_all(btns)
+        nav_tree.selection_set("ui")
+        _show("ui")
         win.after(60, _fs_fit)
 
     def _shutdown_confirm(self):

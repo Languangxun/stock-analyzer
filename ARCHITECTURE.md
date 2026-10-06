@@ -563,6 +563,21 @@ GUI 面板与 `stock_backtest_export.py` 共用），
   启动加载；BOLL 改独立 `show_boll` 打勾（与 MA 同位），不再占用副图——
   副图 combobox 改为 `["MACD", "KDJ", "RSI", "ADX", "量比"]`（新增量比
   `__draw_VOL_ratio`：近5/前15 量比 + 0.8/1.0/1.2 三道阈值 + `vol_regime` 标题尾标）。
+- **设置分区导航（v6.3.2）**：设置窗口改 **PyCharm 式左分区 + 右内容页**——
+  左侧 `ttk.Treeview`（`SettingsNav.Treeview` 无表头、行高 30）分区
+  「外观 / 预测参数 / 指标参数 / 荐股 / AI 接口 / 关于」，右侧单 Canvas 内
+  六个 `ttk.Frame` 同 cell `grid_remove` 切页；窗口高宽随当前页自适应
+  （上限 `vrootheight×0.88`），底部按钮栏固定；滚轮仍递归绑定全部子控件。
+  「关于」页作者信息按用户要求移到最下方（版本 → 免责声明 → 作者/邮箱/QQ）。
+- **指标参数可调（v6.3.2）**：`CFG` 新增 13 个指标参数（MACD 快/慢/信号、
+  KDJ N/M1/M2、RSI 短/长、BOLL 周期/倍数、ADX 周期/平滑/趋势阈值），
+  ini `[inds]` 持久化（`_load_ind_cfg` + `set_ind_param` 范围钳制，
+  `IND_RANGES`/`IND_DEFAULTS` 单一事实源；MACD 自动保证慢线>快线）；
+  `calc_macd/calc_kdj/calc_rsi/calc_boll/calc_adx` 参数缺省改读 `CFG`
+  （`calc_adx` 新增 `smooth` 参数分离 DX 平均/ADX 平滑周期，默认= `ADX_N`），
+  分析页/买卖点打分/消融/逐股回测/研究脚本共用；图表与右栏标签
+  （`RSI{短}/{长}`、`BOLL({N},{K})`、`ADX/DMI({N})`、`ADX≥{阈值}`）
+  随参数动态显示；默认值与原硬编码一致，未改动任何历史结果。
 
 ### 3.14 18 策略共振综合荐股（v6.1.6）
 - **来源**：移植 `chaodi_strategies/et_engine`（通达信口径）进 `stock_gui.py` 算法区，
@@ -785,6 +800,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.3.2**<br>（2026-10-05） | **设置窗口 PyCharm 式分区导航 + 指标参数可调**：①设置由单页滚动改「左分区 Treeview + 右内容页」，分区=外观/预测参数/指标参数/荐股/AI 接口/关于，窗口随页自适应、底栏固定、滚轮递归绑定；作者信息移至关于页最下方。②`CFG` 新增 13 个指标参数（MACD 快/慢/信号 12/26/9、KDJ 9/3/3、RSI 6/12、BOLL 20/2.0、ADX 周期/平滑/阈值 14/14/20），ini `[inds]` 持久化（`_load_ind_cfg`/`set_ind_param`/`IND_RANGES`/`IND_DEFAULTS`，MACD 自动慢线>快线）；`calc_macd/kdj/rsi/boll/adx` 缺省读 `CFG`，`calc_adx` 新增 `smooth` 分离 DX 平均与 Wilder 周期；分析/打分/消融/逐股回测/研究脚本共用，标签动态显示；默认值与旧硬编码逐元素一致（回归对照通过），历史结果不变、未重跑。③`APP_VERSION=6.3.2`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
 | **v6.3.1**<br>（2026-10-05） | **稳健档收紧（IC 确认层 + Top10 + 换仓缓冲带）+ 买卖点稳健档更严格**：①`TIER_CFG*["稳健"]` 四口径由 `blend` Top20 改 **Top10 + `hold_buffer=10` + `ic_filter=True`**；`tier_eval`/`tier_picks_stats`/`tier_latest_picks` 支持**档位级 ic_filter**（全局 `ic_filter=True` 仍强制全档），`tier_sim_phase` 新增 `hold_buffer`（在位股排名 `top+buf` 内保留）；②`tier_sim_phase` 修正「实际买入加入 target」——原实现下整手/涨停跳过后买入的标的次日被旧目标误卖（该修正令均衡/激进旧数字小幅变化，全A 均衡 +56.2→+61.6%）；③`CFG.RISK_PARAMS["稳健"]` `buy_th 2→3、cooldown 5→8`（与保守档同入场门槛、止盈更宽，n=300 实测买点信号 -28%、中位年化基本不变）；④**全量重跑**：标准回测 full/val/bull 四口径（全A 稳健全期 **+73.5%/-19.5%/4180 笔**，原 +30.2%/-8.6%/9708 笔；val **+50.5%**、bull **+87.9%**；主板 +49.7%/-22.5%、ETF +9.5%、全A含ETF +69.6%）、picks10 full/val/bull（10 万口径稳健 +65.6%/-19.7%、val +43.5%、bull +78.7%）、`dashboard.html` 重建；配对实验备案：IC+Top10 无缓冲 +83.0%/4480 笔（1M），缓冲带10 = +73.5%/4180 笔；Top20 加缓冲仅 -3% 交易（前 20 名换手极快）；换手上限方案降换手 -35%~-50% 但全A val 受损未采用；⑤`APP_VERSION=6.3.1`，`stock_predict.py` 由 `build_cli.py` 重新生成；3.6/3.7 节、README/CHANGELOG 同步 |
 | **v6.3.0**<br>（2026-10-04） | **异动·全市场相似历史（可回测）+ 分析页行业/换手率显示**：①新增 3.15 节——`analog_scan` 检测近 20 日「单日/5日累计超自身历史 99.5 分位（底线 5%/10%）」的异动（精确逐日因果分位，无前视）；`_analog_events` 全A（剔 ETF）因果异动事件表（`_analog_flag_panel` 每 20 日重算、跨股向量化，约 8.6 万例，构建 ~24s，进程内缓存 + 锁），按 K线形态/事件后路径/量比/换手率（`et_shares`）/RSI14/波动率/r5 加权距离取 Top50，统计「事件后第 k 日」未来 1/3/5 日与封板率；激进/均衡档方向明确（≥55% 且均收正 / ≤45% 且均收负）时覆盖近端买卖点并改 `band_algo`，激进档封板率≥30% 附打板价，样本分歧维持原策略；设置页可关（ini `[predict] analog_override`）。②**参与回测**：`_sig_analog` 因果生成历史信号（状态窗口步长 2 日、仅方向变化），并入图表/单股 `bt_stats`，并进消融候选池（GUI + 研究 gens、`strategy_signals_full`、逐股导出、三档选型），候选池 12 算法 × 3 档 + 多维评分 = 39；研究消融 `--limit 40` 冒烟通过。③报告标题 `名称(代码)[行业]` + 现价后换手率，顶栏/侧栏同步；`_fetch_quote_tencent` 解析 f38/f39/f46。④`tier_load_panel` 改游标流式 + SQL 前缀过滤（全库 800 万行不再 fetchall），输出逐元素一致、单进程峰值 3.6GB→505MB（消融多 worker OOM 回归修复）。⑤**全量产物重跑**：消融 7236 对象/7183 有效 5123s（analog 入选 保守 98/稳健 132=1.84%/激进 91=1.27%；候选 IC1 中位 +0.058、IC5 +0.041）、三档选型刷新 GUI 缓存与 `ablation_gui_cache.json`、逐股导出 6901 只（analog 321 行/156 只）、标准回测 full/val/bull 三段（数字与昨日一致）、`dashboard.html` 重建且消融表加「异动相似入选」列。⑥`APP_VERSION=6.3.0`，`stock_predict.py` 重新生成；CHANGELOG/README 同步 |
 | **v6.2.4**<br>（2026-10-03） | **换手率/动态PE/PB 入库 + 生产端亏损过滤 + IC 中位卡片**：①`stocks` 表加 `turnover/pe/pb`（启动迁移），东财 clist 扩字段 f8/f9/f23，新增腾讯行情备用通道 `refresh_valuation_tx`（60只/批，7285 只实测全部入库），代码表刷新尾部自动 only_missing 补缺；②`tier_latest_picks` 默认剔除动态 PE≤0（`picks_exclude_loss`，ini `[picks] exclude_loss=0` 可关；缺失不过滤），picks 增 `pe/turnover`，实测剔除 1765 只亏损股；**不参与历史回测**（无时点估值数据）；基本面工具加估值快照行；③仪表盘每只股回测页新增「IC 中位（T+1/T+5）」卡片（与收益中位分开）；`APP_VERSION=6.2.4`，`stock_predict.py` 重新生成；README/CHANGELOG 同步 |

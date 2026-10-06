@@ -118,7 +118,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-10-03 升 6.2.4）
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.3.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -202,6 +202,23 @@ class CFG:
     SIGNAL_COOLDOWN = 5                 # 相邻信号最小间隔(交易日)
     WEAK_IDX_TH = -1.5                  # 大盘弱势阈值(%)
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
+    # ---- 指标计算参数（v6.3.2 起可调；ini [inds] 持久化，设置→指标参数）----
+    # 作用于分析页指标/买卖点打分/消融/逐股回测；改动后需重新分析生效。
+    # 范围：快线2-60 / 慢线3-120 / 信号2-60；KDJ 2-60/2-20/2-20；
+    # RSI 2-60；BOLL 5-120/0.5-4.0；ADX 2-60/2-60/10-60。
+    MACD_FAST = 12                      # MACD 快线 EMA 周期
+    MACD_SLOW = 26                      # MACD 慢线 EMA 周期
+    MACD_SIGNAL = 9                     # MACD DEA 信号线周期
+    KDJ_N = 9                           # KDJ RSV 回看周期
+    KDJ_M1 = 3                          # K 值平滑（k=(m1-1)/m1·k+rsv/m1）
+    KDJ_M2 = 3                          # D 值平滑
+    RSI_SHORT = 6                       # 短 RSI（信号打分/图表用）
+    RSI_LONG = 12                       # 长 RSI（图表用）
+    BOLL_N = 20                         # 布林带周期
+    BOLL_K = 2.0                        # 布林带标准差倍数
+    ADX_N = 14                          # DMI/ADX 周期（TR/±DM Wilder 平滑）
+    ADX_SMOOTH = 14                     # ADX 平滑周期（DX 平均；默认=ADX_N）
+    ADX_TH = 20                         # ADX 趋势阈值（≥此值算趋势形成）
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
     # 单只股票K线联网拉取根数（默认1000；只限制联网拉取，不限制读库/分析，
@@ -369,7 +386,84 @@ def _load_predict_cfg():
         log.exception("读取预测参数失败(使用默认)")
 
 
+def _load_ind_cfg():
+    """从 stock_gui.ini [inds] 读取指标参数（带范围钳制，v6.3.2）。"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("inds"):
+            cp.add_section("inds")
+
+        def gi(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, int(cp.get("inds", key,
+                                                  fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        def gf(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, float(cp.get("inds", key,
+                                                    fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        CFG.MACD_FAST = gi("macd_fast", CFG.MACD_FAST, 2, 60)
+        CFG.MACD_SLOW = gi("macd_slow", CFG.MACD_SLOW, 3, 120)
+        if CFG.MACD_SLOW <= CFG.MACD_FAST:      # 慢线须大于快线
+            CFG.MACD_SLOW = CFG.MACD_FAST + 1
+        CFG.MACD_SIGNAL = gi("macd_signal", CFG.MACD_SIGNAL, 2, 60)
+        CFG.KDJ_N = gi("kdj_n", CFG.KDJ_N, 2, 60)
+        CFG.KDJ_M1 = gi("kdj_m1", CFG.KDJ_M1, 2, 20)
+        CFG.KDJ_M2 = gi("kdj_m2", CFG.KDJ_M2, 2, 20)
+        CFG.RSI_SHORT = gi("rsi_short", CFG.RSI_SHORT, 2, 60)
+        CFG.RSI_LONG = gi("rsi_long", CFG.RSI_LONG, 2, 60)
+        CFG.BOLL_N = gi("boll_n", CFG.BOLL_N, 5, 120)
+        CFG.BOLL_K = gf("boll_k", CFG.BOLL_K, 0.5, 4.0)
+        CFG.ADX_N = gi("adx_n", CFG.ADX_N, 2, 60)
+        CFG.ADX_SMOOTH = gi("adx_smooth", CFG.ADX_SMOOTH, 2, 60)
+        CFG.ADX_TH = gi("adx_th", CFG.ADX_TH, 10, 60)
+    except Exception:
+        log.exception("读取指标参数失败(使用默认)")
+
+
+# 指标参数范围/类型（设置→指标参数 与 ini [inds] 共用）
+IND_RANGES = {
+    "MACD_FAST": (2, 60), "MACD_SLOW": (3, 120), "MACD_SIGNAL": (2, 60),
+    "KDJ_N": (2, 60), "KDJ_M1": (2, 20), "KDJ_M2": (2, 20),
+    "RSI_SHORT": (2, 60), "RSI_LONG": (2, 60),
+    "BOLL_N": (5, 120), "BOLL_K": (0.5, 4.0),
+    "ADX_N": (2, 60), "ADX_SMOOTH": (2, 60), "ADX_TH": (10, 60),
+}
+# 出厂默认（「恢复默认指标参数」按钮用）
+IND_DEFAULTS = {
+    "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+    "KDJ_N": 9, "KDJ_M1": 3, "KDJ_M2": 3,
+    "RSI_SHORT": 6, "RSI_LONG": 12,
+    "BOLL_N": 20, "BOLL_K": 2.0,
+    "ADX_N": 14, "ADX_SMOOTH": 14, "ADX_TH": 20,
+}
+
+
+def set_ind_param(attr, value):
+    """钳制并写入单个指标参数；返回生效值（非法输入返回 None）。
+    MACD 自动保证 慢线 > 快线（v6.3.2）。"""
+    if attr not in IND_RANGES:
+        return None
+    lo, hi = IND_RANGES[attr]
+    try:
+        v = float(value) if attr == "BOLL_K" else int(float(value))
+    except (ValueError, TypeError):
+        return None
+    v = max(lo, min(hi, v))
+    setattr(CFG, attr, v)
+    if attr == "MACD_FAST" and CFG.MACD_SLOW <= v:
+        CFG.MACD_SLOW = min(120, v + 1)
+    return v
+
+
 _load_predict_cfg()
+_load_ind_cfg()
 
 
 W_WINDOW: int = CFG.W_WINDOW
@@ -3724,15 +3818,24 @@ def ema(vals, n):
     return out
 
 
-def calc_macd(closes):
-    dif = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
-    dea_raw = ema(dif, 9)
-    dea = [None] * 8 + dea_raw[8:]
+def calc_macd(closes, fast=None, slow=None, signal=None):
+    """MACD：EMA(快)-EMA(慢)=DIF、DEA=EMA(DIF,信号)、柱=2(DIF-DEA)。
+    周期默认取 CFG（v6.3.2 可调，设置→指标参数）。"""
+    fast = int(fast or CFG.MACD_FAST)
+    slow = int(slow or CFG.MACD_SLOW)
+    signal = int(signal or CFG.MACD_SIGNAL)
+    dif = [a - b for a, b in zip(ema(closes, fast), ema(closes, slow))]
+    dea_raw = ema(dif, signal)
+    dea = [None] * (signal - 1) + dea_raw[signal - 1:]
     hist = [None if dd is None else 2 * (a - dd) for a, dd in zip(dif, dea)]
     return dif, dea, hist
 
 
-def calc_kdj(rows, n=9):
+def calc_kdj(rows, n=None, m1=None, m2=None):
+    """KDJ：RSV(n) 回看，K/D 分别按 m1/m2 平滑（默认 9/3/3，CFG 可调）。"""
+    n = int(n or CFG.KDJ_N)
+    m1 = int(m1 or CFG.KDJ_M1)
+    m2 = int(m2 or CFG.KDJ_M2)
     ks, ds = [], []
     k = d = 50.0
     for i in range(len(rows)):
@@ -3740,14 +3843,16 @@ def calc_kdj(rows, n=9):
         lo = min(r["low"] for r in seg)
         hi = max(r["high"] for r in seg)
         rsv = (rows[i]["close"] - lo) / (hi - lo) * 100 if hi > lo else 50.0
-        k = k * 2 / 3 + rsv / 3
-        d = d * 2 / 3 + k / 3
+        k = k * (m1 - 1) / m1 + rsv / m1
+        d = d * (m2 - 1) / m2 + k / m2
         ks.append(k)
         ds.append(d)
     return ks, ds, [3 * a - 2 * b for a, b in zip(ks, ds)]
 
 
-def calc_rsi(closes, n):
+def calc_rsi(closes, n=None):
+    """RSI（Wilder 平滑）；n 缺省取 CFG.RSI_SHORT（短周期，信号打分用）。"""
+    n = int(n or CFG.RSI_SHORT)
     out = [None] * len(closes)
     if len(closes) <= n:
         return out
@@ -3841,14 +3946,18 @@ def calc_chips(rows, cur_price=None, nbin=None, shares=None):
             "cur": cur_price}
 
 
-def calc_adx(rows, n=14):
-    """DMI/ADX：+DI、-DI、ADX(n=14)。
-    返回 (pdi, mdi, adx) 三条序列，预热期(2n左右)为 None。"""
+def calc_adx(rows, n=None, smooth=None):
+    """DMI/ADX：+DI、-DI、ADX。
+    n = TR/±DM 的 Wilder 平滑周期，smooth = ADX（DX 平均）平滑周期；
+    两者缺省取 CFG.ADX_N / CFG.ADX_SMOOTH（v6.3.2 可调）。
+    返回 (pdi, mdi, adx) 三条序列，预热期为 None。"""
+    n = int(n or CFG.ADX_N)
+    sm = int(smooth or CFG.ADX_SMOOTH)
     m = len(rows)
     pdi = [None] * m
     mdi = [None] * m
     adx = [None] * m
-    if m < 2 * n + 1:
+    if m < n + sm + 1:
         return pdi, mdi, adx
     tr_s = pdm_s = ndm_s = 0.0
     dxs = []
@@ -3875,17 +3984,19 @@ def calc_adx(rows, n=14):
             mdi[i] = 100.0 * ndm_s / tr_s
             s = pdi[i] + mdi[i]
             dxs.append(100.0 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0)
-            if len(dxs) >= n:
+            if len(dxs) >= sm:
                 if adx[i - 1] is None:
-                    adx[i] = sum(dxs[-n:]) / n
+                    adx[i] = sum(dxs[-sm:]) / sm
                 else:
-                    adx[i] = (adx[i - 1] * (n - 1) + dxs[-1]) / n
+                    adx[i] = (adx[i - 1] * (sm - 1) + dxs[-1]) / sm
     return pdi, mdi, adx
 
 
-def calc_boll(closes, n=20, k=2.0):
-    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差。
+def calc_boll(closes, n=None, k=None):
+    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差（默认/范围取 CFG）。
     返回 (mid, up, low) 三条序列，预热期为 None。"""
+    n = int(n or CFG.BOLL_N)
+    k = float(CFG.BOLL_K if k is None else k)
     mid = sma_period(closes, n)
     up = [None] * len(closes)
     low = [None] * len(closes)
@@ -4344,7 +4455,7 @@ def daily_pick_score(rows, ind_ctx=None):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     b_mid, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     mas = {20: sma_period(closes, 20), 60: sma_period(closes, 60)}
@@ -4449,7 +4560,7 @@ def daily_pick_score(rows, ind_ctx=None):
         elif c > b_up[i]:
             _wadd("布林带", -1, "布林上轨超买")
     a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-    if None not in (a_i, p_i, m_i) and a_i >= 20:
+    if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
         if p_i > m_i:
             _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
         elif m_i > p_i:
@@ -5885,7 +5996,7 @@ def _sig_kdj(rows):
 
 def _sig_rsi(rows):
     closes = [r["close"] for r in rows]
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     out = []
     for i in range(1, len(rows)):
         if r6[i] is None or r6[i - 1] is None:
@@ -5936,7 +6047,7 @@ def _composite_precompute(rows, chip_tail=400, use_chips=True):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     _, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     ma20 = sma_period(closes, 20)
@@ -6011,7 +6122,7 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
             sc += _wadd("布林带", 1 if c < b_low[i]
                         else -1 if c > b_up[i] else 0)
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
             sc += _wadd("ADX", 1 if p_i > m_i else -1)
         day_weak = (weak.get(rows[i]["date"]) is not None
                     and weak[rows[i]["date"]] < CFG.WEAK_IDX_TH)
@@ -6470,7 +6581,7 @@ def _sig_lgbm(rows, **_kw):
     vols = [r.get("vol") or 0.0 for r in rows]
     dif_, dea_, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, 6)
+    r6 = calc_rsi(closes, CFG.RSI_SHORT)
     _, b_up, b_low = calc_boll(closes)
     vr_arr = [vol_ratio_at(vols, k) for k in range(n)]
 
@@ -7702,7 +7813,8 @@ def analyze(full, progress=None, quick=False):
     closes_i = [r["close"] for r in disp_rows]
     dif, dea, mhist = calc_macd(closes_i)
     k_, d_, j_ = calc_kdj(disp_rows)
-    r6, r12 = calc_rsi(closes_i, 6), calc_rsi(closes_i, 12)
+    r6, r12 = (calc_rsi(closes_i, CFG.RSI_SHORT),
+               calc_rsi(closes_i, CFG.RSI_LONG))
     b_mid, b_up, b_low = calc_boll(closes_i)
     pdi_a, mdi_a, adx_a = calc_adx(disp_rows)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
@@ -7833,7 +7945,7 @@ def analyze(full, progress=None, quick=False):
         # ADX（权重0.8：趋势强度过滤——只有 ADX≥20 趋势成立时，
         # DI 方向才计分；横盘时不贡献分数）
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
             if p_i > m_i:
                 _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
             elif m_i > p_i:
@@ -8013,11 +8125,11 @@ def analyze(full, progress=None, quick=False):
         r6_i = r6[i]
         if r6_i is not None:
             if r6_i < 30:
-                items.append(("RSI", 1, f"RSI6={r6_i:.0f} 超卖"))
+                items.append(("RSI", 1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超卖"))
             elif r6_i > 70:
-                items.append(("RSI", -1, f"RSI6={r6_i:.0f} 超买"))
+                items.append(("RSI", -1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超买"))
             else:
-                items.append(("RSI", 0, f"RSI6={r6_i:.0f} 中性"))
+                items.append(("RSI", 0, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 中性"))
         v_i = vols_d[i] if disp_rows[i].get("vol") else 0.0
         v5 = (sum(vols_d[max(0, i - 5):i]) / 5) if i >= 5 else 0.0
         if v_i and v5 and v_i > v5 * 1.2:
@@ -8062,7 +8174,7 @@ def analyze(full, progress=None, quick=False):
                 items.append(("ADX", 1 if p_i > m_i else -1,
                               f"ADX={a_i:.0f} 强趋势"
                               f"{'偏多' if p_i > m_i else '偏空'}"))
-            elif a_i >= 20:
+            elif a_i >= CFG.ADX_TH:
                 items.append(("ADX", 1 if p_i > m_i else -1 if p_i != m_i else 0,
                               f"ADX={a_i:.0f} 趋势形成中"))
             else:

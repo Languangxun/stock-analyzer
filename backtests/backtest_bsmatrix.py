@@ -61,7 +61,7 @@ def gen_signals(rows, idx_chg):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6, _ = calc_rsi(closes, 6), calc_rsi(closes, 12)
+    r6, _ = (calc_rsi(closes, CFG.RSI_SHORT), calc_rsi(closes, CFG.RSI_LONG))
     b_mid, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     mas = {nn: sma_period(closes, nn) for nn in (20, 60)}
@@ -147,7 +147,7 @@ def gen_signals(rows, idx_chg):
                 _wadd("布林带", -1)
         # ADX
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
             if p_i > m_i:
                 _wadd("ADX", 1)
             elif m_i > p_i:
