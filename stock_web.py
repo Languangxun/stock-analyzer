@@ -296,6 +296,268 @@ def normalize_code(code):
     raise ValueError(f"不支持的代码: {code}")
 
 
+# ---------- 港/美/加密：与 A 股同一代理架构（Pi 只转发，计算仍在浏览器） ----------
+# 数据源（2026-10 实测可达，归因见 market-sniper/market_sniper/data/sources/，
+# 作者本人项目；仅借用接口形状与代码映射，见 THIRD_PARTY 注）：
+#   港股行情/日K：腾讯 qt.gtimg.cn q=hkXXXXX / ifzq fqkline param=hkXXXXX
+#   美股行情：腾讯 q=usXXX（与 A 股同一字段下标：3现价/4昨收/5今开/33高/34低/30时间）
+#   美股日K：Yahoo v8 chart（query1.finance.yahoo.com，需 UA）
+#   加密行情/日K：OKX 公共接口（Binance 对境内 IP 地理封锁，改用 OKX）
+
+def _valid_hk(code):
+    return bool(re.fullmatch(r"\d{5}", code or ""))
+
+
+def _valid_us(code):
+    return bool(re.fullmatch(r"[A-Za-z0-9.\-]{1,8}", code or ""))
+
+
+def _valid_crypto(sym):
+    return bool(re.fullmatch(r"[A-Za-z0-9]{1,12}-[A-Za-z0-9]{1,12}", sym or ""))
+
+
+def _qt_quote(txcode):
+    """腾讯统一快照解析（A/港/美同一字段下标，已逐项实测）。"""
+    f = http_get(QT_URL + txcode).split("~")
+    if len(f) < 35 or not f[3]:
+        raise ValueError("未查询到该标的")
+    return {"name": f[1], "price": float(f[3]), "prev_close": float(f[4]),
+            "open": float(f[5]), "high": float(f[33]), "low": float(f[34]),
+            "time": f[30]}
+
+
+def _kline_yahoo(symbol, rng="2y"):
+    """Yahoo v8 日K（null 格跳过，与 _kline_tencent 同字段）。"""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+           f"{symbol}?interval=1d&range={rng}")
+    txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
+                                               "Win64; x64)"})
+    r = (json.loads(txt).get("chart") or {}).get("result") or []
+    if not r:
+        raise ValueError("Yahoo 无数据")
+    r = r[0]
+    ts = r.get("timestamp") or []
+    q = ((r.get("indicators") or {}).get("quote") or [{}])[0]
+    out = []
+    for i, t in enumerate(ts):
+        try:
+            c = q["close"][i]
+            if c is None or float(c) <= 0:
+                continue
+            o, h, lo = q["open"][i], q["high"][i], q["low"][i]
+            if o is None or h is None or lo is None:
+                continue
+            out.append({"date": datetime.datetime.fromtimestamp(
+                            t, datetime.timezone.utc).strftime("%Y-%m-%d"),
+                        "open": float(o), "close": float(c),
+                        "high": float(h), "low": float(lo),
+                        "vol": float(q["volume"][i] or 0)})
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out
+
+
+def _kline_us_em(symbol, count=1000):
+    """东财美股日K（secid 105纳斯达克/106纽交所/107美交所轮询；自带中文名）。
+    行格式 "日期,开,收,高,低,量"。Pi/桌面均实测可达。"""
+    last_err = None
+    for mkt in (105, 106, 107):
+        url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+               f"?secid={mkt}.{symbol}&fields1=f1,f2,f3,f4,f5"
+               f"&fields2=f51,f52,f53,f54,f55,f56"
+               f"&klt=101&fqt=1&beg=0&end=20500101&lmt={count}")
+        try:
+            txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15,
+                                headers={"Referer":
+                                         "https://quote.eastmoney.com/"})
+            data = (json.loads(txt).get("data") or {})
+            klines = data.get("klines") or []
+            out = []
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) < 6:
+                    continue
+                try:
+                    close = float(parts[2])
+                    if close <= 0:
+                        continue
+                    out.append({"date": parts[0], "open": float(parts[1]),
+                                "close": close, "high": float(parts[3]),
+                                "low": float(parts[4]),
+                                "vol": float(parts[5])})
+                except (ValueError, IndexError):
+                    continue
+            if len(out) >= 20:
+                return out, data.get("name") or ""
+            last_err = RuntimeError(f"secid={mkt} 返回 {len(out)} 根")
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"东财美股无数据: {last_err}")
+
+
+def _kline_us(symbol):
+    """美股日K：东财优先（Pi 可达），Yahoo 兜底（桌面可达）。"""
+    try:
+        rows, _name = _kline_us_em(symbol)
+        return rows
+    except Exception:
+        return _kline_yahoo(symbol)
+
+
+def _kline_gate(inst, limit=500):
+    """Gate 日K（BTC-USDT->BTC_USDT；[t,v,c,h,l,o]，返回升序）。"""
+    pair = inst.replace("-", "_").upper()
+    url = (f"https://api.gateio.ws/api/v4/spot/candlesticks"
+           f"?currency_pair={pair}&interval=1d&limit={min(limit, 2000)}")
+    txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15)
+    out = []
+    for b in json.loads(txt) or []:
+        try:
+            if float(b[2]) <= 0:
+                continue
+            out.append({"date": datetime.datetime.fromtimestamp(
+                            int(b[0]), datetime.timezone.utc
+                            ).strftime("%Y-%m-%d"),
+                        "open": float(b[5]), "high": float(b[3]),
+                        "low": float(b[4]), "close": float(b[2]),
+                        "vol": float(b[6])})
+        except (ValueError, IndexError):
+            continue
+    return sorted(out, key=lambda x: x["date"])
+
+
+def _gate_ticker(inst):
+    pair = inst.replace("-", "_").upper()
+    txt = _http_get_enc(
+        f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={pair}",
+        enc="utf-8", retries=2, timeout=15)
+    data = json.loads(txt) or []
+    if not data:
+        raise ValueError("未查询到该标的")
+    t = data[0]
+    last = float(t["last"])
+    chg = float(t.get("change_percentage") or 0)
+    open24 = last / (1 + chg / 100) if chg else last
+    return {"name": inst, "price": last, "prev_close": open24,
+            "open": open24,
+            "high": float(t.get("high_24h") or last),
+            "low": float(t.get("low_24h") or last), "time": ""}
+
+
+def _kline_crypto(inst, limit=300):
+    """加密日K：Gate 优先（Pi/桌面均可达），OKX 兜底。"""
+    try:
+        rows = _kline_gate(inst, limit)
+        if len(rows) >= 20:
+            return rows
+    except Exception:
+        pass
+    return _kline_okx(inst, limit)
+
+
+def _crypto_ticker(inst):
+    try:
+        return _gate_ticker(inst)
+    except Exception:
+        return _okx_ticker(inst)
+
+
+def _kline_okx(inst, limit=300):
+    """OKX 日K兜底（instId 如 BTC-USDT；返回升序；不足用历史端点补）。"""
+    rows = []
+    for path in ("market/candles", "market/history-candles"):
+        need = limit - len(rows)
+        if need <= 0:
+            break
+        url = (f"https://www.okx.com/api/v5/{path}"
+               f"?instId={inst}&bar=1D&limit={min(need, 300)}")
+        txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15)
+        data = (json.loads(txt).get("data") or [])
+        for b in reversed(data):
+            try:
+                if float(b[4]) <= 0:
+                    continue
+                rows.append({"date": datetime.datetime.fromtimestamp(
+                                 int(b[0]) / 1000,
+                                 datetime.timezone.utc).strftime("%Y-%m-%d"),
+                             "open": float(b[1]), "high": float(b[2]),
+                             "low": float(b[3]), "close": float(b[4]),
+                             "vol": float(b[5])})
+            except (ValueError, IndexError):
+                continue
+        if len(data) < min(need, 300):
+            break
+    seen, out = set(), []
+    for b in sorted(rows, key=lambda x: x["date"]):
+        if b["date"] not in seen:
+            seen.add(b["date"])
+            out.append(b)
+    return out
+
+
+def _okx_ticker(inst):
+    txt = _http_get_enc(
+        f"https://www.okx.com/api/v5/market/ticker?instId={inst}",
+        enc="utf-8", retries=2, timeout=15)
+    data = (json.loads(txt).get("data") or [])
+    if not data:
+        raise ValueError("未查询到该标的")
+    t = data[0]
+    last = float(t["last"])
+    return {"name": inst, "price": last,
+            "prev_close": float(t.get("open24h") or last),
+            "open": float(t.get("open24h") or last),
+            "high": float(t.get("high24h") or last),
+            "low": float(t.get("low24h") or last), "time": ""}
+
+
+def _pack_bars(name, label, quote, krows):
+    rows = [{"dt": b["date"], "o": b["open"], "c": b["close"],
+             "h": b["high"], "l": b["low"], "v": b["vol"]}
+            for b in krows]
+    if len(rows) < 130:
+        raise ValueError("上市时间太短，样本不足")
+    return {
+        "name": quote["name"] or name, "code": label,
+        "price": quote["price"], "prev_close": quote["prev_close"],
+        "open": quote["open"], "high": quote["high"], "low": quote["low"],
+        "time": quote["time"], "today": time.strftime("%Y-%m-%d"),
+        "bars": rows,
+    }
+
+
+def api_data_mkt(mkt, code):
+    """多市场数据中转（返回体与 api_data 同形，前端图表零改动）。"""
+    mkt = (mkt or "cn").lower()
+    if mkt == "hk":
+        c = "".join(ch for ch in code if ch.isdigit())
+        if not _valid_hk(c):
+            raise ValueError("港股代码格式不对: 如 00700")
+        tx = "hk" + c
+        return _pack_bars(c, "hk" + c, _qt_quote(tx),
+                          _kline_tencent(tx, 500))
+    if mkt == "us":
+        c = code.strip().upper().replace(" ", "")
+        if not _valid_us(c):
+            raise ValueError("美股代码格式不对: 如 AAPL")
+        tx = "us" + c
+        return _pack_bars(c, "us" + c, _qt_quote(tx),
+                          _kline_us(c))
+    if mkt in ("crypto", "加密"):
+        s = code.strip().upper().replace("/", "-").replace(" ", "")
+        if "-" not in s:
+            s += "-USDT"
+        if not _valid_crypto(s):
+            raise ValueError("加密格式不对: 如 BTC-USDT")
+        return _pack_bars(s, s, _crypto_ticker(s), _kline_crypto(s))
+    full = normalize_code(code)
+    if not _valid_code(full):
+        raise ValueError("非法股票代码")
+    return api_data(full)
+
+
 def api_data(full):
     """只做数据中转：实时快照 + 原始日K。"""
     f = http_get(QT_URL + full).split("~")
@@ -370,6 +632,9 @@ th{color:#889;font-weight:normal}
 </head>
 <body>
 <div class="bar">
+  <select id="mkt" onchange="chgMkt()" title="市场">
+    <option value="cn">A股</option><option value="hk">港股</option><option value="us">美股</option><option value="crypto">加密</option>
+  </select>
   <input id="code" placeholder="代码 如002241/600519" size="16" value="000725">
   <button onclick="go()">分析</button>
   <select id="ind" onchange="drawAll()">
@@ -772,11 +1037,20 @@ function renderSide(){
 }
 
 // ================= 加载 =================
+const MKT_PH={cn:"代码 如002241/600519",hk:"港股 如00700/03690",us:"美股 如AAPL/TSLA",crypto:"加密 如BTC-USDT/ETH-USDT"};
+const MKT_DEF={cn:"000725",hk:"00700",us:"AAPL",crypto:"BTC-USDT"};
+function chgMkt(){
+  const m=document.getElementById("mkt").value;
+  const inp=document.getElementById("code");
+  inp.placeholder=MKT_PH[m]||MKT_PH.cn;
+  if(!inp.value||Object.values(MKT_DEF).includes(inp.value))inp.value=MKT_DEF[m];
+}
 function go(){
   const code=document.getElementById("code").value.trim();
+  const mkt=document.getElementById("mkt").value;
   if(!code)return;
   document.getElementById("info").textContent="加载中...";
-  fetch("/api?code="+encodeURIComponent(code)).then(r=>r.json()).then(j=>{
+  fetch("/api?mkt="+encodeURIComponent(mkt)+"&code="+encodeURIComponent(code)).then(r=>r.json()).then(j=>{
     if(j.error){document.getElementById("info").textContent=j.error;return;}
     D=j;
     const t0=performance.now();
@@ -1313,10 +1587,8 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api":
             qs = parse_qs(parsed.query)
             try:
-                full = normalize_code(qs.get("code", [""])[0])
-                if not _valid_code(full):
-                    raise ValueError("非法股票代码")
-                res = api_data(full)
+                mkt = qs.get("mkt", ["cn"])[0]
+                res = api_data_mkt(mkt, qs.get("code", [""])[0])
                 self._send(200, json.dumps(res, ensure_ascii=False),
                            "application/json; charset=utf-8")
             except Exception as e:
