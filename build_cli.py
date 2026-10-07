@@ -29,7 +29,7 @@ K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自�
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--refresh-etf] [--backfill]
                              [--clean] [--research] [--v4 [--v4-limit N]]
-                             [--tiers [--tier 稳健|均衡|激进] [--ai-tier]]
+                             [--tiers [--tier 稳健|均衡|激进|test] [--ai-tier]]
                              [--tiers-backtest] [--universe all|main|etf|all_etf]
                              [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
@@ -39,12 +39,18 @@ K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自�
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
   --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
-  --tiers          v6.1.9 四档组合：输出最新目标持仓/闸门状态（可配 --tier）
-  --ai-tier        荐股前由AI在四档内选一档（按设置里的风险偏好锚定）
+  --tiers          组合档位：输出最新目标持仓/闸门状态（默认稳定三档）
+  --tier test       sm701 LightGBM 实验档（需桌面 sm701 副本；显式指定）
+  --ai-tier        荐股前由AI在稳定三档内选一档（test 仅手动）
   --universe       标的池：all(全A不含ETF，默认)/main(沪深主板)/etf(仅ETF)/all_etf(全A含ETF)
-  --tiers-backtest v6.1.9 四档组合：全期回测摘要（相位平均，含全部费用）
+  --tiers-backtest 组合回测摘要（默认稳定三档；--tier 可显式加 test）
   --picks-backtest v6.1.5 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
+
+sm701 路径：默认自动查找 ~/桌面/sm701 (副本) 与原目录；
+             也可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖。
+风险偏好 test（stock_gui.ini [predict] risk_mode=test，v6.4.1）：
+             单股买卖点不消融，直接用 sm701 模型概率（≥0.55 买入/<0.50 卖出）。
 """
 
 '''
