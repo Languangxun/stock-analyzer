@@ -17588,13 +17588,34 @@ class App:
             avail_h = int(self.root.winfo_screenheight())
         maxh = max(360, int(avail_h * 0.88) - 40)
 
-        def _fs_fit(_e=None):
-            cv.configure(scrollregion=cv.bbox("all"))
-            # 下限 320：立即调用时 host 尚未布局（reqheight=0）会把窗口缩成一条
-            h = max(320, min(host.winfo_reqheight() + 20, maxh))
+        def _fs_sync_scroll(_e=None):
+            # 只刷新滚动范围，不改窗口尺寸：切页时窗口固定才不跳。
+            try:
+                cv.configure(scrollregion=cv.bbox("all"))
+            except Exception:
+                pass
+
+        def _fs_init_size():
+            # 按全部的分页面取最大需求，一次定死窗口/画布高度；
+            # 之后切页只换内容+滚动条，窗口不再忽大忽小、也不再反复居中。
+            try:
+                win.update_idletasks()
+            except Exception:
+                pass
+            max_req_h, max_req_w = 0, 0
+            for _k, _f in secs.items():
+                _f.grid()
+                try:
+                    win.update_idletasks()
+                    max_req_h = max(max_req_h, int(_f.winfo_reqheight()))
+                    max_req_w = max(max_req_w, int(_f.winfo_reqwidth()))
+                except Exception:
+                    pass
+                _f.grid_remove()
+            h = max(320, min(max_req_h + 20, maxh))
             try:
                 cv.configure(height=max(200, h))
-                wcontent = max(600, min(host.winfo_reqwidth() + 20,
+                wcontent = max(600, min(max_req_w + 20,
                                         self.root.winfo_screenwidth()
                                         - nav_w - 40))
                 bh = 12
@@ -17609,7 +17630,7 @@ class App:
                     self._center_win(win, ww, h + bh)
             except Exception:
                 pass
-        host.bind("<Configure>", _fs_fit)
+        host.bind("<Configure>", _fs_sync_scroll)
 
         def _wheel(e):
             try:
@@ -17640,7 +17661,8 @@ class App:
                 else:
                     f.grid_remove()
             cv.yview_moveto(0)
-            win.after(30, _fs_fit)
+            # 窗口尺寸已在 _fs_init_size 一次定死，这里只刷滚动范围。
+            win.after_idle(_fs_sync_scroll)
 
         def _on_nav(_e=None):
             sel = nav_tree.selection()
@@ -18225,9 +18247,9 @@ class App:
         # 默认显示「外观」页，定位放到布局完成之后
         _bind_wheel_all(host)
         _bind_wheel_all(btns)
+        _fs_init_size()
         nav_tree.selection_set("ui")
         _show("ui")
-        win.after(60, _fs_fit)
 
     def _shutdown_confirm(self):
         """小屏设备专用：确认后关机（需 sudoers 免密授权 shutdown）。"""
