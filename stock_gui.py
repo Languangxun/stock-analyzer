@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-07 升 6.4.1）
-APP_VERSION = "6.4.1"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-07 升 6.4.2）
+APP_VERSION = "6.4.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -287,15 +287,17 @@ class CFG:
     # ---- 风险偏好（v6.2.3 起三档；原「高风险」名与参数已删除）----
     # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
     # 稳健=信号严(评分3+冷却8，v6.3.1 由 2/5 收紧、交易数约-28%)
-    #      +止损同保守、止盈更宽(ATR1.5/回落6%)
+    #      +止损同保守、止盈更宽(ATR1.5/回落5%，v6.4.2 由 2%/6%收紧：
+    #      +1.5%即启动保护、回落5%即走，只做高胜率、严控单笔回撤；
+    #      仍宽于保守(1%/4%)、严于激进(5%/10%)，保持三档单调)
     # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
     # 数据源：n=300/6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
         "保守": {"atr_mult": 1.5, "trail_trigger": 1.01,
                  "trail_ratio": 0.96, "buy_th": 3, "cooldown": 8},
-        "稳健": {"atr_mult": 1.5, "trail_trigger": 1.02,
-                 "trail_ratio": 0.94, "buy_th": 3, "cooldown": 8},
+        "稳健": {"atr_mult": 1.5, "trail_trigger": 1.015,
+                 "trail_ratio": 0.95, "buy_th": 3, "cooldown": 8},
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
         # v6.4.1 test：sm701 模型直出档——买卖点不做策略消融，直接用
@@ -6769,8 +6771,13 @@ def _ablation_pool(cands, min_trades):
 
 
 def _ablation_weights(objective):
-    """目标权重：稳健/保守偏 Calmar+PF；激进 偏年化+Calmar。"""
-    return ({"calmar": 0.45, "pf": 0.25, "winrate": 0.20, "ann": 0.10}
+    """目标权重：稳健/保守偏胜率+PF+Calmar（v6.4.2 高胜率导向）；激进偏年化+Calmar。
+
+    稳健档只做高胜率：winrate 0.30 + pf 0.30 合计 0.60 主导选型，
+    calmar 0.30 保留回撤约束，ann 0.10 不追收益（原 0.45/0.25/0.20/0.10
+    偏 Calmar，胜率话语权不足）。保守档经 _pick_one_from_pool 映射到
+    同一目标，同步受益；激进档保持偏年化+Calmar 不变。"""
+    return ({"calmar": 0.30, "pf": 0.30, "winrate": 0.30, "ann": 0.10}
             if objective == "稳健" else
             {"calmar": 0.30, "pf": 0.20, "winrate": 0.15, "ann": 0.35})
 
@@ -6803,7 +6810,7 @@ def _ablation_ranks(pool, objective, key="train"):
 
 def pick_ablation_multi(cands, objective="稳健", min_trades=8):
     """消融多指标结合选优（v6.1，仅用训练集指标，防前视）：
-    稳健 = 偏 Calmar+PF；均衡/激进 = 偏年化+Calmar；
+    稳健 = 偏胜率+PF+Calmar（v6.4.2 高胜率导向）；均衡/激进 = 偏年化+Calmar；
     四个指标各自横截面 rank 后加权，避免量纲/单指标过拟合。"""
     pool = _ablation_pool(cands, min_trades)
     if not pool:
@@ -6869,16 +6876,23 @@ def _pick_one_from_pool(pool, key):
 
     key: 保守/稳健/激进（买卖点风险档；v6.2.3 起原「高风险」档已删除）；
     保守档限定「保守/稳健参数」候选；
-    目标权重：保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar（见 _ablation_weights）。
+    目标权重：保守/稳健=偏胜率+PF+Calmar（v6.4.2 高胜率导向，见 _ablation_weights），
+    激进=偏年化+Calmar。
+    交易样本门槛（v6.4.2 稳健严控）：保守/稳健要求训练段 ≥8 笔才可参选
+    （防“1~2 笔 100% 胜率”假策略；不足自动回退到 ≥3 笔，再不足全量，
+    见 _ablation_pool），激进保持 0（允许低频高赔率）。
     返回 (picked, note)。"""
-    p = pool
+    # v6.4.2 防泄漏：稳定档选型一律排除 test（sm701 模型直出，不参与消融；
+    # 研究脚本若仍用 CFG.RISK_PARAMS 全量跑出 test 候选，此处兜底过滤）。
+    p = [c for c in pool if c.get("mode") != "test"] or pool
     if key == "保守":
         p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
         if p2:
             p = p2
     obj = {"激进": "激进"}.get(key, "稳健")
+    mt = 8 if key in ("保守", "稳健") else 0
     picked, note = pick_ablation_consistent(
-        p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+        p, obj, min_trades=mt, recent_of=lambda c: c.get("recent"))
     if not picked:
         return dict(p[0]), "回退池内首个"
     return picked, note
@@ -10065,12 +10079,17 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
 # 「历史信号 IC 显著为正 + MA20/60 趋势在场」，确认不足宁缺毋滥。
 # v6.4.0 新增 test：独立 sm701 LightGBM 实验档，Top10/每日重排、不设闸门；
 # 只手动选择，不进入 AI 自动选档和默认三档回测。
+# v6.4.2 稳健档再收紧（只做高胜率、严控回撤）：四口径稳健统一加
+# mdd_guard=0.08——本相位净值从峰值回撤超 8% 即清仓熔断（reason="mdd_guard"，
+# 峰值重置、下个调仓日才可重建；跌停/停牌顺延），把最大回撤机械地压在
+# 8%+单日跳空量级，代价是可能踏空反弹；均衡/激进不设，保持进攻弹性。
 _SM701_TEST = dict(score="sm701", top=10, reb=1, gate=None, ma=None,
                    source="sm701", experimental=True,
                    score_start_from_data=True, stop_k=2.0)
 TIER_CFG = {
     "稳健": dict(universe="all", score="blend", top=10, reb=10,
-                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
+                 mdd_guard=0.08),
     "均衡": dict(universe="chinext", score="beta", top=5, reb=10,
                  gate="sz399006", ma=60),
     "激进": dict(_ROT, universe="all"),
@@ -10082,7 +10101,8 @@ TIER_CFG = {
 # 改 blend_mom 后全期 +6.6%、样本外 +13.0%、交易 9564 笔、回撤 -12.3%。
 TIER_CFG_MAIN = {
     "稳健": dict(universe="main", score="blend", top=10, reb=10,
-                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
+                 mdd_guard=0.08),
     "均衡": dict(universe="main", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="main"),
@@ -10093,7 +10113,8 @@ TIER_CFG_MAIN = {
 # 见 tier_sector_features），闸门一律板块轮动口径。
 TIER_CFG_ETF = {
     "稳健": dict(universe="etf", score="blend", top=10, reb=10,
-                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
+                 mdd_guard=0.08),
     "均衡": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="etf"),
@@ -10102,7 +10123,8 @@ TIER_CFG_ETF = {
 # 全A含ETF 口径：个股 + ETF 同一池排序（池内混入 ETF 后创业板高β 不再适用）。
 TIER_CFG_ALLETF = {
     "稳健": dict(universe="all_etf", score="blend", top=10, reb=10,
-                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True),
+                 gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
+                 mdd_guard=0.08),
     "均衡": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
                  reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="all_etf"),
@@ -11429,12 +11451,27 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
     """单相位组合模拟：T-1 决策、T 收盘成交、完整费用与整手约束。
     ic_ok：v6.2.0 荐股确认层（tier_ic_confirm 的 ok 掩码）——非 None 时
     调仓候选须先过「历史信号 IC 显著为正 + 指标在场」确认，再按评分取 TopN；
-    确认数不足时宁可少持仓/持现金，不降低门槛凑数。"""
+    确认数不足时宁可少持仓/持现金，不降低门槛凑数。
+    mdd_guard（v6.4.2 稳健档严控回撤）：cfg.mdd_guard=0.08 表示本相位净值
+    从峰值回撤超 8% 即触发熔断——按 T 收盘清仓全部持仓（reason="mdd_guard"，
+    含正常费用与滑点；跌停/停牌顺延），清空目标并把峰值重置为熔断后净值
+    （重启风险预算，否则现金横盘永远无法恢复、会永久空仓），
+    下个调仓日才允许重新建仓。单段回撤被机械地限制在“guard + 单日跳空”量级；
+    连续下跌中会多次触发、全期总回撤仍可能超 guard（实测全A稳健 -19.5%→-16.4%），
+    但显著小于无熔断；代价是熔断后可能踏空反弹（属预期内的保守行为）。
+    其他档不设此键，行为与旧版逐项一致。"""
     NST = C.shape[0]
     top, reb = cfg["top"], cfg["reb"]
     # 换仓缓冲带（hold_buffer）：在位股排名在 top+buffer 内即保留，
     # 只有跌出缓冲带才被替换——v6.3.1 稳健档启用（提高换入门槛、压低换手）。
     buf = int(cfg.get("hold_buffer", 0) or 0)
+    mdd_guard = cfg.get("mdd_guard")
+    try:
+        mdd_guard = float(mdd_guard) if mdd_guard else None
+    except (TypeError, ValueError):
+        mdd_guard = None
+    if mdd_guard is not None and not (0.02 <= mdd_guard <= 0.30):
+        mdd_guard = None           # 非法值直接关闭，避免误触发/永不触发
     uni = tier_universe_mask(codes, cfg.get("universe", "all"))
     elig = (np.isfinite(C) & (C > _TIER_MIN_PRICE)
             & (feat["barcount"] >= _TIER_MIN_BARS)
@@ -11477,6 +11514,7 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
     for j in range(max(0, start - 40), start + 1):
         f = np.isfinite(C[:, j])
         last[f] = C[f, j]
+    peak = float(capital)      # mdd_guard 用：本相位净值峰值（熔断后重置）
     for t in range(start, i1):
         col = C[:, t]
         fin = np.isfinite(col)
@@ -11537,9 +11575,27 @@ def tier_sim_phase(codes, cal, C, feat, score, gate, i0, i1, cfg, phase=0,
                 t_in[k] = t
                 holding[k] = True
                 target.add(int(k))      # 新买入纳入目标，防止次日被旧目标误卖
-        eq.append(cash + float(np.nansum(np.where(holding,
-                                                  shares * last, 0.0))))
+        eq_v = cash + float(np.nansum(np.where(holding,
+                                               shares * last, 0.0)))
+        eq.append(eq_v)
         eq_cal.append(cal[t])
+        if peak <= 0:
+            peak = eq_v if eq_v > 0 else peak
+        elif eq_v > peak:
+            peak = eq_v
+        elif mdd_guard is not None and peak > 0 \
+                and (peak - eq_v) / peak > mdd_guard and holding.any():
+            # 组合回撤熔断（仅稳健档配置）：清仓→清空目标→重置峰值。
+            # 用 last（当日收盘快照，已处理停牌顺延）按收盘价离场，
+            # 跌停当日按引擎既有约束顺延（limit_dn 在持仓保留分支已处理，
+            # 此处复用同一判定：跌停不卖，留待次日）。
+            for k in np.nonzero(holding)[0]:
+                if not fin[k] or limit_dn[k, t]:
+                    continue
+                close_pos(k, t, col[k] * (1 - _TIER_SLIP), "mdd_guard")
+            target = set()
+            peak = cash + float(np.nansum(np.where(holding,
+                                                   shares * last, 0.0)))
     return np.array(eq), eq_cal, trades
 
 
@@ -12089,8 +12145,10 @@ AI_SYSTEM_PROMPT = (
 RISK_AI_GUIDE = {
     "保守": "风险偏好=保守（最低档）：重确认、轻仓位；等待趋势企稳／突破确认"
             "或回踩支撑再介入，宁可错过不可做错，严格控制回撤，仓位建议 ≤2 成。",
-    "稳健": "风险偏好=稳健：兼顾趋势与风险；可接受回踩确认，但必须给出可执行"
-            "的买点/卖点/止损，仓位建议 2~4 成，不要只给『观望』。",
+    "稳健": "风险偏好=稳健：只做高胜率、严控回撤；兼顾趋势与风险，可接受回踩确认，"
+            "但必须给出可执行的买点/卖点/止损，仓位建议 2~4 成，不要只给『观望』。"
+            "选股须过历史信号 IC 确认+趋势在场（宁缺毋滥），组合回撤超 8% 熔断空仓，"
+            "单笔走 ATR 止损与早止盈（+1.5%启动、回落5%即走）。",
     "激进": "风险偏好=激进（最高档，进攻优先）：以板块轮动为进攻主线——只做"
             "强势板块中的强势股，不因大盘走弱轻易空仓；趋势启动/放量突破即可"
             "给出买入或加仓，接受大波动与大幅回撤、仓位可更集中（4~8 成）。"
