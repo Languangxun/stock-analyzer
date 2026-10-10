@@ -268,14 +268,17 @@ def build_md(report):
                  "各口径**在自己的基数池内做横截面排名**，互不污染。")
     lines.append("- ETF 池：东财 ETF/LOF 代码表（1491 只，剔除货币/现金类），"
                  "回填历史后 1202 只有 K 线、1145 只 ≥250 根；"
-                 "ETF 三档用 blend/blend_mom + 上证 MA20 闸门（ETF 无创业板语义）；"
+                 "稳健/均衡用 blend + 上证 MA20 闸门（ETF 无创业板语义），"
+                 "其中稳健 reb20/buffer20 长期持有、均衡 reb10/buffer10 中期持有；"
                  "激进档为板块轮动策略（选股/闸门、允许打板、"
-                 "宽止损且暂不控制回撤）。")
+                 "不设熔断保持进攻弹性）。")
     lines.append("- 基准：稳健/均衡 = 上证指数；**激进档统一对标科创50**"
                  "（不分是否具备科创板权限），另附创业板指/上证对照，"
                  "避免单一强基准使超额恒负。")
-    lines.append("- 主板激进档（v6.1.1）：改用 blend_mom（动量0.7/低波0.3）"
-                 "高换手配置（reb10/top20/上证MA20）——原 β 口径经诊断证伪。")
+    lines.append("- 档位（v6.5.0）：稳健=blend-Top10/reb20/buffer20/IC/熔断8% "
+                 "长期持有；均衡=老稳健中期口径（blend-Top10/reb10/buffer10/IC/熔断8%）；"
+                 "激进=板块轮动 rotate-Top5/reb10+轮动闸门+打板；"
+                 "原 beta-Top5 / blend_mom-Top20 均衡策略已淘汰（blend_mom 仅研究对照）。")
     lines.append("- 注：全部为历史统计研究，不构成投资建议。")
     return "\n".join(lines)
 

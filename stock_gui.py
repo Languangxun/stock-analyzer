@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-07 升 6.4.2）
-APP_VERSION = "6.4.2"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-10 升 6.5.0）
+APP_VERSION = "6.5.0"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -10049,16 +10049,15 @@ def _v4_print_report(r):
 #
 # 原理（详见 README 第二节；v6.2.3 起三档，去「高风险」名）：
 #   稳健 = 「20日动量 + 20日低波」横截面等权 Top10 + IC 确认层 +
-#          换仓缓冲带10，每10日调仓，上证 MA20 闸门（T-1 收盘在均线上才
-#          持仓）——原「均衡」档，v6.3.1 收紧指标要求/降换手
-#   均衡 = 全A：创业板「60日 β（对创业板指）」最高 Top5，每10日调仓，
-#          创业板指 MA60 闸门（慢闸门过滤熊市、放大上行 beta）；
-#          主板/ETF/全A含ETF：blend_mom（动量0.7/低波0.3）Top20/10，
-#          上证 MA20 闸门——原「激进」档
+#          换仓缓冲带20，每20日调仓，上证 MA20 闸门（T-1 收盘在均线上才
+#          持仓）——长期持有低换手档（v6.5.0 由 reb10/buffer10 拉长）。
+#   均衡 = 老稳健算法（v6.4.2 口径）：blend 等权 Top10 + IC 确认层 +
+#          换仓缓冲带10，每10日调仓，上证 MA20 闸门——中期持有档；
+#          原 beta-Top5 / blend_mom-Top20 均衡策略 v6.5.0 淘汰。
 #   激进 = 板块轮动 rotate（行业20日动量0.5 + 个股动量/低波0.5）Top5/10日，
 #          板块轮动闸门 + 允许打板——原「高风险」档（v6.1.9 新开发）
-#   均衡/激进档基准统一对标科创50（sh000688，原 v6.1.1 口径），
-#   稳健档对标上证。
+#   稳健/均衡档基准统一对标上证（sh000001），
+#   激进档对标科创50（sh000688，原 v6.1.1 口径）。
 # 防前视：信号/闸门/流动性过滤全部截止 T-1，T 日收盘成交；涨停不买、
 #         跌停不卖、停牌顺延；退市/长停 20 日后按最后收盘价了结。
 # 调仓相位：资金分 reb 份错开相位同时运行后平均（tranche averaging），
@@ -10082,51 +10081,61 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
 # v6.4.2 稳健档再收紧（只做高胜率、严控回撤）：四口径稳健统一加
 # mdd_guard=0.08——本相位净值从峰值回撤超 8% 即清仓熔断（reason="mdd_guard"，
 # 峰值重置、下个调仓日才可重建；跌停/停牌顺延），把最大回撤机械地压在
-# 8%+单日跳空量级，代价是可能踏空反弹；均衡/激进不设，保持进攻弹性。
+# 8%+单日跳空量级，代价是可能踏空反弹。
+# v6.5.0 档位重构：原 beta-Top5 / blend_mom-Top20 均衡策略淘汰；
+# 均衡接管 v6.4.2 老稳健口径（blend-Top10/reb10/buffer10/IC/熔断8%），
+# 新稳健在老稳健基础上拉长持有（reb10→20、buffer10→20，换手更低）；
+# 熔断改为稳健/均衡两档配置，激进不设，保持进攻弹性。
 _SM701_TEST = dict(score="sm701", top=10, reb=1, gate=None, ma=None,
                    source="sm701", experimental=True,
                    score_start_from_data=True, stop_k=2.0)
 TIER_CFG = {
-    "稳健": dict(universe="all", score="blend", top=10, reb=10,
+    "稳健": dict(universe="all", score="blend", top=10, reb=20,
+                 gate="sh000001", ma=20, hold_buffer=20, ic_filter=True,
+                 mdd_guard=0.08),
+    "均衡": dict(universe="all", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
-    "均衡": dict(universe="chinext", score="beta", top=5, reb=10,
-                 gate="sz399006", ma=60),
     "激进": dict(_ROT, universe="all"),
     "test": dict(_SM701_TEST, universe="all"),
 }
-# 主板口径：稳健/均衡在沪深主板内运行；均衡改用 blend_mom（动量0.7/低波0.3）
-# 偏弹性 + 高换手（reb10/top20/上证MA20）。依据（2026-09-19 过拟合诊断）：
-# β 选股在主板池全面失效（年化 -6.7%、回撤 -47.2%、参数邻域全负、安慰剂不差），
-# 改 blend_mom 后全期 +6.6%、样本外 +13.0%、交易 9564 笔、回撤 -12.3%。
+# 主板口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
+# （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）。
+# 原 blend_mom 均衡（动量0.7/低波0.3 Top20 高换手）v6.5.0 淘汰，
+# blend_mom 评分保留仅作研究对照。
 TIER_CFG_MAIN = {
-    "稳健": dict(universe="main", score="blend", top=10, reb=10,
+    "稳健": dict(universe="main", score="blend", top=10, reb=20,
+                 gate="sh000001", ma=20, hold_buffer=20, ic_filter=True,
+                 mdd_guard=0.08),
+    "均衡": dict(universe="main", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
-    "均衡": dict(universe="main", score="blend_mom", mom_w=0.7, top=20,
-                 reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="main"),
     "test": dict(_SM701_TEST, universe="main"),
 }
-# ETF 口径：池子仅 ETF/LOF（无创业板/行业语义）——稳健等权 blend、
-# 均衡 blend_mom；激进仍用 rotate（ETF 无行业时板块动量退化为自身动量，
+# ETF 口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
+# （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）；
+# 激进仍用 rotate（ETF 无行业时板块动量退化为自身动量，
 # 见 tier_sector_features），闸门一律板块轮动口径。
 TIER_CFG_ETF = {
-    "稳健": dict(universe="etf", score="blend", top=10, reb=10,
+    "稳健": dict(universe="etf", score="blend", top=10, reb=20,
+                 gate="sh000001", ma=20, hold_buffer=20, ic_filter=True,
+                 mdd_guard=0.08),
+    "均衡": dict(universe="etf", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
-    "均衡": dict(universe="etf", score="blend_mom", mom_w=0.7, top=10,
-                 reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="etf"),
     "test": dict(_SM701_TEST, universe="etf"),
 }
-# 全A含ETF 口径：个股 + ETF 同一池排序（池内混入 ETF 后创业板高β 不再适用）。
+# 全A含ETF 口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
+# （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）。
 TIER_CFG_ALLETF = {
-    "稳健": dict(universe="all_etf", score="blend", top=10, reb=10,
+    "稳健": dict(universe="all_etf", score="blend", top=10, reb=20,
+                 gate="sh000001", ma=20, hold_buffer=20, ic_filter=True,
+                 mdd_guard=0.08),
+    "均衡": dict(universe="all_etf", score="blend", top=10, reb=10,
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
-    "均衡": dict(universe="all_etf", score="blend_mom", mom_w=0.7, top=20,
-                 reb=10, gate="sh000001", ma=20),
     "激进": dict(_ROT, universe="all_etf"),
     "test": dict(_SM701_TEST, universe="all_etf"),
 }
@@ -10134,17 +10143,18 @@ TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
                   "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
 UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
                  "all_etf": "全A含ETF"}
-# 均衡档与激进档统一对标科创50（不分是否具备科创板权限）：全A 均衡选创业板
-# 高β，主板/ETF/全A含ETF 均衡用 blend_mom 弹性档；激进档主基准与均衡一致。
-# ETF 因池内无科创语义，主基准仍统一用科创50（闸门是另一回事，池内实测用上证 MA20）。
+# 稳健/均衡档统一对标上证（sh000001，v6.5.0 起均衡由科创50切回上证，
+# 与其承接的老稳健策略同基准）；激进档对标科创50。
+# ETF 因池内无科创语义，主基准同样统一用上证/科创50（闸门是另一回事，
+# 池内实测用上证 MA20）。
 TIER_BENCH = {
-    ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000688",
+    ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
     ("all", "激进"): "sh000688", ("all", "test"): "sh000001",
-    ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000688",
+    ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
     ("main", "激进"): "sh000688", ("main", "test"): "sh000001",
-    ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000688",
+    ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000001",
     ("etf", "激进"): "sh000688", ("etf", "test"): "sh000001",
-    ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000688",
+    ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000001",
     ("all_etf", "激进"): "sh000688", ("all_etf", "test"): "sh000001",
 }
 # 基准指数中文名（报告/对照用）
@@ -11329,9 +11339,9 @@ def tier_rank_base(codes, universe):
 
 def tier_make_score(feat, kind, mom_w=None, base=None, sec_w=None):
     """合成打分：
-      blend      = 动量20 与 低波20 百分位等权（v6.1.10 前稳健/均衡口径，
-                   现仅均衡档与研究对照用）
-      blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；激进档用，默认 0.7）
+      blend      = 动量20 与 低波20 百分位等权（稳健/均衡两档在用）
+      blend_mom  = 偏动量弹性（动量 mom_w、低波 1-mom_w；v6.5.0 起无组合档在用，
+                   仅研究对照）
       rotate     = 板块轮动（激进档）：板块 20 日动量排名 sec_w 为主，
                    叠加个股动量/低波基准（1-sec_w）；板块动量见
                    tier_sector_features 的 sector_ret20
@@ -12145,10 +12155,14 @@ AI_SYSTEM_PROMPT = (
 RISK_AI_GUIDE = {
     "保守": "风险偏好=保守（最低档）：重确认、轻仓位；等待趋势企稳／突破确认"
             "或回踩支撑再介入，宁可错过不可做错，严格控制回撤，仓位建议 ≤2 成。",
-    "稳健": "风险偏好=稳健：只做高胜率、严控回撤；兼顾趋势与风险，可接受回踩确认，"
+    "稳健": "风险偏好=稳健：只做高胜率、严控回撤；长期持有低换手（20日调仓+"
+            "缓冲带20），兼顾趋势与风险，可接受回踩确认，"
             "但必须给出可执行的买点/卖点/止损，仓位建议 2~4 成，不要只给『观望』。"
             "选股须过历史信号 IC 确认+趋势在场（宁缺毋滥），组合回撤超 8% 熔断空仓，"
             "单笔走 ATR 止损与早止盈（+1.5%启动、回落5%即走）。",
+    "均衡": "风险偏好=均衡（中期持有）：老稳健口径——动量+低波 Top10、"
+            "IC 确认+趋势在场（宁缺毋滥）、换仓缓冲带10、组合回撤超 8% 熔断空仓，"
+            "10日调仓、上证MA20闸门；仓位建议 3~5 成，给出可执行买卖点与止损。",
     "激进": "风险偏好=激进（最高档，进攻优先）：以板块轮动为进攻主线——只做"
             "强势板块中的强势股，不因大盘走弱轻易空仓；趋势启动/放量突破即可"
             "给出买入或加仓，接受大波动与大幅回撤、仓位可更集中（4~8 成）。"
@@ -12421,10 +12435,10 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         "你是量化组合风控官。下面是当前市场环境与各档策略定义：\n"
         f"{ai_market_brief()}\n\n"
         "策略档位：\n"
-        "· 稳健：全A动量+低波Top10（IC确认层+换仓缓冲带），10日调仓，"
+        "· 稳健：全A动量+低波Top10（IC确认层+换仓缓冲带20+8%熔断），20日调仓，"
+        "上证MA20闸门，长期持有低换手\n"
+        "· 均衡：老稳健中期口径（动量+低波Top10+IC确认+缓冲带10+8%熔断），10日调仓，"
         "上证MA20闸门\n"
-        "· 均衡：全A创业板高βTop5（其余口径偏动量Top20），10日调仓，"
-        "创业板指MA60/上证MA20闸门\n"
         "· 激进：板块轮动为主参考——选强势行业里的强势股，闸门以行业广度为主"
         "（大盘权重仅40%，阀门开得更久），Top5/10日调仓，允许涨停价买入（打板），"
         "波动最大、进攻性最强\n\n"
