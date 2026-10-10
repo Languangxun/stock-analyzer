@@ -107,8 +107,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-10 升 6.5.0）
-APP_VERSION = "6.5.0"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-11 升 6.5.1）
+APP_VERSION = "6.5.1"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -226,6 +226,9 @@ class CFG:
     # 方向明确时覆盖原策略买卖点（激进档附打板提示）。
     # ini [predict] analog_override=0 关闭。
     ANALOG_OVERRIDE = True
+    # 消融策略选择窗：three=三档推荐窗 / all=全部组合大表。
+    # 设置→预测参数→消融策略选择；ini [predict] ablation_view=all 切全表。
+    ABLATION_VIEW = "three"
     ANALOG_LOOKBACK = 20        # 异动事件在近 N 个交易日内视为「异动状态」
     ANALOG_PCT = 99.5           # 自身历史分位阈值（单日/5日各算）
     ANALOG_MIN_HIST = 120       # 分位统计最少历史根数
@@ -387,6 +390,9 @@ def _load_predict_cfg():
                                     1 if CFG.AUTO_PREFETCH else 0, 0, 1))
         CFG.ANALOG_OVERRIDE = bool(gi("analog_override",
                                       1 if CFG.ANALOG_OVERRIDE else 0, 0, 1))
+        _av = cp.get("predict", "ablation_view",
+                     fallback=getattr(CFG, "ABLATION_VIEW", "three"))
+        CFG.ABLATION_VIEW = _av if _av in ("three", "all") else "three"
         CFG.MAX_FETCH_BARS = gi("max_fetch_bars", CFG.MAX_FETCH_BARS,
                                 100, 3000)
     except Exception:
@@ -14004,7 +14010,7 @@ class App:
             self._last_ablation = abl
             self._last_ablation_for = full0
             self.progress_var.set("已载入研究消融结果（批量缓存，免本地重算）")
-            self._show_strategy_popup(res, abl)
+            self._show_strategy_result(res, abl)
             return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
                               "MA/筹码峰/板块轮动/多维×4风险档, 近1000交易日)...")
@@ -14032,7 +14038,16 @@ class App:
             return
         self._last_ablation = abl
         self._last_ablation_for = res["full_code"]
-        self._show_strategy_popup(res, abl)
+        self._show_strategy_result(res, abl)
+
+    def _show_strategy_result(self, res, abl):
+        """按设置展示消融结果（v6.5.1，设置→预测参数→消融策略选择）：
+        三档推荐窗 / 全部组合大表。设成全表时走 _rerun_strategy 复用
+        研究全量候选直读 + 本地重算兜底链路。"""
+        if getattr(CFG, "ABLATION_VIEW", "three") == "all":
+            self._rerun_strategy()
+        else:
+            self._show_strategy_popup(res, abl)
 
     def _show_strategy_popup(self, res, abl):
         full = res["full_code"]
@@ -17949,6 +17964,20 @@ class App:
                             "test=sm701模型直出(不消融)").grid(
             row=8, column=2, sticky="w")
 
+        # 消融策略选择：消融完成后弹三档推荐窗还是全部组合大表（v6.5.1）
+        ttk.Label(frm, text="消融策略选择").grid(row=9, column=0,
+                                                 sticky="w", pady=2)
+        ablview_var = tk.StringVar(
+            value="全部组合"
+            if getattr(CFG, "ABLATION_VIEW", "three") == "all"
+            else "三档推荐")
+        cmb_ablview = ttk.Combobox(frm, textvariable=ablview_var,
+                                   width=8, state="readonly",
+                                   values=("三档推荐", "全部组合"))
+        cmb_ablview.grid(row=9, column=1, sticky="w", pady=2)
+        ttk.Label(frm, text="消融完成后弹哪种窗口").grid(
+            row=9, column=2, sticky="w")
+
         def _int_var(attr, lo, hi):
             try:
                 v = int(max(lo, min(hi, float(getattr(CFG, attr)))))
@@ -17979,7 +18008,7 @@ class App:
         ]
         pvars = []
         for i, (lab, var, hint) in enumerate(prows):
-            r = 9 + i
+            r = 10 + i
             ttk.Label(frm, text=lab).grid(row=r, column=0, sticky="w",
                                           pady=2)
             e = ttk.Entry(frm, textvariable=var, width=10)
@@ -17992,7 +18021,7 @@ class App:
         ttk.Checkbutton(frm, text="异动·全市场相似覆盖原策略"
                                   "（激进/均衡档触发时生效）",
                         variable=analog_var).grid(
-            row=9 + len(prows), column=0, columnspan=3, sticky="w",
+            row=10 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(8, 0))
 
         # ---- 使用注意（基于n=4500+回测的诚实边界）----
@@ -18010,7 +18039,7 @@ class App:
             "· 本工具不做仓位/风控，据此操作盈亏自负")
         ttk.Label(frm, text=notes, justify="left", foreground=AXIS_TXT,
                   font=("Microsoft YaHei", 8)).grid(
-            row=10 + len(prows), column=0, columnspan=3, sticky="w",
+            row=11 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(12, 0))
 
         # ---- 指标参数（v6.3.2 新增；存 ini [inds]，保存后立即生效）----
@@ -18209,6 +18238,13 @@ class App:
                        "1" if CFG.ANALOG_OVERRIDE else "0")
                 pnotes.append(
                     f"异动相似覆盖={'开' if CFG.ANALOG_OVERRIDE else '关'}")
+                _av = ("all" if ablview_var.get() == "全部组合"
+                       else "three")
+                CFG.ABLATION_VIEW = _av
+                cp.set("predict", "ablation_view", _av)
+                pnotes.append(
+                    "消融策略选择="
+                    f"{'全部组合' if _av == 'all' else '三档推荐'}")
                 if risk_var.get() in CFG.RISK_PARAMS:
                     CFG.RISK_MODE = risk_var.get()
                     cp.set("predict", "risk_mode", CFG.RISK_MODE)

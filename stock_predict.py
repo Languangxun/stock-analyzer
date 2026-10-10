@@ -123,8 +123,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-10 升 6.5.0）
-APP_VERSION = "6.5.0"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-11 升 6.5.1）
+APP_VERSION = "6.5.1"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -242,6 +242,9 @@ class CFG:
     # 方向明确时覆盖原策略买卖点（激进档附打板提示）。
     # ini [predict] analog_override=0 关闭。
     ANALOG_OVERRIDE = True
+    # 消融策略选择窗：three=三档推荐窗 / all=全部组合大表。
+    # 设置→预测参数→消融策略选择；ini [predict] ablation_view=all 切全表。
+    ABLATION_VIEW = "three"
     ANALOG_LOOKBACK = 20        # 异动事件在近 N 个交易日内视为「异动状态」
     ANALOG_PCT = 99.5           # 自身历史分位阈值（单日/5日各算）
     ANALOG_MIN_HIST = 120       # 分位统计最少历史根数
@@ -403,6 +406,9 @@ def _load_predict_cfg():
                                     1 if CFG.AUTO_PREFETCH else 0, 0, 1))
         CFG.ANALOG_OVERRIDE = bool(gi("analog_override",
                                       1 if CFG.ANALOG_OVERRIDE else 0, 0, 1))
+        _av = cp.get("predict", "ablation_view",
+                     fallback=getattr(CFG, "ABLATION_VIEW", "three"))
+        CFG.ABLATION_VIEW = _av if _av in ("three", "all") else "three"
         CFG.MAX_FETCH_BARS = gi("max_fetch_bars", CFG.MAX_FETCH_BARS,
                                 100, 3000)
     except Exception:
