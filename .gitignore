@@ -35,6 +35,8 @@ research/strategy_ablation_per_stock*.json
 research/perstock_tier_picks.json
 # GUI 消融批量缓存（v6.2.2；四档全量 ~15MB，可由消融+选型脚本重跑）
 research/ablation_gui_cache.json
+# 全量消融进度快照（v6.5.6；运行时原子写，GUI/进度看板实时读取，可重跑）
+research/ablation_progress.json*
 
 # 回测统一规范运行目录（bt_common.py；消融/每只股导出等可重跑，
 # 根目录固定名「最新副本」按需入库，明细随研究包分发）

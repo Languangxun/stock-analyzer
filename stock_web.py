@@ -1248,6 +1248,19 @@ def _pctile(vals, p):
     return s[lo] * (1 - f) + s[hi] * f
 
 
+def _limit_pct_web(code, date):
+    """单日涨跌停幅度(%)（与 stock_gui._limit_pct 同口径的精简版）。
+    20%/30%板样本跨板块照搬会让主板预测出现超跌停价位，预测需按板钳制。"""
+    board = code[2:4] if len(code) >= 4 else ""
+    if board == "68":
+        return 20.0
+    if board == "30":
+        return 20.0 if date >= "2020-08-24" else 10.0
+    if code.startswith("bj"):
+        return 30.0
+    return 10.0
+
+
 def analyze_server(full):
     W = W_WINDOW
     q = _fetch_quote_one(full)
@@ -1290,16 +1303,27 @@ def analyze_server(full):
     def P(key, p):
         return _pctile([s[key] for s in src], p)
 
-    t_pred = {p: {"cl": o_today * (1 + P("cl_o", p)),
-                  "hi": o_today * (1 + P("hi_o", p)),
-                  "lo": o_today * (1 + P("lo_o", p))}
+    # 涨跌停钳制：T日预测锚昨收±板、T+1预测锚T日P50收±板（th）
+    lim_px = _limit_pct_web(full, today) / 100.0
+    pl_t, ph_t = prev_close * (1 - lim_px), prev_close * (1 + lim_px)
+
+    def _clamp(v, lo, hi):
+        return min(max(v, lo), hi)
+
+    t_pred = {p: {"cl": _clamp(o_today * (1 + P("cl_o", p)), pl_t, ph_t),
+                  "hi": _clamp(o_today * (1 + P("hi_o", p)), pl_t, ph_t),
+                  "lo": _clamp(o_today * (1 + P("lo_o", p)), pl_t, ph_t)}
               for p in (10, 25, 50, 75, 90)}
     up_prob = len([s for s in src if s["cl_o"] > 0]) / len(src)
     base = t_pred[50]["cl"]
+    pl_n, ph_n = base * (1 - lim_px), base * (1 + lim_px)
     pred = {"open": base,
-            "close": base * (1 + _pctile([s["t2_cl"] for s in src], 50)),
-            "high": base * (1 + _pctile([s["t2_hi"] for s in src], 75)),
-            "low": base * (1 + _pctile([s["t2_lo"] for s in src], 25))}
+            "close": _clamp(base * (1 + _pctile([s["t2_cl"] for s in src], 50)),
+                            pl_n, ph_n),
+            "high": _clamp(base * (1 + _pctile([s["t2_hi"] for s in src], 75)),
+                           pl_n, ph_n),
+            "low": _clamp(base * (1 + _pctile([s["t2_lo"] for s in src], 25)),
+                          pl_n, ph_n)}
 
     disp = rows + ([live] if live else [])
     ci = [r["close"] for r in disp]

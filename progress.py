@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """progress.py - 后台长任务进度看板
 
-显示三件事（纯标准库，随时可跑，不影响后台任务）：
+显示四件事（纯标准库，随时可跑，不影响后台任务）：
   ① 全市场深历史拉取到 2000 根（读 pull2000_run.log + 查库统计）
   ② 拉完后的四口径回测（读 pull2000_run.log 的 BACKTEST 行）
   ③ 因子实验室全库面板（读 factorlab_full2000_run.log + 产物文件）
+  ④ 全量策略消融（读 research/ablation_progress.json，v6.5.6）
+     —— 与 GUI「工具→数据工具→全量消融→进度查询」同一数据源
 
 用法：
   python3 progress.py          # 看一次
   python3 progress.py -w 30    # 每 30 秒刷新（Ctrl-C 退出）
 """
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -27,6 +30,27 @@ LAB_DIR = os.path.join(ROOT, "research", "factor_lab", "full2000")
 PULL_PAT = re.compile(
     r"全市场回填 (\d+)/(\d+) \((\d+)%\) 成功(\d+) 失败(\d+) ETA (\d+)分")
 STAGE_PAT = re.compile(r"Stage (\d)/4\s+(.+)")
+ABL_PROG = os.path.join(ROOT, "research", "ablation_progress.json")
+
+
+def ablation_status():
+    """全量策略消融进度（v6.5.6：读 research/ablation_progress.json）。"""
+    st = {"log": os.path.exists(ABL_PROG), "running": False, "finished": False}
+    if not st["log"]:
+        return st
+    try:
+        with open(ABL_PROG, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return st
+    st.update(d)
+    pid = d.get("pid") or 0
+    age = time.time() - float(d.get("updated") or 0)
+    alive = (os.path.isdir(f"/proc/{pid}") if pid else
+             age < 180)
+    st["running"] = (not d.get("finished")) and alive and age < 120
+    st["stale"] = (not d.get("finished")) and not st["running"]
+    return st
 
 
 def find_procs(substr):
@@ -182,6 +206,33 @@ def render():
             print(f"   ✓ {label:<12} {size:>9}  {ago}")
     else:
         print("   暂无产物（等待拉取完成后自动开始）")
+    print("-" * 62)
+    ab = ablation_status()
+    if not ab["log"]:
+        print("④ 全量策略消融  [无记录]")
+    else:
+        tag = ("[运行中]" if ab["running"] else
+               "[已完成]" if ab.get("finished") else "[已中断]")
+        ph = {"init": "初始化", "load": "加载指数",
+              "context": "构建行业序列", "ablate": "逐只消融",
+              "write": "写产物", "done": "已完成"}.get(
+                  ab.get("phase") or "", ab.get("phase") or "-")
+        done, tot = int(ab.get("done") or 0), int(ab.get("total") or 0)
+        pct = int(done / tot * 100) if tot else 0
+        bar_w = 30
+        bar = "█" * int(bar_w * pct / 100) + "·" * (bar_w - int(bar_w * pct / 100))
+        print(f"④ 全量策略消融  {tag}  阶段 {ph}")
+        print(f"   [{bar}] {pct}%  {done}/{tot} 只"
+              f"  有效{ab.get('ok', 0)} 跳过{ab.get('skipped', 0)}")
+        eta = ab.get("eta")
+        if eta is not None and not ab.get("finished"):
+            print(f"   已用 {int(ab.get('elapsed') or 0)}s  ETA {int(eta)}s"
+                  f"  更新 {fmt_ago(float(ab.get('updated') or 0))}")
+        else:
+            print(f"   已用 {int(ab.get('elapsed') or 0)}s"
+                  f"  更新 {fmt_ago(float(ab.get('updated') or 0))}")
+        if ab.get("run_dir"):
+            print(f"   运行目录 {os.path.basename(ab['run_dir'])}")
     print("=" * 62)
     print("日志：pull2000_run.log / factorlab_full2000_run.log"
           "（-w 30 自动刷新）")

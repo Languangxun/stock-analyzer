@@ -51,6 +51,26 @@ import bt_common            # 回测统一规范（版本化运行目录/run_met
 OUTPUT_DIR = os.path.join(ROOT, "research")
 PER_STOCK_FILE = os.path.join(OUTPUT_DIR, "strategy_ablation_per_stock.json")
 SUMMARY_FILE = os.path.join(OUTPUT_DIR, "strategy_ablation_summary.json")
+# v6.5.6：进度快照（GUI 数据工具「进度查询」/ progress.py ④ 读取）
+PROGRESS_FILE = os.path.join(OUTPUT_DIR, "ablation_progress.json")
+
+
+def _write_progress(run_dir="", phase="", done=0, total=0, ok=0, skipped=0,
+                    started=None, eta=None, finished=False):
+    """原子写消融进度 JSON（tmp+replace，查询端永远读到完整 JSON）。"""
+    now = time.time()
+    st = {"pid": os.getpid(), "run_dir": run_dir, "phase": phase,
+          "done": done, "total": total, "ok": ok, "skipped": skipped,
+          "started": started or now, "updated": now,
+          "elapsed": now - (started or now), "eta": eta,
+          "finished": bool(finished)}
+    tmp = PROGRESS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, PROGRESS_FILE)
+    except OSError:
+        pass
 
 # 预加载指数 regime，全市场共享
 _IDX_REGIME_CACHE = None
@@ -377,10 +397,12 @@ def main(limit=None, max_workers=None, tag=""):
     summary_latest = os.path.join(
         OUTPUT_DIR, f"strategy_ablation_summary{suffix}.json")
     print(f"本次运行目录: {run_dir}")
+    _write_progress(run_dir=run_dir, phase="init", total=0, started=t0)
 
     print("加载上证指数 regime...")
     regime = _load_index_regime()
     print(f"  regime 日期数: {len(regime)}")
+    _write_progress(run_dir=run_dir, phase="load", total=0, started=t0)
 
     print("加载全缓存对象（个股 + ETF，逐个消融）...")
     stocks = load_stocks(min_bars=200, with_etf=True)
@@ -397,6 +419,8 @@ def main(limit=None, max_workers=None, tag=""):
           f"（其中 ETF {n_etf}）；因 K线<200 未纳入 {len(miss)}")
     if miss:
         print(f"  未纳入清单（前20）: {miss[:20]}")
+    _write_progress(run_dir=run_dir, phase="context", total=len(stocks),
+                    started=t0)
 
     print("构建板块轮动序列（行业5日动量，一次构建注入子进程）...")
     try:
@@ -430,6 +454,21 @@ def main(limit=None, max_workers=None, tag=""):
     # v6.1.8 P1：改用 chunksize 批量提交（map 风格），与 perstock 同思路；
     # 8w×200 只测试每只 ~0.5s，chunksize=20 → 10 chunk/worker，IPC 开销明显下降。
     chunksize = max(5, min(40, len(args_list) // max(1, max_workers * 4) + 1))
+    _last_prog = [0.0]
+
+    def _tick_prog(phase="ablate"):
+        """限频（≥2s）写进度快照，供 GUI/进度看板实时查询。"""
+        now = time.time()
+        if now - _last_prog[0] < 2.0:
+            return
+        _last_prog[0] = now
+        el = now - t0
+        rate = done / el if el > 0 else 0
+        eta = ((len(stocks) - done) / rate) if rate > 0 else None
+        _write_progress(run_dir=run_dir, phase=phase, done=done,
+                        total=len(stocks), ok=len(per_stock),
+                        skipped=skipped, started=t0, eta=eta)
+
     with ProcessPoolExecutor(
             max_workers=max_workers, initializer=_init_sector,
             initargs=(cal_mom, series_mom, med_mom, l2cal, l2series,
@@ -441,11 +480,16 @@ def main(limit=None, max_workers=None, tag=""):
                 skipped += 1
                 if done % 500 == 0:
                     print(f"[{done}/{len(stocks)}] 无有效候选...")
+                _tick_prog()
                 continue
             per_stock.append(res)
             if done % 500 == 0:
                 print(f"[{done}/{len(stocks)}] 完成，累计有效 {len(per_stock)}")
+            _tick_prog()
 
+    _write_progress(run_dir=run_dir, phase="write", done=done,
+                    total=len(stocks), ok=len(per_stock), skipped=skipped,
+                    started=t0)
     n_etf_done = sum(1 for s in per_stock if s.get("is_etf"))
     print(f"\n消融完成: 总对象 {done}, 有效 {len(per_stock)}"
           f"（ETF {n_etf_done}）, 跳过 {skipped}, 耗时 {time.time()-t0:.0f}s")
@@ -504,6 +548,9 @@ def main(limit=None, max_workers=None, tag=""):
               f"(IC5为正占比 {ic.get('ic5_positive_pct')}%)")
 
     print(f"\n全部完成，总耗时 {time.time()-t0:.0f}s")
+    _write_progress(run_dir=run_dir, phase="done", done=done,
+                    total=len(stocks), ok=len(per_stock), skipped=skipped,
+                    started=t0, finished=True)
 
 
 if __name__ == "__main__":

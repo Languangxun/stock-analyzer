@@ -58,6 +58,7 @@ sm701 路径：默认自动查找 ~/桌面/sm701 (副本) 与原目录；
 CLI_IMPORTS = '''
 import atexit
 import configparser
+import datetime
 import heapq
 import json
 import logging
