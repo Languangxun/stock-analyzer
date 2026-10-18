@@ -5,6 +5,194 @@
 
 ## 版本历史
 
+> **v6.6.3：test 档 sm701 切换生产定稿三周期模型（h1/h5/h10 等权）（2026-10-18）**：
+> `test`（预测参数·风险偏好=test / sm701 实验档）由旧单模型
+> `lgbm_output/lgbm_model.txt` 切换为桌面 sm701 生产定稿 `production/`
+> 三周期 tech 模型：
+> ① `sm701_paths()` 新增 `_sm701_production_set()`：副本 `production/`
+> 命中（`features_tech.json` + `prod_h1|h5|h10_tech.txt` 齐全）即启用生产档，
+> 历史分数改读 `production/valid_predictions.csv.gz`；不齐则回退旧单模型口径，
+> `SM701_MODEL` 显式指定时强制单模型、跳过 `production/`；
+> ② 新增 `_sm701_predict_feats()`：对 `_compute_feats` 结果按
+> `features_tech.json` 列序（tech 40 特征）对 h1/h5/h10 三模型分别打分、
+> **等权平均**为 test 分数；`sm701_score_matrix()` / `_sm701_live_predict()` /
+> `sm701_prob_map()` 共用；③ 缓存失效 key 改 `_sm701_model_mtimes()`
+> （三模型逐个 mtime），`sm701_status()` 增 `prod_dir`/`prod_models`/`prod_n_feat`；
+> ④ 副本侧新增 `production/make_predictions.py`：用生产三模型对 2024-01 起
+> 全市场样本外打分，生成 `production/valid_predictions.csv.gz`
+> （`date,code,prob_h1,prob_h5,prob_h10,prob`，`prob`=等权平均）。
+> 实测末交易日 2026-09-30 实时复算与落盘逐元素一致（sh600000 0.42401537）；
+> 生产 h1 模型 2024+ 全A 可交易样本 AUC 0.5446（≈sm701 README §18 0.5440）。
+> `APP_VERSION=6.6.3`；`stock_predict.py` 由 `build_cli.py` 重新生成；
+> README 3.x、ARCHITECTURE 3.7 与第七节同步。
+>
+> **v6.6.2：数据层缓存优先 + 无网络优雅降级（2026-10-18）**：
+> 修复主程序多处「跳过缓存直接联网」的数据逻辑：
+> ① `fetch_daily` 改为调用缓存优先的 `get_daily`，禁止绕过本地库直接拉 K线；
+> ② `fetch_quote_cached` 扩展为全代码通用入口：内存缓存 → SQLite 持久缓存 →
+> 网络，网络失败时返回库内旧缓存；新增 `quote_cache` 表；
+> ③ `fetch_batch_quotes` 改为缓存优先，仅缺失/过期代码参与网络请求，全失败时
+> 返回已有缓存而非空字典；
+> ④ `fetch_f10_metrics` 增加 SQLite 持久缓存（`f10_cache` 表），无网络时降级到
+> 旧财报数据；GUI 实时行情与首次拉取未上市判定均切到 `fetch_quote_cached`。
+> `APP_VERSION=6.6.2`；`stock_predict.py` 重新生成；CHANGELOG 同步。
+>
+> **v6.6.1：更新缓存增加范围弹窗（全A / 自选 / 单股）（2026-10-17）**：
+> 工具栏/小屏工具菜单的「更新缓存」不再固定只刷代码表，先弹窗选范围：
+> **全A**=刷新代码表 + `stale_codes()` 筛出的全部 A 股（剔除 ETF/北交所）
+> 日K增量；**自选**=仅自选池；**单股**=输入/当前代码（默认预填当前分析代码）。
+> 只拉缺失/过期数据，已最新的标的由 `get_daily`/`prefetch` 自动跳过；
+> 全A/自选走后台 `prefetch` 并显示进度，单股完成回报最新日K日期/根数；
+> 新增 `_cache_busy` 与后台主动预取互斥，避免重复拉取；弹窗范围默认按
+> 「当前代码→自选→全A」智能选择。纯 GUI/缓存调度，信号与回测口径零改动；
+> `APP_VERSION=6.6.1`，`stock_predict.py` 重新生成；ARCHITECTURE 2.2、
+> README 与第七节同步。
+>
+> **v6.6.0：支持导入「股票策略工坊」自定义策略 + 外部策略参数化风控（2026-10-17）**：
+> 设置新增「外部策略」分区：一键扫描 `~/桌面/stock_strategy_studio/strategies/custom/*.json`
+> 或手动选择 JSON 导入（复制到仓库 `studio_strategies/`，可刷新/删除）。规则引擎
+> 按工坊 `core/indicator_catalog.py` 同口径纯标准库移植——**42 个技术指标**、
+> AND/OR、数值/指标比较、上穿/下穿、介于区间、较前值升/降，成交量=手、
+> 无成交额时 `vol×100×close` 估算；全部 42 指标已与工坊 pandas 实现逐点对拍一致。
+> 启用导入策略后，单股分析**不再走消融、不再使用风险偏好**：买卖点直接来自
+> 导入规则，交易层改用 **止损% / 止盈% / 最长持有天数**（0=不启用），
+> 设置内风险偏好下拉自动禁用；`_bt_simulate`/`_bt_events` 新增
+> `use_atr_stop=False` 百分比退出路径（交易明细原因=止损/止盈/最长持有），
+> 信号胜率面板、报告与导出同步。`analyze`/`strategy_signals_full` 接入
+> `algo="studio"`；外部策略启用时跳过消融弹窗与「重选策略」，报告标注
+> 外部策略。另修复生成版 CLI 缺 `import datetime` 导致 `last_completed_td`
+> NameError。`APP_VERSION=6.6.0`；`stock_predict.py` 重新生成；README/
+> ARCHITECTURE 1.1、3.16、第七节同步。
+>
+> **v6.5.9：日K多源扩容（8 源，新增新浪/腾讯web）（2026-10-17）**：
+> 用户报「所有源失效」。`_fetch_remote_rows` 在腾讯 4 域与东财之间补入
+> **腾讯 `web.ifzq.gtimg.cn`（HTTPS+HTTP，实测不复权请求正常；历史 hfq 501
+> 不影响本链路）** 与**新浪日K** `CN_MarketData.getKLineData`：新浪返回
+> 不复权 OHLC、volume 股/100 对齐「手」，再乘 `_sina_hfq_factors` 得真乘法
+> 后复权（与腾讯链路同口径；实测单次可取 3000 根）。熔断/代理/直读机制
+> 复用，无新增单源调用。验证：正常调度命中腾讯；把腾讯 6 域+东财全部置熔断
+> 后，`info["src"]="新浪"` 成功接管。`APP_VERSION=6.5.9`；`stock_predict.py`
+> 重新生成；ARCHITECTURE 2.1、README 与 CHANGELOG 同步。
+> **文档补漏**：README 标题/标准回测产品数（三类→四类）/项目文件表（消融
+> 10→12 算法、`progress.py` ④、发布包改为以最新 Release 为准）与 ARCHITECTURE
+> 版本头、脚本数、消融算法数、Web 端涨跌停钳制口径统一到 v6.5.9。
+
+> **v6.5.8：工具窗可最小化（2026-10-17）**：
+> 工具窗原以 `transient(self.root)` 创建，多数窗口管理器不给 transient
+> 子窗最小化按钮（且父窗会压住它）。`open_tools` 去掉 transient，改为独立
+> 顶层窗：可最小化、任务栏独立切换、仍非模态不锁主界面（v6.5.2 热修①）；
+> 其余三个弹窗（基本面/策略消融推荐/全部组合）保持原状。纯 GUI 行为，
+> 回测/信号零改动；`APP_VERSION=6.5.8`；`stock_predict.py` 重新生成；
+> ARCHITECTURE 3.13、README 与 CHANGELOG 同步。
+
+> **v6.5.7：回测运行中主界面保持可用（2026-10-17）**：
+> 工具页日志回流原来每 120ms 无上限抽取队列并逐行 `insert+see`，一键全量
+> 回测/消融刷屏时 Tk 主线程被日志渲染占满，主界面近乎卡死。现 `_ext_poll`
+> 改为**限量限时批量**（每轮 ≤400 行且 ≤30ms；有积压 1ms 后续批，否则 150ms
+> 轮询），`_ext_log_many` 单次 insert 并把日志控件裁剪到末尾约 4000 行；
+> 重开工具页时若任务仍在跑，保留子进程句柄与日志队列并自动续上轮询（此前
+> 会重置 `_ext_proc` 导致日志中断且无法停止）。设置/算法零改动；
+> `APP_VERSION=6.5.7`；`stock_predict.py` 重新生成；ARCHITECTURE 3.13、
+> README 与 CHANGELOG 同步。
+
+> **v6.5.6：全量消融进度查询 + 更新K线源（2026-10-17）**：
+> ①`backtests/backtest_strategy_ablation.py` 每 ≤2s 原子写
+> `research/ablation_progress.json`（pid/阶段/done/total/有效/跳过/已用/ETA/
+> finished），GUI「数据工具 → 全量策略消融」新增**进度查询**按钮并每 3s 自动
+> 刷新（进程消失未标完成显示「已中断」）；`progress.py` 新增 ④ 同源展示；
+> ②同页新增「**更新K线源**」按钮：子进程跑 `stock_firstaid.py` 体检+自救，
+> 实测可用域写回 ini `[data] kline_url`（本次体检：腾讯 5/5、新浪 1/1 活，
+> 东财 0/5、东财列表 0/4、网易 0/1 挂 → kline_url 已切
+> `https://ifzq.gtimg.cn/appstock/app/fqkline/get`，重启生效）。
+> `APP_VERSION=6.5.6`；`stock_predict.py` 重新生成；ARCHITECTURE 3.13、
+> README 与 CHANGELOG 同步。
+
+> **v6.5.5：数据工具新增「全量策略消融」（2026-10-17）**：
+> 「工具 → 数据工具」页新增区块：并发（0=自动 min(16,cpu)）/ 限制只数（0=全部）/
+> 勾选「跑完刷新 GUI 策略缓存」，一键运行 `backtests/backtest_strategy_ablation.py`
+> （全市场逐只 12算法×3档消融）并可选串联 `tier_picks_from_ablation.py`
+> 刷新荐股/消融缓存（bash `&&` 链）；`_ext_spawn/_ext_stop` 支持 `group`
+> 独立进程组，【停止】整组杀除防孤儿进程继续写库。算法/回测口径零改动；
+> `APP_VERSION=6.5.5`；`stock_predict.py` 重新生成；ARCHITECTURE 3.13 数据工具页
+> 小节与 README/CHANGELOG 同步。
+
+> **v6.5.4：修复「不爬新数据」死锁（2026-10-17）**：
+> 本库指数日K停在 2026-09-30 后，节假日锚（库内指数最新日期）把全库判「新鲜」
+> ——个股两周无新根、指数自身也永不重拉（同期日志：扫描"个股应有=2026-09-30
+> 过期=7"，实缺 10-09..10-16 共 6 根）。新增 `_anchor_dead`：锚落后自然日历
+> >5 天（长假窗口内不动）判失真，`last_completed_td`/`_index_expected_td`
+> 退回自然日历口径 → 全库强制回补 10 月缺根，指数补拉后锚自我修复。
+> `APP_VERSION=6.5.4`；`stock_predict.py` 重新生成；ARCHITECTURE 2.2、
+> README、CHANGELOG 同步。
+
+> **v6.5.3：预测匹配只参考自身（大盘指数项默认关闭，2026-10-17）**：
+> L1 形态匹配打分去掉「大盘涨跌点差」项、样本分层筛选去掉「大盘±0.8pp」条件
+> （量能/板块/缺口/开盘缺口兜底照旧），L2/L3 池匹配 `_pool_match` 同口径去掉
+> 指项权重（`distance_idx=0`）；上证/创业板指行情继续用于展示与 AI 市场简报，
+> 不再影响预测区间与样本挑选。旧口径可用 ini `[predict] match_idx_env=1` 恢复
+> （三项全上，含缺数据 0.40 平均惩罚）。新增 `CFG.MATCH_IDX_ENV`（默认 False，
+> ini 持久化）；`APP_VERSION=6.5.3`；`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 3.1/3.2、第七节同步。
+
+> **v6.5.2 热修②：预测K线涨跌停钳制 + AI市场简报后台预热（2026-10-17）**：
+> ①**预测K线异常修复**——`_fusion_prediction` / `_multi_day_prediction` 新增
+> `lim`（当日单日涨跌停，按 `_limit_pct` 板块口径：创业板/科创板20%、主板10%、
+> 北交所30%；复牌/上市首日不设限传 None 跳过）与 `prev_close`：
+> t_pred/pred 的 价位钳到 昨收±涨跌停 内，多日幽灵K线逐日单日收益钳 ±lim；
+> 此前样本池含20%/30%板样本，主板股（如 sz002241）预测出"跌停都不够跌"的
+> 非法跌幅；`analyze()` 与 `load_pools_progressive` 均传入，ctx 增 `limit`；
+> stock_web.py 预测同步钳制。②**AI页点【开始分析】卡死修复**——
+> `ai_market_brief()` 曾在GUI主线程直接构建激进档板块轮动闸门
+> （tier_load_panel 18~170s + tier_build_features ~20s，主线程日志可证）；
+> 现拆分：`ai_market_brief()` 主线程只做轻量指数简报，闸门读后台缓存
+> （10分钟TTL），冷缓存返回"后台预热中"并自动派 daemon 线程
+> `_ai_market_brief_full()` 预热（打开AI页即触发）；`ai_choose_tier`
+> 改全量版（本就在后台线程）。回测/信号口径零改动；`stock_predict.py`
+> 重新生成；README 极限与 ARCHITECTURE 3.1/3.9、第七节同步。
+
+> **v6.5.2 热修①：工具窗非模态化（2026-10-11）**：
+> 工具/基本面/策略消融推荐/全部组合四窗拆除 `grab_set`（全库仅剩的4处模态），
+> 与主窗口可同时操作；各窗打开前先销毁旧实例防堆叠（结果窗恒展示最新一次），
+> `transient` 置顶与居中/聚焦保持；纯GUI行为，回测/信号口径零改动；
+> `stock_predict.py` 重新生成；ARCHITECTURE 3.13 节与第七节同步。
+
+> **v6.5.2：AI画线落图（2026-10-11）**：
+> AI分析首次出图：prompt追加机器可读画线块（```ai-lines JSON，最多6条水平价位+
+> 2段趋势，kind限buy/sell/stop/support/resistance/target，价位须在近60日区间±30%内），
+> `parse_ai_lines()` 校验（非法/越界静默丢弃）后存 `res["ai_lines"]`，
+> 主图以ACCENT色虚线+左侧“AI·标签 价格”绘制（水平线全宽、趋势段按日期映射视野，
+> 越界不画）；AI完成（首轮/追问/缓存复用）即解析重绘，工具栏“AI线”开关显隐，
+> 清空对话/新一轮提问同步清线，切换股票随res更换自动清线；
+> `APP_VERSION=6.5.2`；`stock_predict.py`重新生成；README/ARCHITECTURE（3.9节与第七节）同步。
+> 说明：当前为“完成后即画”（后台线程阻塞调用+完成回调），token级流式边想边画暂未做。
+
+> **v6.5.1 热修③：SELL冷却独立可配（2026-10-11）**：
+> SELL信号冷却不再写死（此前展示侧写死5天、回测跟买入冷却8/8/3）；
+> `RISK_PARAMS` 每档新增 `sell_cooldown`（默认=买入冷却，行为零变化），
+> `_composite_signals` 的SELL分支经 `_sell_cd()` 取值（旧策略缓存无此键自动回退），
+> 设置→预测参数新增三档SELL冷却行（0-30天，0=SELL后不冷却）、ini `[predict]`
+> `sell_cooldown_<档>` 落盘；全部组合窗口选中行同步显示“冷却/卖冷”；
+> 回测/消融/研究脚本（同传 `rp`）口径自动一致，无需重跑；
+> 改动SELL冷却后需重选策略刷新缓存参数；`stock_predict.py` 重新生成；
+> ARCHITECTURE 3.3 节与第七节同步。
+
+> **v6.5.1 热修②：多维评分展示与回测单源化（2026-10-11）**：
+> `analyze()` 展示侧曾手搓120根打分循环，与消融/回测用的 `_composite_signals`
+> 分叉三处——BOLL多算下轨回升/上轨回落±1、SELL冷却写死5（回测用各档 `rp`）、
+> 弱势BUY+1只在展示侧生效，图上信号与消融评估的不是同一套
+> （抽查 sh600608 近1000根：62天BOLL维度差±1，足以翻转±2阈值信号）。
+> 现展示侧直接调 `_composite_signals` 全量生成再截后120根，弱势过滤与消融一致
+> （不加严）；复合图表信号文案变为精简版“多维偏多(分)”；回测/消融口径零改动，
+> 旧策略缓存与历史回测数字不变；`stock_predict.py` 重新生成；ARCHITECTURE 3.3 节与第七节同步。
+
+> **v6.5.1 热修①：预测分位数 OHLC 一致性钳制（2026-10-11）**：
+> 收/高/低三组分位数此前独立加权+`INTERVAL_K` 放大，尾部必然交叉
+> （如 sz000725 休市快照 P10 收5.41 < 低5.42，预测K线自身不成立）。
+> `_fusion_prediction` 现逐分位强制 `lo<=cl<=hi` 且高≥开/收、低≤开/收；
+> `_multi_day_prediction` 同口径逐分位+累计价格双钳制（`_build_ghosts` 本就自洽不动）；
+> 盘中 `live` 钳制后显式再钳一次防舍入反转。区间只向外扩、P50/上行概率/信号/回测口径不变；
+> `stock_predict.py` 由 `build_cli.py` 重新生成；ARCHITECTURE 3.2 节与第七节同步。
+
 > **v6.5.1：消融策略选择窗可配三档/全表（2026-10-11）**：
 > ① 设置→预测参数新增「消融策略选择」下拉（三档推荐/全部组合，
 > `CFG.ABLATION_VIEW`，ini `[predict] ablation_view`，默认三档推荐保持旧行为）；
