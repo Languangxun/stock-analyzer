@@ -40,7 +40,8 @@ from stock_gui import (
     db_conn, _is_etf,
     _sig_macd, _sig_kdj, _sig_rsi, _sig_boll, _sig_ma_trend, _sig_l1_pattern,
     _sig_chip_peak, _sig_sector_rot, _sig_l2_industry,
-    _sig_vol_ratio, _sig_lgbm, _sig_analog, _signal_ic,
+    _sig_vol_ratio, _sig_lgbm, _sig_analog, _sig_sm701_from_probs,
+    _signal_ic,
     _composite_signals, _composite_precompute,
     _bt_events, _precompute_atr, _bull_bear_score, _regime_map,
     _ablation_pf, _ablation_recent, pick_ablation_consistent,
@@ -74,15 +75,46 @@ def _write_progress(run_dir="", phase="", done=0, total=0, ok=0, skipped=0,
 
 # 预加载指数 regime，全市场共享
 _IDX_REGIME_CACHE = None
+# sm701 概率面板（父进程构建，initializer 注入 worker）：
+# (code→行号, date→列号, prob 矩阵[代码×交易日])
+_SM701_PANEL = None
 
 
-def _init_sector(cal, series, med5, l2cal, l2series, l2used):
+def _sm701_signals(code, rows):
+    """从注入的概率矩阵取该股逐日 sm701 概率并生成买卖点。"""
+    if _SM701_PANEL is None or not rows:
+        return []
+    code_pos, date_pos, F = _SM701_PANEL
+    i = code_pos.get(code)
+    if i is None or F is None:
+        return []
+    probs = {}
+    for r in rows:
+        j = date_pos.get(r.get("date"))
+        if j is None:
+            continue
+        v = F[i, j]
+        if np.isfinite(v):
+            probs[r["date"]] = float(v)
+    return _sig_sm701_from_probs(rows, probs)
+
+
+def _init_sector(cal, series, med5, l2cal, l2series, l2used,
+                 sm_codes=None, sm_cal=None, sm_probs=None):
     """子进程初始化：把主进程构建的板块动量序列与 L2 行业序列注入 stock_gui 缓存，
-    避免每个 worker 重复加载全A面板。"""
+    避免每个 worker 重复加载全A面板。v6.6.4 追加 sm701 概率矩阵（父进程
+    一次性构建/实时复算，worker 只按代码×日期取值，不再重复扫预测文件）。"""
     sg._SECTOR_MOM_CACHE["data"] = (cal, series, med5)
     sg._SECTOR_MOM_CACHE["ts"] = time.time()
     sg._SECTOR_L2_CACHE["data"] = (l2cal, l2series, l2used)
     sg._SECTOR_L2_CACHE["ts"] = time.time()
+    global _SM701_PANEL
+    if sm_codes is not None:
+        _SM701_PANEL = (
+            {c: i for i, c in enumerate(sm_codes)},
+            {d: j for j, d in enumerate(sm_cal or [])},
+            sm_probs,
+        )
 
 
 def _load_index_regime():
@@ -181,6 +213,7 @@ def run_ablation_for_stock(args):
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
         "vol_ratio": lambda: _sig_vol_ratio(rows),
         "lgbm": lambda: _sig_lgbm(rows),
+        "sm701": lambda: _sm701_signals(code, rows),
         "analog": lambda: _sig_analog(rows, code),
     }
 
@@ -440,6 +473,17 @@ def main(limit=None, max_workers=None, tag=""):
         print(f"  L2 行业序列构建失败，l2_ind 将跳过: {e}")
         l2cal, l2series, l2used = [], {}, {}
 
+    print("构建 sm701 概率矩阵（历史落盘 + 最新交易日实时复算，一次注入子进程）...")
+    try:
+        sm_codes, sm_cal, _sm_C, _sm_V = sg.tier_load_panel()
+        sm_F = sg.sm701_score_matrix(progress=print)
+        n_cov = int(np.isfinite(sm_F).any(axis=1).sum())
+        print(f"  sm701 覆盖 {n_cov}/{len(sm_codes)} 个标的，"
+              f"日期 {sm_cal[0]} ~ {sm_cal[-1]}")
+    except Exception as e:
+        print(f"  sm701 概率矩阵构建失败，sm701 候选将跳过: {e}")
+        sm_codes, sm_cal, sm_F = [], [], None
+
     if max_workers is None:
         max_workers = max(1, min(os.cpu_count() or 4, 16))
 
@@ -472,7 +516,7 @@ def main(limit=None, max_workers=None, tag=""):
     with ProcessPoolExecutor(
             max_workers=max_workers, initializer=_init_sector,
             initargs=(cal_mom, series_mom, med_mom, l2cal, l2series,
-                      l2used)) as exe:
+                      l2used, sm_codes, sm_cal, sm_F)) as exe:
         for res in exe.map(run_ablation_for_stock, args_list,
                            chunksize=chunksize):
             done += 1

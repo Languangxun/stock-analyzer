@@ -111,7 +111,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-10-18 升 6.6.3）
-APP_VERSION = "6.6.3"
+APP_VERSION = "6.6.4"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -2676,18 +2676,31 @@ def refresh_all_codes(progress=None, force=False):
             return TIERS[2]
 
         today = time.strftime("%Y-%m-%d")
+        with db_conn() as conn:
+            _cur_a = conn.execute(
+                "select count(*) from stocks where substr(code,3,2) "
+                "not in ('51','56','58','15','16','18')").fetchone()[0] or 0
+        # v6.6.4：免费源常在翻页中途断流；残缺列表（如只拿到三千多只）若
+        # 直接 DELETE+INSERT 会把全市场代码表截断，后续增量只更新残表。
+        # 仅在拿到足够完整的列表时全量替换，否则合并保留旧行并下次重试。
+        _full = len(items) >= 5000 and len(items) >= int(_cur_a * 0.9)
+        if not _full:
+            log.warning("代码表仅拉到 %d 只（现有A股 %d），保留旧表并合并",
+                        len(items), _cur_a)
         with db_conn(commit=True) as conn:
             # 只清 A 股行，保留 ETF/LOF 行（v6.1.2：ETF 宇宙独立维护）
-            conn.execute(
-                "DELETE FROM stocks WHERE substr(code,3,2) "
-                "NOT IN ('51','56','58','15','16','18')")
+            if _full:
+                conn.execute(
+                    "DELETE FROM stocks WHERE substr(code,3,2) "
+                    "NOT IN ('51','56','58','15','16','18')")
             conn.executemany(
                 "INSERT OR REPLACE INTO stocks"
                 "(code,name,industry,mktcap,tier,updated,turnover,pe,pb) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 [(c, n, i, cap, tier_of(cap), today, tu, pe, pb)
                  for c, n, i, cap, tu, pe, pb in items])
-            _set_meta(conn, "stocks_updated", repr(time.time()))
+            if _full:
+                _set_meta(conn, "stocks_updated", repr(time.time()))
         if progress:
             progress(f"代码表完成: {len(items)}只, 分界 "
                      f"{q1/1e8:.0f}/{q2/1e8:.0f}亿")
@@ -6248,8 +6261,9 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
 # ================= 策略消融引擎（多算法回测+防过拟合选型） =================
 # 每次分析对该股近1000交易日做一次多算法消融回测：
 #   候选 = MACD / KDJ / RSI / 布林带 / MA20-60趋势 / L1形态 / L2同行业+行业ETF /
-#          筹码峰 / 板块轮动 / 量比 / LGBM / 多维评分（全部 × 3 档风险参数：
-#          保守/稳健/激进；v6.2.3 起原「高风险」档及其参数已删除）
+#          筹码峰 / 板块轮动 / 量比 / LGBM / sm701 / 多维评分（全部 × 3 档风险参数：
+#          保守/稳健/激进；v6.2.3 起原「高风险」档及其参数已删除；
+#          v6.6.4 起 sm701 作为独立候选参与消融）
 # 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
 # 信号只用 T 日及以前数据，信号日收盘成交）。v6.1.5 热修②：选型再加"近端子窗
 # 一致性"——最近 ~250 根也须排前列，否则回退该档「多维评分」（防风格切换失配；
@@ -8566,6 +8580,7 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "sector_rot": lambda: _sig_sector_rot(rows, industry=industry),
         "vol_ratio": lambda: _sig_vol_ratio(rows),
         "lgbm": lambda: _sig_lgbm(rows),
+        "sm701": lambda: _sig_sm701(rows, full),
         "analog": lambda: _sig_analog(rows, full),
     }
     for algo, gen in gens.items():
@@ -11681,12 +11696,34 @@ def _sm701_predict_feats(feats, paths):
     return booster.predict(X)
 
 
+def _db_latest_date(path=None):
+    """行情库最新交易日；path 为空时读主库。失败返回空串。"""
+    try:
+        if path:
+            import urllib.request as _ur
+            uri = ("file:" + _ur.pathname2url(os.path.abspath(path))
+                   + "?mode=ro")
+            conn = sqlite3.connect(uri, uri=True, timeout=30)
+            try:
+                return conn.execute(
+                    "select max(date) from daily_bars").fetchone()[0] or ""
+            finally:
+                conn.close()
+        with db_conn() as conn:
+            return conn.execute(
+                "select max(date) from daily_bars").fetchone()[0] or ""
+    except sqlite3.Error:
+        return ""
+
+
 def _sm701_live_predict(target_dates, cal, progress=None):
     """用副本 LightGBM 模型实时复算目标日期全市场概率。
 
     返回 {(code, date): prob}；cal 为交易日日历（用于取 180 根预热起点）。
-    结果按（预热起点 + 目标日期集合 + 库/模型 mtime）缓存，组合矩阵与
-    单股 test 信号两条链共用同一次复算。"""
+    结果按（预热起点 + 目标日期集合 + 取数库/模型 mtime）缓存，组合矩阵与
+    单股 test 信号两条链共用同一次复算。
+    v6.6.4：sm701 副本日K落后主库时改用主库最新行情复算——两库日K同源
+    （重叠段逐值一致），否则目标日停在副本末日会让 test 荐股整页为空。"""
     import pandas as pd
     if np is None:
         raise RuntimeError("test 档实时评分需要 numpy")
@@ -11698,23 +11735,39 @@ def _sm701_live_predict(target_dates, cal, progress=None):
     first = min(date_pos[d] for d in wanted)
     start_i = max(0, first - (_SM701_WARMUP_BARS - 1))
     start = cal[start_i]
-    key = (start, tuple(wanted), os.path.getmtime(paths["db"]),
-           _sm701_model_mtimes(paths))
+    sm_max = _db_latest_date(paths["db"])
+    src_db, src_max = paths["db"], sm_max
+    main_max = _db_latest_date()
+    if main_max > sm_max:
+        src_db, src_max = DB_PATH, main_max
+    use_main = os.path.abspath(src_db) == os.path.abspath(DB_PATH)
+    key = (start, tuple(wanted), os.path.abspath(src_db), src_max,
+           os.path.getmtime(src_db), _sm701_model_mtimes(paths))
     cached = _SM701_CACHE.get("live")
     if cached and cached[0] == key:
         return cached[1]
-    qual = ("(s.code GLOB 'sh60[0135]*' OR s.code GLOB 'sh68[89]*' "
-            "OR s.code GLOB 'sz00[0123]*' OR s.code GLOB 'sz30[01]*' "
-            "OR s.code GLOB 'bj[489]*')")
-    sql = (f"SELECT b.code,b.date,b.open,b.high,b.low,b.close,b.vol "
-           f"FROM daily_bars b JOIN stocks s ON s.code=b.code "
-           f"WHERE b.date>=? AND {qual} ORDER BY b.code,b.date")
+
+    def _qual(col):
+        return (f"({col} GLOB 'sh60[0135]*' OR {col} GLOB 'sh68[89]*' "
+                f"OR {col} GLOB 'sz00[0123]*' OR {col} GLOB 'sz30[01]*' "
+                f"OR {col} GLOB 'bj[489]*')")
+
     if progress:
-        progress(f"test(sm701)：复算 {wanted[0]} ~ {wanted[-1]} 概率 ...")
-    with _sm701_conn(paths["db"]) as conn:
-        df = pd.read_sql_query(sql, conn, params=[start])
+        progress(f"test(sm701)：复算 {wanted[0]} ~ {wanted[-1]} 概率"
+                 f"（数据至 {src_max or '-'}）...")
+    if use_main:
+        sql = (f"SELECT code,date,open,high,low,close,vol FROM daily_bars "
+               f"WHERE date>=? AND {_qual('code')} ORDER BY code,date")
+        with db_conn() as conn:
+            df = pd.read_sql_query(sql, conn, params=[start])
+    else:
+        sql = (f"SELECT b.code,b.date,b.open,b.high,b.low,b.close,b.vol "
+               f"FROM daily_bars b JOIN stocks s ON s.code=b.code "
+               f"WHERE b.date>=? AND {_qual('s.code')} ORDER BY b.code,b.date")
+        with _sm701_conn(src_db) as conn:
+            df = pd.read_sql_query(sql, conn, params=[start])
     if df.empty:
-        raise RuntimeError("sm701 副本没有可用日K")
+        raise RuntimeError("sm701/主库均无可用日K")
     df["code"] = df["code"].astype("category")
     feats = _sm701_module(paths)._compute_feats(df)
     prob = _sm701_predict_feats(feats, paths)
@@ -11756,9 +11809,13 @@ def sm701_score_matrix(progress=None):
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
         pred_mt = 0.0
+    try:
+        main_mt = os.path.getmtime(DB_PATH)
+    except OSError:
+        main_mt = 0.0
     key = (tuple(codes[:3]), len(codes), cal[0], cal[-1],
            os.path.getmtime(paths["db"]), _sm701_model_mtimes(paths),
-           pred_mt)
+           pred_mt, main_mt)
     cached = _SM701_CACHE.get("scores")
     if cached and cached[0] == key:
         return cached[1]
@@ -11793,6 +11850,7 @@ def sm701_status():
         with _sm701_conn(p["db"]) as conn:
             db_date = conn.execute("select max(date) from daily_bars").fetchone()[0]
         out = {"ok": True, "dir": p["dir"], "db_date": db_date or "",
+               "live_db_date": max(db_date or "", _db_latest_date()),
                "model": p["model"], "pred": p["pred"]}
         prod = p.get("prod")
         if prod:
@@ -11870,20 +11928,19 @@ def sm701_prob_map(full, dates=None):
     return out
 
 
-def _sig_sm701(rows, full, **_kw):
-    """sm701 概率信号（test 档专用，模型直出、不消融）：
-    概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。"""
-    if not rows or not full:
+def _sig_sm701_from_probs(rows, probs):
+    """sm701 概率序列 → 买卖点（probs 可为 {date: prob} 或按行对齐的序列）。
+
+    与 `_sig_sm701` 同一滞回口径，供研究消融在父进程一次性预载概率后
+    直接生成信号，避免每个 worker 重复扫描 70MB+ 预测文件。"""
+    if not rows or probs is None:
         return []
-    try:
-        probs = sm701_prob_map(full, [r.get("date") for r in rows])
-    except Exception:
-        log.exception("sm701 单股概率读取失败")
-        return []
+    seq = isinstance(probs, dict)
     out = []
     state = 0
     for i, r in enumerate(rows):
-        p = probs.get(r.get("date"))
+        p = probs.get(r.get("date")) if seq else (
+            probs[i] if i < len(probs) else None)
         if p is None:
             continue
         if state <= 0 and p >= _SM701_SIG_BUY:
@@ -11897,6 +11954,19 @@ def _sig_sm701(rows, full, **_kw):
     return out
 
 
+def _sig_sm701(rows, full, **_kw):
+    """sm701 概率信号（test 档专用，模型直出、不消融）：
+    概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。"""
+    if not rows or not full:
+        return []
+    try:
+        probs = sm701_prob_map(full, [r.get("date") for r in rows])
+    except Exception:
+        log.exception("sm701 单股概率读取失败")
+        return []
+    return _sig_sm701_from_probs(rows, probs)
+
+
 def tier_segments(cal):
     """回测段定义（tranche 起点由各档 reb 决定，见 tier_eval）。"""
     return {
@@ -11905,6 +11975,8 @@ def tier_segments(cal):
         "val": ("2025-08-29", cal[-1]),
         "val2025": ("2025-01-02", "2025-08-28"),
         "bull": ("2025-03-18", "2026-09-04"),
+        # v6.6.4：与 sm701 历史预测同起点的公平对照区间（研究/对比脚本用）
+        "sm701": ("2024-03-12", cal[-1]),
     }
 
 
@@ -14589,7 +14661,7 @@ class App:
             else:
                 _src = "sm701 实验模型" if m == "test" else "v6.2.3 三档引擎"
                 lb.insert("end", f"{m}：加载 {_src}"
-                                 f"（Top10，首次约1分钟）…")
+                                 f"（Top10，首次约 1~3 分钟）…")
 
                 def worker2():
                     note = None
@@ -14674,6 +14746,9 @@ class App:
             self._picks_rows[row0 + i] = x["code"]
             self._picks_codes.append(x["code"])
         lb.insert("end", "")
+        if not d["picks"]:
+            lb.insert("end", "本期无入围股票：数据源未更新或权限过滤后为空"
+                             "（设置→荐股 可放宽行业/板块权限）。")
         lb.insert("end", f"合计约 {d.get('suggested_cost', 0):,.0f} 元；"
                          "出局规则：跌出 Top / "
                          + ("闸门关闭 / " if cfg.get("gate") else "")
@@ -14684,9 +14759,10 @@ class App:
                              "才入选；确认不足宁缺毋滥，可能少于10只）")
         if cfg.get("source") == "sm701":
             st = sm701_status()
-            lb.insert("end", "test 数据源：sm701 副本"
-                             f"（日K至 {st.get('db_date', '-')}；"
-                             "历史分数读取落盘预测，最新日由 LightGBM 实时复算）")
+            lb.insert("end", "test 数据源：sm701 副本 + 主库最新行情"
+                             f"（sm701 日K至 {st.get('db_date', '-')}，"
+                             f"实时复算至 {st.get('live_db_date') or st.get('db_date', '-')}；"
+                             "历史分数读取落盘预测）")
             lb.insert("end", "注意：sm701 为「次日开盘买→收盘卖」日频 alpha"
                              "（A股 T+1 无法当日卖出）；本工具收盘口径回测为负"
                              "（2024-01~2026-09 年化约 -69%），仅供研究观察。")
@@ -15725,7 +15801,7 @@ class App:
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
             f"每档按各自风险目标在候选中选优"
-            f"（12算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
+            f"（13算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
@@ -16019,7 +16095,7 @@ class App:
         win.resizable(True, True)
 
         ttk.Label(win, text=(
-            f"共 {len(cands)} 个组合（12算法+多维评分 × 风险档）{src_txt}\n"
+            f"共 {len(cands)} 个组合（13算法+多维评分 × 风险档）{src_txt}\n"
             f"回测近{bars}个交易日（训练{train_n}日选型 / 验证{val_n}日"
             f"仅检验）；「排列方式」可切换，双击行或选中后点"
             f"【应用所选策略】。"),
@@ -19166,7 +19242,7 @@ class App:
 
         # —— 全量策略消融（v6.5.5：全市场 12算×3档 + 可选刷新 GUI 策略缓存）——
         ab = ttk.LabelFrame(parent, padding=8,
-                            text=" 全量策略消融（全市场逐只·12算法×3档，AI 不参与） ")
+                            text=" 全量策略消融（全市场逐只·13算法×3档，AI 不参与） ")
         ab.pack(fill="x", pady=(0, 6))
         a1 = ttk.Frame(ab)
         a1.pack(fill="x")
