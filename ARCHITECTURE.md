@@ -1,6 +1,6 @@
 # 架构说明 · 股票形态相似度预测系统
 
-> **版本 v6.6.2　更新于 2026-10-18**
+> **版本 v6.6.5　更新于 2026-10-24**
 > 配套：《README.md》（用户向：功能/快速开始/回测摘要/数据）、`CHANGELOG.md`（版本变更史）、
 > `reports/回测复核报告_20260913.md`（审计报告）。
 > 本文只讲两件事：**这套东西的架构**、**每个环节用的什么算法**。历史版本（v3.2/v3.3）的架构描述已被本文取代。
@@ -103,11 +103,21 @@
 （直连优先）。6 小时内存缓存 `_F10_CACHE`，并新增 **SQLite `f10_cache` 持久缓存**，
 网络失败时优雅降级到旧财报数据。
 
-**日K `_fetch_remote_rows`**（v6.5.9 扩为 8 源）：腾讯（配置域 `KLINE_URL`，默认
-`proxy.finance.qq.com`）→ `proxy` → `ifzq.gtimg.cn`(HTTPS) → `ifzq.gtimg.cn`(HTTP)
-→ `web.ifzq.gtimg.cn`(HTTPS/HTTP，v6.5.9) → **新浪 `CN_MarketData.getKLineData`**
-（v6.5.9，不复权 × `_sina_hfq_factors` 同一乘法口径，volume 股/100=手，实测单次
-可取 3000 根）→ 东财 4 host 轮询（`push2his` / `92` / `93` / `97`）。
+**日K `_fetch_remote_rows`**（v6.5.9 扩为 8 源；**v6.6.5 改为可配置源链 + 同花顺第三梯队**）：
+腾讯（配置域 `KLINE_URL`，默认 `proxy.finance.qq.com`）→ `proxy` → `ifzq.gtimg.cn`(HTTPS)
+→ `ifzq.gtimg.cn`(HTTP) → `web.ifzq.gtimg.cn`(HTTPS/HTTP，v6.5.9) → **新浪
+`CN_MarketData.getKLineData`**（v6.5.9，与腾讯空 fq 位同口径 × `_sina_hfq_factors`
+乘法后复权，volume 股/100=手，实测单次可取 3000 根；v6.6.5 对拍澄清：×因子后与库内
+2000 日重叠偏差 0.000%，无存量口径问题）→ **同花顺 `d.10jqka.com.cn/v6/line`**
+（v6.6.5，JSONP 无需 cookie；个股/ETF/科创板/深证系列指数可用，上证指数无映射交回
+其他源；**完整前复权口径原样入库、绝不乘新浪因子**——除权日收益≈复权真实收益，
+但绝对水平与库内差时变因子（复权表黑盒），与库内不同时由 rebase 机制整段自洽替换）
+→ 东财 4 host 轮询（`push2his` / `92` / `93` / `97`）。
+**源链可配置（v6.6.5，设置→数据源）**：`_kline_sources()` 返回运行时链，内置 9 源
+可启用/停用/排序（ini `[data] kline_srcs`），自定义源（`custom_kline` JSON，类型
+腾讯格式/同花顺/东财/新浪/网易，最多 10 个）追加链尾、熔断键 `自定义:名称`；
+「腾讯」源域与固定变体 URL 相同时自动去重；全停用且无自定义保存时回默认链；
+急救箱切换 `kline_url` 后联动重建（`_reload_kline_srcs`）。
 **2026-09-26 观测**：`web.ifzq.gtimg.cn` 曾对 hfq 请求返 **501**（腾讯反爬）而 qfq
 探测可通过（该域此后实测又恢复，属时段性），旧 `_probe_kline_url` 用 qfq 探测会把
 死域写进 ini；现探测改 **hfq + 连测2次**，且 501 纳入熔断（死源连续2次失败冷却
@@ -116,6 +126,12 @@ v6.5.9 链路只用腾讯**不复权**，故 web.ifzq 的 hfq 501 不再影响�
 不复权再乘因子，落库口径与腾讯源一致（不做减法前复权持久化）。
 全域失败时 `_auto_heal_kline()` 10 分钟限频探测候选域并写入内存+ini；仍无解才触发
 AI 找源（AI 只提议 URL，`_probe_kline_url` 实测有数据才采用）。
+**增量拉取瘦身（v6.6.5）**：`get_daily` 过期回补时本地 ≥120 根且非异常只拉 120 根
+小窗（载荷约 1/17；首拉/异常拉满）；小窗检出基期漂移但不足以整段重定基
+（cover=min(400, 库内/2)）时自动升级拉满全量重试一次，绝不新旧基期混写接缝。
+同轮修复**基期漂移检测存量缺陷**：旧「命中偏差即 break 再验 checked≥5」在口径级
+差异（重叠第一天就分叉）下 checked 恒=1 → 误判"重叠不足"直接混写（实测可留
++95.7% 人为跳变）；`get_daily` 与 `backfill_full_market` 均改为扫完重叠区再判。
 
 **板块**：排行 = 东财 clist（HTTPS/HTTP × 主域/延迟域 4 host 轮换）→ **腾讯行业榜
 `ifzq.gtimg.cn/appstock/app/mktHs/rank`** → akshare（可选依赖 `stock_sector_spot`，未装自动跳过），
@@ -232,7 +248,10 @@ AI 找源（AI 只提议 URL，`_probe_kline_url` 实测有数据才采用）。
   状态栏显示进度；ini `[predict] auto_prefetch = 0` 关闭；
 - **深历史回填**：GUI 设置【全市场回填】/ CLI `--backfill`；腾讯按 **`max(950, CFG.MAX_FETCH_BARS)`
   目标翻页**（主源=不复权，v6.1.5 热修⑪ 起；× 新浪复权因子入库；2000 根 → 3 页）
-  + 东财兜底；501 全局暂停自愈 + 断点续传 + 6 线程；
+  + 东财兜底；**v6.6.5 扩为三级兜底**：腾讯 → **同花顺深历史**（last.js 近140根 +
+  按年文件回拼，完整前复权口径原样使用，与库内口径不同时由重叠偏差检测**整只**
+  替换绝不逐条混写）→ 东财，腾讯整域 501/断连时回填不再中断；
+  501 全局暂停自愈 + 断点续传 + 6 线程；
   `_bf_tx_fetch` 支持 hfq/qfq/不复权三种口径（不存在复权位时不复权翻页需带 end，2026-09-27 修）；
   **v6.2.3**：每股网络请求 5→3——`_bf_fetch_one` 直接把已抓到的腾讯不复权末价
   作为第二条返回值（不再调 `_raw_last_price`），并把 raw 尾部 `date→close` 存入
@@ -1016,6 +1035,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v6.6.5**<br>（2026-10-24） | **日K 同花顺第三梯队源 + 源链可配置 + 回填多源兜底 + 增量瘦身 + 基期检测缺陷修复**：①`_fetch_ths`（`d.10jqka.com.cn/v6/line` JSONP，last.js 近140根 + 按年文件回拼~20年，`_ths_symbol` 映射个股/ETF/科创板/深指、上证指数无映射）——**完整前复权口径原样入库不乘因子**，排新浪后东财前；同轮对拍澄清新浪源口径与库内一致（0.000%）；②源链注册层 `_kline_builtin_defs/_kline_sources/_reload_kline_srcs/_load_kline_src_cfg/_apply_kline_src_cfg/_probe_kline_src`（ini `[data] kline_srcs/custom_kline`），设置新增「数据源」分区（内置源启停/排序/测试 + 自定义源增删测，类型 tx/ths/em/sina/163），同 URL 去重、全停用回默认、急救箱联动；③`_bf_fetch_one` 腾讯→同花顺→东财三级兜底（`_bf_hint_set` 复用）；④`get_daily` 增量只拉 120 根小窗、漂移时自动升级全量重定基；⑤**修复 P0**：基期漂移检测 break-early 缺陷（口径级差异 checked 恒=1 误判重叠不足→混写接缝，实测 +95.7% 跳变），`get_daily`/`backfill_full_market` 均改扫完再判；⑥`_DOMESTIC_SUFFIX`+`10jqka.com.cn`，firstaid 增同花顺套件；`APP_VERSION=6.6.5`，`stock_predict.py` 重新生成；2.1/2.5 节与 README/CHANGELOG 同步 |
 | **v6.6.4**<br>（2026-10-20） | **荐股 sm701 数据源修复 + 代码表防截断 + sm701 并入消融 + 全库三档对照**：①`_sm701_live_predict()` 新增取数库选择（sm701 副本日K落后时用主库，`_db_latest_date()`；缓存 key 加取数库/主库 mtime），修复 test 荐股最新信号日全 NaN、列表 0 只；荐股空结果提示与数据源日期同步；②`refresh_all_codes()` 仅在 ≥5000 只且 ≥现有 A 股 90% 时全量替换，部分拉取改为合并保留旧表（修复 5799→3396 截断）；③`run_ablation`/`backtest_strategy_ablation.py` 新增 `sm701` 候选（13 算法；GUI 42 候选），新增 `_sig_sm701_from_probs()`，研究父进程一次性构建概率矩阵注入 worker；④`backtests/compare_tier_sm701.py` 全库对照（2024-03-12~2026-10-19）：稳健 sm701 胜、均衡/激进当前胜、test 原生负 → 不整体替换；全库消融 7198 有效对象中 sm701 入选稳健 2326（32.3%）/均衡 1911（26.6%），候选层 IC5 +0.105 vs LGBM -0.002；`research/compare_tier_sm701.json`；⑤`APP_VERSION=6.6.4`，`stock_predict.py` 重新生成；3.7/3.8 节与 README/CHANGELOG 同步 |
 | **v6.6.3**<br>（2026-10-18） | **test 档 sm701 切换生产定稿三周期模型**：`_sm701_production_set()` 探测副本 `production/`（`features_tech.json` + `prod_h1\|h5\|h10_tech.txt`），命中即用生产三周期 tech 模型、历史改读 `production/valid_predictions.csv.gz`，否则回退旧单模型（`SM701_MODEL` 显式指定强制单模型）；`_sm701_predict_feats()` 按 `features_tech.json` 列序对三模型打分、**等权平均**（`sm701_score_matrix`/`_sm701_live_predict`/`sm701_prob_map` 共用）；缓存 key 改 `_sm701_model_mtimes()`（三模型逐个 mtime），`sm701_status()` 增 `prod_*`；副本侧新增 `production/make_predictions.py` 生成历史预测；对拍末交易日 2026-09-30 逐元素一致（sh600000 0.42401537），生产 h1 模型 2024+ AUC 0.5446；`APP_VERSION=6.6.3`，`stock_predict.py` 重新生成；3.7 节与 README/CHANGELOG 同步 |
 | **v6.6.2**<br>（2026-10-18） | **数据层缓存优先 + 无网络优雅降级**：`fetch_daily` 改走 `get_daily`，禁止绕过本地库；`fetch_quote_cached` 扩展为通用入口（内存 → SQLite `quote_cache` → 网络，失败降级旧缓存）；`fetch_batch_quotes` 缓存优先、仅缺失/过期代码联网、失败返回缓存；`fetch_f10_metrics` 新增 SQLite `f10_cache` 持久缓存；GUI 实时行情与未上市判定切到缓存入口；`APP_VERSION=6.6.2`，`stock_predict.py` 重新生成；2.1/2.2 节与 CHANGELOG 同步 |

@@ -24,7 +24,8 @@ CLI_HEADER = '''#!/usr/bin/env python3
 价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配，
 多算法消融选策略（10 类信号，训练/验证切分防过拟合）。
 内建 SQLite 缓存（stock_cache.db），同行业/同市值层样本池只回填一次。
-K线源自动切换：腾讯(多域名容灾) -> 东财(4 host)，失效域自动熔断/自愈；支持代理。
+K线源自动切换：腾讯(多域名容灾) -> 新浪 -> 同花顺 -> 东财；源链可在设置→数据源
+调整/添加自定义源（ini [data]）；失效域自动熔断/自愈；支持代理。
 每日拉取诊断：stock_fetch.log（缓存命中/拉取原因/命中源/耗时）。
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--refresh-etf] [--backfill]

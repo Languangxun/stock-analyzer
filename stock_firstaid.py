@@ -63,6 +63,9 @@ SINA_CANDS = [
 N163_CANDS = [
     "http://quotes.money.163.com/service/chddata.html",
 ]
+THS_CANDS = [
+    "https://d.10jqka.com.cn/v6/line",
+]
 UT = "fa5fd1943c7b386f172d6893dbfba10b"
 HDR = {"User-Agent": "Mozilla/5.0",
        "Referer": "https://quote.eastmoney.com/"}
@@ -177,12 +180,30 @@ def v_163(base):
     return build, check
 
 
+def v_ths(base):
+    """同花顺 v6 line（v6.6.5 新源）：JSONP，last.js=近140根，all.js=全历史。"""
+    def build():
+        return base.rstrip("/") + "/hs_" + TEST_CODE[2:] + "/01/last.js"
+
+    def check(txt):
+        try:
+            m = re.search(r"\((\{.*\})\)", txt, re.S)
+            rows = ((json.loads(m.group(1)).get("data") or "")
+                    .split(";"))
+            return (len(rows) >= 5
+                    and RECENT.replace("-", "") in rows[-1])
+        except Exception:
+            return False
+    return build, check
+
+
 SUITES = [
     ("腾讯K线", [(u, *v_tencent(u)) for u in TENCENT_CANDS]),
     ("东财K线", [(u, *v_em_kline(u)) for u in EM_KLINE_CANDS]),
     ("东财列表/板块", [(u, *v_em_list(u)) for u in EM_LIST_CANDS]),
     ("新浪K线", [(u, *v_sina(u)) for u in SINA_CANDS]),
     ("网易163", [(u, *v_163(u)) for u in N163_CANDS]),
+    ("同花顺K线", [(u, *v_ths(u)) for u in THS_CANDS]),
 ]
 
 

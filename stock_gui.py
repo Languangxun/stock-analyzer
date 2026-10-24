@@ -110,8 +110,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-18 升 6.6.3）
-APP_VERSION = "6.6.4"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-24 升 6.6.5）
+APP_VERSION = "6.6.5"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -924,7 +924,7 @@ _PROXY_LOCK = threading.Lock()
 _DOMESTIC_SUFFIX = (
     "eastmoney.com", "gtimg.cn", "qq.com", "sinajs.cn", "sina.com.cn",
     "sina.com", "163.com", "126.net", "sse.com.cn", "szse.cn",
-    "cninfo.com.cn", "csindex.com.cn",
+    "cninfo.com.cn", "csindex.com.cn", "10jqka.com.cn",
 )
 
 
@@ -1529,16 +1529,17 @@ def _sync_adjust(full, rows, raw_map=None):
         log.debug("sync_adjust 失败 %s", full, exc_info=True)
 
 
-def _fetch_163(full, count=600):
+def _fetch_163(full, count=600, base=None):
     """网易163财经（免费，稳定性好，返回CSV）"""
     code163 = _code_to_163(full)
     if not code163:
         return []
     import datetime
+    base = base or "http://quotes.money.163.com/service/chddata.html"
     end = datetime.date.today().strftime("%Y%m%d")
     start = (datetime.date.today() - datetime.timedelta(days=count * 2)
              ).strftime("%Y%m%d")
-    url = (f"http://quotes.money.163.com/service/chddata.html"
+    url = (f"{base}"
            f"?code={code163}&start={start}&end={end}"
            f"&fields=TCLOSE;HIGH;LOW;TOPEN;VOTURNOVER")
     txt = _http_get(url, retries=2, timeout=15, decode="gbk")
@@ -1639,16 +1640,17 @@ def _fetch_sina(full, count=600):
     return out
 
 
-def _fetch_sina_kline(full, count=600):
+def _fetch_sina_kline(full, count=600, base=None):
     """新浪日K（不复权）× 新浪因子 = 真乘法后复权（v6.5.9 多源兜底）。
 
     接口：`CN_MarketData.getKLineData`（免费、无需 key，实测单次可取 3000 根）。
     返回 volume 单位为股，/100 对齐腾讯「手」口径；ETF/指数无因子时原样返回。
-    与腾讯链路共用 `_sina_hfq_factors`，绝不回写仿射 hfq。"""
+    与腾讯链路共用 `_sina_hfq_factors`，绝不回写仿射 hfq。
+    base：自定义源可换镜像基址（v6.6.5）。"""
     n = max(5, min(3000, int(count or 600)))
-    url = ("https://money.finance.sina.com.cn/quotes_service/api/"
-           "json_v2.php/CN_MarketData.getKLineData"
-           f"?symbol={full}&scale=240&ma=no&datalen={n}")
+    base = (base or "https://money.finance.sina.com.cn/quotes_service/api/"
+            "json_v2.php/CN_MarketData.getKLineData").rstrip("/")
+    url = f"{base}?symbol={full}&scale=240&ma=no&datalen={n}"
     txt = _http_get(url, retries=1, timeout=10, decode="utf-8",
                     headers={"Referer": "https://finance.sina.com.cn/"})
     data = json.loads(txt)
@@ -1676,14 +1678,380 @@ def _fetch_sina_kline(full, count=600):
     return rows
 
 
-def _fetch_remote_rows(full, count=600, info=None):
-    """多源自动切换 + 熔断调度：腾讯(配置域) → 腾讯代理 → 腾讯ifzq
-    → 腾讯HTTP → 腾讯web → 腾讯webHTTP → 新浪 → 东财。
+# ---- 同花顺 v6 line（v6.6.5 新源：免费、无需 cookie，全历史单请求）----
 
+_THS_LINE_BASE = "https://d.10jqka.com.cn/v6/line"
+
+
+def _ths_symbol(full):
+    """腾讯代码 → 同花顺 v6 line 的 `市场_代码`；无映射返回 None。
+
+    实测（2026-10）：hs_600000 / hs_688001 / hs_510300 / hs_399001 /
+    hs_399006 均可用；上证指数（sh000*）无 v6 line 映射——hs_000001 是
+    平安银行，绝不能当成上证指数用，一律交回其他源。北交所同无映射。"""
+    num = full[2:]
+    if full.startswith("sh") and num.startswith(("60", "68")):
+        return "hs_" + num
+    if full.startswith("sz") and num.startswith(("00", "30", "39")):
+        return "hs_" + num
+    if num[:2] in ("51", "56", "58", "15", "16", "18"):   # ETF/LOF
+        return "hs_" + num
+    return None
+
+
+def _fetch_ths_raw(full, count=600, base=None):
+    """同花顺不复权日K。接口 `{base}/{市场}_{代码}/01/{last,YYYY}.js`（JSONP）：
+
+    last=近 140 根（保证覆盖最新交易日）；更早历史按年文件 `YYYY.js`
+    逐年回拼（明文 `date,open,high,low,close,volume(股),…`，与 last 同格式）。
+    注意 `all.js` 虽为全历史但是同花顺私有压缩格式（price/volumn/dates
+    差分编码 + priceFactor），不可直接解析，故不使用。
+    量/100 对齐腾讯「手」；与新浪逐值对拍一致（2026-10 实测）。"""
+    sym = _ths_symbol(full)
+    if not sym:
+        return []
+    base = (base or _THS_LINE_BASE).rstrip("/")
+    n = max(5, int(count or 600))
+    rows = _ths_parse(_ths_get(f"{base}/{sym}/01/last.js"))
+    if n <= 140 or not rows:
+        return rows[-n:] if n < len(rows) else rows
+    have = {r["date"] for r in rows}
+    year = datetime.date.today().year
+    empty_streak = 0
+    while len(rows) < n and year >= 1990:
+        try:
+            seg = _ths_parse(_ths_get(f"{base}/{sym}/01/{year}.js"))
+        except Exception:
+            break                 # 年份文件缺失/失败：更早更不会有，保守停止
+        new = [r for r in seg if r["date"] not in have]
+        if not new:
+            # 同花顺年文件只保留最近约20年（更早文件存在但 data 为空）；
+            # 连续3个空年即认为到头（容忍个别整年停牌），不再空拉到1990。
+            empty_streak += 1
+            if empty_streak >= 3:
+                break
+            year -= 1
+            continue
+        empty_streak = 0
+        have.update(r["date"] for r in new)
+        rows = sorted(rows + new, key=lambda r: r["date"])
+        year -= 1
+    return rows[-n:] if n < len(rows) else rows
+
+
+def _ths_get(url):
+    return _http_get(url, retries=1, timeout=10,
+                     headers={"Referer": "https://quote.10jqka.com.cn/"})
+
+
+def _ths_parse(txt):
+    """同花顺 JSONP 行数据解析 → [{date,open,high,low,close,vol(手)}]。"""
+    m = re.search(r"\((\{.*\})\)", txt or "", re.S)
+    if not m:
+        raise RuntimeError("同花顺响应解析失败")
+    d = json.loads(m.group(1))
+    out = []
+    for seg in (d.get("data") or "").split(";"):
+        p = seg.split(",")
+        if len(p) < 6:
+            continue
+        try:
+            ds = p[0].strip()
+            if len(ds) != 8 or not ds.isdigit():
+                continue
+            close = float(p[4])
+            if close <= 0:
+                continue
+            out.append({"date": f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}",
+                        "open": float(p[1]), "high": float(p[2]),
+                        "low": float(p[3]), "close": close,
+                        "vol": float(p[5]) / 100.0})
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _fetch_ths(full, count=600, base=None):
+    """同花顺日K：**完整前复权**口径，原样返回（不乘新浪因子）。
+
+    实测（2026-10，002241 多除权日对拍）：同花顺 v6 line 历史段已按送转
+    +分红折减（前复权），除权日收益≈复权真实收益（与库内差 0.03% 内），
+    但绝对水平与库内「真乘法后复权」差一个时变因子（复权表黑盒，无法
+    用新浪因子重构，2016→2026 累计约 10%）。故：
+    - 绝不乘新浪分红因子（会双重补偿分红，除权日收益错）；
+    - 与库内重叠偏差 >0.5% 时由 get_daily 的 rebase/cover 机制**整段**
+      自洽替换（v6.6.5 起小窗检出漂移会自动升级全量重拉，绝不混写接缝）；
+    - 因此排在新浪之后：仅当腾讯+新浪都不可用时才接管，避免常见故障
+      触发不必要的全库重定基。首拉（无库内历史）则天然自洽。"""
+    return _fetch_ths_raw(full, count=count, base=base)
+
+
+# ================= K线源链配置（v6.6.5：设置→数据源，ini [data]） =================
+# 内置源顺序/启用 + 自定义源（腾讯/同花顺/东财/新浪/网易格式），运行时
+# 组装为 [(源名, fetcher工厂)] 供 _fetch_remote_rows 遍历；源名同时是
+# 熔断器键。自定义源一律追加在内置源之后，源名记作「自定义:名称」。
+
+# 自定义源类型：kind -> 设置页显示名
+_KLINE_KIND_LABELS = {"tx": "腾讯格式", "ths": "同花顺", "em": "东财",
+                      "sina": "新浪", "163": "网易"}
+_KLINE_ORDER = []        # 启用的内置源名（顺序=优先级）；空=全部默认
+_KLINE_CUSTOM = []       # [{"name","kind","url"}]，最多 10 个
+_KLINE_SRC_RUNTIME = []  # 运行时源链，配置变更时整体原子重建
+
+
+def _kline_builtin_defs():
+    """内置K线源定义（顺序=默认优先级）。名称是熔断器键，勿随意改动。"""
+    tx = "appstock/app/fqkline/get"
+    return [
+        ("腾讯", "ini [data] kline_url 配置域（急救箱可自动切换）",
+         lambda f, c: _fetch_tencent_mul(f, c)),
+        ("腾讯代理", "proxy.finance.qq.com",
+         lambda f, c: _fetch_tencent_mul(
+             f, c, "https://proxy.finance.qq.com/ifzqgtimg/" + tx)),
+        ("腾讯ifzq", "ifzq.gtimg.cn (HTTPS)",
+         lambda f, c: _fetch_tencent_mul(
+             f, c, "https://ifzq.gtimg.cn/" + tx)),
+        ("腾讯HTTP", "ifzq.gtimg.cn (HTTP)",
+         lambda f, c: _fetch_tencent_mul(
+             f, c, "http://ifzq.gtimg.cn/" + tx)),
+        ("腾讯web", "web.ifzq.gtimg.cn (HTTPS)",
+         lambda f, c: _fetch_tencent_mul(
+             f, c, "https://web.ifzq.gtimg.cn/" + tx)),
+        ("腾讯webHTTP", "web.ifzq.gtimg.cn (HTTP)",
+         lambda f, c: _fetch_tencent_mul(
+             f, c, "http://web.ifzq.gtimg.cn/" + tx)),
+        ("新浪", "money.finance.sina.com.cn CN_MarketData",
+         _fetch_sina_kline),
+        ("同花顺", "d.10jqka.com.cn（前复权口径，新浪后东财前的第三源）",
+         _fetch_ths),
+        ("东财", "push2his 多host轮询",
+         _fetch_eastmoney),
+    ]
+
+
+def _tx_variant_urls():
+    """各腾讯域当前生效 URL（「腾讯」源用 KLINE_URL 动态域，用于去重）。"""
+    tx = "appstock/app/fqkline/get"
+    return {"腾讯": KLINE_URL,
+            "腾讯代理": "https://proxy.finance.qq.com/ifzqgtimg/" + tx,
+            "腾讯ifzq": "https://ifzq.gtimg.cn/" + tx,
+            "腾讯HTTP": "http://ifzq.gtimg.cn/" + tx,
+            "腾讯web": "https://web.ifzq.gtimg.cn/" + tx,
+            "腾讯webHTTP": "http://web.ifzq.gtimg.cn/" + tx}
+
+
+def _fetch_em_custom(full, count=600, base=""):
+    """东财K线（自定义 host/前缀；fqt=2 后复权，与内置东财源同口径）。"""
+    secid = _code_to_em(full)
+    if not secid:
+        return []
+    u = (base or "").strip().rstrip("/")
+    if not u.lower().endswith("/api/qt/stock/kline/get"):
+        if "://" not in u:
+            u = "https://" + u
+        u += "/api/qt/stock/kline/get"
+    url = (f"{u}?secid={secid}&fields1=f1,f2,f3"
+           f"&fields2=f51,f52,f53,f54,f55,f56"
+           f"&klt=101&fqt=2&beg=0&end=20500101&lmt={count}")
+    txt = _http_get(url, retries=2, timeout=20,
+                    headers={"Referer": "https://quote.eastmoney.com/"})
+    klines = (json.loads(txt).get("data") or {}).get("klines") or []
+    out = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            close = float(parts[2])
+            if close <= 0:
+                continue
+            out.append({"date": parts[0], "open": float(parts[1]),
+                        "close": close, "high": float(parts[3]),
+                        "low": float(parts[4]), "vol": float(parts[5])})
+        except (ValueError, IndexError):
+            continue
+    return out[-count:]
+
+
+def _custom_kline_fetcher(kind, url):
+    """自定义源配置 → fetcher(full, count)->rows。配置非法抛 ValueError。"""
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("URL 须以 http:// 或 https:// 开头")
+    if kind == "tx":
+        if "?" in url or "{" in url:
+            raise ValueError("腾讯格式填接口基址（不带 ?param=… 查询串）")
+        return lambda f, c: _fetch_tencent_mul(f, c, host=url)
+    if kind == "ths":
+        return lambda f, c: _fetch_ths(f, c, base=url)
+    if kind == "em":
+        return lambda f, c: _fetch_em_custom(f, c, url)
+    if kind == "sina":
+        return lambda f, c: _fetch_sina_kline(f, c, base=url)
+    if kind == "163":
+        return lambda f, c: _fetch_163(f, c, base=url)
+    raise ValueError(f"未知源类型: {kind}")
+
+
+def _reload_kline_srcs():
+    """按当前配置重建运行时源链（内置去重 + 自定义追加）。
+
+    「腾讯」源的域是 ini kline_url（急救箱可热切换）；当它与某个固定
+    变体重复时只保留先出现者，避免同 URL 撞两次（v6.6.5）。"""
+    global _KLINE_SRC_RUNTIME
+    defs = _kline_builtin_defs()
+    by_name = dict((d[0], d) for d in defs)
+    order = _KLINE_ORDER or [d[0] for d in defs]
+    vu = _tx_variant_urls()
+    out, seen_url = [], set()
+    for n in order:
+        d = by_name.get(n)
+        if not d:
+            continue
+        u = vu.get(n)
+        if u is not None:
+            if u in seen_url:
+                continue          # 与「腾讯」当前域重复的固定变体不再重试
+            seen_url.add(u)
+        out.append((n, d[2]))
+    for e in _KLINE_CUSTOM:
+        try:
+            f = _custom_kline_fetcher(e.get("kind"), e.get("url"))
+        except Exception:
+            log.warning("自定义K线源配置无效，已跳过: %r", e)
+            continue
+        out.append((f"自定义:{e.get('name')}", f))
+    _KLINE_SRC_RUNTIME = out
+    return out
+
+
+def _kline_sources():
+    """当前生效的K线源链 [(名称, fetcher工厂)]。"""
+    return _KLINE_SRC_RUNTIME or [(d[0], d[2])
+                                  for d in _kline_builtin_defs()]
+
+
+def _load_kline_src_cfg():
+    """读 ini [data] 源链配置（v6.6.5）。
+
+    kline_srcs：启用的内置源名逗号串（顺序=优先级）；缺省/为空=全部默认。
+    custom_kline：自定义源 JSON 数组 [{"name","kind","url"}]。"""
+    global _KLINE_ORDER, _KLINE_CUSTOM
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        names = {d[0] for d in _kline_builtin_defs()}
+        raw = (cp.get("data", "kline_srcs", fallback="")
+               if cp.has_section("data") else "")
+        order = [s.strip() for s in raw.split(",") if s.strip()]
+        order = [s for s in order if s in names]
+        _KLINE_ORDER = order            # 空列表=全默认
+        customs = []
+        try:
+            data = json.loads(cp.get("data", "custom_kline",
+                                     fallback="[]"))
+        except Exception:
+            data = []
+        if isinstance(data, list):
+            seen = set()
+            for e in data[:10]:
+                if not isinstance(e, dict):
+                    continue
+                name = str(e.get("name") or "").strip()[:24]
+                kind = str(e.get("kind") or "")
+                url = str(e.get("url") or "").strip()[:300]
+                if (name and name not in seen
+                        and kind in _KLINE_KIND_LABELS and url):
+                    seen.add(name)
+                    customs.append({"name": name, "kind": kind, "url": url})
+        _KLINE_CUSTOM = customs
+    except Exception:
+        log.exception("读取K线源配置失败(使用默认)")
+
+
+def _apply_kline_src_cfg(order, customs):
+    """校验并暂存源链配置（立即生效），返回待写 ini 的键值对列表。
+
+    全部内置源被停用且无自定义源时回退默认链——否则程序将无源可用。"""
+    global _KLINE_ORDER, _KLINE_CUSTOM
+    names = {d[0] for d in _kline_builtin_defs()}
+    order = [s for s in order if s in names]
+    if not order and not customs:
+        order = [d[0] for d in _kline_builtin_defs()]
+    out, seen = [], set()
+    for e in (customs or [])[:10]:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()[:24]
+        kind = str(e.get("kind") or "")
+        url = str(e.get("url") or "").strip()[:300]
+        if not name or name in seen:
+            continue
+        try:
+            _custom_kline_fetcher(kind, url)     # 只校验配置，不联网
+        except Exception as ex:
+            log.warning("自定义源配置被丢弃 %r: %s", e, ex)
+            continue
+        seen.add(name)
+        out.append({"name": name, "kind": kind, "url": url})
+    _KLINE_ORDER, _KLINE_CUSTOM = order, out
+    _reload_kline_srcs()
+    return [("kline_srcs", ",".join(order)),
+            ("custom_kline", json.dumps(out, ensure_ascii=False)),
+            ("kline_srcs_updated", time.strftime("%Y-%m-%d %H:%M"))]
+
+
+def _kline_src_state():
+    """设置页展示用：(内置源 [(名称,说明,是否启用)] 按当前顺序, 未启用者殿后),
+    自定义源列表副本。"""
+    defs = _kline_builtin_defs()
+    by_name = dict((d[0], d) for d in defs)
+    if _KLINE_ORDER:
+        enabled = [n for n in _KLINE_ORDER if n in by_name]
+        disabled = [d[0] for d in defs if d[0] not in enabled]
+        lst = [(n, by_name[n][1], True) for n in enabled]
+        lst += [(n, by_name[n][1], False) for n in disabled]
+    else:
+        lst = [(d[0], d[1], True) for d in defs]
+    return lst, [dict(e) for e in _KLINE_CUSTOM]
+
+
+def _probe_kline_src(name=None, kind=None, url=None):
+    """实测一个K线源（内置按名 / 自定义按 kind+url）：拉 sz002241 近5根。
+    返回 (ok, 说明)。走 _http_get（共享节流/熔断），不绕过多源机制。"""
+    try:
+        if name is not None:
+            fac = dict((d[0], d[2]) for d in _kline_builtin_defs()).get(name)
+            if fac is None:
+                return False, f"未知内置源 {name}"
+        else:
+            fac = _custom_kline_fetcher(kind, url)
+        rows = fac("sz002241", 5)
+        if rows and len(rows) >= 5:
+            return True, (f"sz002241 返回 {len(rows)} 根"
+                          f"（最新 {rows[-1]['date']} 收 "
+                          f"{rows[-1]['close']:.2f}）")
+        return False, f"仅返回 {len(rows)} 根（无数据或格式不符）"
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+_load_kline_src_cfg()
+_reload_kline_srcs()
+
+
+def _fetch_remote_rows(full, count=600, info=None):
+    """多源自动切换 + 熔断调度：源链来自 `_kline_sources()`
+    （默认 腾讯(配置域+固定域×5) → 新浪 → 同花顺(前复权口径) → 东财）。
+
+    v6.6.5：源链可在设置→数据源调整（启用/排序/自定义源，存 ini [data]）；
+    「腾讯」源与固定变体当前域重复时已在链构建时去重。
     2026-09 实测：web.ifzq.gtimg.cn 对 hfq 返回 501（腾讯反爬），
     但**不复权**请求正常（v6.5.9 起本链路只用不复权+新浪因子，故纳入）；
-    新浪 K 线为独立免费源（v6.5.9），东财 push2his 连接重置/502 属时段性
-    故障，熔断后自动降级。
+    新浪 K 线为独立免费源（v6.5.9，与腾讯同为送转调整价口径），同花顺
+    v6 line 为 v6.6.5 新源（完整前复权口径，原样入库、由 rebase 机制
+    整段自洽替换），东财 push2his 连接重置/502 属时段性故障，熔断后
+    自动降级。
     运行逻辑：
     1. 按优先级遍历数据源，跳过处于熔断冷却期的源；
     2. 若所有源都在冷却（极端503风暴），退化为「半开探测」：
@@ -1693,27 +2061,8 @@ def _fetch_remote_rows(full, count=600, info=None):
     info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。
     口径（v6.1.5 热修⑪）：腾讯只作为**不复权**源，落库前乘新浪后复权因子；
     腾讯 hfq 是仿射失真口径，不再直接入库。东财仅作最后兜底。"""
-    sources = [
-        ("腾讯", lambda: _fetch_tencent_mul(full, count)),
-        ("腾讯代理", lambda: _fetch_tencent_mul(
-            full, count,
-            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
-            "fqkline/get")),
-        ("腾讯ifzq", lambda: _fetch_tencent_mul(
-            full, count,
-            "https://ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("腾讯HTTP", lambda: _fetch_tencent_mul(
-            full, count,
-            "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("腾讯web", lambda: _fetch_tencent_mul(
-            full, count,
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("腾讯webHTTP", lambda: _fetch_tencent_mul(
-            full, count,
-            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("新浪", lambda: _fetch_sina_kline(full, count)),
-        ("东财", lambda: _fetch_eastmoney(full, count)),
-    ]
+    sources = [(name, (lambda fac: lambda: fac(full, count))(fac))
+               for name, fac in _kline_sources()]
     last_err = None
     usable = [(n, f) for n, f in sources if _cb_ok(n)]
     if len(usable) < len(sources):
@@ -1803,6 +2152,7 @@ def _probe_kline_url(base):
 def _persist_kline_url(u):
     """把可用K线源写入内存与 ini（重启后仍生效）。"""
     globals()["KLINE_URL"] = u
+    _reload_kline_srcs()          # v6.6.5：切换域后重建源链（去重随之更新）
     try:
         cp = configparser.ConfigParser()
         cp.read(INI_PATH, encoding="utf-8")
@@ -1963,31 +2313,50 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
         flog.info("拉取 %s 原因=%s 本地=%d根(末日%s)",
                   full, reason, len(rows), old_last)
         try:
-            remote = [r for r in _fetch_remote_rows(
-                full, count=CFG.MAX_FETCH_BARS, info=info)
-                      if (r["date"] < today
-                          or (allow_today and r["date"] == today))
-                      and _bar_ok(r)]
-            # 基期一致性校验：前复权序列每次分红整体重定基，增量合并会在
-            # 缓存接缝处留下人造跳空。重叠日期收盘价偏差>0.5% → 全量替换。
-            rebase = False
-            if rows and remote:
-                newmap = {r["date"]: r["close"] for r in remote}
-                checked = 0
-                for r in rows[-200:]:
-                    c2 = newmap.get(r["date"])
-                    if c2 and r["close"]:
-                        checked += 1
-                        if abs(c2 / r["close"] - 1) > 0.005:
-                            rebase = True
-                            break
-                rebase = rebase and checked >= 5
+            # v6.6.5 增量瘦身：本地已有≥120根且非异常缓存时先拉小窗
+            # （120根，载荷约为全量的1/17），足够回补缺口并做基期漂移
+            # 校验（≥5个重叠日）；首拉/异常缓存仍拉满 MAX_FETCH_BARS。
+            small = (min(CFG.MAX_FETCH_BARS, 120)
+                     if (not bad_cache and len(rows) >= 120)
+                     else CFG.MAX_FETCH_BARS)
+            attempts = ((small, CFG.MAX_FETCH_BARS)
+                        if small < CFG.MAX_FETCH_BARS else (small,))
+            for cnt in attempts:
+                remote = [r for r in _fetch_remote_rows(
+                    full, count=cnt, info=info)
+                          if (r["date"] < today
+                              or (allow_today and r["date"] == today))
+                          and _bar_ok(r)]
+                # 基期一致性校验：前复权序列每次分红整体重定基，增量合并会在
+                # 缓存接缝处留下人造跳空。重叠日期收盘价偏差>0.5% → 全量替换。
+                # v6.6.5 修复存量缺陷：旧逻辑命中偏差即 break，若分叉从重叠
+                # 第一天就开始（口径级差异，如换源），checked 恒=1，
+                # `rebase and checked>=5` 把确凿的口径不同误判成"重叠不足"
+                # → 直接混写接缝。现扫完重叠区再判：bad≥1 且 checked≥5。
+                rebase = False
+                if rows and remote:
+                    newmap = {r["date"]: r["close"] for r in remote}
+                    checked = 0
+                    bad = 0
+                    for r in rows[-200:]:
+                        c2 = newmap.get(r["date"])
+                        if c2 and r["close"]:
+                            checked += 1
+                            if abs(c2 / r["close"] - 1) > 0.005:
+                                bad += 1
+                    rebase = bad > 0 and checked >= 5
+                cover = (max(400, int(len(rows) * 0.9)) if bad_cache
+                         else min(400, len(rows) // 2))
+                if not (rebase and len(remote) < cover):
+                    break
+                # 基期漂移且小窗不足以整段重定基（cover 口径）→ 拉满全量
+                # 重试一次，绝不把新旧基期混写在接缝处（v6.6.5）。
+                flog.info("%s 基期漂移且小窗不足(%d<%d)，改拉全量%d根",
+                          full, len(remote), cover, CFG.MAX_FETCH_BARS)
             with db_conn(commit=True) as conn2:
                 # 只有新数据足够长才允许全量替换，防止短源摧毁深历史。
                 # bad_cache 存在误报（新股/停牌/ST历史）：必须覆盖90%才清空；
                 # rebase（复权基期真变了）维持原「≥缓存一半」口径，保证口径统一。
-                cover = (max(400, int(len(rows) * 0.9)) if bad_cache
-                         else min(400, len(rows) // 2))
                 if (bad_cache or rebase) and len(remote) >= cover:
                     conn2.execute("DELETE FROM daily_bars WHERE code=?",
                                   (full,))
@@ -2259,34 +2628,59 @@ def _to_hfq_mul(full, raw, page=800, target=None):
     return raw
 
 
-def _bf_fetch_one(full, page=800, target=None):
-    """单只：腾讯**不复权**翻页 → 新浪因子得真乘法后复权；东财兜底。
-
-    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）。v6.1.5 热修⑪：
-    此前直接存腾讯 hfq（仿射失真，日收益被逐股缩放），改走乘法口径。"""
-    target = target or max(CFG.MAX_FETCH_BARS, page * 2)
-    raw = _bf_tx_pages(full, page=page, target=target, fq="")
-    if not raw:
-        raise RuntimeError("腾讯空数据")
-    # v6.2.3：留下不复权尾部（date→close）供 _sync_adjust 配对显示缩放 K，
-    # 同时末价直接取自本批数据——省掉 _raw_last_price 的逐股网络请求。
+def _bf_hint_set(full, raw):
+    """记录不复权尾部（date→close）供 _sync_adjust 配对显示缩放 K；
+    同时末价直接取自本批数据——省掉 _raw_last_price 的逐股网络请求
+    （v6.2.3；v6.6.5 抽成函数供腾讯/同花顺两路复用）。"""
     _BF_RAW_HINT[full] = {r.get("date"): r.get("close")
                           for r in raw[-12:]
                           if r.get("date") and r.get("close")}
     if len(_BF_RAW_HINT) > 1000:      # 非常规路径未消费时防无限增长
         for _k in list(_BF_RAW_HINT)[:200]:
             _BF_RAW_HINT.pop(_k, None)
-    raw_last = raw[-1].get("close")
-    rows1 = _to_hfq_mul(full, raw, page=page, target=target)
-    if len(rows1) >= 300:
-        return rows1, raw_last
+    return raw[-1].get("close")
+
+
+def _bf_fetch_one(full, page=800, target=None):
+    """单只深历史回填：腾讯不复权翻页 → 同花顺全历史兜底 → 东财兜底。
+
+    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）。
+    口径（v6.1.5 热修⑪）：主源一律取**不复权** × 新浪因子=真乘法后复权，
+    绝不回写腾讯 hfq 仿射口径；东财兜底为 fqt=2 后复权直存。
+    v6.6.5：腾讯整域 501/断连或浅返回(<300根)时，改走同花顺深历史
+    （完整前复权口径原样使用，与库内口径不同时由上层重叠偏差检测
+    **整只**替换，绝不逐条混写），回填不再随腾讯单点故障中断。"""
+    target = target or max(CFG.MAX_FETCH_BARS, page * 2)
+    raw_last = None
+    try:
+        raw = _bf_tx_pages(full, page=page, target=target, fq="")
+    except Exception:
+        raw = []
+    if raw:
+        raw_last = _bf_hint_set(full, raw)
+        try:
+            rows1 = _to_hfq_mul(full, raw, page=page, target=target)
+            if len(rows1) >= 300:
+                return rows1, raw_last
+        except Exception:
+            pass          # 新浪因子不可得：保住本地数据，转兜底源
+    # 兜底A：同花顺深历史（last+按年，完整前复权口径原样使用——与库内
+    # 腾讯口径不同时由 backfill 的重叠偏差检测整只替换，绝不逐条混写）
+    try:
+        rows2 = _fetch_ths_raw(full, count=max(target, 800))
+        if len(rows2) >= 300:
+            _bf_hint_set(full, rows2)
+            return rows2, rows2[-1].get("close")
+    except Exception:
+        pass
+    # 兜底B：东财（fqt=2 后复权直存）
     try:
         rows = _fetch_eastmoney(full, count=1100)
         if len(rows) >= 300:
             return rows, raw_last
     except Exception:
         pass
-    raise RuntimeError("有效数据不足300根")
+    raise RuntimeError("腾讯/同花顺/东财均无有效数据")
 
 
 def backfill_full_market(progress=None, force=False, limit=0,
@@ -2355,16 +2749,19 @@ def backfill_full_market(progress=None, force=False, limit=0,
                         "SELECT date, close FROM daily_bars WHERE code=? "
                         "ORDER BY date", (c,)).fetchall()
                 newmap = {r["date"]: r["close"] for r in rows}
-                mismatch, checked = False, 0
+                # v6.6.5 修复存量缺陷：旧逻辑命中偏差即 break，口径级差异
+                # （重叠第一天就分叉，如换源）时 checked<5 被 mis判为"重叠
+                # 不足" → 逐条混写。现扫完再判（与 get_daily 同口径）。
+                mismatch, checked, bad = False, 0, 0
                 for d, cl in old[-200:]:
                     c2 = newmap.get(d)
                     if c2 and cl:
                         checked += 1
                         if abs(c2 / cl - 1) > 0.005:
-                            mismatch = True
-                            break
+                            bad += 1
                 if checked < 5:
-                    mismatch = False
+                    bad = 0
+                mismatch = bad > 0
                 if mismatch:
                     full = []
                     try:
@@ -19719,7 +20116,7 @@ class App:
         sections = (("ui", "外观"), ("pred", "预测参数"),
                     ("studio", "外部策略"), ("ind", "指标参数"),
                     ("pick", "荐股"), ("ai", "AI 接口"),
-                    ("about", "关于"))
+                    ("data", "数据源"), ("about", "关于"))
         for _key, _lab in sections:
             nav_tree.insert("", "end", iid=_key, text="  " + _lab)
 
@@ -19738,9 +20135,10 @@ class App:
             _f.grid(row=0, column=0, sticky="nsew")
             _f.grid_remove()
             secs[_key] = _f
-        sec_ui, sec_pred, sec_studio, sec_ind, sec_pick, sec_ai, sec_about = (
-            secs["ui"], secs["pred"], secs["studio"], secs["ind"],
-            secs["pick"], secs["ai"], secs["about"])
+        sec_ui, sec_pred, sec_studio, sec_ind, sec_pick, sec_ai, \
+            sec_data, sec_about = (
+                secs["ui"], secs["pred"], secs["studio"], secs["ind"],
+                secs["pick"], secs["ai"], secs["data"], secs["about"])
         frm = sec_ui                 # 下方既有构建代码按区切换父容器
 
         try:
@@ -20443,6 +20841,190 @@ class App:
                             "all_etf=全A含ETF").grid(
             row=28, column=2, sticky="w")
 
+        # ---- 数据源：K线源链 + 自定义源（v6.6.5，存 ini [data]）----
+        frm = sec_data
+        ttk.Label(frm, text="日K多源容灾：按下列顺序尝试，限流/断连自动熔断"
+                  "降级；同花顺为 v6.6.5 新源（前复权口径，接口挂掉时的第三"
+                  "梯队）。行情感照（腾讯/新浪）与代码表源不走本页。",
+                  foreground=AXIS_TXT, wraplength=430, justify="left"
+                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        src_store, custom_store = _kline_src_state()   # [(名称,说明,启用)], [{}]
+
+        lf_src = ttk.LabelFrame(frm, text="内置K线源（勾选状态 ●启用 ○停用，"
+                                 "可调顺序）", padding=8)
+        lf_src.grid(row=1, column=0, columnspan=3, sticky="we", pady=4)
+        lb_src = tk.Listbox(lf_src, height=9, width=56, bg=LOG_BG,
+                            fg=FG_MAIN, selectbackground=SEL_BG,
+                            selectforeground=FG_MAIN, activestyle="none",
+                            relief="flat", highlightthickness=0,
+                            exportselection=False)
+        lb_src.pack(side="left", fill="y")
+
+        def _src_refresh():
+            lb_src.delete(0, tk.END)
+            for n, d, en in src_store:
+                lb_src.insert(tk.END, f"{'●' if en else '○'} {n} — {d}")
+
+        _src_refresh()
+
+        def _src_sel():
+            sel = lb_src.curselection()
+            return sel[0] if sel else None
+
+        def _src_move(delta):
+            i = _src_sel()
+            if i is None or not (0 <= i + delta < len(src_store)):
+                return
+            src_store[i], src_store[i + delta] = src_store[i + delta], \
+                src_store[i]
+            _src_refresh()
+            lb_src.selection_set(i + delta)
+
+        def _src_toggle():
+            i = _src_sel()
+            if i is None:
+                return
+            n, d, en = src_store[i]
+            if en and sum(1 for _, _, e in src_store if e) == 1 \
+                    and not custom_store:
+                messagebox.showwarning(
+                    "数据源", "至少保留一个内置源（或先添加自定义源），"
+                    "否则将无源可用。")
+                return
+            src_store[i] = (n, d, not en)
+            _src_refresh()
+            lb_src.selection_set(i)
+
+        src_btns = ttk.Frame(lf_src)
+        src_btns.pack(side="left", fill="y", padx=(10, 0))
+        for _lab, _cmd in (("上移", lambda: _src_move(-1)),
+                           ("下移", lambda: _src_move(1)),
+                           ("启用/停用", _src_toggle)):
+            ttk.Button(src_btns, text=_lab, width=10,
+                       command=_cmd).pack(pady=2)
+
+        def _probe_async(kind_args, title):
+            """后台实测源可用性（sz002241 近5根），完成后弹窗回报。"""
+            def worker():
+                try:
+                    ok, msg = _probe_kline_src(**kind_args)
+                except Exception as e:
+                    ok, msg = False, str(e)[:160]
+                try:
+                    win.after(0, lambda: messagebox.showinfo(
+                        title, ("✓ 可用\n" if ok else "✗ 不可用\n") + msg))
+                except Exception:
+                    pass
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _src_probe():
+            i = _src_sel()
+            if i is None:
+                return
+            _probe_async({"name": src_store[i][0]},
+                         f"测试内置源 {src_store[i][0]}")
+
+        def _src_reset():
+            nonlocal custom_store
+            src_store.clear()
+            src_store.extend([(d[0], d[1], True)
+                              for d in _kline_builtin_defs()])
+            custom_store = []
+            _cst_refresh()
+            _src_refresh()
+
+        ttk.Button(src_btns, text="测试", width=10,
+                   command=_src_probe).pack(pady=2)
+        ttk.Button(src_btns, text="恢复默认", width=10,
+                   command=_src_reset).pack(pady=(10, 2))
+
+        lf_cst = ttk.LabelFrame(frm, text="自定义K线源（追加在内置源之后尝试"
+                                "；添加后请先「测试」确认可用）", padding=8)
+        lf_cst.grid(row=2, column=0, columnspan=3, sticky="we", pady=4)
+        crow = ttk.Frame(lf_cst)
+        crow.pack(fill="x")
+        ttk.Label(crow, text="名称").pack(side="left")
+        cst_name = tk.StringVar()
+        ttk.Entry(crow, textvariable=cst_name, width=10).pack(
+            side="left", padx=(2, 8))
+        ttk.Label(crow, text="类型").pack(side="left")
+        cst_kind = tk.StringVar(value="腾讯格式")
+        ttk.Combobox(crow, textvariable=cst_kind, width=8, state="readonly",
+                     values=list(_KLINE_KIND_LABELS.values())).pack(
+                         side="left", padx=(2, 8))
+        ttk.Label(crow, text="URL").pack(side="left")
+        cst_url = tk.StringVar()
+        ttk.Entry(crow, textvariable=cst_url, width=34).pack(
+            side="left", padx=2)
+
+        def _cst_refresh():
+            lb_cst.delete(0, tk.END)
+            for e in custom_store:
+                lb_cst.insert(
+                    tk.END, f"{e['name']} "
+                    f"[{_KLINE_KIND_LABELS.get(e['kind'], e['kind'])}] "
+                    f"{e['url']}")
+
+        def _cst_add():
+            name = cst_name.get().strip()
+            url = cst_url.get().strip()
+            kind = {v: k for k, v in _KLINE_KIND_LABELS.items()}.get(
+                cst_kind.get(), "")
+            if not name or not url:
+                messagebox.showinfo("自定义源", "名称和 URL 都要填。")
+                return
+            if any(e["name"] == name for e in custom_store):
+                messagebox.showinfo("自定义源", f"名称 “{name}” 已存在。")
+                return
+            try:
+                _custom_kline_fetcher(kind, url)   # 只校验配置，不联网
+            except Exception as e:
+                messagebox.showwarning("自定义源", f"配置无效： {e}")
+                return
+            custom_store.append({"name": name, "kind": kind, "url": url})
+            _cst_refresh()
+            cst_name.set("")
+            cst_url.set("")
+
+        def _cst_del():
+            sel = lb_cst.curselection()
+            if sel:
+                custom_store.pop(sel[0])
+                _cst_refresh()
+
+        def _cst_probe():
+            sel = lb_cst.curselection()
+            if not sel:
+                return
+            e = custom_store[sel[0]]
+            _probe_async({"kind": e["kind"], "url": e["url"]},
+                         f"测试自定义源 {e['name']}")
+
+        ttk.Button(crow, text="添加", command=_cst_add).pack(
+            side="left", padx=(8, 0))
+        cst_row2 = ttk.Frame(lf_cst)
+        cst_row2.pack(fill="x", pady=(6, 0))
+        lb_cst = tk.Listbox(cst_row2, height=3, width=56, bg=LOG_BG,
+                            fg=FG_MAIN, selectbackground=SEL_BG,
+                            selectforeground=FG_MAIN, activestyle="none",
+                            relief="flat", highlightthickness=0,
+                            exportselection=False)
+        lb_cst.pack(side="left", fill="x")
+        cst_btns = ttk.Frame(cst_row2)
+        cst_btns.pack(side="left", fill="y", padx=(10, 0))
+        ttk.Button(cst_btns, text="测试", width=10,
+                   command=_cst_probe).pack(pady=2)
+        ttk.Button(cst_btns, text="删除", width=10,
+                   command=_cst_del).pack(pady=2)
+        _cst_refresh()
+        ttk.Label(frm, text="URL 填各源接口基址：腾讯格式如 "
+                  "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
+                  "fqkline/get；同花顺 https://d.10jqka.com.cn/v6/line；"
+                  "东财填 host（自动补 /api/qt/stock/kline/get）。",
+                  foreground=AXIS_TXT, wraplength=430,
+                  justify="left").grid(row=3, column=0, columnspan=3,
+                                       sticky="w", pady=(2, 0))
+
         def save():
             self.settings["theme"] = theme_var.get()
             self.settings["updown"] = ud_var.get()
@@ -20596,6 +21178,15 @@ class App:
                 cp.set("picks", "risk_pref", pref_var.get())
                 cp.set("picks", "universe", uni_var.get())
                 _load_pick_perms()
+                # 数据源：源链启用顺序 + 自定义源（存 [data]，立即生效）
+                if not cp.has_section("data"):
+                    cp.add_section("data")
+                for _k, _v in _apply_kline_src_cfg(
+                        [n for n, _d, en in src_store if en], custom_store):
+                    cp.set("data", _k, _v)
+                pnotes.append(f"K线源x{len(_KLINE_ORDER)}"
+                              + (f"+自定义x{len(_KLINE_CUSTOM)}"
+                                 if _KLINE_CUSTOM else ""))
                 # 同步模块级别名（W_WINDOW/TOPK 被算法直接引用）
                 globals()["W_WINDOW"] = CFG.W_WINDOW
                 globals()["TOPK"] = CFG.TOPK
