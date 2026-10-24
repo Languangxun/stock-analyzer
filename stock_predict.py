@@ -9426,7 +9426,7 @@ def _build_ghosts(o_today, multi_pred):
     return ghosts
 
 
-def analyze(full, progress=None, quick=False):
+def analyze(full, progress=None, quick=False, defer_signals=False):
     """全量分析，切片交给GUI。
     quick=True 只做快速预览（本股缓存 + L1预测，秒开），完整历史/样本池
     由后台增量加载器继续补齐并实时更新预测K线。"""
@@ -9774,10 +9774,16 @@ def analyze(full, progress=None, quick=False):
     sel_mode = (strat or {}).get("mode") or CFG.RISK_MODE
 
     signals = []
+    # ---- 懒加载（v6.6.5）：重信号算法（sm701/lgbm，需全市场模型复算/
+    # 滚动训练）由 GUI 传 defer_signals=True 跳过，先渲染K线/预测区间，
+    # 再由 analyze_finish_signals 后台补算（App._signals_done 重绘）。
+    # CLI 与完整报告路径默认 False，口径不变。analog 与异动覆盖块耦合深
+    # （覆盖改判/报告专区），不在延后集合内。
+    _defer_heavy = bool(defer_signals and sel_algo in ("sm701", "lgbm"))
     # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
     if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern",
                     "chip_peak", "sector_rot", "vol_ratio", "lgbm",
-                    "analog", "sm701", "studio"):
+                    "analog", "sm701", "studio") and not _defer_heavy:
         try:
             if sel_algo == "chip_peak":
                 raw = _sig_chip_peak(disp_rows)
@@ -9844,8 +9850,11 @@ def analyze(full, progress=None, quick=False):
     _win = max(1, len(disp_rows) - 250)
     _recent_n = len([s for s in signals if s[0] >= _win])
     _min_need = 8 if sel_mode == "激进" else 2
-    # test 档严格模型直出 / 外部策略显式规则：信号少也不混入多维评分
-    if sel_mode not in ("test", "外部策略") and _recent_n < _min_need:
+    # test 档严格模型直出 / 外部策略显式规则：信号少也不混入多维评分；
+    # 懒加载延后时同样跳过（后台补算后再按同规则兜底，避免先画兜底信号
+    # 又被 sm701 信号替换造成误导）。
+    if sel_mode not in ("test", "外部策略") and not _defer_heavy \
+            and _recent_n < _min_need:
         try:
             _fb = [s for s in _composite_signals(disp_rows, rp)
                    if s[0] >= max(1, len(disp_rows) - 120)]
@@ -10117,6 +10126,7 @@ def analyze(full, progress=None, quick=False):
         "live_low": live["low"] if live else None,
         "clamped": clamped,
         "quick": bool(quick),
+        "pending_signals": _defer_heavy,
         "_ctx": {
             "full": full, "o_today": o_today, "pre_open": pre_open,
             "live": live, "src": src, "cur": cur,
@@ -10127,6 +10137,83 @@ def analyze(full, progress=None, quick=False):
             "limit": limit_frac,
         },
     }
+
+
+def analyze_finish_signals(res, progress=None):
+    """懒加载第二段（v6.6.5）：补算被 defer_signals 跳过的策略信号与回测统计。
+
+    App 先用 `analyze(..., defer_signals=True)` 渲染K线/预测区间（重算法如
+    sm701 全市场复算 ~110s 不再阻塞首屏），再由后台线程调本函数补齐
+    `res["signals"]/["bt_stats"]` 与波段兜底标注；GUI 收到后 `_rerender()`
+    叠画买卖点。信号生成器、250 根截断、密度兜底与 analyze 主路径同口径；
+    失败时回退多维评分（同主路径）。仅处理 sm701/lgbm 两种延后算法，
+    其他算法直接原样返回。"""
+    if not res.get("pending_signals"):
+        return res
+    disp_rows = res.get("disp_rows") or []
+    if not disp_rows:
+        res["pending_signals"] = False
+        return res
+    strat = res.get("strategy") or {}
+    sel_algo = res.get("sel_algo") or "composite"
+    rp = dict(strat["params"]) if strat.get("params") else CFG.risk_params()
+    sel_mode = strat.get("mode") or CFG.RISK_MODE
+    full = res.get("full_code") or ""
+    try:
+        if sel_algo == "sm701":
+            raw = _sig_sm701(disp_rows, full)
+        else:
+            raw = _sig_lgbm(disp_rows)
+        cut = max(1, len(disp_rows) - 250)
+        signals = [s for s in raw if s[0] >= cut]
+    except Exception:
+        log.exception("策略%s信号后台生成失败(回退多维评分)", sel_algo)
+        sel_algo = "composite"
+        signals = []
+    if sel_algo == "composite":
+        try:
+            _comp_all = _composite_signals(disp_rows, rp)
+        except Exception:
+            log.exception("后台多维评分信号生成失败")
+            _comp_all = []
+        signals = [s for s in _comp_all
+                   if s[0] >= max(1, len(disp_rows) - 120)]
+        res["sel_algo"] = "composite"
+    # 连续同向压缩 + 密度兜底（与 analyze 主路径同规则）
+    signals = _dedup_signals(signals)
+    _win = max(1, len(disp_rows) - 250)
+    _recent_n = len([s for s in signals if s[0] >= _win])
+    _min_need = 8 if sel_mode == "激进" else 2
+    _fb_applied = False
+    if sel_mode not in ("test", "外部策略") and _recent_n < _min_need:
+        try:
+            _fb = [s for s in _composite_signals(disp_rows, rp)
+                   if s[0] >= max(1, len(disp_rows) - 120)]
+        except Exception:
+            log.exception("后台信号过少兜底失败")
+            _fb = []
+        if _fb:
+            signals = _dedup_signals(_fb)
+            _why = (f"近250日仅{_recent_n}个信号" if _recent_n
+                    else "近250日无信号")
+            res["band_algo"] = res.get("band_algo", "") + \
+                f"（{_why} → 兜底改用多维评分·{sel_mode}）"
+            _fb_applied = True
+    res["signals"] = signals
+    bt_stats = None
+    if len(signals) >= 2:
+        try:
+            bt_stats = backtest_signals(disp_rows, signals, rp=rp)
+        except Exception:
+            log.exception("后台回测统计失败(bt_stats=None)")
+    res["bt_stats"] = bt_stats
+    if _fb_applied:
+        res["band_note"] = (f"波段适合度 {res.get('band_score', 0):.0f}/100"
+                            f" → {res.get('band_algo', '')}")
+        if isinstance(res.get("action"), dict):
+            res["action"]["band_note"] = res["band_note"]
+    res["pending_signals"] = False
+    return res
 
 
 # ================= v4.0 自适应ML研究引擎 =================
