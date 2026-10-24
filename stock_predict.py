@@ -12130,14 +12130,28 @@ def _db_latest_date(path=None):
         return ""
 
 
+def _sm701_cache_epoch(src_max):
+    """当日数据的缓存桶：src_max 为今天时按 30 分钟分桶（盘中数据会变），
+    历史日期恒为 0（收盘定型，稳定缓存）。配合 key 用数据指纹替代
+    库文件 mtime——预取/回填写库改变 mtime 但数据未推进，不应触发
+    sm701 全市场重算（v6.6.5 修复：曾致 sm701 股票每次分析卡 100s+）。"""
+    if src_max and src_max >= time.strftime("%Y-%m-%d"):
+        return int(time.time() // 1800)
+    return 0
+
+
 def _sm701_live_predict(target_dates, cal, progress=None):
     """用副本 LightGBM 模型实时复算目标日期全市场概率。
 
     返回 {(code, date): prob}；cal 为交易日日历（用于取 180 根预热起点）。
-    结果按（预热起点 + 目标日期集合 + 取数库/模型 mtime）缓存，组合矩阵与
-    单股 test 信号两条链共用同一次复算。
+    结果按（预热起点 + 目标日期集合 + 取数库最新日K日期/当日30分钟桶/模型
+    mtime）缓存，组合矩阵与单股 test 信号两条链共用同一次复算。
     v6.6.4：sm701 副本日K落后主库时改用主库最新行情复算——两库日K同源
-    （重叠段逐值一致），否则目标日停在副本末日会让 test 荐股整页为空。"""
+    （重叠段逐值一致），否则目标日停在副本末日会让 test 荐股整页为空。
+    v6.6.5：缓存 key 由「取数库 mtime」改为「取数库最新日K日期 +
+    当日 30 分钟桶」——mtime 在每次预取/回填写库后必变，而数据未推进
+    时复算结果不变，曾导致 sm701 股票每次分析都触发 100s+ 全市场复算
+    （主图长时间空白）。"""
     import pandas as pd
     if np is None:
         raise RuntimeError("test 档实时评分需要 numpy")
@@ -12156,7 +12170,7 @@ def _sm701_live_predict(target_dates, cal, progress=None):
         src_db, src_max = DB_PATH, main_max
     use_main = os.path.abspath(src_db) == os.path.abspath(DB_PATH)
     key = (start, tuple(wanted), os.path.abspath(src_db), src_max,
-           os.path.getmtime(src_db), _sm701_model_mtimes(paths))
+           _sm701_cache_epoch(src_max), _sm701_model_mtimes(paths))
     cached = _SM701_CACHE.get("live")
     if cached and cached[0] == key:
         return cached[1]
@@ -12223,13 +12237,10 @@ def sm701_score_matrix(progress=None):
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
         pred_mt = 0.0
-    try:
-        main_mt = os.path.getmtime(DB_PATH)
-    except OSError:
-        main_mt = 0.0
+    main_max = _db_latest_date()
     key = (tuple(codes[:3]), len(codes), cal[0], cal[-1],
            os.path.getmtime(paths["db"]), _sm701_model_mtimes(paths),
-           pred_mt, main_mt)
+           pred_mt, main_max, _sm701_cache_epoch(main_max))
     cached = _SM701_CACHE.get("scores")
     if cached and cached[0] == key:
         return cached[1]
@@ -12296,7 +12307,7 @@ def sm701_prob_map(full, dates=None):
     except OSError:
         pred_mt = 0.0
     key = (pred_mt, _sm701_model_mtimes(paths),
-           os.path.getmtime(paths["db"]))
+           _db_latest_date(paths["db"]))
     cache = _SM701_CACHE.setdefault("probmap", {})
     hit = cache.get(full)
     if hit and hit[0] == key:
