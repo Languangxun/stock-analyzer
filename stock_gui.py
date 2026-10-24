@@ -195,6 +195,18 @@ class CFG:
     SIGNAL_COOLDOWN = 5                 # 相邻信号最小间隔(交易日)
     WEAK_IDX_TH = -1.5                  # 大盘弱势阈值(%)
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
+    # ---- 多维评分动态权重（v6.6.5）：IND_W 作基础权重，乘以「信号对错」
+    # 在线训练出的质量系数。判定=该维度看多/看空贡献的次日方向命中率
+    # （HORIZON 日后收盘，第 i 日才可知 → 严格因果无前视）；命中率 50% =
+    # 保持基础权重，越高放大（上限 ×3）、越低缩小（下限 ×0.3）；样本少时
+    # 按样本数线性收缩到基础权重（防早期噪声）。ini [predict] dyn_weights=0
+    # 关闭（回到静态 IND_W，历史口径可复现）。
+    DYN_WEIGHTS = True
+    DYN_W_HORIZON = 1                   # 信号对错判定视界（交易日）
+    DYN_W_ALPHA = 0.02                  # 命中率 EWMA 平滑（越大适应越快）
+    DYN_W_WARMUP = 60                   # 质量系数完全生效所需已判定样本数
+    DYN_W_MIN = 0.3                     # 权重倍数下限
+    DYN_W_MAX = 3.0                     # 权重倍数上限
     # ---- 指标计算参数（v6.3.2 起可调；ini [inds] 持久化，设置→指标参数）----
     # 作用于分析页指标/买卖点打分/消融/逐股回测；改动后需重新分析生效。
     # 范围：快线2-60 / 慢线3-120 / 信号2-60；KDJ 2-60/2-20/2-20；
@@ -435,6 +447,9 @@ def _load_predict_cfg():
         # 打分大盘项 + 样本分层「大盘±0.8pp」筛选 + 池匹配指数项。
         CFG.MATCH_IDX_ENV = bool(gi("match_idx_env",
                                     1 if CFG.MATCH_IDX_ENV else 0, 0, 1))
+        # 多维评分动态权重开关（v6.6.5）：0=回静态 IND_W（历史口径复现）
+        CFG.DYN_WEIGHTS = bool(gi("dyn_weights",
+                                  1 if CFG.DYN_WEIGHTS else 0, 0, 1))
         _av = cp.get("predict", "ablation_view",
                      fallback=getattr(CFG, "ABLATION_VIEW", "three"))
         CFG.ABLATION_VIEW = _av if _av in ("three", "all") else "three"
@@ -6948,7 +6963,14 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
                        use_chips=True, pre=None):
     """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
     rp: 风险参数（buy_th/cooldown/sell_cooldown）。pre 为 _composite_precompute 结果，
-    同一只股票多档复用可避免重复计算指标。返回 [(i,date,"BUY"/"SELL",reason)]。"""
+    同一只股票多档复用可避免重复计算指标。返回 [(i,date,"BUY"/"SELL",reason)]。
+
+    v6.6.5 动态权重：IND_W 作基础权重，每个维度乘以「信号对错」在线训练出的
+    质量系数——该维度的看多/看空贡献在 DYN_W_HORIZON 日后收盘方向上的命中率
+    （EWMA），50% 保持基础权重、越高放大（≤×3）、越低缩小（≥×0.3），样本数
+    不足 DYN_W_WARMUP 时按比例收缩到基础权重。结算严格因果：第 i 日只结算
+    i-HORIZON 日的贡献（其结果收盘此时才可知），对消融/回测无前视污染。
+    ini [predict] dyn_weights=0 关闭（回静态 IND_W）。"""
     n = len(rows)
     if n < 60:
         return []
@@ -6958,64 +6980,113 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
      ma20, vols_d, chip_snaps) = pre
     weak = idx_chg_by_date or {}
     buy_th = rp["buy_th"]
-    out = []
-    prev_dir = 0
-    cooldown = 0
-    start = max(1, n - 1000)
-    for i in range(start, n):
-        if cooldown > 0:
-            cooldown -= 1
-            continue
-        if None in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
-            continue
-        sc = 0
 
-        def _wadd(dim, pts):
-            return int(round(pts * CFG.IND_W.get(dim, 1.0)))
-
-        sc += _wadd("MACD", 2 if (dif[i - 1] <= dea[i - 1] and dif[i] > dea[i])
-                    else -2 if (dif[i - 1] >= dea[i - 1] and dif[i] < dea[i])
-                    else 1 if dif[i] > dea[i] else -1)
-        sc += _wadd("KDJ", 2 if (k_[i - 1] <= d_[i - 1] and k_[i] > d_[i]
-                                 and k_[i] < 45)
+    def _raw_scores(i):
+        """第 i 日各维度原始分（未加权，±2/±1/0），判定条件与历史口径一致。"""
+        s = {}
+        s["MACD"] = (2 if (dif[i - 1] <= dea[i - 1] and dif[i] > dea[i])
+                     else -2 if (dif[i - 1] >= dea[i - 1]
+                                 and dif[i] < dea[i])
+                     else 1 if dif[i] > dea[i] else -1)
+        s["KDJ"] = (2 if (k_[i - 1] <= d_[i - 1] and k_[i] > d_[i]
+                          and k_[i] < 45)
                     else -2 if (k_[i - 1] >= d_[i - 1] and k_[i] < d_[i]
                                 and k_[i] > 65)
                     else 1 if k_[i] > d_[i] else -1)
         if r6[i] is not None and r6[i - 1] is not None:
-            sc += _wadd("RSI", 2 if (r6[i - 1] < 20 and r6[i] >= 20)
+            s["RSI"] = (2 if (r6[i - 1] < 20 and r6[i] >= 20)
                         else -2 if (r6[i - 1] > 80 and r6[i] <= 80)
                         else 1 if r6[i] < 30 else -1 if r6[i] > 70 else 0)
         c, cp = rows[i]["close"], rows[i - 1]["close"]
         v5 = sum(vols_d[max(0, i - 5):i]) / max(1, min(5, i))
         vr_d = vols_d[i] / v5 if v5 > 0 else 0.0
-        sc += _wadd("量价", 1 if (vr_d > 1.5 and c > cp)
-                    else -1 if (vr_d > 1.5 and c < cp) else 0)
+        if vr_d > 1.5:
+            s["量价"] = 1 if c > cp else -1 if c < cp else 0
         m20, m20p = ma20[i], ma20[i - 1]
-        if m20 and m20p:
-            sc += _wadd("MA20", 1 if (c > m20 and m20 > m20p)
-                        else -1 if (c < m20 and m20 < m20p) else 0)
+        if m20 and m20p and (c > m20 or c < m20):
+            s["MA20"] = (1 if (c > m20 and m20 > m20p)
+                         else -1 if (c < m20 and m20 < m20p) else 0)
         snap = chip_snaps.get(rows[i]["date"])
         if snap:
             sup_i, res_i = snap[0], snap[1]
             if sup_i and c <= sup_i * 1.01:
-                sc += _wadd("筹码", 1)
+                s["筹码"] = 1
             elif res_i and c >= res_i * 0.99:
-                sc += _wadd("筹码", -1)
-        if None not in (b_up[i], b_low[i]):
-            sc += _wadd("布林带", 1 if c < b_low[i]
-                        else -1 if c > b_up[i] else 0)
+                s["筹码"] = -1
+        if None not in (b_up[i], b_low[i]) and \
+                (c < b_low[i] or c > b_up[i]):
+            s["布林带"] = 1 if c < b_low[i] else -1
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
-            sc += _wadd("ADX", 1 if p_i > m_i else -1)
+        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH and p_i != m_i:
+            s["ADX"] = 1 if p_i > m_i else -1
+        return s
+
+    start = max(1, n - 1000)
+    # 每日原始分只算一次（判定条件与动态权重共用；冷却日也参与训练）
+    raw = {}
+    for i in range(start, n):
+        if None not in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
+            raw[i] = _raw_scores(i)
+
+    # ---- 在线训练：每维度「看对率」EWMA + 样本数收缩 ----
+    hits = {d: 0.5 for d in CFG.IND_W}
+    nsamp = {d: 0 for d in CFG.IND_W}
+
+    def _dyn_w(dim):
+        base = CFG.IND_W.get(dim, 1.0)
+        if not CFG.DYN_WEIGHTS:
+            return base
+        q = hits.get(dim, 0.5) - 0.5           # -0.5 ~ +0.5
+        shrink = min(1.0, nsamp.get(dim, 0) / max(1, CFG.DYN_W_WARMUP))
+        mult = 1.0 + 4.0 * q * shrink
+        return base * max(CFG.DYN_W_MIN, min(CFG.DYN_W_MAX, mult))
+
+    def _wadd(dim, pts):
+        return int(round(pts * _dyn_w(dim)))
+
+    out = []
+    prev_dir = 0
+    cooldown = 0
+    H = max(1, int(CFG.DYN_W_HORIZON))
+    for i in range(start, n):
+        # 1) 结算 i-H 日的维度贡献对错（其结果收盘在第 i 日才可知，因果）
+        j = i - H
+        if CFG.DYN_WEIGHTS and j >= start:
+            pr = raw.get(j)
+            cj = rows[j]["close"]
+            ci = rows[i]["close"]
+            if pr and cj and ci:
+                ret = ci / cj - 1
+                o = 1 if ret > 0 else (-1 if ret < 0 else 0)
+                if o:
+                    a = CFG.DYN_W_ALPHA
+                    for dim, sv in pr.items():
+                        if not sv:
+                            continue
+                        hit = 1.0 if (1 if sv > 0 else -1) == o else 0.0
+                        hits[dim] = (1 - a) * hits[dim] + a * hit
+                        nsamp[dim] += 1
+        # 2) 冷却期内跳过信号生成（训练不受影响，已在步骤1完成）
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+        sc = 0
+        for dim, sv in (raw.get(i) or {}).items():
+            if sv:
+                sc += _wadd(dim, sv)
         day_weak = (weak.get(rows[i]["date"]) is not None
                     and weak[rows[i]["date"]] < CFG.WEAK_IDX_TH)
         th = buy_th + 1 if day_weak else buy_th
         if sc >= th and prev_dir <= 0:
-            out.append((i, rows[i]["date"], "BUY", f"多维偏多({sc})"))
+            out.append((i, rows[i]["date"], "BUY",
+                        f"多维偏多({sc})" + ("·动态权重" if CFG.DYN_WEIGHTS
+                                             else "")))
             prev_dir = 1
             cooldown = rp["cooldown"]
         elif sc <= CFG.SIGNAL_SCORE_SELL and prev_dir >= 0:
-            out.append((i, rows[i]["date"], "SELL", f"多维偏空({sc})"))
+            out.append((i, rows[i]["date"], "SELL",
+                        f"多维偏空({sc})" + ("·动态权重" if CFG.DYN_WEIGHTS
+                                             else "")))
             prev_dir = -1
             cooldown = _sell_cd(rp)
     return out
