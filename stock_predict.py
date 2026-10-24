@@ -6691,8 +6691,13 @@ def _strat_key(full):
     return "strategy:" + full
 
 
-def load_strategy(full):
-    """读策略缓存（meta表），5日过期返回 None。"""
+def load_strategy(full, allow_stale=False):
+    """读策略缓存（meta表），5日过期返回 None。
+
+    v6.6.5：allow_stale=True 时过期缓存不再丢弃——返回旧策略并附
+    "_stale": True（analyze 沿用旧策略出买卖点，同时 _ensure_strategy
+    后台跑新一轮消融，完成后自动替换并清理，绝不在消融期间回退默认
+    多维评分丢掉用户已选策略）。"""
     try:
         with db_conn() as conn:
             v = _get_meta(conn, _strat_key(full))
@@ -6700,7 +6705,10 @@ def load_strategy(full):
             return None
         d = json.loads(v)
         if time.time() - float(d.get("ts", 0)) > STRAT_TTL:
-            return None
+            if not allow_stale:
+                return None
+            d = dict(d)
+            d["_stale"] = True
         return d
     except Exception:
         log.exception("load_strategy 失败(忽略)")
@@ -6710,10 +6718,31 @@ def load_strategy(full):
 def save_strategy(full, strat):
     try:
         strat = dict(strat)
+        strat.pop("_stale", None)
         strat["ts"] = time.time()
         with db_conn(commit=True) as conn:
             _set_meta(conn, _strat_key(full),
                       json.dumps(strat, ensure_ascii=False))
+            # v6.6.5：新策略落库即清理旧值（覆盖同键）+ 顺手清掉全库已过期
+            # 的策略缓存，防止旧策略在别的股票上被 allow_stale 沿用后
+            # 长期滞留 meta。
+            try:
+                stale_cut = time.time() - STRAT_TTL
+                purged = 0
+                for k, v in conn.execute(
+                        "SELECT key, value FROM meta "
+                        "WHERE key LIKE 'strat:%'").fetchall():
+                    try:
+                        ts = float(json.loads(v).get("ts", 0))
+                    except Exception:
+                        continue
+                    if ts < stale_cut:
+                        conn.execute("DELETE FROM meta WHERE key=?", (k,))
+                        purged += 1
+                if purged:
+                    log.info("策略缓存清理: 移除 %d 只过期策略", purged)
+            except Exception:
+                log.debug("过期策略缓存清理失败(忽略)", exc_info=True)
     except Exception:
         log.exception("save_strategy 失败(忽略)")
 
@@ -8981,6 +9010,8 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         pass
 
     # 生成所有基础信号（只生成一次）
+    # v6.6.5：逐个报进度——sm701/lgbm/analog 单个就可能要几十秒到几分钟，
+    # 此前 13 个信号 + 42 候选评估全程静默（GUI 手动消融像卡死）。
     sig_cache = {}
     gens = {
         "macd": lambda: _sig_macd(rows),
@@ -8997,7 +9028,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "sm701": lambda: _sig_sm701(rows, full),
         "analog": lambda: _sig_analog(rows, full),
     }
-    for algo, gen in gens.items():
+    for i, (algo, gen) in enumerate(gens.items(), 1):
+        if progress:
+            progress(f"消融进度: 生成信号 {i}/{len(gens)} "
+                     f"({ALGO_LABEL.get(algo, algo)})...")
         try:
             sig_cache[algo] = gen()
         except Exception:
@@ -9052,8 +9086,16 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     cands = []
     # 使用线程池并行评估候选（I/O轻、计算密集，GIL会部分释放）
     from concurrent.futures import ThreadPoolExecutor
+    n_tasks = len(tasks)
+    if progress:
+        progress(f"消融进度: 候选评估 0/{n_tasks}...")
+    _ev_done = [0]
     with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as exe:
         for r in exe.map(_eval_task, tasks):
+            _ev_done[0] += 1
+            if progress:
+                progress(f"消融进度: 候选评估 {_ev_done[0]}/{n_tasks} "
+                         f"({_ev_done[0] * 100 // n_tasks}%)")
             if r is not None:
                 cands.append(r)
 
@@ -9765,7 +9807,13 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
                      "params": dict(CFG.RISK_PARAMS["test"]),
                      "label": "sm701 模型·test（不消融）"}
         else:
-            strat = load_strategy(full)
+            # v6.6.5：缓存过期不再丢弃旧策略——沿用出买卖点（_stale 标记），
+            # 同时 _ensure_strategy 后台跑新一轮消融，完成后自动替换。
+            strat = load_strategy(full, allow_stale=True)
+    if strat and strat.get("_stale"):
+        strat = dict(strat)
+        strat["label"] = ((strat.get("label") or "旧策略")
+                          + "·缓存已过期(沿用)")
     rp = dict(strat["params"]) if (strat and strat.get("params")) \
         else CFG.risk_params()
     sel_algo = (strat or {}).get("algo", "composite")
