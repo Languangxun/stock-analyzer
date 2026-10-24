@@ -543,12 +543,14 @@ def migrate_all(db, workers=2, limit=None, force=False, log=print,
     return bad
 
 
-def scan(conn):
+def scan(conn, progress=None):
     """全库扫描，返回 {code: {...问题列表}} 与全局统计。
 
     v6.2.3：按股流式处理（itertools.groupby 游标）——旧实现
     `fetchall()` 把全库 1200+ 万根日K 一次性载入内存再分组，
-    峰值内存数 GB；流式后内存只保留单只，统计结果完全一致。"""
+    峰值内存数 GB；流式后内存只保留单只，统计结果完全一致。
+    v6.6.5：progress(done, total, n_issue) 回调——扫描 12M 行约 1~3 分钟，
+    此前全程静默（GUI 日志/CLI 都像卡死），现每 500 只或每 5s 报一次。"""
     from itertools import groupby
     names = {r[0]: (r[1] or "") for r in
              conn.execute("SELECT code, name FROM stocks").fetchall()}
@@ -562,6 +564,8 @@ def scan(conn):
              "suspicious": 0, "delisted": 0, "zero_vol": 0, "stale": 0,
              "low_price": 0, "neg_price": 0, "stale_vs_market": 0,
              "stale_bj": 0, "orphan": 0}
+    total = max(1, len(names))
+    t_last = [time.time()]
 
     def add(c, kind, detail):
         issues.setdefault(c, []).append((kind, detail))
@@ -573,6 +577,10 @@ def scan(conn):
         bars = [(r[1], r[2], r[3], r[4], r[5], r[6] or 0.0) for r in grp]
         stats["codes"] += 1
         stats["bars"] += len(bars)
+        if progress and (stats["codes"] % 500 == 0
+                         or time.time() - t_last[0] >= 5.0):
+            t_last[0] = time.time()
+            progress(stats["codes"], total, len(issues))
         name = names.get(c, "")
         # ---- 1) 结构异常 ----
         bad = [b for b in bars if not _bar_valid(b)]
@@ -694,6 +702,10 @@ def check_adj(db, sample=200, workers=3, log=print):
     lock = threading.Lock()
     rows, skipped, lowvol = [], [0], [0]
 
+    from concurrent.futures import ThreadPoolExecutor
+    done_n = [0]
+    t_last = [time.time()]
+
     def one(c):
         # 库内基准：个股/指数对比不复权收益；ETF/LOF 落库口径是腾讯 qfq
         ref_fq = "qfq" if _is_etf(c) else ""
@@ -722,9 +734,17 @@ def check_adj(db, sample=200, workers=3, log=print):
             rows.append({"code": c, "s": s, "r2": fit[2] if fit else 0.0,
                          "n": len(ds)})
 
-    from concurrent.futures import ThreadPoolExecutor
+    def _one_progress(c):
+        with lock:
+            done_n[0] += 1
+            if done_n[0] % 20 == 0 or done_n[0] == len(codes) \
+                    or time.time() - t_last[0] >= 10.0:
+                t_last[0] = time.time()
+                log(f"  体检进度 {done_n[0]}/{len(codes)} "
+                    f"({done_n[0] * 100 // max(1, len(codes))}%)")
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(one, codes))
+        list(ex.map(lambda c: (one(c), _one_progress(c)), codes))
     bad = sorted([r for r in rows if abs(r["s"] - 1) > 0.02],
                  key=lambda r: -abs(r["s"] - 1))
     ss = [r["s"] for r in rows]
@@ -779,6 +799,10 @@ def main():
         print(s, flush=True)
         lines.append(s)
 
+    def plog(s):
+        """进度行：只进控制台/GUI日志回流，不写入报告（v6.6.5）。"""
+        print(s, flush=True)
+
     if args.check_adj:
         check_adj(args.db, sample=args.sample, workers=args.workers, log=log)
         os.makedirs(os.path.dirname(ADJ_REPORT_PATH), exist_ok=True)
@@ -806,7 +830,13 @@ def main():
     conn = sqlite3.connect(args.db, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     t0 = time.time()
-    issues, stats, names = scan(conn)
+    plog(f"清洗扫描开始（模式: {mode}）...")
+    issues, stats, names = scan(
+        conn, progress=lambda done, total, n_bad:
+            plog(f"清洗进度: {done}/{total} 只 "
+                 f"({done * 100 // max(1, total)}%) 已发现问题 {n_bad} 处"))
+    plog(f"扫描完成: {stats['codes']} 只 / {stats['bars']} 根，"
+         f"耗时 {time.time() - t0:.0f}s")
     log(f"扫描完成({time.time() - t0:.0f}s)：{stats['codes']}只代码 "
         f"{stats['bars']}根日K")
     log(f"- 结构异常bar: {stats['bad_bars']}")
@@ -841,7 +871,12 @@ def main():
                      "code TEXT PRIMARY KEY, last_date TEXT, ts REAL)")
         ensure_tables(conn)
         fixed = kept = 0
-        for c, items in issues.items():
+        n_total = len(issues)
+        t_fix = time.time()
+        for i, (c, items) in enumerate(issues.items(), 1):
+            if i % 3 == 0 or i == n_total:
+                plog(f"修复进度: {i}/{n_total}（成功 {fixed} 保留 {kept}）"
+                     f" 已用 {time.time() - t_fix:.0f}s")
             kinds = {k for k, _ in items}
             if kinds & {"bad_bars", "refetch", "low_price", "stale",
                         "stale_vs_market"} and not c.startswith("bj"):
