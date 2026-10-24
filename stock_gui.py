@@ -19181,123 +19181,174 @@ class App:
                            fill=AXIS_TXT, font=("Microsoft YaHei", 8))
 
         def run_bt():
+            # v6.6.5：计算段后台化——本函数在工具窗打开 80ms 后自动执行，
+            # 此前在主线程同步跑 strategy_signals_full（sm701 需全市场模型
+            # 复算，冷缓存 ~110s）+ backtest_signals + _bt_segments，
+            # 整个 UI 冻结数分钟（用户表现为"打开工具/点数据工具就卡死"）。
+            # 现计算放后台线程，完成后回主线程渲染（懒加载同模式）。
             if not self.res or not win.winfo_exists():
                 return
-            strat = self.res.get("strategy") or {}
+            if getattr(win, "_bt_busy", False):
+                return
+            res = self.res
+            strat = res.get("strategy") or {}
             rp = (strat.get("params")
-                  or CFG.RISK_PARAMS.get(self.res.get("risk_mode"))
+                  or CFG.RISK_PARAMS.get(res.get("risk_mode"))
                   or CFG.risk_params())
             # 与消融同窗（近1000根）+ 同 75/25 切分：主图只展示近250根，
             # 而消融选型用的是近1000根；若拿全历史(可达2400根)切分，
             # 训练段会落在策略数据起点之前（如 L2 行业ETF 2024 才有数据）
             # → 训练集恒空、曲线一条水平线（688012/002491 实测）。
-            rows_bt = self.res["disp_rows"]
-            if self.res.get("has_live"):
+            rows_bt = res["disp_rows"]
+            if res.get("has_live"):
                 rows_bt = rows_bt[:-1]   # 与消融一致：盘中假K不计入回测
             if len(rows_bt) > ABL_BARS:
                 rows_bt = rows_bt[-ABL_BARS:]
             try:
-                info = get_stock_info(self.res["full_code"]) or {}
+                info = get_stock_info(res["full_code"]) or {}
                 industry = info.get("industry") or ""
             except Exception:
                 industry = ""
-            sig_use = strategy_signals_full(rows_bt, strat, industry,
-                                            full=self.res["full_code"])
-            if not sig_use:
-                sig_use = self.res["signals"]
-            bt = backtest_signals(rows_bt, sig_use, rp=rp)
-            if bt:
-                # v6.1.6：训练/验证/全期改用消融同引擎（_bt_events）与同切分
-                # （val=max(200,n/4)），保证与「策略消融」弹窗逐项一致。
-                ev_full, ev_tr, ev_va, split = _bt_segments(
-                    rows_bt, sig_use, rp, detail=True)
-                if ev_full:
-                    for _k in ("trades", "closed", "wins", "losses",
-                               "winrate", "total", "ann", "mdd", "floating",
-                               "avg_win", "avg_loss", "profit_loss",
-                               "curve", "detail"):
-                        bt[_k] = ev_full.get(_k)
-                    bt["train"] = ev_tr
-                    bt["val"] = ev_va
-                    bt["split_i"] = split if 0 < split < len(rows_bt) else None
-                bt["_signals"] = sig_use
-                bt["_rows"] = rows_bt
-            _bt_last[0] = bt
+            fallback_sigs = res.get("signals") or []
+            win._bt_busy = True
+            try:
+                btn_bt.config(state="disabled")
+            except Exception:
+                pass
             bt_result.config(state="normal")
             bt_result.delete("1.0", "end")
+            bt_result.insert("end",
+                             "\n  后台计算中…（重信号策略首次需全市场模型"
+                             "复算，约1~3分钟，期间界面可正常使用）\n")
 
-            def _seg(title, m, extra="", n_sig=None):
-                if not m:
-                    if n_sig == 0:
-                        why = "该段无信号"
-                    elif n_sig is not None:
-                        why = f"该段 {n_sig} 个信号，但未形成可回测交易"
-                    else:
-                        why = "信号不足"
-                    bt_result.insert("end",
-                        f"\n  ── {title} ──{extra}\n  {why}\n")
+            def worker():
+                sig_use = strategy_signals_full(rows_bt, strat, industry,
+                                                full=res["full_code"])
+                if not sig_use:
+                    sig_use = fallback_sigs
+                bt = backtest_signals(rows_bt, sig_use, rp=rp)
+                if bt:
+                    # v6.1.6：训练/验证/全期改用消融同引擎（_bt_events）与
+                    # 同切分（val=max(200,n/4)），保证与「策略消融」弹窗
+                    # 逐项一致。
+                    ev_full, ev_tr, ev_va, split = _bt_segments(
+                        rows_bt, sig_use, rp, detail=True)
+                    if ev_full:
+                        for _k in ("trades", "closed", "wins", "losses",
+                                   "winrate", "total", "ann", "mdd",
+                                   "floating", "avg_win", "avg_loss",
+                                   "profit_loss", "curve", "detail"):
+                            bt[_k] = ev_full.get(_k)
+                        bt["train"] = ev_tr
+                        bt["val"] = ev_va
+                        bt["split_i"] = (split
+                                         if 0 < split < len(rows_bt) else None)
+                    bt["_signals"] = sig_use
+                    bt["_rows"] = rows_bt
+                return bt
+
+            def done(bt, err):
+                win._bt_busy = False
+                try:
+                    btn_bt.config(state="normal")
+                except Exception:
+                    pass
+                if err:
+                    log.exception("信号胜率后台计算失败")
+                    try:
+                        self.progress_var.set("信号胜率计算失败（详见日志）")
+                    except Exception:
+                        pass
                     return
-                bt_result.insert("end",
-                    f"\n  ── {title} ──{extra}\n"
-                    f"  交易 {m['trades']} 次（已平仓 {m['closed']}）  "
-                    f"胜率 {_fmt_pct(m.get('winrate'))}"
-                    f"（{m['wins']}/{m['closed']}）\n"
-                    f"  区间收益 {_fmt_pct(m.get('total'), True)}  "
-                    f"年化 {_fmt_pct(m.get('ann'), True)}  "
-                    f"最大回撤 {_fmt_pct(m.get('mdd'))}\n"
-                    f"  盈亏比 {m.get('profit_loss', 0):.2f}  "
-                    f"均盈 {_fmt_pct(m.get('avg_win'), True)}  "
-                    f"均亏 {_fmt_pct(m.get('avg_loss'), True)}\n")
+                if not (win.winfo_exists() and self.res is res):
+                    return          # 窗口已关/已切换股票，丢弃过期结果
+                _bt_last[0] = bt
+                sig_use = bt.get("_signals") or []
+                bt_result.config(state="normal")
+                bt_result.delete("1.0", "end")
 
-            if not bt or bt.get("winrate") is None:
-                bt_result.insert("end", "该策略在近1000根窗口内没有可回测交易（信号不足）")
-            else:
-                rows_ = bt.get("_rows") or self.res["disp_rows"]
-                si = bt.get("split_i")
-                _seg("全期（无手续费）", bt,
-                     f"  {rows_[0]['date']} ~ {rows_[-1]['date']}")
-                if bt["floating"] is not None:
-                    bt_result.insert("end",
-                        f"  未平仓浮盈 {_fmt_pct(bt['floating'], True)}\n")
-                if si:
-                    n_tr = len([s for s in sig_use if s[0] < si])
-                    _seg("训练集", bt.get("train"),
-                         f"  {rows_[0]['date']} ~ {rows_[si - 1]['date']}",
-                         n_sig=n_tr)
-                    _seg("验证集", bt.get("val"),
-                         f"  {rows_[si]['date']} ~ {rows_[-1]['date']}",
-                         n_sig=len(sig_use) - n_tr)
-                ics = []
-                for h, k in ((1, "ic1"), (5, "ic5")):
-                    ic, nic = (bt.get(k) or (None, 0))
-                    ics.append(f"IC(T+{h})={'%.3f' % ic if ic is not None else '-'}"
-                               f"(n={nic})")
-                bt_result.insert("end",
-                    f"\n  ── 信号质量 ──\n"
-                    f"  {'  '.join(ics)}\n")
-                fwd = bt.get("fwd") or {}
-                for typ, name in (("BUY", "买入信号后"), ("SELL", "卖出信号后")):
-                    rec = fwd.get(typ) or {}
-                    parts = []
-                    for h in (1, 5):
-                        n_, avg, up = rec.get(h, (0, None, None))
-                        if avg is None:
-                            parts.append(f"T+{h} 无样本")
+                def _seg(title, m, extra="", n_sig=None):
+                    if not m:
+                        if n_sig == 0:
+                            why = "该段无信号"
+                        elif n_sig is not None:
+                            why = f"该段 {n_sig} 个信号，但未形成可回测交易"
                         else:
-                            parts.append(
-                                f"T+{h} 均值{avg * 100:+.2f}% 上涨{up * 100:.0f}%"
-                                f"(n={n_})")
-                    bt_result.insert("end", f"  {name}: " + "  ".join(parts) + "\n")
-                bt_result.insert("end",
-                    f"\n  提示：回测与消融**同窗（近1000根）同引擎**（_bt_events），\n"
-                    f"  交易/胜率/年化/回撤与「策略消融」弹窗逐项一致；\n"
-                    f"  用所选策略信号，T日收盘信号/T+1成交，"
-                    f"退出规则: {_bt_exit_note(rp)}；\n"
-                    f"  训练/验证按 val=max(200,n/4) 切分，验证集不参与选型。\n")
-            bt_result.config(state="disabled")
-            _fill_detail(bt)            # 交易明细子页同步刷新
-            bt_result.yview_moveto(0)   # 每次计算后回到顶部，先看全期/训练/验证
-            _draw_curve(bt)
+                            why = "信号不足"
+                        bt_result.insert("end",
+                            f"\n  ── {title} ──{extra}\n  {why}\n")
+                        return
+                    bt_result.insert("end",
+                        f"\n  ── {title} ──{extra}\n"
+                        f"  交易 {m['trades']} 次（已平仓 {m['closed']}）  "
+                        f"胜率 {_fmt_pct(m.get('winrate'))}"
+                        f"（{m['wins']}/{m['closed']}）\n"
+                        f"  区间收益 {_fmt_pct(m.get('total'), True)}  "
+                        f"年化 {_fmt_pct(m.get('ann'), True)}  "
+                        f"最大回撤 {_fmt_pct(m.get('mdd'))}\n"
+                        f"  盈亏比 {m.get('profit_loss', 0):.2f}  "
+                        f"均盈 {_fmt_pct(m.get('avg_win'), True)}  "
+                        f"均亏 {_fmt_pct(m.get('avg_loss'), True)}\n")
+
+                if not bt or bt.get("winrate") is None:
+                    bt_result.insert(
+                        "end",
+                        "该策略在近1000根窗口内没有可回测交易（信号不足）")
+                else:
+                    rows_ = bt.get("_rows") or res["disp_rows"]
+                    si = bt.get("split_i")
+                    _seg("全期（无手续费）", bt,
+                         f"  {rows_[0]['date']} ~ {rows_[-1]['date']}")
+                    if bt["floating"] is not None:
+                        bt_result.insert("end",
+                            f"  未平仓浮盈 {_fmt_pct(bt['floating'], True)}\n")
+                    if si:
+                        n_tr = len([s for s in sig_use if s[0] < si])
+                        _seg("训练集", bt.get("train"),
+                             f"  {rows_[0]['date']} ~ {rows_[si - 1]['date']}",
+                             n_sig=n_tr)
+                        _seg("验证集", bt.get("val"),
+                             f"  {rows_[si]['date']} ~ {rows_[-1]['date']}",
+                             n_sig=len(sig_use) - n_tr)
+                    ics = []
+                    for h, k in ((1, "ic1"), (5, "ic5")):
+                        ic, nic = (bt.get(k) or (None, 0))
+                        ics.append(
+                            f"IC(T+{h})={'%.3f' % ic if ic is not None else '-'}"
+                            f"(n={nic})")
+                    bt_result.insert("end",
+                        f"\n  ── 信号质量 ──\n"
+                        f"  {'  '.join(ics)}\n")
+                    fwd = bt.get("fwd") or {}
+                    for typ, name in (("BUY", "买入信号后"),
+                                      ("SELL", "卖出信号后")):
+                        rec = fwd.get(typ) or {}
+                        parts = []
+                        for h in (1, 5):
+                            n_, avg, up = rec.get(h, (0, None, None))
+                            if avg is None:
+                                parts.append(f"T+{h} 无样本")
+                            else:
+                                parts.append(
+                                    f"T+{h} 均值{avg * 100:+.2f}% "
+                                    f"上涨{up * 100:.0f}%"
+                                    f"(n={n_})")
+                        bt_result.insert(
+                            "end", f"  {name}: " + "  ".join(parts) + "\n")
+                    bt_result.insert("end",
+                        f"\n  提示：回测与消融**同窗（近1000根）同引擎**"
+                        f"（_bt_events），\n"
+                        f"  交易/胜率/年化/回撤与「策略消融」弹窗逐项一致；\n"
+                        f"  用所选策略信号，T日收盘信号/T+1成交，"
+                        f"退出规则: {_bt_exit_note(rp)}；\n"
+                        f"  训练/验证按 val=max(200,n/4) 切分，"
+                        f"验证集不参与选型。\n")
+                bt_result.config(state="disabled")
+                _fill_detail(bt)            # 交易明细子页同步刷新
+                bt_result.yview_moveto(0)   # 回到顶部，先看全期/训练/验证
+                _draw_curve(bt)
+
+            self._run_bg(worker, done)
 
         _curve_job = [None]
 
