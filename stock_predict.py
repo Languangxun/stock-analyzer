@@ -12197,22 +12197,38 @@ def _sm701_predict_feats(feats, paths):
     return booster.predict(X)
 
 
+_DB_LATEST_CACHE = {}           # path -> (ts, date)；MAX(date) 无 date 索引，
+                                # 主库/副本全表扫 0.6~2s，60s 缓存供
+                                # sm701 缓存 key 等高频调用方复用（v6.6.5）
+
+
 def _db_latest_date(path=None):
-    """行情库最新交易日；path 为空时读主库。失败返回空串。"""
+    """行情库最新交易日；path 为空时读主库。失败返回空串。
+    v6.6.5：加 60s 进程内缓存——本函数被 sm701 缓存 key 高频调用，
+    全表 MAX(date) 在主库/副本上每次 0.6~2s；数据推进频率为日级，
+    60s 缓存安全。"""
     try:
+        key = os.path.abspath(path) if path else "main"
+        hit = _DB_LATEST_CACHE.get(key)
+        now = time.time()
+        if hit and now - hit[0] < 60:
+            return hit[1]
         if path:
             import urllib.request as _ur
             uri = ("file:" + _ur.pathname2url(os.path.abspath(path))
                    + "?mode=ro")
             conn = sqlite3.connect(uri, uri=True, timeout=30)
             try:
-                return conn.execute(
+                d = conn.execute(
                     "select max(date) from daily_bars").fetchone()[0] or ""
             finally:
                 conn.close()
-        with db_conn() as conn:
-            return conn.execute(
-                "select max(date) from daily_bars").fetchone()[0] or ""
+        else:
+            with db_conn() as conn:
+                d = conn.execute(
+                    "select max(date) from daily_bars").fetchone()[0] or ""
+        _DB_LATEST_CACHE[key] = (now, d)
+        return d
     except sqlite3.Error:
         return ""
 
