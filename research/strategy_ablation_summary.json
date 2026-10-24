@@ -1,188 +1,188 @@
 {
-  "total_stocks": 7203,
-  "total_objects": 7203,
-  "etf_count": 1474,
-  "stock_count": 5729,
-  "timestamp": "2026-10-24T19:00:26.040517",
+  "total_stocks": 7206,
+  "total_objects": 7206,
+  "etf_count": 1476,
+  "stock_count": 5730,
+  "timestamp": "2026-10-24T20:43:10.898337",
   "modes": {
     "稳健": {
-      "count": 7203,
+      "count": 7206,
       "algo_distribution": {
         "composite": {
-          "count": 871,
-          "pct": 12.09
+          "count": 861,
+          "pct": 11.95
         },
         "macd": {
-          "count": 502,
-          "pct": 6.97
+          "count": 533,
+          "pct": 7.4
         },
         "kdj": {
-          "count": 623,
-          "pct": 8.65
+          "count": 428,
+          "pct": 5.94
         },
         "l1_pattern": {
-          "count": 595,
-          "pct": 8.26
+          "count": 601,
+          "pct": 8.34
         },
         "chip_peak": {
-          "count": 308,
-          "pct": 4.28
+          "count": 294,
+          "pct": 4.08
         },
         "rsi": {
           "count": 459,
           "pct": 6.37
         },
-        "boll": {
-          "count": 661,
-          "pct": 9.18
-        },
         "vol_ratio": {
-          "count": 52,
-          "pct": 0.72
+          "count": 43,
+          "pct": 0.6
+        },
+        "boll": {
+          "count": 813,
+          "pct": 11.28
         },
         "lgbm": {
-          "count": 596,
-          "pct": 8.27
+          "count": 645,
+          "pct": 8.95
         },
         "ma_trend": {
-          "count": 98,
-          "pct": 1.36
+          "count": 102,
+          "pct": 1.42
         },
         "analog": {
-          "count": 127,
-          "pct": 1.76
+          "count": 120,
+          "pct": 1.67
         },
         "sm701": {
-          "count": 2206,
-          "pct": 30.63
+          "count": 2213,
+          "pct": 30.71
         },
         "l2_ind": {
-          "count": 83,
-          "pct": 1.15
+          "count": 74,
+          "pct": 1.03
         },
         "sector_rot": {
-          "count": 22,
-          "pct": 0.31
+          "count": 20,
+          "pct": 0.28
         }
       },
       "train": {
-        "ann_median": 0.16876305294548177,
-        "ann_mean": 0.19863100895168445,
-        "mdd_median": -0.13646892655367315,
-        "winrate_median": 0.5897435897435898,
+        "ann_median": 0.17178076047642388,
+        "ann_mean": 0.2037399729291883,
+        "mdd_median": -0.1364434762882779,
+        "winrate_median": 0.5833333333333334,
         "trades_median": 18.0
       },
       "val": {
-        "ann_median": -0.01180549980109541,
-        "ann_mean": 0.020202771766801696,
-        "mdd_median": -0.1636745402442797,
+        "ann_median": -0.01110085592290333,
+        "ann_mean": 0.01889087835537717,
+        "mdd_median": -0.16499274167930078,
         "winrate_median": 0.42857142857142855,
         "trades_median": 9.0
       },
       "regime": {
-        "bull_ann_median": 0.28399220508272627,
-        "bear_ann_median": 0.03937532668384751
+        "bull_ann_median": 0.286271248234631,
+        "bear_ann_median": 0.04116083927123021
       },
       "ic": {
-        "ic1_median": 0.018524607567581577,
-        "ic5_median": 0.09287024068447328,
-        "ic5_positive_pct": 78.1
+        "ic1_median": 0.019886747059716145,
+        "ic5_median": 0.09168240112131373,
+        "ic5_positive_pct": 77.7
       }
     },
     "均衡": {
-      "count": 7203,
+      "count": 7206,
       "algo_distribution": {
         "composite": {
-          "count": 1028,
-          "pct": 14.27
+          "count": 987,
+          "pct": 13.7
         },
         "macd": {
-          "count": 636,
-          "pct": 8.83
+          "count": 703,
+          "pct": 9.76
         },
         "kdj": {
-          "count": 745,
-          "pct": 10.34
+          "count": 578,
+          "pct": 8.02
         },
         "l1_pattern": {
-          "count": 657,
-          "pct": 9.12
+          "count": 640,
+          "pct": 8.88
         },
         "chip_peak": {
-          "count": 334,
-          "pct": 4.64
+          "count": 329,
+          "pct": 4.57
         },
         "rsi": {
-          "count": 474,
-          "pct": 6.58
-        },
-        "boll": {
-          "count": 638,
-          "pct": 8.86
+          "count": 498,
+          "pct": 6.91
         },
         "vol_ratio": {
-          "count": 38,
-          "pct": 0.53
+          "count": 34,
+          "pct": 0.47
+        },
+        "boll": {
+          "count": 756,
+          "pct": 10.49
         },
         "lgbm": {
-          "count": 536,
-          "pct": 7.44
+          "count": 599,
+          "pct": 8.31
         },
         "ma_trend": {
-          "count": 70,
-          "pct": 0.97
+          "count": 74,
+          "pct": 1.03
         },
         "analog": {
-          "count": 91,
-          "pct": 1.26
+          "count": 89,
+          "pct": 1.24
         },
         "sm701": {
-          "count": 1794,
-          "pct": 24.91
+          "count": 1760,
+          "pct": 24.42
         },
         "l2_ind": {
-          "count": 124,
-          "pct": 1.72
+          "count": 116,
+          "pct": 1.61
         },
         "sector_rot": {
-          "count": 38,
-          "pct": 0.53
+          "count": 43,
+          "pct": 0.6
         }
       },
       "train": {
-        "ann_median": 0.1882873255349189,
-        "ann_mean": 0.21864154087380944,
-        "mdd_median": -0.14888247211750616,
-        "winrate_median": 0.5625,
+        "ann_median": 0.19403475172067353,
+        "ann_mean": 0.2266908349256558,
+        "mdd_median": -0.15047132896299287,
+        "winrate_median": 0.56,
         "trades_median": 19.0
       },
       "val": {
-        "ann_median": -0.017676458046369747,
-        "ann_mean": 0.018875596279589006,
-        "mdd_median": -0.17206418895022468,
-        "winrate_median": 0.4166666666666667,
+        "ann_median": -0.01484869677639078,
+        "ann_mean": 0.019323923969455835,
+        "mdd_median": -0.1750351466751885,
+        "winrate_median": 0.42857142857142855,
         "trades_median": 10.0
       },
       "regime": {
-        "bull_ann_median": 0.3183141900025971,
-        "bear_ann_median": 0.040634246056453334
+        "bull_ann_median": 0.3209158353019713,
+        "bear_ann_median": 0.04393241249647281
       },
       "ic": {
-        "ic1_median": 0.018046864501100032,
-        "ic5_median": 0.09094512996445472,
-        "ic5_positive_pct": 77.8
+        "ic1_median": 0.01699162410559187,
+        "ic5_median": 0.08785764965929088,
+        "ic5_positive_pct": 77.2
       }
     }
   },
   "coverage": {
     "cache_objects": 7636,
     "included": 7247,
-    "ablated": 7203,
+    "ablated": 7206,
     "skipped": 0,
     "skipped_detail": [],
     "etf_cache": 1796,
     "etf_included": 1509,
-    "etf_ablated": 1474,
+    "etf_ablated": 1476,
     "excluded_by_bars": [
       [
         "bj920003",
