@@ -17283,6 +17283,10 @@ class App:
         except ValueError as e:
             messagebox.showwarning("代码有误", str(e))
             return
+        # v7.0.1：搜索片段/变体输入在提交后回填正式代码，旧搜索不残留
+        if self.code_var.get() != full:
+            self.code_var.set(full)
+        self._wiz_active = False
         self.btn_run.config(state="disabled")
         # 启动先快速填最近K线（走缓存秒开），完整历史/样本池后台补齐；
         # v6.6.5 懒加载：重信号算法（sm701/lgbm）后台补算，先画K线再叠买卖点
@@ -18304,16 +18308,19 @@ class App:
     # ---------- 多市场切换（v6.6.5：A股/港股/美股/期货/加密） ----------
     # ---------- 策略工坊窗（v6.6.5：按市场应用外部策略） ----------
     def _open_studio_window(self):
-        c = self.api.colors() if hasattr(self, "api") else None
-        colors = dict(DARK_BG=DARK_BG, PANEL_BG=PANEL_BG, FG_MAIN=FG_MAIN,
-                      BTN_BG=BTN_BG, BTN_FG=BTN_FG, BTN_HOVER=BTN_HOVER,
-                      AXIS_TXT=AXIS_TXT, TITLE_TXT=TITLE_TXT)
         win = tk.Toplevel(self.root)
         win.title("策略工坊 · 按市场应用")
         win.configure(bg=DARK_BG)
         win.transient(self.root)
         self._center_win(win, 760, 560)
-        ttk.Label(win, text="— 股票策略工坊：选中策略 → 应用到市场 —",
+        self._build_studio_frame(win, win)
+        return win
+
+    def _build_studio_frame(self, parent, ui_root=None):
+        """工坊内容（列表/绑定/编辑器入口）构建到 parent；ui_root 为
+        messagebox 父窗（嵌入工具窗页签时=工具窗）。v7.0.1。"""
+        win = ui_root or parent
+        ttk.Label(parent, text="— 股票策略工坊：选中策略 → 应用到市场 —",
                   background=DARK_BG, foreground=TITLE_TXT,
                   font=("Microsoft YaHei", 10, "bold")).pack(
                       anchor="w", padx=10, pady=(10, 2))
@@ -18323,7 +18330,7 @@ class App:
                   font=("Microsoft YaHei", 8), wraplength=700,
                   justify="left").pack(anchor="w", padx=10, pady=(0, 6))
 
-        lb = tk.Listbox(win, height=10, bg=PANEL_BG, fg=FG_MAIN,
+        lb = tk.Listbox(parent, height=10, bg=PANEL_BG, fg=FG_MAIN,
                         selectbackground=SEL_BG, selectforeground=FG_MAIN,
                         relief="flat", highlightthickness=0,
                         font=("Microsoft YaHei", 9), exportselection=False)
@@ -18348,7 +18355,7 @@ class App:
                 return None
             return lb.get(sel[0]).split("·")[1].strip().split("←")[0].strip()
 
-        row = ttk.Frame(win)
+        row = ttk.Frame(parent)
         row.pack(fill="x", padx=10, pady=4)
         ttk.Label(row, text="应用到:").pack(side="left")
         binds_box = ttk.Combobox(row, width=8, state="readonly",
@@ -18394,10 +18401,10 @@ class App:
 
         ttk.Button(row, text="编辑选中", command=_edit_sel).pack(
             side="left", padx=4)
-        ttk.Button(win, text="关闭", command=win.destroy).pack(
-            side="bottom", anchor="e", padx=10, pady=8)
+        ttk.Button(row, text="新建策略", command=lambda: self._studio_editor(
+            None, on_saved=refresh)).pack(side="left", padx=(16, 4))
         refresh()
-        return win
+        return lb
 
     # ---------- 策略编辑器（v7.0.1：可视化生成工坊 JSON） ----------
     _STUDIO_PARAM_NAMES = {
@@ -19966,8 +19973,10 @@ class App:
         if cp_:
             p("■ 筹码参考")
             p(f"  平均成本 {cp_['avg_cost']:.2f} | 现价 {cp_['cur']:.2f}")
-            p(f"  获利盘 {cp_['profit']*100:.0f}%"
-              f"（{'有获利抛压' if cp_['profit'] < 0.3 else '套牢盘较少' if cp_['profit'] > 0.7 else '筹码较均衡'}）")
+            _cp_tag = ("获利盘沉重·获利抛压大" if cp_["profit"] > 0.7
+                       else "获利盘稀少·套牢盘为主" if cp_["profit"] < 0.3
+                       else "筹码较均衡")
+            p(f"  获利盘 {cp_['profit']*100:.0f}%（{_cp_tag}）")
             if cp_["p5"] and cp_["p95"]:
                 p(f"  90%筹码区间 {cp_['p5']:.2f} ~ {cp_['p95']:.2f}")
             lv_txt = []
@@ -21460,6 +21469,10 @@ class App:
         nb.add(f_data, text=" 数据工具 ")
         self._tools_data_tab = f_data
         self._build_data_tools(f_data, win)
+        # v7.0.1：策略工坊页签（按市场应用外部策略 + 可视化编辑器）
+        f_studio = ttk.Frame(nb, padding=6)
+        nb.add(f_studio, text=" 策略工坊 ")
+        self._build_studio_frame(f_studio, win)
         if not res_ok:                   # 未分析股票时只开放 基本面/数据工具
             nb.tab(0, state="disabled")
             nb.tab(1, state="disabled")
