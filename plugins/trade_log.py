@@ -26,6 +26,18 @@ ACCOUNTS = (("live", "实盘"), ("sim", "模拟"))
 DEFAULT_CAPITAL_SIM = 1000000.0     # 模拟盘默认本金 100 万
 
 
+def _code_market(code):
+    """代码所属市场（与宿主 _market_of 同口径的插件内联版）。"""
+    s = (code or "").strip().lower()
+    if s.startswith("crypto") and len(s) > 6:
+        return "crypto"
+    if s[:2] in ("hk", "us") and len(s) > 2:
+        return s[:2]
+    if s[:2] == "fu" and len(s) > 2:
+        return "futures"
+    return "cn"
+
+
 class TradeLogPlugin(StockPlugin):
     """交易记录插件。"""
 
@@ -45,7 +57,7 @@ class TradeLogPlugin(StockPlugin):
             "capital_live": 0.0,        # 实盘本金（0=未填写）
             "capital_sim": DEFAULT_CAPITAL_SIM,
             "link_analysis": True,      # 是否参与荐股/信号联动
-            "view_account": "live",     # 面板当前显示的账本
+            "view_mode": "live",        # 面板当前显示的 实盘/模拟
         }
         self._ai_msgs = []
         self.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -64,7 +76,9 @@ class TradeLogPlugin(StockPlugin):
             # v6.6.5 迁移：无 account 字段的旧记录归入实盘
             for r in self._records:
                 if not r.get("account"):
-                    r["account"] = "live"
+                    r["account"] = "cn:live"
+                elif ":" not in r["account"]:
+                    r["account"] = "cn:" + r["account"]
         except Exception:
             self._records = []
         try:
@@ -97,14 +111,47 @@ class TradeLogPlugin(StockPlugin):
             self.api.log.exception("保存设置失败")
 
     # ------------------------------------------------------------------
-    # 账本基础
+    # 账本基础（v7.0.1：账本键 = "市场:实盘|模拟"，分市场 + 杠杆 + T+0）
     # ------------------------------------------------------------------
+    def _view_market(self):
+        """当前视图市场：优先跟随宿主市场模式，A股/港股/美股/期货/加密。"""
+        try:
+            from stock_gui import _CUR_MARKET
+            return _CUR_MARKET[0] if _CUR_MARKET[0] != "cn" else "cn"
+        except Exception:
+            return "cn"
+
     def _view_acc(self):
-        return self._settings.get("view_account", "live")
+        """账本键：``{market}:{live|sim}``（旧版纯 live/sim 视图键兼容）。"""
+        mode = self._settings.get("view_mode", "live")
+        return f"{self._view_market()}:{mode}"
+
+    def _acc_market(self, acc):
+        return (acc or "").split(":")[0] or "cn"
+
+    def _acc_leverage(self, acc):
+        """该账本市场杠杆（购买力倍数；1=无杠杆）。默认：期货10/加密5/其他1。"""
+        mk = self._acc_market(acc)
+        dflt = 10.0 if mk == "futures" else (5.0 if mk == "crypto" else 1.0)
+        try:
+            return max(1.0, float(self._settings.get(
+                f"leverage_{mk}", dflt) or dflt))
+        except (TypeError, ValueError):
+            return dflt
 
     def _capital(self, acc):
-        key = "capital_live" if acc == "live" else "capital_sim"
-        return float(self._settings.get(key, 0.0) or 0.0)
+        mk = self._acc_market(acc)
+        mode = (acc or "").split(":")[-1] if ":" in (acc or "") else "live"
+        if mode not in ("live", "sim"):
+            mode = "live"
+        key = f"cap_{mk}_{mode}"
+        val = self._settings.get(key)
+        if val is None:                     # 旧版键迁移
+            legacy = ("capital_live" if mode == "live" else "capital_sim")
+            val = self._settings.get(legacy, 0.0) or 0.0
+            if mk != "cn":
+                val = 0.0                   # 非 cn 市场不从 cn 迁移，需单独设
+        return float(val or 0.0)
 
     def _recs(self, acc=None):
         """某账本的记录（缺省=当前视图）；按日期稳定排序供重放。"""
@@ -114,29 +161,34 @@ class TradeLogPlugin(StockPlugin):
         return sorted(recs, key=lambda r: (r.get("date", ""), r.get("code", "")))
 
     def _calc_fee(self, price, volume, is_sell=False, code=""):
-        """真实费用：佣金(含最低) + 印花税(仅卖出) + 过户费(仅沪市) + 滑点。"""
+        """真实费用：佣金(含最低) + 滑点；印花税/过户费仅 A股（沪市过户）。
+        港股按双边费率简化走佣金率；期货/加密无税。"""
         amount = price * volume
         commission = max(amount * self._settings["commission"],
                          self._settings["min_commission"])
-        stamp = amount * self._settings["stamp_tax"] if is_sell else 0.0
-        # 过户费仅沪市（sh 开头）收取；深市 2015 年起已免
+        mk = _code_market(code)
+        stamp = (amount * self._settings["stamp_tax"]
+                 if is_sell and mk == "cn" else 0.0)
         transfer = (amount * self._settings["transfer_fee"]
-                    if str(code).startswith("sh") else 0.0)
+                    if mk == "cn" and str(code).startswith("sh") else 0.0)
         slip = amount * float(self._settings.get("slippage", 0.0) or 0.0)
         return round(commission + stamp + transfer + slip, 2)
 
-    def _replay(self, recs, capital):
+    def _replay(self, recs, capital, leverage=1.0, market="cn"):
         """按日期顺序重放账本。返回 (最终现金, 持仓, 错误列表)。
 
-        校验规则（真实 A 股口径）：
-        - 卖出不可超持仓（含 T+1：当日买入部分不可当日卖出）
-        - 买入金额+费用不可超可用现金
-        - 买入须整手（100 股倍数）；卖出允许零股（清仓真实存在）
-        同日多笔按 先卖后买 处理；资金不足/超卖即记错误（阻止入库）。"""
+        校验规则（v7.0.1 按市场）：
+        - 卖出不可超持仓；**T+1 仅 A股**——港股/美股/期货/加密 T+0
+          （当日买入当日可卖）；买入须整手也仅 A股；
+        - 买入金额+费用 ≤ 可用现金×杠杆（购买力；期货/加密支持杠杆）；
+        - 同日多笔按 先卖后买 处理；资金不足/超卖即记错误（阻止入库）。"""
         cash = capital
+        used = 0.0      # 已占用购买力（净买入；卖出回款冲减）
+        lev = max(1.0, float(leverage or 1.0))
         hold = {}       # code -> {"vol": 总持仓, "today": 今日买入}
         cur_date = None
         errs = []
+        t_plus_1 = market == "cn"
         for rec in recs:
             code = rec.get("code", "")
             vol = int(rec.get("volume", 0) or 0)
@@ -145,27 +197,33 @@ class TradeLogPlugin(StockPlugin):
             d = rec.get("date", "")
             if d != cur_date:
                 cur_date = d
-                for h in hold.values():
-                    h["today"] = 0
+                if t_plus_1:
+                    for h in hold.values():
+                        h["today"] = 0
             if rec.get("type") == "SELL":
                 h = hold.get(code)
-                avail = (h["vol"] - h["today"]) if h else 0
+                avail = (h["vol"] - h["today"]) if (h and t_plus_1) \
+                    else (h["vol"] if h else 0)
                 if vol > avail:
-                    errs.append(f"{d} {code} 卖出{vol}股超过可卖持仓{avail}"
-                                f"（含T+1当日买入不可卖）")
+                    errs.append(f"{d} {code} 卖出{vol}超过可卖持仓{avail}"
+                                + ("（T+1当日买入不可卖）" if t_plus_1 else ""))
                     continue
                 h["vol"] -= vol
                 cash += price * vol - fee
+                used -= price * vol - fee
             else:
-                if vol % 100:
+                if t_plus_1 and vol % 100:
                     errs.append(f"{d} {code} 买入{vol}股不是100股整数倍")
                     continue
                 need = price * vol + fee
-                if capital > 0 and need > cash + 1e-6:
+                buying_power = capital * lev - used
+                if capital > 0 and need > buying_power + 1e-6:
                     errs.append(f"{d} {code} 买入需{need:,.0f}元 "
-                                f"超过可用现金{cash:,.0f}元")
+                                f"超过剩余购买力{buying_power:,.0f}元"
+                                f"（本金{capital:,.0f}×杠杆{lev:g}）")
                     continue
                 cash -= need
+                used += need
                 h = hold.setdefault(code, {"vol": 0, "today": 0})
                 h["vol"] += vol
                 h["today"] += vol
@@ -220,7 +278,7 @@ class TradeLogPlugin(StockPlugin):
         if not self._settings.get("link_analysis", True):
             return {"available": False,
                     "source": "交易记录插件（联动已关闭）"}
-        acc = "live"
+        acc = "cn:live"
         capital = self._capital(acc)
         cash, positions = self._positions_detail(acc)
         mv = 0.0
@@ -308,8 +366,11 @@ class TradeLogPlugin(StockPlugin):
         # 账本切换（实盘/模拟独立记账）
         acc_frame = tk.Frame(self._frame, bg=c["DARK_BG"])
         acc_frame.pack(fill="x", padx=6, pady=(0, 2))
-        tk.Label(acc_frame, text="账本：", bg=c["DARK_BG"], fg=c["AXIS_TXT"],
-                 font=("Microsoft YaHei", 9)).pack(side="left")
+        self._wl_market_lab = tk.Label(
+            acc_frame, text=f"账本（{_code_market('cn')}）:",
+            bg=c["DARK_BG"], fg=c["AXIS_TXT"],
+            font=("Microsoft YaHei", 9))
+        self._wl_market_lab.pack(side="left")
         self._acc_var = tk.StringVar(value=self._view_acc())
         self._acc_btns = {}
         for key, lab in ACCOUNTS:
@@ -381,7 +442,7 @@ class TradeLogPlugin(StockPlugin):
         return self._frame
 
     def _switch_acc(self, key):
-        self._settings["view_account"] = key
+        self._settings["view_mode"] = key
         self._save_data()
         self._acc_var.set(key)
         self._refresh_list()
@@ -511,8 +572,9 @@ class TradeLogPlugin(StockPlugin):
             initialvalue=cur, minvalue=0.0, parent=self._frame)
         if val is None:
             return
-        key = "capital_live" if acc == "live" else "capital_sim"
-        self._settings[key] = float(val)
+        mk = self._acc_market(acc)
+        mode = acc.split(":")[-1] if ":" in acc else "live"
+        self._settings[f"cap_{mk}_{mode}"] = float(val)
         self._save_data()
         self._update_capital_label()
 
@@ -638,10 +700,12 @@ class TradeLogPlugin(StockPlugin):
                     messagebox.showwarning("提示", "价格/数量必须大于0",
                                            parent=win)
                     return
-                if typ == "BUY" and volume % 100:
+                if (typ == "BUY" and volume % 100
+                        and self._acc_market(acc) == "cn"):
                     messagebox.showwarning(
                         "提示", "A股买入须为100股（一手）整数倍\n"
-                                "卖出允许零股（清仓）", parent=win)
+                                "卖出允许零股（清仓）；港美期市无整手限制",
+                        parent=win)
                     return
 
                 acc = self._view_acc()
@@ -653,7 +717,9 @@ class TradeLogPlugin(StockPlugin):
                 # 真实性校验：按日期重放（卖出≤持仓含T+1、买入≤现金）
                 test = self._recs(acc) + [rec]
                 _cash, _pos, errs = self._replay(
-                    test, self._capital(acc))
+                    test, self._capital(acc),
+                    leverage=self._acc_leverage(acc),
+                    market=self._acc_market(acc))
                 if errs:
                     messagebox.showwarning(
                         "记录未通过真实性校验",

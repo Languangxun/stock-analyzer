@@ -1,6 +1,6 @@
 # 架构说明 · 股票形态相似度预测系统
 
-> **版本 v6.6.5　更新于 2026-10-24**
+> **版本 v7.0.1　更新于 2026-10-25（多市场正式版）**
 > 配套：《README.md》（用户向：功能/快速开始/回测摘要/数据）、`CHANGELOG.md`（版本变更史）、
 > `reports/回测复核报告_20260913.md`（审计报告）。
 > 本文只讲两件事：**这套东西的架构**、**每个环节用的什么算法**。历史版本（v3.2/v3.3）的架构描述已被本文取代。
@@ -78,6 +78,23 @@
 ---
 
 ## 二、数据层
+
+### 2.0 多市场（v7.0.1：港股/美股/期货/加密）
+- **代码前缀**：`hk00700 / usaapl / fugc（GC=F）/ cryptobtcusdt`，与 cn（sh/sz/bj）
+  同库同表（daily_bars/quote_cache/minute_cache/stocks），复用全部缓存/显示/
+  分时/离线降级链路；`normalize_code` 前缀直通 + 模式感知归一（顶栏市场下拉，
+  ini `[market] mode` 持久化）；
+- **数据源**：hk/us/fut 优先直读 sm701 副本库行情表（hk_daily/us_daily/fut_daily
+  ——训练数据源，特征口径一致；`_sm701_market_bars`），Yahoo chart v8 兜底
+  （`_yf_chart`，urllib 走 `_http_get` 继承节流/熔断/离线/代理路由）；crypto 仅 Yahoo；
+- **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
+  > **sm701 直出**（`sm701_paths(market)` 生产集 `prod_{hk|us|fut}_h{1,5,10}_tech.txt`
+  + 各市场样本外预测文件；`_sm701_live_one` 副本库同源实时复算）> 多维评分
+  （crypto 无模型回退并标注）；
+- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
+  （杠杆 `leverage_市场`，T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
+  （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
+- 涨跌停：`_limit_pct` 非 cn 返回 None（钳制/异常校验自动放行）。
 
 ### 2.1 数据源容灾：通道策略 + 快照/日K/板块多源（2026-09-25 热修）
 
@@ -1040,6 +1057,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.0.1**<br>（2026-10-25） | **多市场正式版（合并 market-sniper）**：①市场前缀代码（hk/us/fu/crypto）与 cn 同库同表，顶栏市场下拉+模式感知 normalize；②sm701 多市场直出（副本库同源行情 + 各市场生产三模型 + 样本外概率文件，`_sm701_live_one` 单股复算，策略链 工坊绑定>sm701>多维）；③工坊按市场应用（`[studio] bind_*`）；④交易插件分市场账本+杠杆+T+0（`{市场}:{实盘|模拟}`，`leverage_市场`）；⑤指标参数分市场（`[inds_市场]` 覆盖 + `INDP()` 线程上下文）；⑥自选池按市场分开；⑦`backtest_sm701_markets.py` 三市场回测（hk 胜率60%/us 55.6%/fut 53.1%）+ 网页面板「多市场 sm701 信号概览」节；⑧`APP_VERSION=7.0.1`；2.0 节新增 |
 | **v6.6.5**<br>（2026-10-24） | **日K 同花顺第三梯队源 + 源链可配置 + 回填多源兜底 + 增量瘦身 + 基期检测缺陷修复**：①`_fetch_ths`（`d.10jqka.com.cn/v6/line` JSONP，last.js 近140根 + 按年文件回拼~20年，`_ths_symbol` 映射个股/ETF/科创板/深指、上证指数无映射）——**完整前复权口径原样入库不乘因子**，排新浪后东财前；同轮对拍澄清新浪源口径与库内一致（0.000%）；②源链注册层 `_kline_builtin_defs/_kline_sources/_reload_kline_srcs/_load_kline_src_cfg/_apply_kline_src_cfg/_probe_kline_src`（ini `[data] kline_srcs/custom_kline`），设置新增「数据源」分区（内置源启停/排序/测试 + 自定义源增删测，类型 tx/ths/em/sina/163），同 URL 去重、全停用回默认、急救箱联动；③`_bf_fetch_one` 腾讯→同花顺→东财三级兜底（`_bf_hint_set` 复用）；④`get_daily` 增量只拉 120 根小窗、漂移时自动升级全量重定基；⑤**修复 P0**：基期漂移检测 break-early 缺陷（口径级差异 checked 恒=1 误判重叠不足→混写接缝，实测 +95.7% 跳变），`get_daily`/`backfill_full_market` 均改扫完再判；⑥`_DOMESTIC_SUFFIX`+`10jqka.com.cn`，firstaid 增同花顺套件；⑦**修复「分析后 K 线长时间不显示」**：`_SM701_CACHE` 三个缓存 key 由库文件 mtime 改为数据内容指纹（`_db_latest_date()` + 当日 30 分钟桶 `_sm701_cache_epoch`）——mtime 随每轮预取写库必变，致 sm701 选型股（全库 ~4200 只）每次分析都触发 ~110s 全市场实时复算、主图空白（实测首算 115s→二次 5.3s→模拟写库后 2.4s）；⑧**买卖点懒加载**：`analyze(defer_signals=)` + `analyze_finish_signals()`——GUI 五入口先渲染K线（实测首屏 1.2s）、sm701/lgbm 信号后台补算后 `_signals_done` 重绘叠画，CLI 默认不 defer 口径零变化；`APP_VERSION=6.6.5`，`stock_predict.py` 重新生成；2.1/2.5 节与 README/CHANGELOG 同步 |
 | **v6.6.4**<br>（2026-10-20） | **荐股 sm701 数据源修复 + 代码表防截断 + sm701 并入消融 + 全库三档对照**：①`_sm701_live_predict()` 新增取数库选择（sm701 副本日K落后时用主库，`_db_latest_date()`；缓存 key 加取数库/主库 mtime），修复 test 荐股最新信号日全 NaN、列表 0 只；荐股空结果提示与数据源日期同步；②`refresh_all_codes()` 仅在 ≥5000 只且 ≥现有 A 股 90% 时全量替换，部分拉取改为合并保留旧表（修复 5799→3396 截断）；③`run_ablation`/`backtest_strategy_ablation.py` 新增 `sm701` 候选（13 算法；GUI 42 候选），新增 `_sig_sm701_from_probs()`，研究父进程一次性构建概率矩阵注入 worker；④`backtests/compare_tier_sm701.py` 全库对照（2024-03-12~2026-10-19）：稳健 sm701 胜、均衡/激进当前胜、test 原生负 → 不整体替换；全库消融 7198 有效对象中 sm701 入选稳健 2326（32.3%）/均衡 1911（26.6%），候选层 IC5 +0.105 vs LGBM -0.002；`research/compare_tier_sm701.json`；⑤`APP_VERSION=6.6.4`，`stock_predict.py` 重新生成；3.7/3.8 节与 README/CHANGELOG 同步 |
 | **v6.6.3**<br>（2026-10-18） | **test 档 sm701 切换生产定稿三周期模型**：`_sm701_production_set()` 探测副本 `production/`（`features_tech.json` + `prod_h1\|h5\|h10_tech.txt`），命中即用生产三周期 tech 模型、历史改读 `production/valid_predictions.csv.gz`，否则回退旧单模型（`SM701_MODEL` 显式指定强制单模型）；`_sm701_predict_feats()` 按 `features_tech.json` 列序对三模型打分、**等权平均**（`sm701_score_matrix`/`_sm701_live_predict`/`sm701_prob_map` 共用）；缓存 key 改 `_sm701_model_mtimes()`（三模型逐个 mtime），`sm701_status()` 增 `prod_*`；副本侧新增 `production/make_predictions.py` 生成历史预测；对拍末交易日 2026-09-30 逐元素一致（sh600000 0.42401537），生产 h1 模型 2024+ AUC 0.5446；`APP_VERSION=6.6.3`，`stock_predict.py` 重新生成；3.7 节与 README/CHANGELOG 同步 |

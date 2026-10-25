@@ -205,11 +205,24 @@ def collect_ablation(research_dir, max_n=2):
     return out
 
 
+def collect_sm701_markets(research_dir):
+    """多市场 sm701 回测汇总（v7.0.1：research/sm701_markets.json）。"""
+    p = os.path.join(research_dir, "sm701_markets.json")
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def build_dashboard(research_dir, out=None, max_runs=6):
     runs = collect_runs(research_dir, max_runs=max_runs)
     gui = collect_gui(research_dir)
     perstock = collect_perstock(research_dir)
     ablations = collect_ablation(research_dir)
+    sm701mk = collect_sm701_markets(research_dir)
     data = {
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "research_dir": os.path.abspath(research_dir),
@@ -217,6 +230,7 @@ def build_dashboard(research_dir, out=None, max_runs=6):
         "gui": gui,
         "perstock": perstock,
         "ablations": ablations,
+        "sm701_markets": sm701mk,
         "tables": list(TABLE_FILES),
         "charts": list(CHART_FILES),
     }
@@ -346,6 +360,8 @@ tr:hover td{background:var(--panel2)}
     <div id="c-metrics"></div>
     <h3 style="margin:14px 0 4px;font-size:15px">消融汇总 · 全市场逐股（含 IC 中位数）<span class="sub" id="abl-sub"></span></h3>
     <div id="c-abl"></div>
+    <h3 style="margin:14px 0 4px;font-size:15px">多市场 sm701 信号概览 · 港股/美股/期货 top30<span class="sub" id="smk-sub"></span></h3>
+    <div id="c-smk"></div>
   </section>
   <section id="tab-metrics" class="tab">
     <div class="ctl">
@@ -736,6 +752,7 @@ function renderCurve(){
   $("#c-sum").innerHTML=cards?('<div class="cards">'+cards+'</div>'):"";
   renderMetricsTable(run,u,tiers);
   renderAblTable();
+  renderSm701Markets();
 }
 /* 组合指标表（净值曲线下方，v6.2.1 可读性：一张表看全档关键数字） */
 function renderMetricsTable(run,u,tiers){
@@ -796,6 +813,28 @@ function renderAblTable(){
   $("#c-abl").innerHTML=h+'</table>'+
     '<div class="note">IC=选中策略信号方向 vs 未来1/5日收益的 Spearman 相关系数'+
     '（全样本描述性统计，不参与选型）；年化/胜率中位=逐股消融选中策略的中位数。</div>';
+}
+function renderSm701Markets(){
+  const mk=DATA.sm701_markets;
+  if(!mk||!mk.markets){$("#c-smk").innerHTML=
+    '<div class="note">暂无多市场回测：跑 backtests/backtest_sm701_markets.py 后刷新。</div>';
+    $("#smk-sub").textContent="";return;}
+  $("#smk-sub").textContent="　生成 "+(mk.generated||"")+"（概率滞回信号·test风控·近1000根）";
+  let h='<table><tr><th>市场</th><th>有效/抽样</th><th>交易数中位</th><th>胜率中位</th>'+
+    '<th>年化中位</th><th>回撤中位</th><th>区间收益中位</th><th>买入持有中位</th></tr>';
+  Object.keys(mk.markets).forEach(k=>{
+    const v=mk.markets[k]||{};
+    if(v.skipped){h+=`<tr><td>${esc(k)}</td><td colspan="7">无生产模型</td></tr>`;return;}
+    const s=v.summary||{};
+    const pct2=(x,d)=>x==null?'-':(x*100).toFixed(d)+'%';
+    h+=`<tr><td>${esc(k)}</td><td>${num(s.n_traded,0)}/${num(s.n,0)}</td>`+
+       `<td>${num(s.trades_median,1)}</td><td>${pct2(s.winrate_median,1)}</td>`+
+       `<td>${pct2(s.ann_median,1)}</td><td>${pct2(s.mdd_median,1)}</td>`+
+       `<td>${pct2(s.total_median,1)}</td><td>${pct2(s.bh_median,1)}</td></tr>`;
+  });
+  $("#c-smk").innerHTML=h+'</table>'+
+    '<div class="note">sm701 概率滞回信号（≥0.55买/<0.50卖，test 档风控），'+
+    '各市场成交量 Top30、近1000根日K逐股回测的中位数；历史概率为样本外落盘。</div>';
 }
 function renderMetrics(){
   const run=curRun(); if(!run)return;

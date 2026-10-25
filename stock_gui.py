@@ -110,8 +110,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-24 升 6.6.5）
-APP_VERSION = "6.6.5"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-10-25 升 7.0.1 多市场）
+APP_VERSION = "7.0.1"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -494,6 +494,39 @@ def _load_studio_cfg():
         log.exception("读取外部策略参数失败(使用默认)")
 
 
+
+# ---- 指标参数分市场（v7.0.1）：ini [inds] 为A股，[inds_市场] 为覆盖；
+# calc_* 经 INDP() 读取：优先当前线程上下文市场（analyze/消融入口设置），
+# 无上下文用 A股。实现线程本地，避免并发分析互相串参数。
+_IND_TLS = threading.local()
+
+
+def _ind_ctx_market():
+    return getattr(_IND_TLS, "market", None)
+
+
+def _ind_ctx_set(market):
+    _IND_TLS.market = market if market in _MARKET_LABELS else None
+
+
+def _ind_ctx_clear():
+    if getattr(_IND_TLS, "market", None) is not None:
+        _IND_TLS.market = None
+
+
+_IND_BY_MARKET = {}     # market -> {attr: value}（_load_ind_cfg 填充）
+
+
+def INDP(attr):
+    """当前生效的指标参数：线程上下文市场的覆盖值 > A股值。"""
+    mk = getattr(_IND_TLS, "market", None)
+    if mk and mk != "cn":
+        ov = _IND_BY_MARKET.get(mk)
+        if ov and attr in ov:
+            return ov[attr]
+    return getattr(CFG, attr)
+
+
 def _load_ind_cfg():
     """从 stock_gui.ini [inds] 读取指标参数（带范围钳制，v6.3.2）。"""
     try:
@@ -516,23 +549,54 @@ def _load_ind_cfg():
             except (ValueError, TypeError):
                 return dflt
 
-        CFG.MACD_FAST = gi("macd_fast", CFG.MACD_FAST, 2, 60)
-        CFG.MACD_SLOW = gi("macd_slow", CFG.MACD_SLOW, 3, 120)
-        if CFG.MACD_SLOW <= CFG.MACD_FAST:      # 慢线须大于快线
-            CFG.MACD_SLOW = CFG.MACD_FAST + 1
-        CFG.MACD_SIGNAL = gi("macd_signal", CFG.MACD_SIGNAL, 2, 60)
-        CFG.KDJ_N = gi("kdj_n", CFG.KDJ_N, 2, 60)
-        CFG.KDJ_M1 = gi("kdj_m1", CFG.KDJ_M1, 2, 20)
-        CFG.KDJ_M2 = gi("kdj_m2", CFG.KDJ_M2, 2, 20)
-        CFG.RSI_SHORT = gi("rsi_short", CFG.RSI_SHORT, 2, 60)
-        CFG.RSI_LONG = gi("rsi_long", CFG.RSI_LONG, 2, 60)
-        CFG.BOLL_N = gi("boll_n", CFG.BOLL_N, 5, 120)
-        CFG.BOLL_K = gf("boll_k", CFG.BOLL_K, 0.5, 4.0)
-        CFG.ADX_N = gi("adx_n", CFG.ADX_N, 2, 60)
-        CFG.ADX_SMOOTH = gi("adx_smooth", CFG.ADX_SMOOTH, 2, 60)
-        CFG.ADX_TH = gi("adx_th", CFG.ADX_TH, 10, 60)
+        CFG.MACD_FAST = gi("macd_fast", INDP("MACD_FAST"), 2, 60)
+        CFG.MACD_SLOW = gi("macd_slow", INDP("MACD_SLOW"), 3, 120)
+        if INDP("MACD_SLOW") <= INDP("MACD_FAST"):      # 慢线须大于快线
+            CFG.MACD_SLOW = INDP("MACD_FAST") + 1
+        CFG.MACD_SIGNAL = gi("macd_signal", INDP("MACD_SIGNAL"), 2, 60)
+        CFG.KDJ_N = gi("kdj_n", INDP("KDJ_N"), 2, 60)
+        CFG.KDJ_M1 = gi("kdj_m1", INDP("KDJ_M1"), 2, 20)
+        CFG.KDJ_M2 = gi("kdj_m2", INDP("KDJ_M2"), 2, 20)
+        CFG.RSI_SHORT = gi("rsi_short", INDP("RSI_SHORT"), 2, 60)
+        CFG.RSI_LONG = gi("rsi_long", INDP("RSI_LONG"), 2, 60)
+        CFG.BOLL_N = gi("boll_n", INDP("BOLL_N"), 5, 120)
+        CFG.BOLL_K = gf("boll_k", INDP("BOLL_K"), 0.5, 4.0)
+        CFG.ADX_N = gi("adx_n", INDP("ADX_N"), 2, 60)
+        CFG.ADX_SMOOTH = gi("adx_smooth", INDP("ADX_SMOOTH"), 2, 60)
+        CFG.ADX_TH = gi("adx_th", INDP("ADX_TH"), 10, 60)
     except Exception:
         log.exception("读取指标参数失败(使用默认)")
+    # v7.0.1 分市场覆盖：[inds_hk]/[inds_us]/[inds_futures]/[inds_crypto]
+    # （键与 [inds] 相同；未设项继承 A股值）
+    _IND_BY_MARKET.clear()
+    for mk in ("hk", "us", "futures", "crypto"):
+        sec = f"inds_{mk}"
+        ov = {}
+        try:
+            cp = configparser.ConfigParser()
+            cp.read(INI_PATH, encoding="utf-8")
+            if cp.has_section(sec):
+                for key in ("macd_fast", "macd_slow", "macd_signal",
+                            "kdj_n", "kdj_m1", "kdj_m2", "rsi_short",
+                            "rsi_long", "boll_n", "boll_k", "adx_n",
+                            "adx_smooth", "adx_th"):
+                    raw = cp.get(sec, key, fallback="").strip()
+                    if not raw:
+                        continue
+                    attr = key.upper()
+                    lo, hi = IND_RANGES[attr]
+                    try:
+                        v = float(raw) if attr == "BOLL_K" else int(float(raw))
+                    except (ValueError, TypeError):
+                        continue
+                    ov[attr] = max(lo, min(hi, v))
+        except Exception:
+            log.exception("读取 %s 指标覆盖失败(忽略)" % sec)
+        if ov:
+            _IND_BY_MARKET[mk] = ov
+    if _IND_BY_MARKET:
+        log.info("指标参数分市场覆盖: %s",
+                 {k: len(v) for k, v in _IND_BY_MARKET.items()})
 
 
 # 指标参数范围/类型（设置→指标参数 与 ini [inds] 共用）
@@ -565,7 +629,7 @@ def set_ind_param(attr, value):
         return None
     v = max(lo, min(hi, v))
     setattr(CFG, attr, v)
-    if attr == "MACD_FAST" and CFG.MACD_SLOW <= v:
+    if attr == "MACD_FAST" and INDP("MACD_SLOW") <= v:
         CFG.MACD_SLOW = min(120, v + 1)
     return v
 
@@ -1298,10 +1362,13 @@ def sanitize_daily_db() -> None:
 
 def _limit_pct(code, name, date):
     """该股当日允许的涨跌幅限制(%)，无限制返回None。
+    - 港股/美股/期货/加密无涨跌停限制（v6.6.5 多市场）；
     - 主板普通股10%；主板ST在2026-07-06新规实施前为5%，之后统一10%
     - 创业板2020-08-24注册制改革后20%（含ST）、科创板20%（含ST）
     - 北交所30%
     - 1996-12-16涨跌停板制度实施前不限"""
+    if _market_of(code) != "cn":
+        return None              # 港美期市无涨跌停（加密 7×24）
     if date < "1996-12-16":
         return None
     if code.startswith("bj"):
@@ -2359,7 +2426,10 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     只有从未成功获取过的代码才会触发网络请求和负缓存。
     tail: 非空时只返回最近 tail 根（用于启动快速预览，走缓存秒开）。
     库内一律存后复权(hfq)；返回前按 adjust 缩放为乘法前复权显示。
-    2026-09-26：缓存判定/拉取/来源写入 stock_fetch.log（见 flog）。"""
+    2026-09-26：缓存判定/拉取/来源写入 stock_fetch.log（见 flog）。
+    v6.6.5：hk/us/fu/crypto 前缀走多市场链路（Yahoo，独立新鲜度/口径）。"""
+    if _market_of(full) != "cn":
+        return _get_daily_market(full, tail=tail)
     _fstat_inc("calls")
     today = time.strftime("%Y-%m-%d")
     # 指数用"收盘后才有今日"口径（自身是日历锚），个股用节假日安全口径
@@ -3948,6 +4018,29 @@ def normalize_code(code):
         for ch in code)
     # 只保留ASCII字母数字：零宽/NBSP/控制字符/中文标点一次性清除
     code = "".join(ch for ch in code if ch.isascii() and ch.isalnum())
+    # ---- 多市场（v6.6.5）：hk00700 / usaapl / fugc / cryptobtcusdt ----
+    for p in ("crypto", "hk", "us", "fu"):
+        if code.startswith(p) and len(code) > len(p):
+            body = code[len(p):]
+            if p == "hk" and body.isdigit() and 1 <= len(body) <= 5:
+                return "hk" + body.zfill(5)
+            if p == "us" and body.isalnum():
+                return "us" + body
+            if p == "fu" and body.isalnum():
+                return "fu" + body
+            if p == "crypto" and body.isalnum():
+                return "crypto" + body
+    # 当前市场模式下的无前缀输入（GUI 市场下拉切换后生效）
+    mk = _CUR_MARKET[0]
+    if mk == "hk" and code.isdigit() and 1 <= len(code) <= 5:
+        return "hk" + code.zfill(5)
+    if mk == "us" and code.isalnum() and not code.isdigit() \
+            and len(code) <= 6:
+        return "us" + code
+    if mk == "futures" and code.isalnum() and 1 <= len(code) <= 3:
+        return "fu" + code
+    if mk == "crypto" and 5 < len(code) <= 12 and code.isalnum():
+        return "crypto" + code
     # 兼容 002241sz / sz.002241 / sh-600519 / 600519.SH 等变体
     if len(code) == 8 and code[-2:] in ("sh", "sz", "bj"):
         code = code[-2:] + code[:6]    # 002241sz → sz002241
@@ -4338,7 +4431,10 @@ def _fetch_quote_em(full):
 
 
 def fetch_quote(full):
-    """行情快照多源容灾：腾讯 → 新浪 → 东财，任一成功即返回。"""
+    """行情快照多源容灾：腾讯 → 新浪 → 东财，任一成功即返回。
+    v6.6.5：hk/us/fu/crypto 走 Yahoo 快照（多市场）。"""
+    if _market_of(full) != "cn":
+        return fetch_market_quote(full)
     last = None
     for name, fetcher in (("腾讯行情", _fetch_quote_tencent),
                           ("新浪行情", _fetch_quote_sina),
@@ -4483,14 +4579,24 @@ def fetch_batch_quotes(codes, ttl=_IDX_QUOTE_TTL):
     # 3) 网络批量拉取（只拉缺失/过期的）
     fetched = {}
     last = None
-    for fetcher in (_batch_tencent, _batch_sina):
-        try:
-            fetched = fetcher(still_need)
-            if fetched:
-                break
-        except Exception as e:
-            last = e
-            continue
+    if any(_market_of(c) != "cn" for c in still_need):
+        # v6.6.5 多市场：腾讯批量仅支持 cn（hk/us 需逐只），走市场路由缓存
+        for c in still_need:
+            try:
+                fetched[c] = fetch_quote_cached(c)
+            except Exception as e:
+                last = e
+        if not fetched:
+            fetched = {}
+    else:
+        for fetcher in (_batch_tencent, _batch_sina):
+            try:
+                fetched = fetcher(still_need)
+                if fetched:
+                    break
+            except Exception as e:
+                last = e
+                continue
     if fetched:
         with _STATE_LOCK:
             for c, q in fetched.items():
@@ -4636,7 +4742,37 @@ def fetch_minute_lines(full):
     - 盘中：内存缓存 60s，过期重拉（拉取失败回退缓存，显示最近可得分时）；
     - 收盘/休市：当日数据已定型，直接用缓存（库内/内存），不联网；
     - SQLite minute_cache 每代码只保留最新一个交易日（写入即清旧行），
-      跨重启、离线均可显示最近交易日的分时。"""
+      跨重启、离线均可显示最近交易日的分时。
+    v6.6.5：hk/us/fu/crypto 走 Yahoo 1m（分时缓存口径相同）。"""
+    if _market_of(full) != "cn":
+        active = True            # 港美期加交易时段各异，统一 60s TTL 重拉
+        now = time.time()
+        with _MINUTE_LOCK:
+            hit = _MINUTE_MEM.get(full)
+            if hit and now - hit.get("ts", 0) < _MINUTE_TTL_LIVE:
+                return hit
+        try:
+            data = _fetch_minute_market(full)
+        except Exception:
+            if hit:
+                return hit
+            raise
+        data["vols"], data["avg"] = _minute_derive(data["rows"])
+        data["ts"] = now
+        with _MINUTE_LOCK:
+            _MINUTE_MEM[full] = data
+        try:
+            blob = json.dumps({k: data[k] for k in
+                               ("day", "rows", "prev_close", "vols", "avg")},
+                              ensure_ascii=False, separators=(",", ":"))
+            with db_conn(commit=True) as conn:
+                conn.execute("DELETE FROM minute_cache WHERE code=?", (full,))
+                conn.execute(
+                    "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
+                    (full, data["day"], blob, now))
+        except Exception:
+            log.debug("分时缓存写库失败", exc_info=True)
+        return data
     now = time.time()
     active = _minute_active()
     with _MINUTE_LOCK:
@@ -4690,6 +4826,427 @@ def fetch_daily(full):
     return get_daily(full, min_bars=100)
 
 
+# ================= 多市场（v6.6.5：港股/美股/期货/加密 快速切换） =================
+# 合并桌面 market-sniper 的多市场能力（HK/US/CRYPTO + 期货），用本项目 UI。
+# 代码前缀：hk00700 / usaapl / fugc（GC=F）/ cryptobtcusdt（BTC-USD）；
+# cn（sh/sz/bj）原链路完全不动。日K/分钟/报价统一走 Yahoo chart v8
+# （经 _http_get：复用节流/数据源熔断/离线快速失败/代理路由——国外域名代理
+# 优先）。sniper 原库不读不写，池子与符号映射内联（含 sniper 默认池）。
+
+_MARKET_LABELS = {"cn": "A股", "hk": "港股", "us": "美股",
+                  "futures": "期货", "crypto": "加密"}
+_CUR_MARKET = ["cn"]            # 当前模式（normalize 的无前缀输入归一用）
+
+_MARKET_POOLS = {
+    "hk": [("00700", "腾讯控股"), ("09988", "阿里巴巴-W"),
+           ("03690", "美团-W"), ("01810", "小米集团-W"),
+           ("02318", "中国平安"), ("01211", "比亚迪股份"),
+           ("00939", "建设银行"), ("01398", "工商银行"),
+           ("00388", "香港交易所"), ("00005", "汇丰控股"),
+           ("00941", "中国移动"), ("02020", "安踏体育"),
+           ("01024", "快手-W"), ("09618", "京东集团-SW"),
+           ("09961", "携程集团-S"), ("02628", "中国人寿"),
+           ("02269", "药明生物-W")],
+    "us": [("AAPL", "Apple Inc."), ("MSFT", "Microsoft"),
+           ("GOOGL", "Alphabet A"), ("AMZN", "Amazon"),
+           ("NVDA", "NVIDIA"), ("META", "Meta Platforms"),
+           ("TSLA", "Tesla"), ("NFLX", "Netflix"),
+           ("AMD", "AMD"), ("INTC", "Intel"),
+           ("BABA", "Alibaba ADR"), ("PDD", "PDD Holdings"),
+           ("NIO", "NIO"), ("XOM", "Exxon"),
+           ("JPM", "JPMorgan"), ("V", "Visa"),
+           ("MA", "Mastercard"), ("DIS", "Disney"),
+           ("COIN", "Coinbase"), ("MSTR", "MicroStrategy")],
+    "futures": [("GC", "COMEX黄金"), ("SI", "COMEX白银"),
+                ("CL", "NYMEX原油"), ("NG", "NYMEX天然气"),
+                ("HG", "COMEX铜"), ("PL", "COMEX铂金"),
+                ("ES", "标普500期货"), ("NQ", "纳斯达克100期货"),
+                ("YM", "道指期货"), ("RTY", "罗素2000期货"),
+                ("ZN", "美10年期国债"), ("6E", "欧元期货"),
+                ("6J", "日元期货"), ("BTC", "比特币期货")],
+    "crypto": [("BTCUSDT", "Bitcoin"), ("ETHUSDT", "Ethereum"),
+               ("SOLUSDT", "Solana"), ("BNBUSDT", "BNB"),
+               ("XRPUSDT", "XRP"), ("DOGEUSDT", "Dogecoin"),
+               ("ADAUSDT", "Cardano"), ("AVAXUSDT", "Avalanche"),
+               ("TRXUSDT", "TRON"), ("DOTUSDT", "Polkadot"),
+               ("LINKUSDT", "Chainlink"), ("LTCUSDT", "Litecoin"),
+               ("BCHUSDT", "Bitcoin Cash"), ("ETCUSDT", "Ethereum Classic"),
+               ("UNIUSDT", "Uniswap"), ("APTUSDT", "Aptos"),
+               ("ARBUSDT", "Arbitrum"), ("OPUSDT", "Optimism")],
+}
+
+
+def set_market_mode(market):
+    """设置当前市场模式（normalize 无前缀输入的归一口径；GUI 下拉/CLI 默认 cn）。"""
+    if market in _MARKET_LABELS:
+        _CUR_MARKET[0] = market
+    return _CUR_MARKET[0]
+
+
+def _market_of(full):
+    """代码所属市场：hk/us/fu(crypto 前缀另判)/cn。"""
+    s = (full or "").strip().lower()
+    if s.startswith("crypto") and len(s) > 6:
+        return "crypto"
+    if s[:2] in ("hk", "us") and len(s) > 2:
+        return s[:2]
+    if s[:2] == "fu" and len(s) > 2:
+        return "futures"
+    return "cn"
+
+
+def _market_yf_symbol(full):
+    """本项目前缀代码 → Yahoo 符号：hk00700→0700.HK、usaapl→AAPL、
+    fugc→GC=F、cryptobtcusdt→BTC-USD。"""
+    s = (full or "").strip().lower()
+    mk = _market_of(s)
+    body = s[2:] if mk != "crypto" else s[6:]
+    if mk == "hk":
+        digits = body.lstrip("0") or "0"
+        return digits.zfill(4) + ".HK"
+    if mk == "us":
+        return body.upper()
+    if mk == "futures":
+        return body.upper() + "=F"
+    # crypto：BASEQUOTE → BASE-QUOTE（USDT 计价 → USD，Yahoo 惯例）
+    body = body.upper()
+    for q in ("USDT", "USD", "BTC", "ETH"):
+        if body.endswith(q) and len(body) > len(q):
+            base = body[:-len(q)]
+            return base + "-" + ("USD" if q == "USDT" else q)
+    return body
+
+
+def _sm701_market_bars(full):
+    """多市场日K**同源数据**：直读 sm701 副本库行情表（hk_daily/us_daily/
+    fut_daily——sm701 训练数据源，特征口径完全一致）。无该股返回 []。"""
+    mk = _market_of(full)
+    if mk not in _SM701_MK or mk == "cn":
+        return []
+    try:
+        paths = sm701_paths(market=mk)
+    except Exception:
+        return []
+    table = _SM701_MK[mk]["table"]
+    code = _sm701_code(full)
+    con = _sm701_conn(paths["db"])
+    try:
+        rows = con.execute(
+            f"SELECT date,open,high,low,close,vol FROM {table} "
+            f"WHERE code=? ORDER BY date", (code,)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        con.close()
+    out = []
+    for d, o, h, l, c, v in rows:
+        if c and c > 0:
+            out.append({"date": d, "open": float(o), "high": float(h),
+                        "low": float(l), "close": float(c),
+                        "vol": float(v or 0)})
+    return out
+
+
+def _sniper_names(market):
+    """sniper 库 stocks 表的市场名称映射（只读；{code: name}）。"""
+    cache = _SNIPER_NAMES.get(market)
+    if cache is not None:
+        return cache
+    out = {}
+    try:
+        home = os.path.expanduser("~")
+        db = os.path.join(home, "桌面", "market-sniper", "data",
+                          "market_cache.db")
+        if os.path.isfile(db):
+            uri = ("file:" + urllib.parse.quote(db) + "?mode=ro")
+            con = sqlite3.connect(uri, uri=True, timeout=10)
+            try:
+                for c, n in con.execute(
+                        "SELECT code, name FROM stocks WHERE market=? "
+                        "AND name IS NOT NULL AND name<>''", (market.upper(),)):
+                    out[c] = n
+            finally:
+                con.close()
+    except Exception:
+        log.debug("sniper 名称表读取失败(忽略)", exc_info=True)
+    _SNIPER_NAMES[market] = out
+    return out
+
+
+_SNIPER_NAMES = {}
+
+
+def _sm701_market_pool(market):
+    """多市场池（从 sm701 副本库行情表取实际有数据的代码，名称借 sniper 库）。
+    futures=副本库 fut_daily 的 82 只国内期货品种（A0 等）。"""
+    mk = market
+    if mk not in ("hk", "us", "futures"):
+        return None
+    if mk == "futures":
+        table = "fut_daily"
+    else:
+        table = f"{mk}_daily"
+    try:
+        paths = sm701_paths(market=mk)
+    except Exception:
+        return None
+    con = _sm701_conn(paths["db"])
+    try:
+        codes = [r[0] for r in con.execute(
+            f"SELECT code, COUNT(*) c FROM {table} GROUP BY code "
+            f"HAVING c>=200 ORDER BY code")]
+    except sqlite3.Error:
+        codes = []
+    finally:
+        con.close()
+    names = _sniper_names({"hk": "HK", "us": "US"}.get(mk, ""))
+    out = []
+    for code in codes:
+        full = (mk[:2] if mk != "futures" else "fu") + code.lower()
+        out.append((full, names.get(code, code)))
+    return out
+
+
+def _market_last_expected(full):
+    """多市场日K应最新的自然日（周六日回退到周五；crypto 按 UTC 当日）。"""
+    import datetime
+    d = datetime.date.today()
+    if _market_of(full) == "crypto":
+        return d.strftime("%Y-%m-%d")
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+_YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+_YF_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "1h", "1d", "1wk",
+                 "1mo"}
+
+
+def _yf_chart(yf_symbol, interval="1d", period="1mo"):
+    """Yahoo chart v8（urllib 走 _http_get：节流/熔断/离线快速失败/代理路由）。
+    429 时退避重试一次。返回解析后的 chart json。"""
+    if interval not in _YF_INTERVALS:
+        raise ValueError(f"bad interval: {interval}")
+    url = (f"{_YF_BASE}/{urllib.parse.quote(yf_symbol)}"
+           f"?interval={interval}&range={period}&includePrePost=false")
+    last = None
+    for attempt in range(2):
+        try:
+            txt = _http_get(url, retries=2, timeout=15,
+                            headers={"Accept": "application/json",
+                                     "Accept-Language": "en-US"})
+            j = json.loads(txt)
+            err = (j.get("chart") or {}).get("error")
+            if err:
+                raise RuntimeError(f"yahoo error: {err}")
+            return j
+        except Exception as e:
+            last = e
+            if _is_ratelimit_err(e) and attempt == 0:
+                time.sleep(1.0)
+                continue
+            break
+    raise RuntimeError(f"yahoo fetch failed: {last}")
+
+
+def _yf_rows(j, interval):
+    """chart json → [{date, open, high, low, close, vol}]（升序）。"""
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return []
+    r0 = res[0]
+    ts_list = r0.get("timestamp") or []
+    ind = ((r0.get("indicators") or {}).get("quote") or [{}])[0]
+    meta = r0.get("meta") or {}
+    out = []
+    for i, ts in enumerate(ts_list):
+        o, h, l, c, v = (ind.get("open") or [None] * len(ts_list))[i], \
+            (ind.get("high") or [None] * len(ts_list))[i], \
+            (ind.get("low") or [None] * len(ts_list))[i], \
+            (ind.get("close") or [None] * len(ts_list))[i], \
+            (ind.get("volume") or [0] * len(ts_list))[i]
+        if o is None or c is None or c <= 0:
+            continue
+        if interval == "1d":
+            date = time.strftime("%Y-%m-%d", time.gmtime(ts))
+        else:
+            date = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+        out.append({"date": date, "open": float(o), "high": float(h),
+                    "low": float(l), "close": float(c),
+                    "vol": float(v or 0)})
+    return out
+
+
+def fetch_market_daily(full, count=None):
+    """多市场日K：Yahoo 1d period=10y（一次拉足，差量入库）。"""
+    yf = _market_yf_symbol(full)
+    j = _yf_chart(yf, interval="1d", period="10y")
+    rows = _yf_rows(j, "1d")
+    n = int(count or CFG.MAX_FETCH_BARS * 2)
+    return rows[-n:] if n and len(rows) > n else rows
+
+
+def fetch_market_quote(full):
+    """多市场快照：Yahoo 5d 日K meta（last/prev_close/OHLC/名称/币种）。"""
+    yf = _market_yf_symbol(full)
+    j = _yf_chart(yf, interval="1d", period="5d")
+    rows = _yf_rows(j, "1d")
+    if not rows:
+        raise RuntimeError(f"{full} yahoo 无数据")
+    meta = ((j.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+    last_row = rows[-1]
+    prev = 0.0
+    try:
+        prev = float(meta.get("chartPreviousClose") or 0)
+    except (TypeError, ValueError):
+        prev = 0.0
+    if not prev and len(rows) > 1:
+        prev = rows[-2]["close"]
+    if not prev:
+        prev = last_row["open"] or last_row["close"]
+    ts = int(meta.get("regularMarketTime") or 0)
+    return {
+        "name": (meta.get("longName") or meta.get("shortName") or ""),
+        "price": float(last_row["close"]),
+        "prev_close": float(prev),
+        "open": float(meta.get("regularMarketOpen") or last_row["open"]),
+        "high": float(meta.get("regularMarketDayHigh") or last_row["high"]),
+        "low": float(meta.get("regularMarketDayLow") or last_row["low"]),
+        "time": (time.strftime("%Y%m%d%H%M%S", time.gmtime(ts))
+                 if ts else last_row["date"].replace("-", "")),
+        "currency": meta.get("currency"),
+        "market": _market_of(full),
+    }
+
+
+def _get_daily_market(full, tail=None):
+    """多市场日K（hk/us/fu/crypto）：库缓存 → Yahoo → 入库。
+
+    复用 daily_bars（code 前缀区分市场；vol 单位为股，同市场自洽）；
+    新鲜判定按市场日历（周六日回退周五，crypto 按当日）；yf 返回全历史，
+    差量时整只替换（同源同口径，无接缝风险）。失败回退本地缓存。"""
+    _fstat_inc("calls")
+    today = time.strftime("%Y-%m-%d")
+    fresh = _market_last_expected(full)
+    with db_conn() as conn:
+        rows = _db_rows(conn, full)
+    need = (not rows or len(rows) < 60 or rows[-1]["date"] < fresh)
+    if rows and not need:
+        _fstat_inc("hit")
+        return _display_rows(full, rows, tail)
+    t_pull = time.time()
+    info = {}
+    try:
+        # v6.6.5 同源优先：hk/us/fut 直读 sm701 副本库（训练数据源，特征
+        # 口径与模型一致）；副本无该股 → Yahoo 兜底。crypto 仅 Yahoo。
+        remote = _sm701_market_bars(full)
+        if remote:
+            info["src"] = "sm701副本库"
+        else:
+            remote = [r for r in fetch_market_daily(full)
+                      if r["date"] < today or _allow_today_bar()
+                      and r["date"] == today]
+            if not remote:
+                raise RuntimeError("yahoo 空K线")
+            info["src"] = "yahoo"
+    except Exception as e:
+        _fstat_inc("pull_fail")
+        flog.info("多市场拉取失败 %s: %s", full, e)
+        if rows:
+            return _display_rows(full, rows, tail)      # 离线回退缓存
+        _record_fail(full, e)
+        raise
+    with db_conn(commit=True) as conn:
+        conn.execute("DELETE FROM failed WHERE code=?", (full,))
+        if len(remote) >= len(rows):
+            conn.execute("DELETE FROM daily_bars WHERE code=?", (full,))
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily_bars"
+            "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
+            [(full, r["date"], r["open"], r["high"], r["low"],
+              r["close"], r["vol"]) for r in remote])
+        rows = _db_rows(conn, full)
+    _fstat_inc("pull_ok")
+    flog.info("多市场入库 %s 源=yahoo %d根 合并后=%d根(末日%s) 耗时=%.0fms",
+              full, len(remote), len(rows), rows[-1]["date"] if rows else "-",
+              (time.time() - t_pull) * 1000)
+    return _display_rows(full, rows, tail)
+
+
+def _fetch_minute_market(full):
+    """多市场分时：Yahoo 1m period=1d（crypto 按 UTC 日）→ 与腾讯分时同构
+    rows[(hhmm, price, cum_vol, 0)]；prev_close 取库内前一交易日收盘。"""
+    yf = _market_yf_symbol(full)
+    j = _yf_chart(yf, interval="1m", period="1d")
+    bars = _yf_rows(j, "1m")
+    if len(bars) < 10:
+        raise RuntimeError("yahoo 分时数据过短")
+    rows, cum = [], 0.0
+    for b in bars:
+        hhmm = b["date"][11:13] + b["date"][14:16]
+        cum += b["vol"]
+        rows.append((hhmm, b["close"], cum, 0.0))
+    day = bars[-1]["date"][:10]
+    prev = None
+    try:
+        with db_conn() as conn:
+            r = conn.execute(
+                "SELECT close FROM daily_bars WHERE code=? AND date<? "
+                "ORDER BY date DESC LIMIT 1",
+                (full, day)).fetchone()
+        prev = float(r[0]) if r else None
+    except Exception:
+        prev = None
+    return {"day": day, "rows": rows, "prev_close": prev}
+
+
+def set_market_pool(market):
+    """把该市场池写入 stocks 表（搜索补全/预取即用；幂等）。
+
+    v6.6.5：hk/us/futures 优先从 sm701 副本库动态取（实际有数据的代码，
+    名称借 sniper 库；futures=82 只国内期货品种 A0 等），fallback 内置池。"""
+    dyn = _sm701_market_pool(market)
+    pool = dyn if dyn else _MARKET_POOLS.get(market) or []
+    label = _MARKET_LABELS.get(market, market)
+    n = 0
+    try:
+        with db_conn(commit=True) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS stocks("
+                "code TEXT PRIMARY KEY, name TEXT, industry TEXT, "
+                "mktcap REAL, tier TEXT, updated TEXT, "
+                "turnover REAL, pe REAL, pb REAL)")
+            for code, name in pool:
+                conn.execute(
+                    "INSERT OR REPLACE INTO stocks VALUES(?,?,?,?,?,?,?,?,?)",
+                    (code, name, label, None, None,
+                     time.strftime("%Y-%m-%d"), None, None, None))
+                n += 1
+            # 池替换：清除该市场旧行（如旧 GC=F 池；用户手输代码重输即可）
+            if pool:
+                marks = ",".join("?" * len(pool))
+                conn.execute(
+                    f"DELETE FROM stocks WHERE industry=? AND code NOT IN "
+                    f"({marks})", (label, *[c for c, _ in pool]))
+    except Exception:
+        log.exception("市场池写入失败 %s", market)
+    return n
+
+
+def _load_market_mode():
+    """启动时从 ini [market] mode 恢复市场模式（A股/港股/美股/期货/加密）。"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        set_market_mode(cp.get("market", "mode", fallback="cn").strip())
+    except Exception:
+        pass
+
+
+_load_market_mode()
+
+
 # ================= 指标计算 =================
 
 def sma_period(vals, n):
@@ -4715,9 +5272,9 @@ def ema(vals, n):
 def calc_macd(closes, fast=None, slow=None, signal=None):
     """MACD：EMA(快)-EMA(慢)=DIF、DEA=EMA(DIF,信号)、柱=2(DIF-DEA)。
     周期默认取 CFG（v6.3.2 可调，设置→指标参数）。"""
-    fast = int(fast or CFG.MACD_FAST)
-    slow = int(slow or CFG.MACD_SLOW)
-    signal = int(signal or CFG.MACD_SIGNAL)
+    fast = int(fast or INDP("MACD_FAST"))
+    slow = int(slow or INDP("MACD_SLOW"))
+    signal = int(signal or INDP("MACD_SIGNAL"))
     dif = [a - b for a, b in zip(ema(closes, fast), ema(closes, slow))]
     dea_raw = ema(dif, signal)
     dea = [None] * (signal - 1) + dea_raw[signal - 1:]
@@ -4727,9 +5284,9 @@ def calc_macd(closes, fast=None, slow=None, signal=None):
 
 def calc_kdj(rows, n=None, m1=None, m2=None):
     """KDJ：RSV(n) 回看，K/D 分别按 m1/m2 平滑（默认 9/3/3，CFG 可调）。"""
-    n = int(n or CFG.KDJ_N)
-    m1 = int(m1 or CFG.KDJ_M1)
-    m2 = int(m2 or CFG.KDJ_M2)
+    n = int(n or INDP("KDJ_N"))
+    m1 = int(m1 or INDP("KDJ_M1"))
+    m2 = int(m2 or INDP("KDJ_M2"))
     ks, ds = [], []
     k = d = 50.0
     for i in range(len(rows)):
@@ -4745,8 +5302,8 @@ def calc_kdj(rows, n=None, m1=None, m2=None):
 
 
 def calc_rsi(closes, n=None):
-    """RSI（Wilder 平滑）；n 缺省取 CFG.RSI_SHORT（短周期，信号打分用）。"""
-    n = int(n or CFG.RSI_SHORT)
+    """RSI（Wilder 平滑）；n 缺省取 INDP("RSI_SHORT")（短周期，信号打分用）。"""
+    n = int(n or INDP("RSI_SHORT"))
     out = [None] * len(closes)
     if len(closes) <= n:
         return out
@@ -4843,10 +5400,10 @@ def calc_chips(rows, cur_price=None, nbin=None, shares=None):
 def calc_adx(rows, n=None, smooth=None):
     """DMI/ADX：+DI、-DI、ADX。
     n = TR/±DM 的 Wilder 平滑周期，smooth = ADX（DX 平均）平滑周期；
-    两者缺省取 CFG.ADX_N / CFG.ADX_SMOOTH（v6.3.2 可调）。
+    两者缺省取 INDP("ADX_N") / INDP("ADX_SMOOTH")（v6.3.2 可调）。
     返回 (pdi, mdi, adx) 三条序列，预热期为 None。"""
-    n = int(n or CFG.ADX_N)
-    sm = int(smooth or CFG.ADX_SMOOTH)
+    n = int(n or INDP("ADX_N"))
+    sm = int(smooth or INDP("ADX_SMOOTH"))
     m = len(rows)
     pdi = [None] * m
     mdi = [None] * m
@@ -4889,8 +5446,8 @@ def calc_adx(rows, n=None, smooth=None):
 def calc_boll(closes, n=None, k=None):
     """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差（默认/范围取 CFG）。
     返回 (mid, up, low) 三条序列，预热期为 None。"""
-    n = int(n or CFG.BOLL_N)
-    k = float(CFG.BOLL_K if k is None else k)
+    n = int(n or INDP("BOLL_N"))
+    k = float(INDP("BOLL_K") if k is None else k)
     mid = sma_period(closes, n)
     up = [None] * len(closes)
     low = [None] * len(closes)
@@ -5407,7 +5964,7 @@ def daily_pick_score(rows, ind_ctx=None):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, CFG.RSI_SHORT)
+    r6 = calc_rsi(closes, INDP("RSI_SHORT"))
     b_mid, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     mas = {20: sma_period(closes, 20), 60: sma_period(closes, 60)}
@@ -5512,7 +6069,7 @@ def daily_pick_score(rows, ind_ctx=None):
         elif c > b_up[i]:
             _wadd("布林带", -1, "布林上轨超买")
     a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-    if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH:
+    if None not in (a_i, p_i, m_i) and a_i >= INDP("ADX_TH"):
         if p_i > m_i:
             _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
         elif m_i > p_i:
@@ -7065,7 +7622,7 @@ def _sig_kdj(rows):
 
 def _sig_rsi(rows):
     closes = [r["close"] for r in rows]
-    r6 = calc_rsi(closes, CFG.RSI_SHORT)
+    r6 = calc_rsi(closes, INDP("RSI_SHORT"))
     out = []
     for i in range(1, len(rows)):
         if r6[i] is None or r6[i - 1] is None:
@@ -7116,7 +7673,7 @@ def _composite_precompute(rows, chip_tail=400, use_chips=True):
     closes = [r["close"] for r in rows]
     dif, dea, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, CFG.RSI_SHORT)
+    r6 = calc_rsi(closes, INDP("RSI_SHORT"))
     _, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     ma20 = sma_period(closes, 20)
@@ -7198,7 +7755,7 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
                 (c < b_low[i] or c > b_up[i]):
             s["布林带"] = 1 if c < b_low[i] else -1
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
-        if None not in (a_i, p_i, m_i) and a_i >= CFG.ADX_TH and p_i != m_i:
+        if None not in (a_i, p_i, m_i) and a_i >= INDP("ADX_TH") and p_i != m_i:
             s["ADX"] = 1 if p_i > m_i else -1
         return s
 
@@ -8203,6 +8760,91 @@ def studio_active_strategy():
     }
 
 
+# ---- 策略工坊按市场绑定（v6.6.5）：ini [studio] bind_hk/us/futures/crypto ----
+_STUDIO_BIND_KEYS = {"hk": "bind_hk", "us": "bind_us",
+                     "futures": "bind_futures", "crypto": "bind_crypto"}
+
+
+def _load_studio_binds():
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        out = {}
+        for mk, key in _STUDIO_BIND_KEYS.items():
+            out[mk] = (cp.get("studio", key, fallback="") or "").strip()
+        return out
+    except Exception:
+        return {}
+
+
+def studio_bound_strategy(market):
+    """该市场绑定的策略工坊策略（未绑定/文件缺失返回 None）。
+
+    多市场策略链最高优先级：绑定 > sm701 直出（hk/us/fut）> 默认多维。"""
+    if market not in _STUDIO_BIND_KEYS:
+        return None
+    slug = _load_studio_binds().get(market) or ""
+    if not slug:
+        return None
+    definition = studio_get_definition(slug)
+    if not definition:
+        return None
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+
+        def gf(key, dflt):
+            try:
+                return float(cp.get("studio", key, fallback=dflt))
+            except (ValueError, TypeError):
+                return dflt
+        params = dict(CFG.RISK_PARAMS.get("稳健", {}))
+        params.update({
+            "stop_loss_pct": gf(f"stop_loss_pct_{market}", 5.0),
+            "take_profit_pct": gf(f"take_profit_pct_{market}", 0.0),
+            "max_hold_days": int(gf(f"max_hold_days_{market}", 0)),
+            "use_atr_stop": False,
+        })
+    except Exception:
+        params = dict(CFG.RISK_PARAMS.get("稳健", {}))
+        params["use_atr_stop"] = False
+    return {
+        "algo": "studio", "mode": "外部策略",
+        "params": params,
+        "label": f"策略工坊·{definition['name']}·{_MARKET_LABELS.get(market, market)}",
+        "definition": definition, "ts": time.time(),
+    }
+
+
+def studio_bind_market(market, slug):
+    """把工坊策略绑定到市场（slug 空串=解绑），写 ini 并立即生效。"""
+    if market not in _STUDIO_BIND_KEYS:
+        return
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("studio"):
+            cp.add_section("studio")
+        cp.set("studio", _STUDIO_BIND_KEYS[market], (slug or "").strip())
+        with open(INI_PATH, "w", encoding="utf-8") as f:
+            cp.write(f)
+    except Exception:
+        log.exception("工坊策略绑定保存失败 %s", market)
+
+
+def sm701_has_model(market, _cache={}):
+    """该市场是否有 sm701 生产模型集（结果缓存；crypto 恒 False）。"""
+    if market not in _SM701_MK:
+        return False
+    if market not in _cache:
+        try:
+            sm701_paths(market=market)
+            _cache[market] = True
+        except Exception:
+            _cache[market] = False
+    return _cache[market]
+
+
 def _px_distances(rets, cur, W):
     """滑窗z-normalize后与cur的欧氏距离：返回数组（窗口k=rets[k:k+W]）。
     numpy可用时向量化（快约50倍），否则退回纯Python循环。"""
@@ -8629,7 +9271,7 @@ def _sig_lgbm(rows, **_kw):
     vols = [r.get("vol") or 0.0 for r in rows]
     dif_, dea_, _ = calc_macd(closes)
     k_, d_, _ = calc_kdj(rows)
-    r6 = calc_rsi(closes, CFG.RSI_SHORT)
+    r6 = calc_rsi(closes, INDP("RSI_SHORT"))
     _, b_up, b_low = calc_boll(closes)
     vr_arr = [vol_ratio_at(vols, k) for k in range(n)]
 
@@ -9214,6 +9856,15 @@ def _annualized_vol(rows, lookback=250):
 
 
 def run_ablation(full, rows, idx_rows=None, progress=None):
+    _ind_ctx_set(_market_of(full))
+    try:
+        return _run_ablation_body(full, rows, idx_rows=idx_rows,
+                                  progress=progress)
+    finally:
+        _ind_ctx_clear()
+
+
+def _run_ablation_body(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
     v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
 
@@ -9704,6 +10355,16 @@ def _build_ghosts(o_today, multi_pred):
 
 
 def analyze(full, progress=None, quick=False, defer_signals=False):
+    """入口：按代码所属市场设置指标参数上下文（v7.0.1 分市场指标）。"""
+    _ind_ctx_set(_market_of(full))
+    try:
+        return _analyze_body(full, progress=progress, quick=quick,
+                             defer_signals=defer_signals)
+    finally:
+        _ind_ctx_clear()
+
+
+def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     """全量分析，切片交给GUI。
     quick=True 只做快速预览（本股缓存 + L1预测，秒开），完整历史/样本池
     由后台增量加载器继续补齐并实时更新预测K线。"""
@@ -10040,8 +10701,8 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
     closes_i = [r["close"] for r in disp_rows]
     dif, dea, mhist = calc_macd(closes_i)
     k_, d_, j_ = calc_kdj(disp_rows)
-    r6, r12 = (calc_rsi(closes_i, CFG.RSI_SHORT),
-               calc_rsi(closes_i, CFG.RSI_LONG))
+    r6, r12 = (calc_rsi(closes_i, INDP("RSI_SHORT")),
+               calc_rsi(closes_i, INDP("RSI_LONG")))
     b_mid, b_up, b_low = calc_boll(closes_i)
     pdi_a, mdi_a, adx_a = calc_adx(disp_rows)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
@@ -10051,7 +10712,21 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
     # 不参与消融；风险偏好不生效，交易层改用止损/止盈/最长持有参数。
     # v6.4.1：预测参数风险偏好=test → 不读消融缓存、不消融，直接用
     # sm701 模型概率出买卖点（见 _sig_sm701）。
-    strat = studio_active_strategy()
+    strat = None
+    mk = _market_of(full)
+    if mk != "cn":
+        # v6.6.5 多市场策略链：工坊绑定（显式）> sm701 直出（默认）。
+        # crypto 暂无生产模型 → 回退多维评分（label 标注）。
+        bound = studio_bound_strategy(mk)
+        if bound:
+            strat = bound
+        elif mk in _SM701_MK and sm701_has_model(mk):
+            strat = {"algo": "sm701", "mode": "sm701",
+                     "params": dict(CFG.RISK_PARAMS["test"]),
+                     "label": f"sm701模型·{_MARKET_LABELS[mk]}（直出，不消融）"}
+        # crypto/无模型：strat 保持 None → 走默认多维评分
+    if not strat:
+        strat = studio_active_strategy()
     if not strat:
         if CFG.RISK_MODE == "test":
             strat = {"algo": "sm701", "mode": "test",
@@ -10267,11 +10942,11 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
         r6_i = r6[i]
         if r6_i is not None:
             if r6_i < 30:
-                items.append(("RSI", 1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超卖"))
+                items.append(("RSI", 1, f"RSI{INDP("RSI_SHORT")}={r6_i:.0f} 超卖"))
             elif r6_i > 70:
-                items.append(("RSI", -1, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 超买"))
+                items.append(("RSI", -1, f"RSI{INDP("RSI_SHORT")}={r6_i:.0f} 超买"))
             else:
-                items.append(("RSI", 0, f"RSI{CFG.RSI_SHORT}={r6_i:.0f} 中性"))
+                items.append(("RSI", 0, f"RSI{INDP("RSI_SHORT")}={r6_i:.0f} 中性"))
         v_i = vols_d[i] if disp_rows[i].get("vol") else 0.0
         v5 = (sum(vols_d[max(0, i - 5):i]) / 5) if i >= 5 else 0.0
         if v_i and v5 and v_i > v5 * 1.2:
@@ -10316,7 +10991,7 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
                 items.append(("ADX", 1 if p_i > m_i else -1,
                               f"ADX={a_i:.0f} 强趋势"
                               f"{'偏多' if p_i > m_i else '偏空'}"))
-            elif a_i >= CFG.ADX_TH:
+            elif a_i >= INDP("ADX_TH"):
                 items.append(("ADX", 1 if p_i > m_i else -1 if p_i != m_i else 0,
                               f"ADX={a_i:.0f} 趋势形成中"))
             else:
@@ -12307,11 +12982,39 @@ _SM701_LOCK = threading.RLock()
 _SM701_WARMUP_BARS = 180
 
 
-def _sm701_production_set(base):
-    """桌面 sm701 `production/` 三周期 tech 模型集；缺失任一文件返回 None。"""
+_SM701_MK = {
+    # 市场 -> (模型前缀, 历史预测文件, 副本库行情表)；cn 表=daily_bars
+    "cn":      {"mpre": "",     "pred": "valid_predictions.csv.gz",
+                "table": "daily_bars"},
+    "hk":      {"mpre": "hk_",  "pred": "valid_predictions_hk.csv.gz",
+                "table": "hk_daily"},
+    "us":      {"mpre": "us_",  "pred": "valid_predictions_us.csv.gz",
+                "table": "us_daily"},
+    "futures": {"mpre": "fut_", "pred": "valid_predictions_fut.csv.gz",
+                "table": "fut_daily"},
+}
+# crypto 无生产模型：信号回退多维评分并标注（见 analyze 市场分支）
+
+
+def _sm701_code(full):
+    """本项目前缀代码 → sm701 预测文件/副本库 code 形态：
+    hk00700→'00700'、usaapl→'AAPL'、fua0→'A0'；cn 原样。"""
+    mk = _market_of(full)
+    if mk == "hk":
+        return full[2:].zfill(5)
+    if mk == "us":
+        return full[2:].upper()
+    if mk == "futures":
+        return full[2:].upper()
+    return full
+
+
+def _sm701_production_set(base, mpre=""):
+    """桌面 sm701 `production/` 三周期 tech 模型集（mpre=市场前缀）；缺失
+    任一文件返回 None。v6.6.5 多市场：prod_{hk|us|fut}_h{1,5,10}_tech.txt。"""
     pdir = os.path.join(base, "production")
     man = os.path.join(pdir, "features_tech.json")
-    models = {h: os.path.join(pdir, f"prod_h{h}_tech.txt")
+    models = {h: os.path.join(pdir, f"prod_{mpre}h{h}_tech.txt")
               for h in ("1", "5", "10")}
     if not (os.path.isfile(man)
             and all(os.path.isfile(v) for v in models.values())):
@@ -12325,8 +13028,9 @@ def _sm701_production_set(base):
         return None
     if not feats:
         return None
-    return {"dir": pdir, "features": feats, "models": models,
-            "pred": os.path.join(pdir, "valid_predictions.csv.gz")}
+    pred = os.path.join(pdir, "valid_predictions" +
+                        ("" if not mpre else "_" + mpre[:-1]) + ".csv.gz")
+    return {"dir": pdir, "features": feats, "models": models, "pred": pred}
 
 
 def _sm701_model_mtimes(paths):
@@ -12343,10 +13047,13 @@ def _sm701_model_mtimes(paths):
     return tuple(out)
 
 
-def sm701_paths(refresh=False):
-    """定位 sm701 副本及模型/预测产物；优先副本，其次原目录。"""
-    if not refresh and _SM701_CACHE.get("paths"):
-        return dict(_SM701_CACHE["paths"])
+def sm701_paths(refresh=False, market="cn"):
+    """定位 sm701 副本及模型/预测产物；优先副本，其次原目录。
+    v6.6.5 多市场：models/pred 按市场（prod_{hk|us|fut}_*），按市场缓存。"""
+    mk = market if market in _SM701_MK else "cn"
+    cache_key = "paths_" + mk
+    if not refresh and _SM701_CACHE.get(cache_key):
+        return dict(_SM701_CACHE[cache_key])
     env_dir = (os.environ.get("SM701_DIR") or "").strip()
     env_model = (os.environ.get("SM701_MODEL") or "").strip()
     env_pred = (os.environ.get("SM701_PRED") or "").strip()
@@ -12367,6 +13074,8 @@ def sm701_paths(refresh=False):
     ):
         if base and base not in candidates:
             candidates.append(base)
+    mpre = _SM701_MK[mk]["mpre"]
+    pred_file = _SM701_MK[mk]["pred"]
     for base in candidates:
         base = os.path.abspath(os.path.expanduser(base))
         db = (os.environ.get("SM701_DB") or
@@ -12374,28 +13083,33 @@ def sm701_paths(refresh=False):
         script = os.path.join(base, "lgbm_train_backtest.py")
         if not (os.path.isfile(db) and os.path.isfile(script)):
             continue
-        # SM701_MODEL 显式指定时强制单模型口径，跳过 production/。
-        prod = None if env_model else _sm701_production_set(base)
+        # SM701_MODEL 显式指定时强制单模型口径（仅 cn；多市场跳过 production 探测）
+        prod = None if (env_model or mk != "cn") \
+            else _sm701_production_set(base)
+        if mk != "cn":
+            prod = _sm701_production_set(base, mpre)
+            if not prod:
+                continue        # 该市场无生产模型集
         if prod:
             model = prod["models"]["1"]
-            pred = env_pred or (prod["pred"] if os.path.isfile(prod["pred"])
-                                else os.path.join(base, "lgbm_output",
-                                                  "valid_predictions.csv.gz"))
+            pred = env_pred if (env_pred and mk == "cn") else \
+                (prod["pred"] if os.path.isfile(prod["pred"])
+                 else os.path.join(base, "lgbm_output", pred_file))
         else:
             model = (env_model or
                      os.path.join(base, "lgbm_output", "lgbm_model.txt"))
             pred = env_pred or os.path.join(base, "lgbm_output",
                                             "valid_predictions.csv.gz")
-        if not os.path.isfile(model):
+        if not os.path.isfile(model) or not os.path.isfile(pred):
             continue
         out = {"dir": base, "db": db, "model": model, "pred": pred,
-               "script": script, "prod": prod}
-        _SM701_CACHE["paths"] = out
+               "script": script, "prod": prod, "market": mk,
+               "table": _SM701_MK[mk]["table"]}
+        _SM701_CACHE[cache_key] = out
         return dict(out)
     raise RuntimeError(
-        "未找到 sm701 副本（需 stock_cache.db + production/ 或 "
-        "lgbm_output/lgbm_model.txt + lgbm_train_backtest.py）；"
-        "可用 SM701_DIR 指定目录")
+        f"未找到 sm701 {mk} 市场模型集（需 production/prod_{mpre}h*_tech.txt "
+        f"+ {pred_file}）；可用 SM701_DIR 指定目录")
 
 
 def _sm701_conn(path=None):
@@ -12697,14 +13411,91 @@ _SM701_SIG_BUY = 0.55
 _SM701_SIG_SELL = 0.50
 
 
+def _sm701_live_one(full, dates, progress=None):
+    """多市场单股实时复算：读**副本库同源行情表**（hk_daily/us_daily/fut_daily
+    ——特征与训练同源同口径），取 ≥180 根预热 + 目标日段，三周期模型等权。
+
+    返回 {date: prob}。副本库缺最新日时用主库同前缀代码补（重叠段副本优先，
+    接缝仅影响最后一日特征尾部）。缓存按（full, dates, 主库最新日/模型mtime）。"""
+    import pandas as pd
+    mk = _market_of(full)
+    paths = sm701_paths(market=mk)
+    sm_code = _sm701_code(full)
+    dates_u = list(dict.fromkeys(d for d in dates if d))
+    if not dates_u:
+        return {}
+    src_max = _db_latest_date()
+    key = (full, tuple(dates_u), src_max, _sm701_cache_epoch(src_max),
+           _sm701_model_mtimes(paths))
+    cache = _SM701_CACHE.setdefault("live_one", {})
+    hit = cache.get(key)
+    if hit is not None:
+        return dict(hit)
+    table = _SM701_MK[mk]["table"]
+    con = _sm701_conn(paths["db"])
+    try:
+        df = pd.read_sql_query(
+            f"SELECT code,date,open,high,low,close,vol FROM {table} "
+            f"WHERE code=? AND date>=? ORDER BY date",
+            con, params=[sm_code, "2010-01-01"])
+    finally:
+        con.close()
+    if df.empty:
+        raise RuntimeError(f"副本库 {table} 无 {sm_code} 行情")
+    # 主库补最新日（副本滞后时；重叠日以副本为准）
+    try:
+        with db_conn() as conn:
+            extra = pd.read_sql_query(
+                "SELECT code,date,open,high,low,close,vol FROM daily_bars "
+                "WHERE code=? ORDER BY date", conn, params=[full])
+        if not extra.empty:
+            have = set(df["date"])
+            add = extra[~extra["date"].isin(have)]
+            if not add.empty:
+                df = pd.concat([df, add], ignore_index=True)
+                df = df.sort_values("date").reset_index(drop=True)
+    except Exception:
+        log.debug("主库补最新分时数据失败(忽略)", exc_info=True)
+    for c in ("open", "high", "low", "close", "vol"):
+        df[c] = df[c].astype("float64")
+    df["code"] = df["code"].astype("category")
+    mod = _sm701_module(paths)
+    feats = mod._compute_feats(df)
+    date_arr = [str(d) for d in df["date"]]
+    pos = {d: i for i, d in enumerate(date_arr)}
+    want_idx = [i for d in dates_u if (i := pos.get(d)) is not None]
+    if not want_idx:
+        return {}
+    need_from = min(want_idx) - (_SM701_WARMUP_BARS - 1)
+    if need_from < 0:
+        need_from = 0
+    sub = df.iloc[need_from:].reset_index(drop=True)
+    sub_feats = {k: v[need_from:] for k, v in feats.items()}
+    probs = _sm701_predict_feats(sub_feats, paths)
+    sub_dates = [str(d) for d in sub["date"]]
+    pmap = {d: float(p) for d, p in zip(sub_dates, probs) if p == p}
+    out = {d: pmap[d] for d in dates_u if d in pmap}
+    cache[key] = dict(out)
+    return out
+
+
 def sm701_prob_map(full, dates=None):
     """单股 sm701 概率序列 {date: prob}：历史落盘 + 新交易日实时复算。
 
-    历史段流式读 valid_predictions.csv.gz（只留该股，按文件 mtime 缓存）；
-    dates 中晚于历史末日的交易日走 _sm701_live_predict（全市场特征口径）。"""
+    历史段流式读对应市场 valid_predictions[_市场].csv.gz（只留该股，按文件
+    mtime 缓存）；dates 中晚于历史末日的交易日走实时复算——cn 全市场口径
+    （_sm701_live_predict），hk/us/fut 单股口径（_sm701_live_one，
+    v6.6.5 多市场）。crypto 无模型返回 {}。"""
     if np is None:
         return {}
-    paths = sm701_paths()
+    mk = _market_of(full)
+    if mk not in _SM701_MK:
+        return {}
+    try:
+        paths = sm701_paths(market=mk)
+    except Exception:
+        return {}
+    sm_code = _sm701_code(full)
     try:
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
@@ -12734,7 +13525,7 @@ def sm701_prob_map(full, dates=None):
                 if pi >= 0:
                     need = max(ci, di, pi)
                     for row in rd:
-                        if len(row) <= need or row[ci] != full:
+                        if len(row) <= need or row[ci] != sm_code:
                             continue
                         try:
                             out[row[di]] = float(row[pi])
@@ -12744,13 +13535,16 @@ def sm701_prob_map(full, dates=None):
     if dates:
         hist_max = max(out) if out else ""
         missing = ([d for d in dict.fromkeys(dates) if d > hist_max]
-                   if hist_max else [])
+                   if hist_max else list(dict.fromkeys(dates)))
         if missing:
             try:
-                preds = _sm701_live_predict(missing, list(dict.fromkeys(dates)))
-                for (code, date), pv in preds.items():
-                    if code == full:
-                        out[date] = pv
+                if mk == "cn":
+                    preds = _sm701_live_predict(
+                        missing, list(dict.fromkeys(dates)))
+                    out.update({d: pv for (code, d), pv in preds.items()
+                                if code == full and pv is not None})
+                else:
+                    out.update(_sm701_live_one(full, missing))
             except Exception:
                 log.exception("sm701 单股实时概率复算失败")
     return out
@@ -14883,7 +15677,7 @@ class App:
         self.settings = {"theme": "dark", "updown": "red_up",
                        "ma_colors": {}, "boll_colors": {}, "ind_w": 1}
         self.api_key = ""
-        self.watchlist = []
+        self._watchlists = {}       # v6.6.5：自选池按市场分开 {market: [codes]}
         self.ai_text = ""
         self.idx_data = {}
         self._prog_running = False
@@ -15144,6 +15938,13 @@ class App:
                        command=self.open_settings).pack(side="right", padx=2)
             top2 = ttk.Frame(self.root)
             top2.pack(fill="x")
+            ttk.Label(top2, text="市场:").pack(side="left")
+            cmb_m = ttk.Combobox(top2, width=5, state="readonly",
+                                 values=["A股", "港股", "美股", "期货", "加密"])
+            cmb_m.set(_MARKET_LABELS.get(_CUR_MARKET[0], "A股"))
+            cmb_m.pack(side="left", padx=2)
+            cmb_m.bind("<<ComboboxSelected>>",
+                       lambda e: self._switch_market(e.widget.get()))
             ttk.Label(top2, text="周期:").pack(side="left")
             cb = ttk.Combobox(top2, textvariable=self.show_n, width=4,
                               state="readonly", values=[15, 30, 45, 60])
@@ -15174,6 +15975,13 @@ class App:
         else:
             ttk.Separator(top, orient="vertical").pack(side="left", fill="y",
                                                        padx=8)
+            ttk.Label(top, text="市场:").pack(side="left")
+            cmb_m = ttk.Combobox(top, width=5, state="readonly",
+                                 values=["A股", "港股", "美股", "期货", "加密"])
+            cmb_m.set(_MARKET_LABELS.get(_CUR_MARKET[0], "A股"))
+            cmb_m.pack(side="left", padx=3)
+            cmb_m.bind("<<ComboboxSelected>>",
+                       lambda e: self._switch_market(e.widget.get()))
             ttk.Label(top, text="周期:").pack(side="left")
             cb = ttk.Combobox(top, textvariable=self.show_n, width=5,
                               state="readonly", values=[30, 60, 90, 120])
@@ -15750,6 +16558,8 @@ class App:
             m.add_separator()
             m.add_command(label="ETF：刷新代码表 + 回填历史",
                           command=self.run_etf_sync_bg)
+        m.add_command(label="策略工坊（外部策略·按市场应用）",
+                      command=lambda: self._open_studio_window())
         m.add_separator()
         m.add_command(label="⚙ 设置", command=self.open_settings)
         x = anchor_widget.winfo_rootx()
@@ -17464,6 +18274,126 @@ class App:
         self._rerender()
         self._notify_plugins("on_tick", q)
 
+    # ---------- 多市场切换（v6.6.5：A股/港股/美股/期货/加密） ----------
+    # ---------- 策略工坊窗（v6.6.5：按市场应用外部策略） ----------
+    def _open_studio_window(self):
+        c = self.api.colors() if hasattr(self, "api") else None
+        colors = dict(DARK_BG=DARK_BG, PANEL_BG=PANEL_BG, FG_MAIN=FG_MAIN,
+                      BTN_BG=BTN_BG, BTN_FG=BTN_FG, BTN_HOVER=BTN_HOVER,
+                      AXIS_TXT=AXIS_TXT, TITLE_TXT=TITLE_TXT)
+        win = tk.Toplevel(self.root)
+        win.title("策略工坊 · 按市场应用")
+        win.configure(bg=DARK_BG)
+        win.transient(self.root)
+        self._center_win(win, 760, 560)
+        ttk.Label(win, text="— 股票策略工坊：选中策略 → 应用到市场 —",
+                  background=DARK_BG, foreground=TITLE_TXT,
+                  font=("Microsoft YaHei", 10, "bold")).pack(
+                      anchor="w", padx=10, pady=(10, 2))
+        ttk.Label(win, text="绑定后该市场所有标的用此策略出买卖点"
+                  "（优先于 sm701 直出）；A股用 设置→外部策略 的全局启用。",
+                  background=DARK_BG, foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8), wraplength=700,
+                  justify="left").pack(anchor="w", padx=10, pady=(0, 6))
+
+        lb = tk.Listbox(win, height=10, bg=PANEL_BG, fg=FG_MAIN,
+                        selectbackground=SEL_BG, selectforeground=FG_MAIN,
+                        relief="flat", highlightthickness=0,
+                        font=("Microsoft YaHei", 9), exportselection=False)
+        lb.pack(fill="both", expand=True, padx=10, pady=4)
+        binds = _load_studio_binds()
+
+        def refresh():
+            lb.delete(0, tk.END)
+            defs = studio_list_strategies()
+            if not defs:
+                lb.insert(tk.END, "（工坊目录无策略——先在 设置→外部策略 导入 JSON）")
+            for d in defs:
+                bound_to = [dict(_MARKET_LABELS)[m] for m, s in
+                            _load_studio_binds().items() if s == d["slug"]]
+                tag = ("  ← 已绑定: " + "/".join(bound_to)) if bound_to else ""
+                lb.insert(tk.END, f"{d['name']}  ·  {d['slug']}{tag}")
+
+        def cur_slug():
+            sel = lb.curselection()
+            if not sel or "·" not in lb.get(sel[0]):
+                messagebox.showinfo("提示", "先选择一个策略", parent=win)
+                return None
+            return lb.get(sel[0]).split("·")[1].strip().split("←")[0].strip()
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=10, pady=4)
+        ttk.Label(row, text="应用到:").pack(side="left")
+        binds_box = ttk.Combobox(row, width=8, state="readonly",
+                                 values=["港股", "美股", "期货", "加密"])
+        binds_box.current(0)
+        binds_box.pack(side="left", padx=4)
+
+        def _apply():
+            slug = cur_slug()
+            if slug is None:
+                return
+            mk = {"港股": "hk", "美股": "us", "期货": "futures",
+                  "加密": "crypto"}[binds_box.get()]
+            if not sm701_has_model(mk) and mk == "crypto":
+                pass      # crypto 无模型：studio 绑定正是唯一信号源，放行
+            studio_bind_market(mk, slug)
+            refresh()
+            self.progress_var.set(
+                f"已将策略工坊 {slug} 应用到{binds_box.get()}市场"
+                "（下次分析生效）")
+
+        def _unbind():
+            mk = {"港股": "hk", "美股": "us", "期货": "futures",
+                  "加密": "crypto"}[binds_box.get()]
+            studio_bind_market(mk, "")
+            refresh()
+            self.progress_var.set(f"已解绑{binds_box.get()}市场策略"
+                                  "（该市场回退 sm701/多维）")
+
+        ttk.Button(row, text="应用", command=_apply).pack(side="left",
+                                                         padx=4)
+        ttk.Button(row, text="解绑", command=_unbind).pack(side="left",
+                                                           padx=4)
+        ttk.Button(row, text="刷新", command=refresh).pack(side="left",
+                                                           padx=4)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(
+            side="bottom", anchor="e", padx=10, pady=8)
+        refresh()
+        return win
+
+    def _switch_market(self, label):
+        """顶栏市场下拉：切模式 → 注入该市场默认池 → 重建搜索清单。"""
+        inv = {v: k for k, v in _MARKET_LABELS.items()}
+        key = inv.get(label)
+        if not key or key == _CUR_MARKET[0]:
+            return
+        set_market_mode(key)
+        try:
+            cp = configparser.ConfigParser()
+            cp.read(INI_PATH, encoding="utf-8")
+            if not cp.has_section("market"):
+                cp.add_section("market")
+            cp.set("market", "mode", key)
+            with open(INI_PATH, "w", encoding="utf-8") as f:
+                cp.write(f)
+        except Exception:
+            log.exception("市场模式持久化失败(忽略)")
+        n = set_market_pool(key)
+        self._init_search()          # 重建搜索补全清单（含新池）
+        self._pools_done = None
+        self.progress_var.set(
+            f"已切换到{label}模式（内置 {n} 只：{label}池已入搜索，"
+            f"可直接输入代码/名称）")
+        # 自选池随市场切换（v6.6.5 按市场分开）
+        self._render_watchlist()
+        self._refresh_names()
+        # 分时/日K 视图按新模式重绘当前股票（不自动换股）
+        if self.minute_mode.get():
+            self._load_minute()
+        else:
+            self._rerender()
+
     def _tick(self):
         """秒级实时：只拉一次行情快照，更新现价/实时bar/预测区间/状态角标。"""
         self._safe_after(self.TICK_MS, self._tick)
@@ -18407,8 +19337,8 @@ class App:
         self._line(cv, xs, v["rsi12"], ymap, C_BLUE)
         last6 = [x for x in v["rsi6"] if x is not None]
         last12 = [x for x in v["rsi12"] if x is not None]
-        label = (f"RSI  橙RSI{CFG.RSI_SHORT}:{last6[-1]:.1f} / "
-                 f"蓝RSI{CFG.RSI_LONG}:{last12[-1]:.1f}") \
+        label = (f"RSI  橙RSI{INDP("RSI_SHORT")}:{last6[-1]:.1f} / "
+                 f"蓝RSI{INDP("RSI_LONG")}:{last12[-1]:.1f}") \
             if last6 and last12 else "RSI"
         cv.create_text(g["L"] + 2, g["T"] - 3, text=label, anchor="w",
                        font=("Microsoft YaHei", 8), fill=TITLE_TXT)
@@ -18499,7 +19429,7 @@ class App:
             else:
                 r6 = v["rsi6"][idx]
                 r12 = v["rsi12"][idx]
-                ind_txt = (f"  RSI{CFG.RSI_SHORT}:%.1f RSI{CFG.RSI_LONG}:%s"
+                ind_txt = (f"  RSI{INDP("RSI_SHORT")}:%.1f RSI{INDP("RSI_LONG")}:%s"
                            % (r6, f"{r12:.1f}" if r12 is not None else "-"))
         if b["date"] in ("T+1预测", "T日预测", "T+5预测", "T+10预测"):
             tag = {"T+1预测": "预测T+1", "T日预测": "预测T日",
@@ -18630,7 +19560,7 @@ class App:
             pos = ("上轨上方·超买" if q["price"] > bl_up
                    else "下轨下方·超卖" if q["price"] < bl_low
                    else "带内")
-            L.append(f"-- 布林带({CFG.BOLL_N},{CFG.BOLL_K:g}) --")
+            L.append(f"-- 布林带({INDP("BOLL_N")},{INDP("BOLL_K"):g}) --")
             L.append(f"上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | "
                      f"下轨 {bl_low:.2f} | 现价 {q['price']:.2f} 位于{pos}")
         _adx = next((x for x in reversed(res["ind"]["adx"])
@@ -18640,10 +19570,10 @@ class App:
         _mdi = next((x for x in reversed(res["ind"]["mdi"])
                      if x is not None), None)
         if None not in (_adx, _pdi, _mdi):
-            L.append(f"-- ADX/DMI({CFG.ADX_N}) --")
+            L.append(f"-- ADX/DMI({INDP("ADX_N")}) --")
             L.append(f"ADX {_adx:.0f}"
                      + ("（强趋势）" if _adx >= 25
-                        else "（趋势形成）" if _adx >= CFG.ADX_TH
+                        else "（趋势形成）" if _adx >= INDP("ADX_TH")
                         else "（无趋势·震荡）")
                      + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
                      + (" 多头占优" if _pdi > _mdi else " 空头占优"))
@@ -18779,7 +19709,7 @@ class App:
         bl_low = next((x for x in reversed(res["ind"]["boll_low"])
                        if x is not None), None)
         if None not in (bl_up, bl_mid, bl_low):
-            p(f"■ 布林带({CFG.BOLL_N},{CFG.BOLL_K:g})")
+            p(f"■ 布林带({INDP("BOLL_N")},{INDP("BOLL_K"):g})")
             p(f"  上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | 下轨 {bl_low:.2f}")
             cur_px = res["quote"]["price"]
             pos = ("上轨上方·超买" if cur_px > bl_up
@@ -18794,10 +19724,10 @@ class App:
         _mdi = next((x for x in reversed(res["ind"]["mdi"])
                      if x is not None), None)
         if None not in (_adx, _pdi, _mdi):
-            p(f"■ ADX/DMI({CFG.ADX_N})")
+            p(f"■ ADX/DMI({INDP("ADX_N")})")
             p(f"  ADX {_adx:.0f}"
               + ("（强趋势）" if _adx >= 25
-                 else "（趋势形成）" if _adx >= CFG.ADX_TH
+                 else "（趋势形成）" if _adx >= INDP("ADX_TH")
                  else "（无趋势·震荡）")
               + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
               + (" 多头占优" if _pdi > _mdi else " 空头占优"))
@@ -18882,15 +19812,31 @@ class App:
 
     # ---------- 自选池 ----------
 
+    @property
+    def watchlist(self):
+        """当前市场模式的自选池（v6.6.5 按市场分开；兼容旧引用点）。"""
+        return self._watchlists.get(_CUR_MARKET[0], [])
+
+    @watchlist.setter
+    def watchlist(self, codes):
+        self._watchlists[_CUR_MARKET[0]] = list(codes or [])
+
     def _load_config(self):
         cp = configparser.ConfigParser()
         if os.path.exists(INI_PATH):
             try:
                 cp.read(INI_PATH, encoding="utf-8")
-                codes = [c.strip() for c in
-                         cp.get("watchlist", "codes", fallback="").split(",")
-                         if c.strip()]
-                self.watchlist = codes
+                # v6.6.5：自选池按市场分开（codes_cn/hk/us/futures/crypto）；
+                # 旧 codes 键迁移到 A股（codes_cn）后删除
+                for mk in _MARKET_LABELS:
+                    raw = cp.get("watchlist", f"codes_{mk}", fallback="")
+                    self._watchlists[mk] = [
+                        c.strip() for c in raw.split(",") if c.strip()]
+                legacy = [c.strip() for c in
+                          cp.get("watchlist", "codes", fallback="").split(",")
+                          if c.strip()]
+                if legacy and not self._watchlists.get("cn"):
+                    self._watchlists["cn"] = legacy
                 self._last_code = cp.get("ui", "last", fallback="")
                 self.settings["theme"] = cp.get("ui", "theme",
                                                 fallback="dark")
@@ -18936,7 +19882,11 @@ class App:
             log.exception("读取 ini 失败(按空配置继续)")
         if not cp.has_section("watchlist"):
             cp.add_section("watchlist")
-        cp.set("watchlist", "codes", ",".join(self.watchlist))
+        # v6.6.5：按市场分别保存；旧 codes 键删除（已迁移）
+        for mk in _MARKET_LABELS:
+            cp.set("watchlist", f"codes_{mk}",
+                   ",".join(self._watchlists.get(mk, [])))
+        cp.remove_option("watchlist", "codes")
         if not cp.has_section("ui"):
             cp.add_section("ui")
         cp.set("ui", "last", self.code_var.get())
@@ -18996,10 +19946,13 @@ class App:
         except ValueError as e:
             messagebox.showwarning("代码有误", str(e))
             return
-        if full in self.watchlist:
+        # v6.6.5：按代码所属市场归入对应自选池（跨市场加自选也正确）
+        mk = _market_of(full)
+        wl = self._watchlists.setdefault(mk, [])
+        if full in wl:
             self.progress_var.set(f"{full} 已在自选池")
             return
-        self.watchlist.append(full)
+        wl.append(full)
         self._save_ini()
         self._refresh_names()
 
@@ -19239,14 +20192,14 @@ class App:
             f"DIF={f3(last(ind['dif']))} DEA={f3(last(ind['dea']))} "
             f"MACD柱={f3(last(ind['mhist']))}\n"
             f"K={f1(last(ind['k']))} D={f1(last(ind['d']))} J={f1(last(ind['j']))}\n"
-            f"RSI{CFG.RSI_SHORT}={f1(last(ind['rsi6']))} "
-            f"RSI{CFG.RSI_LONG}={f1(last(ind['rsi12']))}\n"
-            f"布林带({CFG.BOLL_N},{CFG.BOLL_K:g}): 上轨={f3(last(ind['boll_up']))} "
+            f"RSI{INDP("RSI_SHORT")}={f1(last(ind['rsi6']))} "
+            f"RSI{INDP("RSI_LONG")}={f1(last(ind['rsi12']))}\n"
+            f"布林带({INDP("BOLL_N")},{INDP("BOLL_K"):g}): 上轨={f3(last(ind['boll_up']))} "
             f"中轨={f3(last(ind['boll_mid']))} 下轨={f3(last(ind['boll_low']))}"
             f" 现价位于{'上轨上方' if cur_px > (last(ind['boll_up']) or 1e18) else ('下轨下方' if cur_px < (last(ind['boll_low']) or -1) else '带内')}\n"
-            f"ADX/DMI({CFG.ADX_N}): ADX={f1(last(ind['adx']))} "
+            f"ADX/DMI({INDP("ADX_N")}): ADX={f1(last(ind['adx']))} "
             f"+DI={f1(last(ind['pdi']))} -DI={f1(last(ind['mdi']))}"
-            f"（ADX≥25强趋势 / <{CFG.ADX_TH}震荡，DI方向即趋势方向）\n\n"
+            f"（ADX≥25强趋势 / <{INDP("ADX_TH")}震荡，DI方向即趋势方向）\n\n"
             f"历史形态统计预测(锚定{res.get('anchor', '今开')})：\n"
             f"今日收盘 P50={tp['cl'][50]:.2f}(P10 {tp['cl'][10]:.2f}/"
             f"P90 {tp['cl'][90]:.2f}) 上行概率{tp['up_prob']*100:.0f}%\n"
@@ -21460,6 +22413,31 @@ class App:
         frm = sec_ind
         ttk.Label(frm, text="— 指标计算参数（保存后重新分析生效）—").grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(4, 6))
+        # v7.0.1 分市场：编辑目标市场（A股=全局；其他市场写覆盖节）
+        ttk.Label(frm, text="编辑市场:").grid(row=0, column=3,
+                                              sticky="e", padx=(16, 2))
+        ind_mk_var = tk.StringVar(
+            value=_MARKET_LABELS.get(_CUR_MARKET[0], "A股"))
+        ind_mk_box = ttk.Combobox(frm, width=5, state="readonly",
+                                  values=list(_MARKET_LABELS.values()),
+                                  textvariable=ind_mk_var)
+        ind_mk_box.grid(row=0, column=4, sticky="w")
+
+        def _ind_mk():
+            return {v: k for k, v in _MARKET_LABELS.items()}.get(
+                ind_mk_var.get(), "cn")
+
+        def _load_ind_for_mk(_mk):
+            for _a in ind_vars:
+                if _mk == "cn":
+                    ind_vars[_a].set(str(getattr(CFG, _a)))
+                else:
+                    ov = (_IND_BY_MARKET.get(_mk) or {}).get(_a)
+                    ind_vars[_a].set(
+                        str(ov if ov is not None else getattr(CFG, _a)))
+
+        ind_mk_box.bind("<<ComboboxSelected>>",
+                        lambda e: _load_ind_for_mk(_ind_mk()))
         ind_defs = [
             ("MACD 快线", "MACD_FAST", "EMA 快线周期 (2-60)"),
             ("MACD 慢线", "MACD_SLOW", "EMA 慢线周期 (3-120，须>快线)"),
@@ -21882,19 +22860,44 @@ class App:
                 cp.set("studio", "max_hold_days", str(CFG.STUDIO_MAX_HOLD))
                 pnotes.append("外部策略="
                               + (_sd["name"] if _sd else "自动消融"))
-                # 指标参数（存 [inds]；非法输入保留原值，写入钳制后的生效值）
-                if not cp.has_section("inds"):
-                    cp.add_section("inds")
+                # 指标参数（v7.0.1 分市场：A股→[inds]，其他→[inds_市场]；
+                # 非A股值与A股相同时不写覆盖=继承）
+                _ind_mk = _ind_mk()
+                _sec = "inds" if _ind_mk == "cn" else f"inds_{_ind_mk}"
+                if not cp.has_section(_sec):
+                    cp.add_section(_sec)
                 _bad = []
+                _vals = {}
                 for _attr, _var in ind_vars.items():
-                    if set_ind_param(_attr, _var.get()) is None:
-                        _bad.append(_attr)
+                    if _ind_mk == "cn":
+                        if set_ind_param(_attr, _var.get()) is None:
+                            _bad.append(_attr)
+                        _vals[_attr] = getattr(CFG, _attr)
+                    else:
+                        try:
+                            _lo, _hi = IND_RANGES[_attr]
+                            _v = float(_var.get()) if _attr == "BOLL_K" \
+                                else int(float(_var.get()))
+                            _vals[_attr] = max(_lo, min(_hi, _v))
+                        except (ValueError, TypeError):
+                            _vals[_attr] = getattr(CFG, _attr)
+                            _bad.append(_attr)
                 for _attr in IND_RANGES:
-                    _v = getattr(CFG, _attr)
-                    cp.set("inds", _attr.lower(),
-                           f"{_v:g}" if isinstance(_v, float) else str(_v))
-                pnotes.append(f"指标x{len(ind_vars)}"
-                              + (f"(跳过非法:{','.join(_bad)})" if _bad else ""))
+                    _v = _vals[_attr]
+                    if _ind_mk == "cn":
+                        cp.set("inds", _attr.lower(),
+                               f"{_v:g}" if isinstance(_v, float) else str(_v))
+                    else:
+                        if _v == getattr(CFG, _attr):
+                            cp.remove_option(_sec, _attr.lower())   # 继承A股
+                        else:
+                            cp.set(_sec, _attr.lower(),
+                                   f"{_v:g}" if isinstance(_v, float)
+                                   else str(_v))
+                _load_ind_cfg()      # 重载生效（含覆盖节）
+                pnotes.append(
+                    f"指标x{len(ind_vars)}({_MARKET_LABELS.get(_ind_mk)})"
+                    + (f"(跳过非法:{','.join(_bad)})" if _bad else ""))
                 # 荐股权限 / AI自动选档 / 股票池（存 [picks]）
                 if not cp.has_section("picks"):
                     cp.add_section("picks")
