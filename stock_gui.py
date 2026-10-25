@@ -993,13 +993,71 @@ def _open_url(req, url, timeout):
     raise last if last is not None else RuntimeError("无可用网络通道")
 
 
+def _is_net_down_err(e):
+    """连接类失败（目标不可达/DNS失败/超时）——离线熔断判定依据。
+
+    服务器可达的错误**不算**：HTTP 4xx/5xx（有响应）与 Connection reset
+    （东财反爬典型表现）都不计入，避免把单源反爬误判成整机离线。"""
+    if e is None:
+        return False
+    if getattr(e, "code", None) is not None:
+        return False
+    s = str(e).lower()
+    for key in ("connection refused", "timed out", "timeout",
+                "temporary failure", "name or service not known",
+                "nodename nor servname", "unknown host",
+                "network is unreachable", "no route to host",
+                "网络不可达"):
+        if key in s:
+            return True
+    return False
+
+
+# ---- 离线熔断（v6.6.5 无网启动优化）----
+# 连续 ≥3 次连接类失败 → 判定网络离线 120s：期间 _http_get 直接快速失败
+# （毫秒级），不再逐源等 15-20s 超时×重试，启动/分析立即走缓存。
+# 任一请求成功即恢复；离线到期后自动半开放行探测。
+_NET_DOWN_UNTIL = [0.0]
+_NET_FAILS = [0]
+_NET_LOCK = threading.Lock()
+_NET_FAIL_TH = 3
+_NET_DOWN_SECONDS = 120.0
+
+
+def _net_gate():
+    """离线期内快速失败（抛出即放弃本次请求）。"""
+    with _NET_LOCK:
+        if time.time() < _NET_DOWN_UNTIL[0]:
+            raise RuntimeError("网络不可达(离线快速失败)")
+
+
+def _net_record(ok, err=None):
+    """上报请求结果给离线熔断器（成功清零；连接类失败累计判定）。"""
+    with _NET_LOCK:
+        if ok:
+            if _NET_FAILS[0] or _NET_DOWN_UNTIL[0]:
+                log.info("网络恢复，退出离线模式")
+            _NET_FAILS[0] = 0
+            _NET_DOWN_UNTIL[0] = 0.0
+            return
+        if _is_net_down_err(err):
+            _NET_FAILS[0] += 1
+            if _NET_FAILS[0] >= _NET_FAIL_TH:
+                if time.time() >= _NET_DOWN_UNTIL[0]:
+                    log.warning("连续 %d 次连接失败，判定网络离线 %.0f 秒"
+                                "（期间直接走缓存，到时自动重试）",
+                                _NET_FAILS[0], _NET_DOWN_SECONDS)
+                _NET_DOWN_UNTIL[0] = time.time() + _NET_DOWN_SECONDS
+
+
 def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
               src_name=None):
-    """HTTP GET（带限流感知重试）。
+    """HTTP GET（带限流感知重试 + 离线熔断）。
 
     - 普通错误：指数退避+抖动后原URL重试；
     - 503/429等限流：只做最多1次退避重试就抛出，
       让上层多源切换/熔断机制接管，避免反复撞同一限流IP。
+    - 离线（连续连接类失败）：直接快速失败，让上层走缓存降级；
     - src_name 非空时向数据源熔断器上报成败。"""
     last = None
     hdr = {"User-Agent": "Mozilla/5.0"}
@@ -1007,6 +1065,7 @@ def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
         hdr.update(headers)
     ok_flag = False
     try:
+        _net_gate()
         for a in range(retries):
             with _THROTTLE_LOCK:
                 wait = _MIN_INTERVAL - (time.time() - _LAST_REQ[0])
@@ -1031,6 +1090,7 @@ def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
     finally:
         if src_name:
             _cb_record(src_name, ok_flag, last)
+        _net_record(ok_flag, last)
 
 
 # ================= 交易日辅助 =================
@@ -9551,7 +9611,23 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
         except Exception:
             log.warning("analyze: pool_codes 失败 %s", full, exc_info=True)
             pool_info = None
-    q = f_q.result()
+    # v6.6.5 无网启动：行情快照三级降级（网络 → quote_cache 持久快照 →
+    # 最近收盘合成最小快照），K线缓存照常显示；旧快照由既有 stale_snap
+    # 机制锚定"最近收盘"，报告/侧栏自动标注快照日期。
+    offline = False
+    try:
+        q = f_q.result()
+    except Exception:
+        try:
+            q = fetch_quote_cached(full)
+        except Exception:
+            rows = f_rows.result()
+            last_close = (rows[-1]["close"] if rows else 0.0)
+            q = {"name": "", "price": last_close,
+                 "prev_close": last_close, "open": last_close,
+                 "high": last_close, "low": last_close, "time": ""}
+            offline = True
+            log.info("无网络且无 %s 快照缓存，用最近收盘合成快照", full)
     rows = f_rows.result()
 
     # 识别今日盘中bar（缓存库只存已收盘日K，实时bar由快照合成）
@@ -10229,6 +10305,7 @@ def analyze(full, progress=None, quick=False, defer_signals=False):
         "clamped": clamped,
         "quick": bool(quick),
         "pending_signals": _defer_heavy,
+        "offline": bool(offline),
         "_ctx": {
             "full": full, "o_today": o_today, "pre_open": pre_open,
             "live": live, "src": src, "cur": cur,
@@ -16284,6 +16361,10 @@ class App:
             self._fail(str(err))
             return
         self._loaded(res)
+        if res.get("offline"):
+            # v6.6.5 无网启动：明确告知当前为缓存口径
+            self.progress_var.set(
+                "无网络：已显示缓存K线与最近快照（联网后自动恢复实时）")
         self._maybe_finish_signals(res)
         if res.get("quick"):
             # 启动后后台逐步加载样本池，边加载边更新预测K线（不阻塞界面）
