@@ -632,6 +632,8 @@ def init_db() -> None:
                     code TEXT PRIMARY KEY, data TEXT, ts REAL);
                 CREATE TABLE IF NOT EXISTS f10_cache(
                     code TEXT PRIMARY KEY, data TEXT, ts REAL);
+                CREATE TABLE IF NOT EXISTS minute_cache(
+                    code TEXT PRIMARY KEY, day TEXT, data TEXT, ts REAL);
             """)
             # 迁移：旧库 failed 表若无 reason 列则补列
             try:
@@ -4562,6 +4564,125 @@ def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
         _IDX_QUOTE_CACHE[full] = (now, q)
     _quote_cache_set(full, q)
     return q
+
+
+# ================= 分时线（v6.6.5：缓存周期=一个交易日） =================
+# 数据源：腾讯 minute/query（今日/最近交易日 1 分钟：HHMM 价格 累计量 累计额）。
+# 缓存：内存（盘中 60s TTL，收盘后当日定型）+ SQLite minute_cache（每代码
+# 只保留最新一个交易日，离线可显示）。均价线 = 分钟增量 VWAP（Σprice×Δvol /
+# ΣΔvol，与量纲无关、必然落在当日价格区间内）。
+
+_MINUTE_MEM = {}                # code -> data dict（含 ts）
+_MINUTE_TTL_LIVE = 60.0         # 盘中重拉间隔（秒）
+_MINUTE_LOCK = threading.Lock()
+
+
+def _minute_active():
+    """是否可能产生新的分钟数据（9:15~15:05 且指数快照表明今日为交易日）。"""
+    if not ("0915" <= time.strftime("%H%M") < "1505"):
+        return False
+    return _today_is_session() is not False
+
+
+def _fetch_minute_tx(full):
+    """腾讯分时原始数据：{"day","rows":[(hhmm,price,cum_vol,cum_amount)],
+    "prev_close"}；失败抛异常。"""
+    txt = _http_get("https://ifzq.gtimg.cn/appstock/app/minute/query?code="
+                    + full, retries=1, timeout=8)
+    d = (json.loads(txt).get("data") or {}).get(full) or {}
+    inner = d.get("data") or {}
+    day = str(inner.get("date") or "")
+    rows = []
+    for seg in inner.get("data") or []:
+        p = seg.split()
+        if len(p) < 3:
+            continue
+        try:
+            rows.append((p[0], float(p[1]), float(p[2]),
+                         float(p[3]) if len(p) > 3 else 0.0))
+        except (ValueError, IndexError):
+            continue
+    prev = None
+    qt = (d.get("qt") or {}).get(full) or []
+    try:
+        prev = float(qt[4])
+    except (ValueError, IndexError, TypeError):
+        prev = None
+    if not rows or len(day) != 8:
+        raise RuntimeError("分时数据为空")
+    return {"day": f"{day[:4]}-{day[4:6]}-{day[6:8]}", "rows": rows,
+            "prev_close": prev}
+
+
+def _minute_derive(rows):
+    """分钟增量量（cum_vol 差分，负差分归零防毛刺）与 VWAP 均价序列。"""
+    vols, avg = [], []
+    pv = 0.0
+    ca = cv_ = 0.0
+    for _t, price, cumv, _a in rows:
+        dv = max(0.0, cumv - pv)
+        pv = cumv
+        vols.append(dv)
+        ca += price * dv
+        cv_ += dv
+        avg.append(ca / cv_ if cv_ > 0 else price)
+    return vols, avg
+
+
+def fetch_minute_lines(full):
+    """分时线（带缓存，**缓存周期=一个交易日**）。返回 dict：
+    {"day","rows","prev_close","vols","avg","ts"}；全部不可得时抛异常。
+
+    - 盘中：内存缓存 60s，过期重拉（拉取失败回退缓存，显示最近可得分时）；
+    - 收盘/休市：当日数据已定型，直接用缓存（库内/内存），不联网；
+    - SQLite minute_cache 每代码只保留最新一个交易日（写入即清旧行），
+      跨重启、离线均可显示最近交易日的分时。"""
+    now = time.time()
+    active = _minute_active()
+    with _MINUTE_LOCK:
+        hit = _MINUTE_MEM.get(full)
+        if hit and (not active or now - hit.get("ts", 0) < _MINUTE_TTL_LIVE):
+            return hit
+    cached = None
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT data FROM minute_cache WHERE code=?",
+                (full,)).fetchone()
+        if row:
+            cached = json.loads(row[0])
+    except Exception:
+        cached = None
+    if cached and not active:
+        data = dict(cached, ts=now)
+        with _MINUTE_LOCK:
+            _MINUTE_MEM[full] = data
+        return data
+    try:
+        data = _fetch_minute_tx(full)
+    except Exception:
+        if hit:
+            return hit
+        if cached:
+            return dict(cached, ts=now)
+        raise
+    data["vols"], data["avg"] = _minute_derive(data["rows"])
+    data["ts"] = now
+    with _MINUTE_LOCK:
+        _MINUTE_MEM[full] = data
+    try:
+        blob = json.dumps({k: data[k] for k in
+                           ("day", "rows", "prev_close", "vols", "avg")},
+                          ensure_ascii=False,
+                          separators=(",", ":"))
+        with db_conn(commit=True) as conn:
+            conn.execute("DELETE FROM minute_cache WHERE code=?", (full,))
+            conn.execute(
+                "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
+                (full, data["day"], blob, now))
+    except Exception:
+        log.debug("分时缓存写库失败", exc_info=True)
+    return data
 
 
 def fetch_daily(full):
@@ -14796,6 +14917,10 @@ class App:
         self.view_pan = 0       # 平移偏移：0=最新，正=往左看更早
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
         self.show_boll = tk.BooleanVar(value=True)    # BOLL 独立打勾（与 MA 同位）
+        self.minute_mode = tk.BooleanVar(value=False)  # 分时视图（v6.6.5）
+        self._minute_data = None      # 当前分时缓存（fetch_minute_lines 结果）
+        self._minute_busy = False
+        self._minute_ts = 0.0
         self.show_ai_lines = tk.BooleanVar(value=True)  # AI画线显隐（v6.5.2）
         self.boll_on = {"up": tk.BooleanVar(value=True),
                         "mid": tk.BooleanVar(value=True),
@@ -15036,6 +15161,10 @@ class App:
                             command=self._rerender).pack(side="left", padx=2)
             ttk.Checkbutton(top2, text="折叠", width=4, variable=self.fold_sub,
                             command=self._toggle_sub).pack(side="left", padx=2)
+            ttk.Checkbutton(top2, text="分时", width=4,
+                            variable=self.minute_mode,
+                            command=self._toggle_minute).pack(side="left",
+                                                              padx=2)
             # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
             ttk.Button(top2, text="工具", width=4,
                        command=lambda: self._tools_menu(top2)
@@ -15063,6 +15192,11 @@ class App:
                            selectcolor=FIELD_BG).pack(side="left")
             tk.Checkbutton(top, text="AI线", variable=self.show_ai_lines,
                            command=self._rerender, font=("Consolas", 8),
+                           bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
+                           activeforeground=FG_MAIN,
+                           selectcolor=FIELD_BG).pack(side="left")
+            tk.Checkbutton(top, text="分时", variable=self.minute_mode,
+                           command=self._toggle_minute, font=("Consolas", 8),
                            bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
                            activeforeground=FG_MAIN,
                            selectcolor=FIELD_BG).pack(side="left")
@@ -16365,6 +16499,8 @@ class App:
             # v6.6.5 无网启动：明确告知当前为缓存口径
             self.progress_var.set(
                 "无网络：已显示缓存K线与最近快照（联网后自动恢复实时）")
+        if self.minute_mode.get():
+            self._load_minute()      # 切股票：分时跟随重拉（v6.6.5）
         self._maybe_finish_signals(res)
         if res.get("quick"):
             # 启动后后台逐步加载样本池，边加载边更新预测K线（不阻塞界面）
@@ -17342,6 +17478,10 @@ class App:
             return
         self._tick_busy = True
         self._run_bg(lambda: fetch_quote_cached(full), self._tick_done)
+        # 分时模式：盘中每 60s 重拉一次（收盘/休市走定型缓存，不联网）
+        if self.minute_mode.get() and not self._minute_busy \
+                and time.time() - self._minute_ts > 60:
+            self._load_minute()
 
     def _fail(self, msg):
         self.btn_run.config(state="normal")
@@ -17403,8 +17543,131 @@ class App:
                 f"现价{q['price']:.2f}({chg:+.2f}%){_to_txt}  快照{q['time']}"
                 + ("  [含盘中实时bar]" if res["has_live"] else "") + tail)
 
+    # ---------- 分时视图（v6.6.5：主图切分时线，缓存周期=一个交易日） ----------
+    def _toggle_minute(self):
+        if not self.minute_mode.get():
+            self._minute_data = None
+            self._rerender()
+            return
+        self._load_minute()
+
+    def _load_minute(self):
+        """后台拉当前股票分时（_minute_busy 防重入；离线走交易日缓存）。"""
+        if self._minute_busy:
+            return
+        full = (self.res or {}).get("full_code") or self.code_var.get()
+        try:
+            full = normalize_code(full)
+        except ValueError:
+            return
+        self._minute_busy = True
+        self.progress_var.set("分时加载中...")
+        self._run_bg(lambda: fetch_minute_lines(full), self._minute_done)
+
+    def _minute_done(self, data, err):
+        self._minute_busy = False
+        if not self.minute_mode.get():
+            return
+        if err or not data:
+            self.progress_var.set(
+                f"分时加载失败：{err}"[:70] + "（收盘/休市日为最近交易日缓存）")
+            return
+        self._minute_data = data
+        self._minute_ts = time.time()
+        self._draw_minute_view()
+        self.progress_var.set(
+            f"分时 {data['day']}（{len(data['rows'])} 分钟，"
+            f"{'盘后定型缓存' if not _minute_active() else '盘中60s刷新'}）")
+
+    def _draw_minute_view(self):
+        """主图分时：价格线+均价线(VWAP)+昨收基准，右侧涨跌幅轴；
+        副图画分钟量（相对昨收红/绿）。纯展示，不参与预测/信号。"""
+        cv = self.cv_main
+        cv.delete("all")
+        d = self._minute_data
+        if not d:
+            return
+        rows = d["rows"]
+        n = len(rows)
+        if n < 2:
+            return
+        prices = [r[1] for r in rows]
+        avgs = d.get("avg") or []
+        prev = d.get("prev_close") or prices[0]
+        mx = max(max(prices), max(avgs) if avgs else prices[0], prev)
+        mn = min(min(prices), min(avgs) if avgs else prices[0], prev)
+        half = max(mx - prev, prev - mn, prev * 0.004)
+        hi, lo = prev + half * 1.08, prev - half * 1.08
+        w = max(cv.winfo_width(), 420)
+        h = max(cv.winfo_height(), 300)
+        L, R, T, B = 62, 52, 26, 28
+
+        def xm(i):
+            return L + i / max(1, n - 1) * (w - L - R)
+
+        def ym(p):
+            return T + (hi - p) / max(1e-9, hi - lo) * (h - T - B)
+
+        for k in range(5):
+            p = lo + (hi - lo) * k / 4
+            yy = ym(p)
+            cv.create_line(L, yy, w - R, yy, fill=GRID_C, dash=(2, 3))
+            cv.create_text(L - 4, yy, anchor="e", text=f"{p:.2f}",
+                           fill=AXIS_TXT, font=("Consolas", 8))
+            pct = (p / prev - 1) * 100 if prev else 0.0
+            color = UP if pct > 0 else (DOWN if pct < 0 else AXIS_TXT)
+            cv.create_text(w - R + 4, yy, anchor="w",
+                           text=f"{pct:+.2f}%", fill=color,
+                           font=("Consolas", 8))
+        # 昨收基准
+        cv.create_line(L, ym(prev), w - R, ym(prev),
+                       fill=GUIDE_C, dash=(4, 3))
+        # 价格线
+        pts = []
+        for i, p in enumerate(prices):
+            pts.extend((xm(i), ym(p)))
+        if len(pts) >= 4:
+            cv.create_line(*pts, fill=ACCENT, width=1,
+                           joinstyle="round")
+        # 均价线（VWAP，黄色，同花顺惯例）
+        if avgs:
+            pts = []
+            for i, p in enumerate(avgs):
+                pts.extend((xm(i), ym(p)))
+            cv.create_line(*pts, fill="#ffd54a", width=1, dash=(3, 2))
+        # 标题
+        cv.create_text(L, T - 10, anchor="w",
+                       text=f"分时 {d['day']}  昨收 {prev:.2f}"
+                            f"  现价 {prices[-1]:.2f} "
+                            f"({(prices[-1] / prev - 1) * 100:+.2f}%)"
+                            f"  均价 {avgs[-1]:.2f}" if avgs else
+                       f"分时 {d['day']}  昨收 {prev:.2f}",
+                       fill=TITLE_TXT, font=("Microsoft YaHei", 9, "bold"))
+        # 副图：分钟量（相对昨收红/绿）
+        vols = d.get("vols") or []
+        cv2 = self.cv_vol
+        if cv2 is None or not vols:
+            return
+        cv2.delete("all")
+        w2 = max(cv2.winfo_width(), 420)
+        h2 = max(cv2.winfo_height(), 60)
+        vmax = max(vols) or 1.0
+        bw = max(1.0, (w2 - L - R) / n - 0.5)
+        for i, v in enumerate(vols):
+            if v <= 0:
+                continue
+            hh = v / vmax * (h2 - 8)
+            color = UP if prices[i] >= prev else DOWN
+            cv2.create_rectangle(xm(i) - bw / 2, h2 - hh,
+                                 xm(i) + bw / 2, h2 - 1,
+                                 fill=color, outline="")
+
     def _rerender(self):
         self._drag_job = None
+        if self.minute_mode.get():
+            # 分时模式：独立渲染（数据已在缓存，盘中由 _tick 定时刷新）
+            self._draw_minute_view()
+            return
         if not self.res:
             return
         try:
@@ -18157,6 +18420,8 @@ class App:
     def _on_motion(self, event, key):
         if getattr(self, "_drag_x", None) is not None:
             return          # 拖拽平移中，不画十字光标（避免拖拽卡顿）
+        if self.minute_mode.get():
+            return          # 分时视图：无 scales 映射，跳过K线十字光标
         """十字光标：线/标签连续跟随鼠标，数据读数吸附最近K线。"""
         if key not in self.scales or not self.view:
             return

@@ -647,6 +647,8 @@ def init_db() -> None:
                     code TEXT PRIMARY KEY, data TEXT, ts REAL);
                 CREATE TABLE IF NOT EXISTS f10_cache(
                     code TEXT PRIMARY KEY, data TEXT, ts REAL);
+                CREATE TABLE IF NOT EXISTS minute_cache(
+                    code TEXT PRIMARY KEY, day TEXT, data TEXT, ts REAL);
             """)
             # 迁移：旧库 failed 表若无 reason 列则补列
             try:
@@ -4579,6 +4581,125 @@ def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
         _IDX_QUOTE_CACHE[full] = (now, q)
     _quote_cache_set(full, q)
     return q
+
+
+# ================= 分时线（v6.6.5：缓存周期=一个交易日） =================
+# 数据源：腾讯 minute/query（今日/最近交易日 1 分钟：HHMM 价格 累计量 累计额）。
+# 缓存：内存（盘中 60s TTL，收盘后当日定型）+ SQLite minute_cache（每代码
+# 只保留最新一个交易日，离线可显示）。均价线 = 分钟增量 VWAP（Σprice×Δvol /
+# ΣΔvol，与量纲无关、必然落在当日价格区间内）。
+
+_MINUTE_MEM = {}                # code -> data dict（含 ts）
+_MINUTE_TTL_LIVE = 60.0         # 盘中重拉间隔（秒）
+_MINUTE_LOCK = threading.Lock()
+
+
+def _minute_active():
+    """是否可能产生新的分钟数据（9:15~15:05 且指数快照表明今日为交易日）。"""
+    if not ("0915" <= time.strftime("%H%M") < "1505"):
+        return False
+    return _today_is_session() is not False
+
+
+def _fetch_minute_tx(full):
+    """腾讯分时原始数据：{"day","rows":[(hhmm,price,cum_vol,cum_amount)],
+    "prev_close"}；失败抛异常。"""
+    txt = _http_get("https://ifzq.gtimg.cn/appstock/app/minute/query?code="
+                    + full, retries=1, timeout=8)
+    d = (json.loads(txt).get("data") or {}).get(full) or {}
+    inner = d.get("data") or {}
+    day = str(inner.get("date") or "")
+    rows = []
+    for seg in inner.get("data") or []:
+        p = seg.split()
+        if len(p) < 3:
+            continue
+        try:
+            rows.append((p[0], float(p[1]), float(p[2]),
+                         float(p[3]) if len(p) > 3 else 0.0))
+        except (ValueError, IndexError):
+            continue
+    prev = None
+    qt = (d.get("qt") or {}).get(full) or []
+    try:
+        prev = float(qt[4])
+    except (ValueError, IndexError, TypeError):
+        prev = None
+    if not rows or len(day) != 8:
+        raise RuntimeError("分时数据为空")
+    return {"day": f"{day[:4]}-{day[4:6]}-{day[6:8]}", "rows": rows,
+            "prev_close": prev}
+
+
+def _minute_derive(rows):
+    """分钟增量量（cum_vol 差分，负差分归零防毛刺）与 VWAP 均价序列。"""
+    vols, avg = [], []
+    pv = 0.0
+    ca = cv_ = 0.0
+    for _t, price, cumv, _a in rows:
+        dv = max(0.0, cumv - pv)
+        pv = cumv
+        vols.append(dv)
+        ca += price * dv
+        cv_ += dv
+        avg.append(ca / cv_ if cv_ > 0 else price)
+    return vols, avg
+
+
+def fetch_minute_lines(full):
+    """分时线（带缓存，**缓存周期=一个交易日**）。返回 dict：
+    {"day","rows","prev_close","vols","avg","ts"}；全部不可得时抛异常。
+
+    - 盘中：内存缓存 60s，过期重拉（拉取失败回退缓存，显示最近可得分时）；
+    - 收盘/休市：当日数据已定型，直接用缓存（库内/内存），不联网；
+    - SQLite minute_cache 每代码只保留最新一个交易日（写入即清旧行），
+      跨重启、离线均可显示最近交易日的分时。"""
+    now = time.time()
+    active = _minute_active()
+    with _MINUTE_LOCK:
+        hit = _MINUTE_MEM.get(full)
+        if hit and (not active or now - hit.get("ts", 0) < _MINUTE_TTL_LIVE):
+            return hit
+    cached = None
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT data FROM minute_cache WHERE code=?",
+                (full,)).fetchone()
+        if row:
+            cached = json.loads(row[0])
+    except Exception:
+        cached = None
+    if cached and not active:
+        data = dict(cached, ts=now)
+        with _MINUTE_LOCK:
+            _MINUTE_MEM[full] = data
+        return data
+    try:
+        data = _fetch_minute_tx(full)
+    except Exception:
+        if hit:
+            return hit
+        if cached:
+            return dict(cached, ts=now)
+        raise
+    data["vols"], data["avg"] = _minute_derive(data["rows"])
+    data["ts"] = now
+    with _MINUTE_LOCK:
+        _MINUTE_MEM[full] = data
+    try:
+        blob = json.dumps({k: data[k] for k in
+                           ("day", "rows", "prev_close", "vols", "avg")},
+                          ensure_ascii=False,
+                          separators=(",", ":"))
+        with db_conn(commit=True) as conn:
+            conn.execute("DELETE FROM minute_cache WHERE code=?", (full,))
+            conn.execute(
+                "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
+                (full, data["day"], blob, now))
+    except Exception:
+        log.debug("分时缓存写库失败", exc_info=True)
+    return data
 
 
 def fetch_daily(full):
