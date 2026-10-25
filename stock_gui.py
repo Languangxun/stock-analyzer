@@ -15972,6 +15972,7 @@ class App:
             cmb_m.pack(side="left", padx=2)
             cmb_m.bind("<<ComboboxSelected>>",
                        lambda e: self._switch_market(e.widget.get()))
+            self._mkt_boxes = getattr(self, "_mkt_boxes", []) + [cmb_m]
             ttk.Label(top2, text="周期:").pack(side="left")
             cb = ttk.Combobox(top2, textvariable=self.show_n, width=4,
                               state="readonly", values=[15, 30, 45, 60])
@@ -16009,6 +16010,7 @@ class App:
             cmb_m.pack(side="left", padx=3)
             cmb_m.bind("<<ComboboxSelected>>",
                        lambda e: self._switch_market(e.widget.get()))
+            self._mkt_boxes = getattr(self, "_mkt_boxes", []) + [cmb_m]
             ttk.Label(top, text="周期:").pack(side="left")
             cb = ttk.Combobox(top, textvariable=self.show_n, width=5,
                               state="readonly", values=[30, 60, 90, 120])
@@ -17287,6 +17289,8 @@ class App:
         if self.code_var.get() != full:
             self.code_var.set(full)
         self._wiz_active = False
+        # v7.0.1：代码属于其他市场 → 自动切换市场模式（下拉/池/自选联动）
+        self._auto_switch_market(full)
         self.btn_run.config(state="disabled")
         # 启动先快速填最近K线（走缓存秒开），完整历史/样本池后台补齐；
         # v6.6.5 懒加载：重信号算法（sm701/lgbm）后台补算，先画K线再叠买卖点
@@ -18645,12 +18649,9 @@ class App:
                   font=("Microsoft YaHei", 8)).pack(side="left")
         return win
 
-    def _switch_market(self, label):
-        """顶栏市场下拉：切模式 → 注入该市场默认池 → 重建搜索清单。"""
-        inv = {v: k for k, v in _MARKET_LABELS.items()}
-        key = inv.get(label)
-        if not key or key == _CUR_MARKET[0]:
-            return
+    def _apply_market_mode(self, key):
+        """市场模式生效（模式/ini/池/搜索清单/自选面板/下拉标签）——
+        顶栏切换与搜索自动切换共用（v7.0.1）。"""
         set_market_mode(key)
         try:
             cp = configparser.ConfigParser()
@@ -18662,15 +18663,36 @@ class App:
                 cp.write(f)
         except Exception:
             log.exception("市场模式持久化失败(忽略)")
-        n = set_market_pool(key)
+        set_market_pool(key)
         self._init_search()          # 重建搜索补全清单（含新池）
         self._pools_done = None
-        self.progress_var.set(
-            f"已切换到{label}模式（内置 {n} 只：{label}池已入搜索，"
-            f"可直接输入代码/名称）")
-        # 自选池随市场切换（v6.6.5 按市场分开）
+        for box in getattr(self, "_mkt_boxes", []):
+            try:
+                box.set(_MARKET_LABELS.get(key, key))
+            except Exception:
+                pass
         self._render_watchlist()
         self._refresh_names()
+
+    def _auto_switch_market(self, full):
+        """run() 时检测代码所属市场 ≠ 当前模式 → 自动切换（v7.0.1）。"""
+        mk = _market_of(full)
+        if mk == _CUR_MARKET[0] or mk not in _MARKET_LABELS:
+            return
+        self._apply_market_mode(mk)
+        self.progress_var.set(
+            f"检测到{_MARKET_LABELS.get(mk, mk)}代码 {full}，"
+            f"已自动切换到{_MARKET_LABELS.get(mk, mk)}模式")
+
+    def _switch_market(self, label):
+        """顶栏市场下拉：切模式 → 注入该市场默认池 → 重建搜索清单。"""
+        inv = {v: k for k, v in _MARKET_LABELS.items()}
+        key = inv.get(label)
+        if not key or key == _CUR_MARKET[0]:
+            return
+        self._apply_market_mode(key)
+        self.progress_var.set(
+            f"已切换到{label}模式（{label}池已入搜索，可直接输入代码/名称）")
         # 分时/日K 视图按新模式重绘当前股票（不自动换股）
         if self.minute_mode.get():
             self._load_minute()
