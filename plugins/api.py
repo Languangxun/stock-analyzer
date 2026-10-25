@@ -78,3 +78,60 @@ class PluginAPI:
         """宿主 logger（``logging.Logger``），插件用它记录日志。"""
         import stock_gui as sg
         return sg.log
+
+    # ------------------------------------------------------------------
+    # 交易日历 / 历史价格（v6.6.5，交易记录插件用）
+    # ------------------------------------------------------------------
+    _CAL_CACHE = {"days": None, "ts": 0.0}
+
+    def trading_days(self, max_age=600.0):
+        """全部交易日日期集合（库内上证指数日K，进程内缓存 10 分钟）。"""
+        import time as _t
+        c = self._CAL_CACHE
+        if c["days"] is None or _t.time() - c["ts"] > max_age:
+            try:
+                import stock_gui as sg
+                with sg.db_conn() as conn:
+                    days = frozenset(
+                        r[0] for r in conn.execute(
+                            "SELECT DISTINCT date FROM daily_bars "
+                            "WHERE code='sh000001'"))
+                if days:
+                    c["days"], c["ts"] = days, _t.time()
+            except Exception:
+                self.log.debug("交易日历读取失败", exc_info=True)
+        return c["days"] or frozenset()
+
+    def align_trading_day(self, date_str):
+        """把日期对齐到 ≤该日的最近交易日；早于全部历史时返回最早交易日。
+
+        无交易日历（空库）时原样返回。``date_str`` 形如 ``YYYY-MM-DD``。"""
+        days = self.trading_days()
+        if not days or not date_str:
+            return date_str
+        if date_str in days:
+            return date_str
+        prev = max((d for d in days if d < date_str), default=None)
+        if prev:
+            return prev
+        return min(days)          # 早于全部历史：归到最早交易日
+
+    def close_map(self, code):
+        """该代码全部日K收盘价 {date: close}，**显示价口径**（库内 hfq ×
+        adjust.k，与图表/现价同量纲）；停牌/未上市日期需调用方自行取
+        ≤t 的最近值。无数据返回 {}。"""
+        try:
+            import stock_gui as sg
+            with sg.db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT date, close FROM daily_bars WHERE code=? "
+                    "ORDER BY date", (code,)).fetchall()
+            if not rows:
+                return {}
+            k = sg._get_adjust(code)
+            if k and k > 0:
+                return {d: c * k for d, c in rows}
+            return dict(rows)
+        except Exception:
+            self.log.debug("close_map 读取失败 %s", code, exc_info=True)
+            return {}
