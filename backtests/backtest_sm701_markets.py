@@ -40,7 +40,7 @@ def market_top_codes(market, top):
     return [r[0] for r in rows if r[0]]
 
 
-def backtest_one(full):
+def backtest_one(full, keep_curve=False):
     try:
         rows = sg.get_daily(full)[-1000:]
         if len(rows) < 300:
@@ -49,13 +49,46 @@ def backtest_one(full):
         rp = dict(sg.CFG.RISK_PARAMS["test"])
         bt = sg._bt_events(rows, sigs, rp) if sigs else None
         bh = (rows[-1]["close"] / rows[0]["close"] - 1) if rows else 0
+        out = {"code": full, "bh": bh}
         if not bt:
-            return {"code": full, "trades": 0, "bh": bh}
-        return {"code": full, "trades": bt.get("trades", 0),
-                "winrate": bt.get("winrate"), "ann": bt.get("ann"),
-                "mdd": bt.get("mdd"), "total": bt.get("total"), "bh": bh}
+            out["trades"] = 0
+            if keep_curve and rows:
+                out["curve"] = [1.0] * len(rows)
+                out["curve_dates"] = [r["date"] for r in rows]
+            return out
+        out.update({"trades": bt.get("trades", 0),
+                    "winrate": bt.get("winrate"), "ann": bt.get("ann"),
+                    "mdd": bt.get("mdd"), "total": bt.get("total")})
+        if keep_curve:
+            curve = bt.get("curve") or []
+            dates = [r["date"] for r in rows]
+            if curve and len(curve) == len(dates):
+                out["curve"] = [round(float(v), 6) for v in curve]
+                out["curve_dates"] = dates
+        return out
     except Exception as e:
         return {"code": full, "error": str(e)[:80]}
+
+
+def market_curve(detail):
+    """市场等权平均净值曲线：按日期对齐全部含曲线标的，逐日等权平均。"""
+    import statistics as st
+    by_date = {}
+    for r in detail:
+        cu = r.get("curve")
+        if not cu:
+            continue
+        for d, v in zip(r.get("curve_dates") or [], cu):
+            by_date.setdefault(d, []).append(v)
+    if not by_date:
+        return None
+    dates = sorted(by_date)
+    vals = [st.mean(by_date[d]) for d in dates]
+    # 起点 1.0 对齐
+    if vals and vals[0]:
+        base = vals[0]
+        vals = [v / base for v in vals]
+    return {"dates": dates, "curve": [round(v, 6) for v in vals]}
 
 
 def summarize(results):
@@ -96,9 +129,11 @@ def main():
         codes = market_top_codes(market, args.top)
         print(f"[{market}] top{len(codes)} 回测中...", flush=True)
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            results = list(ex.map(backtest_one, codes))
+            results = list(ex.map(lambda c: backtest_one(c, keep_curve=True),
+                                  codes))
         summ = summarize([r for r in results if r and "error" not in r])
-        out["markets"][market] = {"summary": summ, "detail": results}
+        out["markets"][market] = {"summary": summ, "detail": results,
+                                  "curve": market_curve(results)}
         md.append(f"## {sg._MARKET_LABELS[market]}（top {len(codes)}）")
         md.append(f"- 有效 {summ['n_traded']}/{summ['n']}；"
                   f"交易数中位 {summ['trades_median']}；"

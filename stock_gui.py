@@ -4976,6 +4976,31 @@ def _sniper_names(market):
 _SNIPER_NAMES = {}
 
 
+# 国内期货主力连续品种中文名（郑商所/大商所/上期所/中金所/上能源；未列出的回退代码）
+_FUT_NAMES = {
+    "A0": "豆一", "AD0": "豆一专", "AG0": "沪银", "AL0": "沪铝", "AO0": "氧化铝",
+    "AP0": "苹果", "AU0": "沪金", "B0": "豆二", "BC0": "国际铜", "BR0": "丁二烯胶",
+    "BU0": "沥青", "BZ0": "苯乙烯专", "C0": "玉米", "CF0": "棉花", "CJ0": "红枣",
+    "CS0": "玉米淀粉", "CU0": "沪铜", "CY0": "棉纱", "EB0": "苯乙烯",
+    "EC0": "欧线集运", "EG0": "乙二醇", "FB0": "纤维板", "FG0": "玻璃",
+    "FU0": "燃油", "HC0": "热卷", "I0": "铁矿石", "IC0": "中证500期货",
+    "IF0": "沪深300期货", "IH0": "上证50期货", "IM0": "中证1000期货",
+    "J0": "焦炭", "JD0": "鸡蛋", "JM0": "焦煤", "JR0": "粳稻",
+    "L0": "塑料", "LC0": "碳酸锂", "LG0": "原木", "LH0": "生猪",
+    "LR0": "籼稻", "LU0": "低硫燃油", "M0": "豆粕", "MA0": "甲醇",
+    "NI0": "沪镍", "NR0": "20号胶", "OI0": "菜油", "OP0": "菜油专",
+    "P0": "棕榈油", "PB0": "沪铅", "PD0": "钯金", "PF0": "短纤",
+    "PG0": "LPG", "PK0": "花生", "PL0": " Dix", "PP0": "聚丙烯",
+    "PR0": "数据专", "PS0": "数据PS", "PT0": "PTA专", "PX0": "对二甲苯",
+    "RB0": "螺纹钢", "RI0": "早籼稻", "RM0": "菜粕", "RR0": "粳米",
+    "RS0": "菜籽", "RU0": "橡胶", "SA0": "纯碱", "SC0": "原油",
+    "SF0": "硅铁", "SH0": "烧碱", "SI0": "工业硅", "SM0": "锰硅",
+    "SN0": "沪锡", "SP0": "纸浆", "SR0": "白糖", "SS0": "不锈钢",
+    "TA0": "PTA", "TF0": "二债期货", "TS0": "短融期货", "UR0": "尿素",
+    "V0": "PVC", "WH0": "小麦", "Y0": "豆油", "ZN0": "沪锌",
+}
+
+
 def _sm701_market_pool(market):
     """多市场池（从 sm701 副本库行情表取实际有数据的代码，名称借 sniper 库）。
     futures=副本库 fut_daily 的 82 只国内期货品种（A0 等）。"""
@@ -5003,7 +5028,9 @@ def _sm701_market_pool(market):
     out = []
     for code in codes:
         full = (mk[:2] if mk != "futures" else "fu") + code.lower()
-        out.append((full, names.get(code, code)))
+        name = names.get(code) or _FUT_NAMES.get(code, code) \
+            if mk == "futures" else names.get(code, code)
+        out.append((full, name))
     return out
 
 

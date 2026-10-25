@@ -818,6 +818,66 @@ function renderAblTable(){
     '（全样本描述性统计，不参与选型）；年化/胜率中位=逐股消融选中策略的中位数。</div>';
 }
 let smkMkt=null;   // 当前查看的多市场键（null=汇总）
+function drawSmkCurve(){
+  const cv=document.getElementById('smk-cv');
+  if(!cv)return;
+  const dpr=window.devicePixelRatio||1;
+  const W=cv.clientWidth||760,H=260;
+  cv.width=W*dpr;cv.height=H*dpr;
+  const g=cv.getContext('2d');g.scale(dpr,dpr);
+  g.clearRect(0,0,W,H);
+  const mk=DATA.sm701_markets; if(!mk||!mk.markets)return;
+  const mks=Object.keys(mk.markets).filter(k=>mk.markets[k]&&mk.markets[k].skipped!==true);
+  const cur=smkMkt||null;
+  const colors={hk:'#4da3ff',us:'#e8c14a',futures:'#39d98a',crypto:'#e26bd0'};
+  const getCur=k=>{
+    if(cur&&k!==cur)return null;
+    const c=(mk.markets[k]||{}).curve; 
+    return c&&c.curve&&c.curve.length?c:null;
+  };
+  // y 范围（取可见曲线的 min/max）
+  let lo=9,hi=0.1,seen=false;
+  const vis=mks.map(k=>getCur(k)).filter(Boolean);
+  vis.forEach(c=>c.curve.forEach(v=>{if(v<lo)lo=v;if(v>hi)hi=v;seen=true;}));
+  if(!seen){g.fillStyle='#8b98a5';g.font='12px sans-serif';
+    g.fillText('无净值曲线数据（回测未含 curve）',20,H/2);return;}
+  const pad=(hi-lo)*0.08||0.05;lo-=pad;hi+=pad;
+  const L=52,R=10,T=10,B=22;
+  const X=i=>L+(i/(vis[0].curve.length-1))*(W-L-R);
+  const Y=v=>T+(hi-v)/(hi-lo)*(H-T-B);
+  // 网格 + 轴
+  g.strokeStyle='#2a3440';g.fillStyle='#8b98a5';g.font='10px sans-serif';
+  for(let k=0;k<=4;k++){
+    const v=lo+(hi-lo)*k/4,y=Y(v);
+    g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();
+    g.fillText((v*100).toFixed(0)+'%',4,y+3);
+  }
+  // 1.0 基准
+  if(1.0>=lo&&1.0<=hi){g.strokeStyle='#e8c14a';g.setLineDash([4,3]);
+    g.beginPath();g.moveTo(L,Y(1.0));g.lineTo(W-R,Y(1.0));g.stroke();g.setLineDash([]);}
+  // 曲线
+  vis.forEach(c=>{
+    const k=Object.keys(mk.markets).find(key=>mk.markets[key].curve===c);
+    g.strokeStyle=colors[k]||'#d7dee6';g.lineWidth=1.5;
+    g.beginPath();
+    c.curve.forEach((v,i)=>{const x=X(i),y=Y(v);i?g.lineTo(x,y):g.moveTo(x,y);});
+    g.stroke();
+  });
+  g.lineWidth=1;
+  // 图例
+  let lx=L;g.font='11px sans-serif';
+  vis.forEach(c=>{
+    const k=Object.keys(mk.markets).find(key=>mk.markets[key].curve===c);
+    const col=colors[k]||'#d7dee6';
+    g.fillStyle=col;g.fillRect(lx,4,10,3);
+    g.fillStyle='#d7dee6';
+    const v=c.curve[c.curve.length-1];
+    const lbl=k+' '+(v*100-100).toFixed(1)+'%';
+    g.fillText(lbl,lx+14,10);
+    lx+=g.measureText(lbl).width+40;
+  });
+}
+
 function renderSm701Markets(){
   const mk=DATA.sm701_markets;
   if(!mk||!mk.markets){$("#c-smk").innerHTML=
@@ -843,9 +903,11 @@ function renderSm701Markets(){
          `<td>${pct2(s.total_median,1)}</td><td>${pct2(s.bh_median,1)}</td></tr>`;
     });
     $("#c-smk").innerHTML=h+'</table>'+
+      '<canvas id="smk-cv" style="width:100%;height:260px;margin-top:8px"></canvas>'+
       '<div class="note">sm701 概率滞回信号（≥0.55买/<0.50卖，test 档风控），'+
-      '各市场成交量 Top30、近1000根日K逐股回测的中位数；点市场名看逐标的明细。</div>';
-    bindSmkTabs();return;
+      '各市场成交量 Top30、近1000根日K逐股回测的中位数；曲线=各市场标的等权平均净值'+
+      '（起点1.0）；点市场名看逐标的明细。</div>';
+    bindSmkTabs();requestAnimationFrame(drawSmkCurve);return;
   }
   // 逐标的明细（按区间收益降序）
   const det=(mk.markets[smkMkt]||{}).detail||[];
@@ -860,8 +922,9 @@ function renderSm701Markets(){
        `<td>${pct2(r.bh,1,true)}</td></tr>`;
   });
   $("#c-smk").innerHTML=h+'</table>'+
+    '<canvas id="smk-cv" style="width:100%;height:260px;margin-top:8px"></canvas>'+
     '<div class="note">'+esc(smkMkt)+' 逐标的（点「汇总」返回；交易0笔的标的未列出）。</div>';
-  bindSmkTabs();
+  bindSmkTabs();requestAnimationFrame(drawSmkCurve);
 }
 function bindSmkTabs(){
   document.querySelectorAll('#c-smk .tabbtn').forEach(el=>{
