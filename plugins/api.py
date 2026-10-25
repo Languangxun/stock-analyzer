@@ -57,7 +57,7 @@ class PluginAPI:
         keys = ("UP", "DOWN", "PRED_C", "TPRED_C", "BG", "GRID_C", "GUIDE_C",
                 "AXIS_TXT", "TITLE_TXT", "CROSS_C", "DARK_BG", "PANEL_BG",
                 "FIELD_BG", "FG_MAIN", "BTN_BG", "BTN_FG", "BTN_HOVER",
-                "BTN_BORDER")
+                "BTN_BORDER", "SEL_BG", "LOG_BG", "ACCENT")
         return {k: getattr(sg, k) for k in keys if hasattr(sg, k)}
 
     def current_theme(self):

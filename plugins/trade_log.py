@@ -18,6 +18,7 @@ import json
 import os
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
+import time
 from datetime import datetime
 
 from .base import StockPlugin
@@ -81,6 +82,14 @@ class TradeLogPlugin(StockPlugin):
                     r["account"] = "cn:" + r["account"]
         except Exception:
             self._records = []
+        self._notes = []
+        try:
+            path = self.api.storage_path("trade_notes.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self._notes = json.load(f)
+        except Exception:
+            self._notes = []
         try:
             path = self.api.storage_path("trade_settings.json")
             if os.path.exists(path):
@@ -103,6 +112,12 @@ class TradeLogPlugin(StockPlugin):
                 json.dump(self._records, f, ensure_ascii=False, indent=2)
         except Exception:
             self.api.log.exception("保存交易记录失败")
+        try:
+            path = self.api.storage_path("trade_notes.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._notes, f, ensure_ascii=False, indent=2)
+        except Exception:
+            self.api.log.exception("保存交易笔记失败")
         try:
             path = self.api.storage_path("trade_settings.json")
             with open(path, "w", encoding="utf-8") as f:
@@ -354,6 +369,14 @@ class TradeLogPlugin(StockPlugin):
             relief="flat", cursor="hand2",
             font=("Microsoft YaHei", 9))
         self._btn_equity.pack(side="left", padx=(0, 4))
+
+        self._btn_notes = tk.Button(
+            btn_frame, text="交易笔记", command=self._show_notes_dialog,
+            bg=c["BTN_BG"], fg=c["BTN_FG"],
+            activebackground=c["BTN_HOVER"], activeforeground=c["BTN_FG"],
+            relief="flat", cursor="hand2",
+            font=("Microsoft YaHei", 9))
+        self._btn_notes.pack(side="left", padx=(0, 4))
 
         self._btn_ai = tk.Button(
             btn_frame, text="AI分析", command=self._show_ai_dialog,
@@ -1060,6 +1083,150 @@ class TradeLogPlugin(StockPlugin):
                   font=("Microsoft YaHei", 9)).pack(side="right")
 
     # ------------------------------------------------------------------
+    # 交易笔记（v7.0.1：复盘/心得，可关联代码与标签）
+    # ------------------------------------------------------------------
+    def _notes_sorted(self):
+        return sorted(self._notes,
+                      key=lambda n: (n.get("date", ""), n.get("ts", 0)),
+                      reverse=True)
+
+    def _show_notes_dialog(self):
+        c = self.api.colors()
+        win = tk.Toplevel(self._frame)
+        win.title("交易笔记（复盘/心得）")
+        win.configure(bg=c["DARK_BG"])
+        win.transient(self._frame)
+        win.geometry("760x560")
+
+        top = tk.Frame(win, bg=c["DARK_BG"])
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(top, text="日期").pack(side="left")
+        date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d"))
+        ttk.Entry(top, textvariable=date_var, width=11).pack(
+            side="left", padx=(2, 8))
+        ttk.Label(top, text="关联代码").pack(side="left")
+        code_var = tk.StringVar(value=self.api.current_code or "")
+        ttk.Entry(top, textvariable=code_var, width=12).pack(
+            side="left", padx=(2, 8))
+        ttk.Label(top, text="标签").pack(side="left")
+        tag_var = tk.StringVar()
+        ttk.Entry(top, textvariable=tag_var, width=10).pack(
+            side="left", padx=2)
+
+        mid = tk.Frame(win, bg=c["DARK_BG"])
+        mid.pack(fill="both", expand=True, padx=8, pady=4)
+        listf = tk.Frame(mid, bg=c["DARK_BG"])
+        listf.pack(side="left", fill="both", expand=False)
+        cols = ("date", "code", "tag")
+        tv = ttk.Treeview(listf, columns=cols, show="headings", height=18)
+        for cid, t in (("date", "日期"), ("code", "代码"), ("tag", "标签")):
+            tv.heading(cid, text=t)
+            tv.column(cid, width=70 if cid != "date" else 78, anchor="w")
+        tvs = ttk.Scrollbar(listf, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=tvs.set)
+        tv.pack(side="left", fill="y")
+        tvs.pack(side="left", fill="y")
+        editf = tk.Frame(mid, bg=c["DARK_BG"])
+        editf.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        txt = tk.Text(editf, bg=c["PANEL_BG"], fg=c["FG_MAIN"],
+                      font=("Microsoft YaHei", 10), relief="flat",
+                      wrap="word", insertbackground=c["FG_MAIN"],
+                      selectbackground=c["SEL_BG"], padx=8, pady=6)
+        txt.pack(fill="both", expand=True)
+
+        state = {"idx": None}
+
+        def refresh_list():
+            tv.delete(*tv.get_children())
+            for i, n in enumerate(self._notes_sorted()):
+                tv.insert("", "end", iid=str(i), values=(
+                    n.get("date", ""), n.get("code") or "",
+                    n.get("tag") or ""))
+            state["idx"] = None
+            txt.delete("1.0", "end")
+
+        def on_select(_e=None):
+            sel = tv.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            notes = self._notes_sorted()
+            if i >= len(notes):
+                return
+            n = notes[i]
+            state["idx"] = self._notes.index(n)
+            date_var.set(n.get("date", ""))
+            code_var.set(n.get("code") or "")
+            tag_var.set(n.get("tag") or "")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", n.get("text", ""))
+
+        tv.bind("<<TreeviewSelect>>", on_select)
+
+        def save_note():
+            text = txt.get("1.0", "end").strip()
+            d = (date_var.get().strip() or
+                 datetime.now().strftime("%Y-%m-%d"))
+            d = self.api.align_trading_day(d)
+            rec = {"date": d, "code": code_var.get().strip(),
+                   "tag": tag_var.get().strip(), "text": text,
+                   "ts": time.time()}
+            if state["idx"] is not None and state["idx"] < len(self._notes):
+                rec["ts"] = self._notes[state["idx"]].get("ts") or rec["ts"]
+                self._notes[state["idx"]] = rec
+            else:
+                self._notes.append(rec)
+            self._save_data()
+            self._notes.sort(
+                key=lambda n: (n.get("date", ""), n.get("ts", 0)))
+            refresh_list()
+            try:
+                self.progress_var.set("交易笔记已保存")
+            except Exception:
+                pass
+
+        def new_note():
+            state["idx"] = None
+            txt.delete("1.0", "end")
+            date_var.set(datetime.now().strftime("%Y-%m-%d"))
+            code_var.set(self.api.current_code or "")
+            tag_var.set("")
+
+        def del_note():
+            if state["idx"] is None or state["idx"] >= len(self._notes):
+                messagebox.showinfo("提示", "先在列表选中一条笔记", parent=win)
+                return
+            if not messagebox.askyesno("删除", "确定删除选中的笔记？",
+                                       parent=win):
+                return
+            self._notes.pop(state["idx"])
+            self._save_data()
+            refresh_list()
+
+        btns = tk.Frame(win, bg=c["DARK_BG"])
+        btns.pack(fill="x", padx=8, pady=(2, 8))
+        for _lab, _cmd in (("新建", new_note), ("保存笔记", save_note),
+                           ("删除", del_note)):
+            tk.Button(btns, text=_lab, command=_cmd,
+                      bg=c["BTN_BG"], fg=c["BTN_FG"],
+                      activebackground=c["BTN_HOVER"],
+                      activeforeground=c["BTN_FG"], relief="flat",
+                      cursor="hand2", font=("Microsoft YaHei", 9)
+                      ).pack(side="left", padx=4)
+        tk.Label(btns, text="笔记会自动附入 AI 交易分析上下文（最近10条）",
+                 bg=c["DARK_BG"], fg=c["AXIS_TXT"],
+                 font=("Microsoft YaHei", 8)).pack(side="left", padx=10)
+        tk.Button(btns, text="关闭", command=win.destroy,
+                  bg=c["BTN_BG"], fg=c["BTN_FG"],
+                  activebackground=c["BTN_HOVER"],
+                  activeforeground=c["BTN_FG"], relief="flat",
+                  cursor="hand2",
+                  font=("Microsoft YaHei", 9)).pack(side="right")
+        refresh_list()
+        return win
+
+    # ------------------------------------------------------------------
     # AI 分析（保持原逻辑，提示词带账本区分）
     # ------------------------------------------------------------------
     def _show_ai_dialog(self):
@@ -1134,6 +1301,12 @@ class TradeLogPlugin(StockPlugin):
                       f"{st[2]['mdd'] * 100:.1f}%"
                       if isinstance(st[2], dict) else "暂无（未设本金或无记录）")
 
+            notes = self._notes_sorted()[:10]
+            notes_txt = ("\n".join(
+                f"- {n.get('date','')} "
+                f"{('['+n['tag']+']') if n.get('tag') else ''} "
+                f"{(n.get('code') or '')} {n.get('text','')[:160]}"
+                for n in notes) or "（暂无）")
             prompt = f"""请基于以下数据进行交易分析（{name}账本）：
 
 【账户】本金 {capital:,.0f} 元，可用现金 {cash:,.0f} 元；历史收益曲线：{eq_txt}
@@ -1141,6 +1314,9 @@ class TradeLogPlugin(StockPlugin):
 
 【当前持仓（含浮动盈亏）】
 {pos_text}
+
+【交易笔记（最近10条，含本人复盘心得）】
+{notes_txt}
 
 【最近交易记录】
 {records_text}
@@ -1247,7 +1423,8 @@ class TradeLogPlugin(StockPlugin):
             self._cap_label.config(bg=c["DARK_BG"], fg=c["FG_MAIN"])
             self._summary_label.config(bg=c["DARK_BG"], fg=c["FG_MAIN"])
             for b in (self._btn_add, self._btn_delete, self._btn_settings,
-                      self._btn_capital, self._btn_equity, self._btn_ai):
+                      self._btn_capital, self._btn_equity, self._btn_notes,
+                      self._btn_ai):
                 b.config(bg=c["BTN_BG"], fg=c["BTN_FG"],
                          activebackground=c["BTN_HOVER"])
             self._highlight_acc_btn()
