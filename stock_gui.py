@@ -18384,9 +18384,258 @@ class App:
                                                            padx=4)
         ttk.Button(row, text="刷新", command=refresh).pack(side="left",
                                                            padx=4)
+        ttk.Button(row, text="新建策略", command=lambda: self._studio_editor(
+            None, on_saved=refresh)).pack(side="left", padx=(16, 4))
+
+        def _edit_sel():
+            slug = cur_slug()
+            if slug:
+                self._studio_editor(slug, on_saved=refresh)
+
+        ttk.Button(row, text="编辑选中", command=_edit_sel).pack(
+            side="left", padx=4)
         ttk.Button(win, text="关闭", command=win.destroy).pack(
             side="bottom", anchor="e", padx=10, pady=8)
         refresh()
+        return win
+
+    # ---------- 策略编辑器（v7.0.1：可视化生成工坊 JSON） ----------
+    _STUDIO_PARAM_NAMES = {
+        "period": "周期", "fast": "快线", "slow": "慢线", "signal": "信号线",
+        "n": "N", "m1": "M1", "m2": "M2", "length": "长度",
+        "k": "倍数", "upper": "上轨", "lower": "下轨", "pct": "百分比",
+    }
+
+    def _studio_editor(self, slug, on_saved=None):
+        """可视化策略编辑器：指标/操作符下拉 + 逗号参数简式，产出与
+        策略工坊 JSON 完全兼容的定义（存 studio_strategies/）。"""
+        colors = {"DARK_BG": DARK_BG, "PANEL_BG": PANEL_BG,
+                  "FG_MAIN": FG_MAIN, "AXIS_TXT": AXIS_TXT,
+                  "TITLE_TXT": TITLE_TXT, "BTN_BG": BTN_BG,
+                  "BTN_FG": BTN_FG, "BTN_HOVER": BTN_HOVER,
+                  "FIELD_BG": FIELD_BG, "SEL_BG": SEL_BG}
+        ind_keys = list(_STUDIO_INDICATORS.keys())
+        ind_labels = [f"{_STUDIO_INDICATORS[k][0]} ({k})" for k in ind_keys]
+        op_labels = {o: _STUDIO_OP_TEXT.get(o, "介于") for o in _STUDIO_OPS}
+        existing = studio_get_definition(slug) if slug else None
+
+        win = tk.Toplevel(self.root)
+        win.title("策略编辑器" + (f" · {slug}" if slug else " · 新建"))
+        win.configure(bg=DARK_BG)
+        win.transient(self.root)
+        self._center_win(win, 900, 640)
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=10, pady=(10, 2))
+        ttk.Label(head, text="名称:").pack(side="left")
+        name_var = tk.StringVar(
+            value=(existing or {}).get("name") or "")
+        ttk.Entry(head, textvariable=name_var, width=24).pack(
+            side="left", padx=4)
+        ttk.Label(head, text="描述:").pack(side="left", padx=(10, 0))
+        desc_var = tk.StringVar(value=(existing or {}).get("description") or "")
+        ttk.Entry(head, textvariable=desc_var, width=32).pack(
+            side="left", padx=4)
+
+        cond_rows = {"entry": [], "exit": []}
+
+        def params_to_str(key, params):
+            spec = _STUDIO_INDICATORS.get(key, ("", "", (), None))[2]
+            if not spec:
+                return ""
+            vals = [str(params.get(k, d))
+                    for k, _l, _k2, d, _lo, _hi in spec]
+            return ",".join(vals)
+
+        def str_to_params(key, text):
+            spec = _STUDIO_INDICATORS.get(key, ("", "", (), None))[2]
+            parts = [p.strip() for p in (text or "").split(",") if p.strip()]
+            out = {}
+            for i, (k, _l, kind, d, lo, hi) in enumerate(spec):
+                if i < len(parts):
+                    try:
+                        v = float(parts[i]) if kind == "float" \
+                            else int(float(parts[i]))
+                        out[k] = max(lo, min(hi, v))
+                    except (ValueError, TypeError):
+                        out[k] = d
+                else:
+                    out[k] = d
+            return out
+
+        def build_cond_row(parent, side, cond=None):
+            """一条条件的行控件。cond 为已有条件 dict 或 None。"""
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", pady=2)
+            cond = cond or {}
+            left = cond.get("left") or {}
+            op0 = cond.get("op") or "gt"
+            right = cond.get("right") or {}
+
+            lcb = ttk.Combobox(fr, width=22, state="readonly",
+                               values=ind_labels)
+            lkey = left.get("indicator") or "close"
+            lcb.set(f"{_STUDIO_INDICATORS.get(lkey, ('?'))[0]} ({lkey})")
+            lcb.pack(side="left")
+            lpar = ttk.Entry(fr, width=8)
+            lpar.insert(0, params_to_str(lkey, left.get("params") or {}))
+            lpar.pack(side="left", padx=(2, 4))
+
+            opcb = ttk.Combobox(fr, width=9, state="readonly",
+                                values=[op_labels[o] for o in _STUDIO_OPS])
+            opcb.set(op_labels.get(op0, op0))
+            opcb.pack(side="left")
+
+            rtype = tk.StringVar(
+                value=(right.get("type") or "value") if op0 not in
+                ("rising", "falling") else "none")
+            rtc = ttk.Combobox(fr, width=5, state="readonly",
+                               values=("数值", "指标", "无"),
+                               textvariable=rtype)
+            rtc.pack(side="left", padx=(4, 2))
+            rtxt = right.get("value")
+            if op0 == "between":
+                rval_text = f"{right.get('value', 0):g},{right.get('value2', 0):g}"
+            elif right.get("type") == "indicator":
+                rk = right.get("indicator") or "close"
+                rval_text = f"{rk}:{params_to_str(rk, right.get('params') or {})}"
+            elif op0 in ("rising", "falling"):
+                rval_text = ""
+            else:
+                rval_text = ("" if rtxt is None else
+                             (f"{float(rtxt):g}"))
+            ren = ttk.Entry(fr, width=14)
+            ren.insert(0, rval_text)
+            ren.pack(side="left")
+
+            row = {"fr": fr, "lcb": lcb, "lpar": lpar, "opcb": opcb,
+                   "rtype": rtype, "ren": ren,
+                   "lkey": lkey, "lcb_labels": ind_labels}
+
+            def on_lcb(_e=None):
+                sel = lcb.get()
+                nk = sel.split("(")[-1].rstrip(")").strip() or "close"
+                if nk != row["lkey"]:
+                    row["lkey"] = nk
+                    lpar.delete(0, tk.END)
+                    lpar.insert(0, params_to_str(nk, {}))
+            lcb.bind("<<ComboboxSelected>>", on_lcb)
+
+            def del_row():
+                fr.destroy()
+                cond_rows[side].remove(row)
+            ttk.Button(fr, text="✕", width=2, command=del_row).pack(
+                side="left", padx=(4, 0))
+            cond_rows[side].append(row)
+            return row
+
+        def row_to_cond(row):
+            """行控件 → 条件 dict（经 _st_normalize_condition 校验）。"""
+            lk = row["lcb"].get().split("(")[-1].rstrip(")").strip()
+            left = {"indicator": lk,
+                    "params": str_to_params(lk, row["lpar"].get())}
+            op = {v: k for k, v in op_labels.items()}.get(
+                row["opcb"].get(), "gt")
+            t = row["rtype"].get()
+            txt = row["ren"].get().strip()
+            if op in ("rising", "falling"):
+                return {"left": left, "op": op}
+            if op == "between":
+                a, _, b = txt.partition(",")
+                return {"left": left, "op": op,
+                        "right": {"type": "value", "value": float(a or 0),
+                                  "value2": float(b or 0)}}
+            if t == "指标":
+                rk, _, rpar = txt.partition(":")
+                return {"left": left, "op": op,
+                        "right": {"type": "indicator",
+                                  "indicator": rk.strip(),
+                                  "params": str_to_params(rk.strip(), rpar)}}
+            return {"left": left, "op": op,
+                    "right": {"type": "value",
+                              "value": float(txt or 0)}}
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=10, pady=4)
+        sec_defs = (("entry", "买入条件（满足 entry_logic 触发 BUY）"),
+                    ("exit", "卖出条件（满足 exit_logic 触发 SELL）"))
+        logic_vars = {}
+        cond_frames = {}
+        for side, title in sec_defs:
+            lf = ttk.LabelFrame(body, text=title, padding=6)
+            lf.pack(fill="both", expand=True, pady=4)
+            top = ttk.Frame(lf)
+            top.pack(fill="x")
+            lv = tk.StringVar(
+                value="全部满足" if (existing or {}).get(
+                    side + "_logic", "all") == "all" else "任一满足")
+            logic_vars[side] = lv
+            ttk.Combobox(top, width=9, state="readonly",
+                         values=("全部满足", "任一满足"),
+                         textvariable=lv).pack(side="left")
+            cond_frames[side] = ttk.Frame(lf)
+            cond_frames[side].pack(fill="x")
+            ttk.Button(top, text="+ 加条件",
+                       command=lambda s=side, cf=cond_frames[side]:
+                       build_cond_row(cf, s)).pack(side="right")
+            for c in (existing or {}).get(side + "_conditions") or []:
+                build_cond_row(cond_frames[side], side, c)
+            if not ((existing or {}).get(side + "_conditions")):
+                build_cond_row(cond_frames[side], side)
+
+        def save():
+            rows_e = [row_to_cond(r) for r in cond_rows["entry"]]
+            rows_x = [row_to_cond(r) for r in cond_rows["exit"]]
+            raw = {
+                "name": name_var.get().strip(),
+                "description": desc_var.get().strip(),
+                "entry_logic": "all" if logic_vars["entry"].get()
+                == "全部满足" else "any",
+                "exit_logic": "all" if logic_vars["exit"].get()
+                == "全部满足" else "any",
+                "entry_conditions": rows_e,
+                "exit_conditions": rows_x,
+            }
+            if slug:
+                raw["slug"] = slug
+            try:
+                d = _st_normalize_definition(raw)
+            except Exception as e:
+                messagebox.showwarning("保存失败", str(e), parent=win)
+                return
+            out_slug = d["slug"] or (
+                "user_" + re.sub(r"[^a-z0-9]+", "_",
+                                 d["name"].lower()).strip("_")[:40]
+                + "_" + time.strftime("%m%d%H%M"))
+            d["slug"] = out_slug
+            path = _studio_definition_path(out_slug)
+            if not path:
+                messagebox.showwarning("保存失败", "策略 ID 非法", parent=win)
+                return
+            try:
+                os.makedirs(STUDIO_STORE, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                messagebox.showerror("保存失败", str(e), parent=win)
+                return
+            self.progress_var.set(f"策略已保存: {d['name']}（{out_slug}）"
+                                  "——可在上方选中并应用到市场")
+            messagebox.showinfo("已保存",
+                                f"策略 {d['name']} 已保存\nID: {out_slug}",
+                                parent=win)
+            win.destroy()
+            if on_saved:
+                on_saved()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=10, pady=(2, 10))
+        ttk.Button(btns, text="保存策略", command=save).pack(side="right")
+        ttk.Label(btns,
+                  text="参数填法：按指标提示的顺序逗号分隔（如 MACD=12,26,9；"
+                       "均线=20）；右类型选「指标」时填 指标key:参数（如 ma:20）。",
+                  foreground=AXIS_TXT, justify="left",
+                  font=("Microsoft YaHei", 8)).pack(side="left")
         return win
 
     def _switch_market(self, label):
