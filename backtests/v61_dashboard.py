@@ -250,6 +250,9 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>stock-analyzer · 回测仪表盘</title>
 <style>
+.tabbtn{display:inline-block;padding:2px 10px;margin:0 4px 4px 0;border:1px solid var(--line);
+  border-radius:10px;font-size:12px;color:var(--dim)}
+.tabbtn.on{background:var(--gold);color:#111;border-color:var(--gold);font-weight:600}
 :root{--bg:#0f1419;--panel:#171d24;--panel2:#1e2630;--fg:#d7dee6;
       --dim:#8b98a5;--line:#2a3440;--gold:#e8c14a;--blue:#4da3ff;
       --up:#ff5252;--down:#26c281;--grid:#26303b;--cross:#ffffff55;
@@ -814,27 +817,57 @@ function renderAblTable(){
     '<div class="note">IC=选中策略信号方向 vs 未来1/5日收益的 Spearman 相关系数'+
     '（全样本描述性统计，不参与选型）；年化/胜率中位=逐股消融选中策略的中位数。</div>';
 }
+let smkMkt=null;   // 当前查看的多市场键（null=汇总）
 function renderSm701Markets(){
   const mk=DATA.sm701_markets;
   if(!mk||!mk.markets){$("#c-smk").innerHTML=
     '<div class="note">暂无多市场回测：跑 backtests/backtest_sm701_markets.py 后刷新。</div>';
     $("#smk-sub").textContent="";return;}
   $("#smk-sub").textContent="　生成 "+(mk.generated||"")+"（概率滞回信号·test风控·近1000根）";
-  let h='<table><tr><th>市场</th><th>有效/抽样</th><th>交易数中位</th><th>胜率中位</th>'+
-    '<th>年化中位</th><th>回撤中位</th><th>区间收益中位</th><th>买入持有中位</th></tr>';
-  Object.keys(mk.markets).forEach(k=>{
-    const v=mk.markets[k]||{};
-    if(v.skipped){h+=`<tr><td>${esc(k)}</td><td colspan="7">无生产模型</td></tr>`;return;}
-    const s=v.summary||{};
-    const pct2=(x,d)=>x==null?'-':(x*100).toFixed(d)+'%';
-    h+=`<tr><td>${esc(k)}</td><td>${num(s.n_traded,0)}/${num(s.n,0)}</td>`+
-       `<td>${num(s.trades_median,1)}</td><td>${pct2(s.winrate_median,1)}</td>`+
-       `<td>${pct2(s.ann_median,1)}</td><td>${pct2(s.mdd_median,1)}</td>`+
-       `<td>${pct2(s.total_median,1)}</td><td>${pct2(s.bh_median,1)}</td></tr>`;
+  const mks=Object.keys(mk.markets).filter(k=>mk.markets[k]&&!mk.markets[k].skipped);
+  const pct2=(x,d)=>x==null?'-':(x*100).toFixed(d)+'%';
+  // 市场切换 tabs（点市场名看逐标的明细，再点回汇总）
+  let tabs='<div style="margin:4px 0">'+
+    `<span class="tabbtn ${smkMkt==null?'on':''}" data-mk="">汇总</span>`+
+    mks.map(k=>`<span class="tabbtn ${smkMkt==k?'on':''}" data-mk="${k}">${esc(k)}</span>`).join('')+
+    '</div>';
+  if(!smkMkt){
+    let h=tabs+'<table><tr><th>市场</th><th>有效/抽样</th><th>交易数中位</th><th>胜率中位</th>'+
+      '<th>年化中位</th><th>回撤中位</th><th>区间收益中位</th><th>买入持有中位</th></tr>';
+    mks.forEach(k=>{
+      const s=(mk.markets[k]||{}).summary||{};
+      h+=`<tr><td><span class="tabbtn" data-mk="${esc(k)}">${esc(k)}</span></td>`+
+         `<td>${num(s.n_traded,0)}/${num(s.n,0)}</td>`+
+         `<td>${num(s.trades_median,1)}</td><td>${pct2(s.winrate_median,1)}</td>`+
+         `<td>${pct2(s.ann_median,1)}</td><td>${pct2(s.mdd_median,1)}</td>`+
+         `<td>${pct2(s.total_median,1)}</td><td>${pct2(s.bh_median,1)}</td></tr>`;
+    });
+    $("#c-smk").innerHTML=h+'</table>'+
+      '<div class="note">sm701 概率滞回信号（≥0.55买/<0.50卖，test 档风控），'+
+      '各市场成交量 Top30、近1000根日K逐股回测的中位数；点市场名看逐标的明细。</div>';
+    bindSmkTabs();return;
+  }
+  // 逐标的明细（按区间收益降序）
+  const det=(mk.markets[smkMkt]||{}).detail||[];
+  const rows=[...det].sort((a,b)=>(b.total??-9)-(a.total??-9));
+  let h=tabs+'<table><tr><th>代码</th><th>交易数</th><th>胜率</th><th>年化</th>'+
+    '<th>最大回撤</th><th>区间收益</th><th>买入持有</th></tr>';
+  rows.forEach(r=>{
+    if(r.error){h+=`<tr><td>${esc(r.code)}</td><td colspan="6" class="note">${esc(r.error)}</td></tr>`;return;}
+    h+=`<tr><td>${esc(r.code)}</td><td>${num(r.trades,0)}</td>`+
+       `<td>${pct2(r.winrate,1)}</td><td>${pct2(r.ann,1,true)}</td>`+
+       `<td>${pct2(r.mdd,1)}</td><td>${pct2(r.total,1,true)}</td>`+
+       `<td>${pct2(r.bh,1,true)}</td></tr>`;
   });
   $("#c-smk").innerHTML=h+'</table>'+
-    '<div class="note">sm701 概率滞回信号（≥0.55买/<0.50卖，test 档风控），'+
-    '各市场成交量 Top30、近1000根日K逐股回测的中位数；历史概率为样本外落盘。</div>';
+    '<div class="note">'+esc(smkMkt)+' 逐标的（点「汇总」返回；交易0笔的标的未列出）。</div>';
+  bindSmkTabs();
+}
+function bindSmkTabs(){
+  document.querySelectorAll('#c-smk .tabbtn').forEach(el=>{
+    el.style.cursor='pointer';
+    el.onclick=()=>{smkMkt=el.dataset.mk||null;renderSm701Markets();};
+  });
 }
 function renderMetrics(){
   const run=curRun(); if(!run)return;
