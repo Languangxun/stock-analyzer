@@ -847,10 +847,16 @@ def _normalize_ai_base(base: str) -> str:
 
 AI_MODEL = _load_ai_model()
 AI_BASE_URL = _normalize_ai_base(_load_ai_base())
+AI_MODEL_CHOICES = ["deepseek-flash", "deepseek-v4-pro",
+                    "deepseek-chat", "deepseek-reasoner"]
 
 
-def _save_ai_conf(model=None, base=None) -> None:
-    """持久化 AI 模型/接口地址到 ini（None 表示不改）。"""
+AI_EFFORTS = ("max", "high", "low")
+
+
+def _save_ai_conf(model=None, base=None, thinking=None, effort=None,
+                  tools=None, web_search=None) -> None:
+    """持久化 AI 模型/接口/思考/工具开关到 ini（None 表示不改）。"""
     global AI_MODEL, AI_BASE_URL
     try:
         cp = configparser.ConfigParser()
@@ -863,6 +869,16 @@ def _save_ai_conf(model=None, base=None) -> None:
         if base is not None:
             AI_BASE_URL = _normalize_ai_base(base)
             cp.set("deepseek", "base_url", AI_BASE_URL)
+        if thinking is not None:
+            cp.set("deepseek", "thinking", "1" if thinking else "0")
+        if effort is not None:
+            e = str(effort).strip().lower()
+            cp.set("deepseek", "reasoning_effort",
+                   e if e in AI_EFFORTS else "max")
+        if tools is not None:
+            cp.set("deepseek", "tools", "1" if tools else "0")
+        if web_search is not None:
+            cp.set("deepseek", "web_search", "1" if web_search else "0")
         with open(INI_PATH, "w", encoding="utf-8") as f:
             cp.write(f)
     except Exception:
@@ -883,6 +899,43 @@ def get_ai_key() -> str:
     """当前可用 Key：环境变量 > ini > 主目录 opencode-go 授权。"""
     return (ENV_API_KEY or _ai_ini_get("deepseek", "api_key", "")
             or _opencode_go_key()).strip()
+
+
+def _ai_web_search_enabled() -> bool:
+    """ini [deepseek] web_search：AI 分析前自动联网检索个股资讯。
+    默认开（仅 DeepSeek 官方 Search API 生效，其他 OpenAI 兼容网关自动跳过）。"""
+    return _ai_ini_get("deepseek", "web_search", "1") != "0"
+
+
+def set_ai_web_search(on: bool) -> None:
+    """持久化「AI 分析自动联网检索」开关到 ini。"""
+    _save_ai_conf(web_search=on)
+
+
+def _ai_thinking_enabled() -> bool:
+    """ini [deepseek] thinking：深度思考默认开（DeepSeek 官方接口生效）。"""
+    return _ai_ini_get("deepseek", "thinking", "1") != "0"
+
+
+def _ai_reasoning_effort() -> str:
+    """ini [deepseek] reasoning_effort：low/high/max，默认 max。"""
+    e = (_ai_ini_get("deepseek", "reasoning_effort", "max") or "max").lower()
+    return e if e in AI_EFFORTS else "max"
+
+
+def set_ai_thinking(on: bool, effort=None) -> None:
+    """持久化深度思考开关/强度。"""
+    _save_ai_conf(thinking=on, effort=effort)
+
+
+def _ai_tools_enabled() -> bool:
+    """ini [deepseek] tools：AI 分析按需调用工具取数（默认开）。"""
+    return _ai_ini_get("deepseek", "tools", "1") != "0"
+
+
+def set_ai_tools(on: bool) -> None:
+    """持久化「AI 按需工具取数」开关。"""
+    _save_ai_conf(tools=on)
 
 
 # ================= 荐股权限（板块/行业，供设置与荐股过滤共用） =================
@@ -15197,6 +15250,9 @@ RISK_AI_GUIDE = {
             " sm701 LightGBM 概率（≥0.55 买入 / <0.50 卖出）。请围绕模型概率"
             "给出结论，并提示这是研究口径的「次日开盘→收盘」日内 alpha，"
             "A 股 T+1 不可当日卖出、样本外 AUC 仅约 0.53，风险自负。",
+    "sm701": "风险偏好=sm701 模型直出档（多市场）：买卖点不做策略消融，直接来自"
+             " sm701 模型概率（≥0.55 买入 / <0.50 卖出，滞回）。请围绕模型概率"
+             "与趋势给结论，仍须给出可执行价位/仓位，不要用『观望』搪塞。",
     "外部策略": "外部策略模式（股票策略工坊）：买卖点来自用户导入的策略规则，"
                 "不适用风险偏好；退出按设置→外部策略中的止损/止盈/最长持有执行。"
                 "请围绕该策略规则与显式风控参数给结论，不要套用内置三档偏好。",
@@ -15207,6 +15263,17 @@ def ai_risk_guide(mode=""):
     """按风险偏好返回 AI 行为约束（未知/空回退稳健）。"""
     return RISK_AI_GUIDE.get(mode or CFG.RISK_MODE,
                              RISK_AI_GUIDE["稳健"])
+
+
+def ai_risk_mode(res=None):
+    """AI 行为约束口径：外部策略/模型直出等特殊档优先，其余用**设置里**
+    的风险偏好（`CFG.RISK_MODE`）。策略缓存档位（`res["risk_mode"]`）是
+    该股消融时选中的回测档，可能和当前设置不同，不能覆盖用户设置。"""
+    rm = ((res or {}).get("risk_mode") or "").strip()
+    if rm in ("外部策略", "test", "sm701"):
+        return rm
+    prefer = CFG.RISK_MODE
+    return prefer if prefer in RISK_AI_GUIDE else "稳健"
 
 
 def ai_system_prompt(mode=""):
@@ -15304,6 +15371,126 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
     return sorted(set(out))
 
 
+# ================= DeepSeek Search（AI 分析自动联网资讯） =================
+# 文档：https://api-docs.deepseek.com/guides/search
+# 仅官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关无此能力时自动跳过。
+AI_SEARCH_COUNT = 5
+AI_SEARCH_TTL = 1800          # 同股资讯缓存 30 分钟（避免重复计费）
+AI_SEARCH_FAIL_TTL = 300      # 失败/空结果缓存 5 分钟，网络恢复后尽快重试
+_AI_SEARCH_CACHE = {}         # code -> {"exp": float, "txt": str}
+_AI_SEARCH_LOCK = threading.Lock()
+
+
+def _ai_is_deepseek(base_url="") -> bool:
+    """当前接口是否 DeepSeek 官方（Search/思考/工具调用仅官方支持）。"""
+    import urllib.parse
+    p = urllib.parse.urlsplit(_normalize_ai_base(base_url or AI_BASE_URL))
+    return (p.hostname or "").lower() == "api.deepseek.com"
+
+
+def _ai_search_url(base_url="") -> str:
+    """DeepSeek 官方 Search API 地址；非官方接口返回空串（不支持）。"""
+    import urllib.parse
+    base = _normalize_ai_base(base_url or AI_BASE_URL)
+    if not _ai_is_deepseek(base):
+        return ""
+    p = urllib.parse.urlsplit(base)
+    return urllib.parse.urlunsplit((p.scheme or "https", p.netloc,
+                                    "/v1/tools/search", "", ""))
+
+
+def _ai_thinking_params(thinking=None, effort=None) -> dict:
+    """DeepSeek 官方思考参数：默认取全局设置；窗口可传一次性覆盖。
+    非官方接口不发送（部分网关会拒绝未知字段）。"""
+    if not _ai_is_deepseek():
+        return {}
+    think = _ai_thinking_enabled() if thinking is None else bool(thinking)
+    if not think:
+        return {"thinking": {"type": "disabled"}}
+    eff = str(effort or _ai_reasoning_effort()).lower()
+    if eff not in AI_EFFORTS:
+        eff = _ai_reasoning_effort()
+    return {"thinking": {"type": "enabled"}, "reasoning_effort": eff}
+
+
+def deepseek_search(api_key, query, count=AI_SEARCH_COUNT, timeout=12,
+                    base_url=""):
+    """DeepSeek Search API（纯标准库）。返回 results 列表；不支持时返回 []。"""
+    url = _ai_search_url(base_url)
+    if not url or not api_key or not (query or "").strip():
+        return []
+    d = _ai_http_json(url, {"query": query.strip(), "count": count},
+                      api_key, timeout)
+    return d.get("results") if isinstance(d, dict) else []
+
+
+def _fmt_search_results(results, limit=None):
+    """把 Search API 结果压成适合塞进 prompt 的短文本。"""
+    lines = []
+    for i, r in enumerate((results or [])[:limit or AI_SEARCH_COUNT], 1):
+        if not isinstance(r, dict):
+            continue
+        title = re.sub(r"\s+", " ", str(r.get("title") or "")).strip()
+        summary = re.sub(r"\s+", " ", str(r.get("summary")
+                                          or r.get("snippet") or "")).strip()
+        if not title and not summary:
+            continue
+        if len(summary) > 360:
+            summary = summary[:360].rstrip() + "…"
+        meta = "，".join(x for x in (str(r.get("date") or "")[:10],
+                                     str(r.get("site_name") or "").strip())
+                         if x)
+        line = f"{i}. {title or summary[:40]}"
+        if meta:
+            line += f"（{meta}）"
+        if summary and summary != title:
+            line += f"：{summary}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def ai_stock_news(code="", name="", timeout=12):
+    """AI 分析前自动检索个股近期资讯（DeepSeek Search）。
+
+    返回可直接拼入 prompt 的格式化文本；未开启/非官方接口/无 Key/失败均返回
+    空串，绝不阻断分析。同股 30 分钟内复用缓存，避免重复请求计费。"""
+    ck = (code or name or "").strip()
+    if not ck or not _ai_web_search_enabled():
+        return ""
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return ""
+    now = time.time()
+    with _AI_SEARCH_LOCK:
+        ent = _AI_SEARCH_CACHE.get(ck)
+        if ent and now < ent.get("exp", 0):
+            return ent.get("txt", "")
+    since = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+    code_q, low = (code or "").strip(), (code or "").strip().lower()
+    if low.startswith("crypto"):
+        code_q = code_q[6:]
+    elif low[:2] in ("sh", "sz", "bj", "hk", "us", "fu"):
+        code_q = code_q[2:]
+    name_q = (name or "").replace('"', "").strip()
+    q = " ".join([x for x in (f'"{name_q}"' if name_q else "", code_q,
+                              "最新消息 公告 业绩", f"after:{since}") if x])
+    txt = ""
+    try:
+        results = deepseek_search(key, q, timeout=timeout)
+        txt = _fmt_search_results(results)
+        log.info("联网检索 %s：%d 条资讯", ck, len(results or []))
+    except Exception as e:
+        log.warning("DeepSeek 联网检索失败(忽略): %s", e)
+    ttl = AI_SEARCH_TTL if txt else AI_SEARCH_FAIL_TTL
+    with _AI_SEARCH_LOCK:
+        _AI_SEARCH_CACHE[ck] = {"exp": now + ttl, "txt": txt}
+        if len(_AI_SEARCH_CACHE) > 200:
+            for k in [k for k, v in _AI_SEARCH_CACHE.items()
+                      if v.get("exp", 0) < now]:
+                _AI_SEARCH_CACHE.pop(k, None)
+    return txt
+
+
 def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
                   session="", system=None):
     """单轮调用 OpenAI 兼容 chat 接口（纯标准库）。model 缺省用 AI_MODEL。
@@ -15312,13 +15499,38 @@ def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
                           model, timeout, session=session, system=system)
 
 
+_AI_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                  "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+                  "reasoning_tokens")
+
+
+def _ai_usage_add(sink, usage):
+    """累加 OpenAI usage（DeepSeek 含 cache hit/miss/reasoning 细分）。"""
+    if sink is None or not isinstance(usage, dict):
+        return
+    for k in _AI_USAGE_KEYS:
+        try:
+            sink[k] = int(sink.get(k, 0)) + int(usage.get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        det = usage.get("completion_tokens_details") or {}
+        rt = int(det.get("reasoning_tokens") or 0)
+        if rt:
+            sink["reasoning_tokens"] = int(sink.get("reasoning_tokens", 0)) + rt
+    except (TypeError, ValueError):
+        pass
+
+
 def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
-                   system=None):
+                   system=None, return_message=False, usage_sink=None,
+                   thinking=None, effort=None):
     """多轮调用 OpenAI 兼容 chat 接口。messages 为 [{role,content},...]，
     首条 user 消息应携带完整共享数据上下文，后续追问只追加新问题，
     从而复用同一份数据（不重复拼装）。model 缺省用 ini 配置的 AI_MODEL。
     system 缺省用 ai_system_prompt()（通用要求+当前风险偏好约束）。
-    session 见 _ai_session_id（opencode zen 必需）。"""
+    session 见 _ai_session_id（opencode zen 必需）。
+    return_message=True 时返回原始 message dict（含 reasoning_content）。"""
     payload = {
         "model": model or AI_MODEL,
         "messages": [{"role": "system",
@@ -15326,11 +15538,14 @@ def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
                     + list(messages),
         "temperature": 0.3,
     }
+    payload.update(_ai_thinking_params(thinking, effort))
     d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
                       session=session)
+    _ai_usage_add(usage_sink, d.get("usage"))
     try:
-        return d["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+        msg = d["choices"][0]["message"]
+        return msg if return_message else (msg.get("content") or "")
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise RuntimeError(f"接口返回格式异常: {str(d)[:200]}")
 
 
@@ -15351,36 +15566,76 @@ def _ai_cache_key(code, model=""):
     return f"ai:{code}:{model or AI_MODEL}"
 
 
-# AI画线（v6.5.2）：AI 在正文末尾附机器可读价位块（```ai-lines {...}```），
-# 解析后存 res["ai_lines"]，主图绘制。 kinds 固定6种；segs 为可选趋势段。
+# AI画线（v6.5.2；2026-11-04 扩展）：AI 在正文末尾附机器可读块
+# （```ai-lines {...}```），解析后存 res["ai_lines"]，主图绘制：
+# 水平价位 lines + 斜线段/射线 segs + 文字标注 notes + 区间 zones。
 _AI_LINE_KINDS = ("buy", "sell", "stop", "support", "resistance", "target")
-_AI_LINES_MAX = 6
-_AI_SEGS_MAX = 2
+_AI_SEG_KINDS = ("trend", "support", "resistance", "channel", "ray")
+_AI_NOTE_KINDS = ("note", "buy", "sell", "warning", "target")
+_AI_ZONE_KINDS = ("zone", "channel", "risk", "target")
+_AI_LINES_MAX = 8
+_AI_SEGS_MAX = 6
+_AI_NOTES_MAX = 6
+_AI_ZONES_MAX = 3
+_AI_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+AI_DRAW_SCHEMA = (
+    "\n【画线/标注输出：正文结束后另起一段，只输出以下代码块，无其它文字】\n"
+    "```ai-lines\n"
+    '{"lines": [{"price": 5.32, "label": "买点", "kind": "buy"}],\n'
+    ' "segs": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
+    '           "b": {"date": "2026-10-20", "price": 5.60},\n'
+    '           "label": "上升趋势", "kind": "trend",\n'
+    '           "extend": true, "dash": true}],\n'
+    ' "notes": [{"date": "2026-10-20", "price": 5.60,\n'
+    '            "text": "放量突破", "kind": "note"}],\n'
+    ' "zones": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
+    '            "b": {"date": "2026-10-20", "price": 5.60},\n'
+    '            "label": "震荡区间", "kind": "zone"}]}\n'
+    "```\n"
+    "规则：lines≤8（buy/sell/stop/support/resistance/target）；"
+    "segs≤6（斜线/趋势线/通道线，kind=trend/support/resistance/channel/ray，"
+    "extend=true 向右延伸、\"both\" 向两端延伸，dash=false 实线）；"
+    "notes≤6（在图上日期+价位处加文字标注，text≤20字，"
+    "kind=note/buy/sell/warning/target）；zones≤3（矩形区间，"
+    "kind=zone/channel/risk/target）；日期用 YYYY-MM-DD 且须在最近60个"
+    "交易日（当前图可见范围）内；价位须在近60日区间正负30%内；必须是合法JSON"
+    "（数字不加引号、无注释、无尾逗号）。"
+)
+
+
+def _ai_date_ok(s):
+    return bool(_AI_DATE_RE.match((s or "").strip()))
 
 
 def parse_ai_lines(text, lo, hi):
-    """解析AI画线块，返回 (levels, segs)。非法/越界条目静默丢弃。
-    levels: [{"price","label","kind"}]；segs: [{"a":{"date","price"},
-    "b":{"date","price"},"label"}]。lo/hi 为允许的价格区间。"""
-    levels, segs = [], []
+    """解析AI画线块，返回 (levels, segs, notes, zones)。非法/越界静默丢弃。
+    levels: [{"price","label","kind"}]
+    segs:   [{"a":{"date","price"},"b":{...},"label","kind","extend",
+              "extend_both","dash"}]
+    notes:  [{"date","price","text","kind"}]
+    zones:  [{"a":{"date","price"},"b":{...},"label","kind"}]
+    lo/hi 为允许的价格区间。"""
+    levels, segs, notes, zones = [], [], [], []
     if not text or not (lo and hi) or hi <= 0 or lo <= 0:
-        return levels, segs
+        return levels, segs, notes, zones
     try:
         m = re.search(r"```ai-lines\s*(\{.*?\})\s*```", text, re.S)
         raw = m.group(1) if m else None
         if raw is None:
             m2 = None
-            for m2 in re.finditer(r"\{[^{}]*\"lines\"[^{}]*\}", text):
+            for m2 in re.finditer(
+                    r'\{[^{}]*"(?:lines|segs|notes|zones)"[^{}]*\}', text):
                 pass
             raw = m2.group(0) if m2 else None
         if not raw:
-            return levels, segs
+            return levels, segs, notes, zones
         try:
             d = json.loads(raw)
         except Exception:
-            return levels, segs  # AI常输出残缺JSON，静默丢弃不刷日志
+            return levels, segs, notes, zones  # 残缺JSON静默丢弃
         if not isinstance(d, dict):
-            return levels, segs
+            return levels, segs, notes, zones
         for e in (d.get("lines") or [])[:_AI_LINES_MAX]:
             try:
                 px = float(e.get("price"))
@@ -15404,16 +15659,65 @@ def parse_ai_lines(text, lo, hi):
                     continue
                 if not (lo <= pa <= hi and lo <= pb <= hi):
                     continue
-                if len(da) < 10 or len(db) < 10:
+                if not (_ai_date_ok(da) and _ai_date_ok(db)):
                     continue
+                kind = str(s.get("kind") or "trend").lower()
+                if kind not in _AI_SEG_KINDS:
+                    kind = "trend"
+                ext = s.get("extend", False)
+                if isinstance(ext, str):
+                    ext_l = ext.strip().lower()
+                    extend = ext_l in ("1", "true", "yes", "right", "both")
+                    extend_both = ext_l == "both"
+                else:
+                    extend = bool(ext)
+                    extend_both = False
                 segs.append({"a": {"date": da[:10], "price": round(pa, 2)},
                              "b": {"date": db[:10], "price": round(pb, 2)},
-                             "label": lab})
+                             "label": lab, "kind": kind, "extend": extend,
+                             "extend_both": extend_both,
+                             "dash": bool(s.get("dash", True))})
+            except (ValueError, TypeError, AttributeError):
+                continue
+        for n in (d.get("notes") or [])[:_AI_NOTES_MAX]:
+            try:
+                da = str(n.get("date") or "")
+                px = float(n.get("price"))
+                txt = re.sub(r"\s+", " ", str(n.get("text") or "")).strip()[:20]
+                kind = str(n.get("kind") or "note").lower()
+                if kind not in _AI_NOTE_KINDS:
+                    kind = "note"
+                if not txt or not _ai_date_ok(da):
+                    continue
+                if not (math.isfinite(px) and lo <= px <= hi):
+                    continue
+                notes.append({"date": da[:10], "price": round(px, 2),
+                              "text": txt, "kind": kind})
+            except (ValueError, TypeError, AttributeError):
+                continue
+        for z in (d.get("zones") or [])[:_AI_ZONES_MAX]:
+            try:
+                a, b = z.get("a") or {}, z.get("b") or {}
+                pa, pb = float(a.get("price")), float(b.get("price"))
+                da, db = str(a.get("date") or ""), str(b.get("date") or "")
+                lab = str(z.get("label") or "")[:10]
+                kind = str(z.get("kind") or "zone").lower()
+                if kind not in _AI_ZONE_KINDS:
+                    kind = "zone"
+                if not (math.isfinite(pa) and math.isfinite(pb)):
+                    continue
+                if not (lo <= pa <= hi and lo <= pb <= hi):
+                    continue
+                if not (_ai_date_ok(da) and _ai_date_ok(db)):
+                    continue
+                zones.append({"a": {"date": da[:10], "price": round(pa, 2)},
+                              "b": {"date": db[:10], "price": round(pb, 2)},
+                              "label": lab, "kind": kind})
             except (ValueError, TypeError, AttributeError):
                 continue
     except Exception:
         log.exception("AI画线块解析失败(忽略)")
-    return levels, segs
+    return levels, segs, notes, zones
 
 
 def ai_session_load(code, model=""):
@@ -15625,6 +15929,510 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         return pref, f"AI 输出无法解析，回退 {pref}"
     except Exception as e:
         return pref, f"AI 选档失败，回退 {pref}（{e}）"
+
+
+# ================= AI 工具取数（按需调用，不预塞全文） =================
+# 仅 DeepSeek 官方接口（思考模式支持 tool calls）；其他网关回退完整上下文。
+
+def _ai_tool_int(v, dflt, lo, hi):
+    try:
+        return max(lo, min(hi, int(float(v))))
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _ai_tool_f(v, nd=2):
+    try:
+        f = float(v)
+        return f"{f:.{nd}f}" if math.isfinite(f) else "-"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_pct(v, nd=2):
+    try:
+        return f"{float(v) * 100:.{nd}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_spct(v, nd=2):
+    try:
+        return f"{float(v):+.{nd}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_json(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"),
+                      default=str)
+
+
+def _ai_tool_rows(res, days, end=None):
+    code = res.get("full_code") or ""
+    disp = res.get("disp_rows") or []
+    rows = disp
+    _end = str(end or "").strip()[:10]
+    if days > len(disp) or (_end and disp
+                            and _end < (disp[0].get("date") or "")):
+        try:
+            more = get_daily(code, min_bars=max(100, days)) or []
+        except Exception:
+            more = []
+        if more:
+            rows = more
+            if disp and (disp[-1].get("date") or "") > \
+                    (rows[-1].get("date") or ""):
+                rows = list(rows) + [disp[-1]]
+    if _end:
+        rows = [r for r in rows if (r.get("date") or "") <= _end]
+    return rows[-days:]
+
+
+def _ai_tool_kline(ctx, args):
+    days = _ai_tool_int(args.get("days"), 60, 1, 240)
+    rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+    if not rows:
+        return "无日K数据"
+    out = [f"日K {rows[0]['date']}~{rows[-1]['date']} 共{len(rows)}根"
+           "（列：日期,开,高,低,收,量）"]
+    out.extend(
+        f"{r['date']},{_ai_tool_f(r.get('open'))},"
+        f"{_ai_tool_f(r.get('high'))},{_ai_tool_f(r.get('low'))},"
+        f"{_ai_tool_f(r.get('close'))},{_ai_tool_f(r.get('vol'), 0)}"
+        for r in rows)
+    return "\n".join(out)
+
+
+_AI_IND_COLS = {
+    "ma": lambda ind: [(f"MA{k}", (ind.get("ma") or {}).get(k))
+                       for k in sorted(ind.get("ma") or {})],
+    "macd": lambda ind: [("DIF", ind.get("dif")), ("DEA", ind.get("dea")),
+                         ("HIST", ind.get("mhist"))],
+    "kdj": lambda ind: [("K", ind.get("k")), ("D", ind.get("d")),
+                        ("J", ind.get("j"))],
+    "rsi": lambda ind: [("RSI6", ind.get("rsi6")),
+                        ("RSI12", ind.get("rsi12"))],
+    "boll": lambda ind: [("UP", ind.get("boll_up")),
+                         ("MID", ind.get("boll_mid")),
+                         ("LOW", ind.get("boll_low"))],
+    "adx": lambda ind: [("ADX", ind.get("adx")), ("PDI", ind.get("pdi")),
+                        ("MDI", ind.get("mdi"))],
+}
+
+
+def _ai_tool_indicators(ctx, args):
+    res = ctx.get("res") or {}
+    ind = res.get("ind") or {}
+    rows = res.get("disp_rows") or []
+    days = _ai_tool_int(args.get("days"), 30, 1, 240)
+    names = [x.strip().lower() for x in
+             str(args.get("names") or "ma,macd,kdj,rsi,boll,adx").split(",")
+             if x.strip()]
+    cols = []
+    for nm in names:
+        if nm == "vol":
+            cols.append(("VOL", [r.get("vol") for r in rows]))
+        elif nm in _AI_IND_COLS:
+            cols.extend((h, arr) for h, arr in _AI_IND_COLS[nm](ind) if arr)
+    if not cols or not rows:
+        return "无可返回指标"
+    n = min([len(rows)] + [len(a) for _, a in cols if a])
+    out = ["日期," + ",".join(h for h, _ in cols)]
+    for i in range(max(0, n - days), n):
+        vals = [_ai_tool_f((a[i] if a and i < len(a) else None), 3)
+                for _, a in cols]
+        out.append(f"{rows[i]['date']}," + ",".join(vals))
+    return "\n".join(out)
+
+
+def _ai_tool_prediction(ctx, args):
+    res = ctx.get("res") or {}
+    tp = res.get("t_pred") or {}
+    sm = res.get("samples") or []
+    vals = [s.get("n1_cl") for s in sm if s.get("n1_cl") is not None]
+    vs = sorted(vals)
+    stats = {
+        "n": len(vals),
+        "avg_n1_pct": round(sum(vals) / len(vals) * 100, 2) if vals else None,
+        "up_rate_pct": (round(len([v for v in vals if v > 0]) / len(vals)
+                              * 100, 1) if vals else None),
+        "n1_p25_pct": (round(vs[len(vs) // 4] * 100, 2)
+                       if len(vs) >= 4 else None),
+        "n1_p75_pct": (round(vs[(len(vs) * 3) // 4] * 100, 2)
+                       if len(vs) >= 4 else None),
+    }
+    multi = []
+    for d in (res.get("multi_pred") or []):
+        try:
+            multi.append({
+                "label": d.get("label"),
+                "cl50": round(d["cl"][50], 2),
+                "hi75": round(d["hi"][75], 2),
+                "lo25": round(d["lo"][25], 2),
+                "up_prob": round(d.get("up_prob") or 0, 3),
+                "cum_cl_pct": round((d.get("cum_cl") or 0) * 100, 2),
+                "price_cl": round(d.get("price_cl") or 0, 2),
+            })
+        except (KeyError, TypeError):
+            continue
+    return _ai_tool_json({
+        "anchor": res.get("anchor"),
+        "next_label": res.get("next_label"),
+        "today_close": tp.get("cl"),
+        "today_up_prob": tp.get("up_prob"),
+        "next_day": res.get("pred"),
+        "t5": res.get("t5_pred"),
+        "multi_day": multi,
+        "ghosts": res.get("ghosts"),
+        "sample_stats": stats,
+    })
+
+
+def _ai_tool_samples(ctx, args):
+    res = ctx.get("res") or {}
+    limit = _ai_tool_int(args.get("limit"), 10, 1, 30)
+    rows = (res.get("samples") or [])[:limit]
+    out = ["T日,T+1日,次日%,T+2%,T+3%,缺口%,量比,相似度,权重,量能状态"]
+    for s in rows:
+        out.append(",".join([
+            str(s.get("t_date") or ""), str(s.get("n1_date") or ""),
+            _ai_tool_pct(s.get("n1_cl")), _ai_tool_pct(s.get("n2_cl")),
+            _ai_tool_pct(s.get("n3_cl")), _ai_tool_pct(s.get("gap")),
+            _ai_tool_f(s.get("vr"), 2),
+            _ai_tool_f(s.get("similarity_score"), 3),
+            _ai_tool_f(s.get("weight"), 2), str(s.get("regime") or ""),
+        ]))
+    return "\n".join(out) if len(out) > 1 else "无相似样本"
+
+
+def _ai_tool_market(ctx, args):
+    res = ctx.get("res") or {}
+    try:
+        brief = _ai_market_brief_full()
+    except Exception as e:
+        brief = f"市场简报构建失败: {e}"
+    head = (f"上证今日 {_ai_tool_spct(res.get('idx_chg_today'))}；"
+            f"板块 {res.get('sector_name') or '-'} "
+            f"{_ai_tool_spct(res.get('sector_chg_today'))}；"
+            f"量比 {_ai_tool_f(res.get('vr_now'), 2)}"
+            f"（{res.get('cur_regime') or '-'}）")
+    return head + "\n" + brief
+
+
+def _ai_tool_chips(ctx, args):
+    res = ctx.get("res") or {}
+    out = []
+    cp = res.get("chips")
+    if cp:
+        out.append(
+            f"筹码：平均成本{_ai_tool_f(cp.get('avg_cost'))} "
+            f"获利盘{_ai_tool_f((cp.get('profit') or 0) * 100, 0)}% "
+            f"90%区间{_ai_tool_f(cp.get('p5'))}~{_ai_tool_f(cp.get('p95'))}"
+            + (f" 支撑{_ai_tool_f(cp.get('sup'))}" if cp.get("sup") else "")
+            + (f" 压力{_ai_tool_f(cp.get('res'))}" if cp.get("res") else ""))
+    act = res.get("action")
+    if act:
+        items = "; ".join(f"{lab}{sc:+d}({note})"
+                          for lab, sc, note in (act.get("items") or []))
+        out.append(f"多维评分 {int(act.get('score') or 0):+d} "
+                   f"{act.get('verdict')} [{items}]")
+    sigs = res.get("signals") or []
+    if sigs:
+        out.append("近期信号：" + "; ".join(
+            f"{d}[{t}]{x}" for _, d, t, x in sigs[-12:]))
+    bt = res.get("bt_stats") or {}
+    if bt:
+        clean = {k: v for k, v in bt.items()
+                 if k not in ("curve", "trades_list", "train", "val")}
+        for seg in ("train", "val"):
+            if isinstance(bt.get(seg), dict):
+                clean[seg] = {k: v for k, v in bt[seg].items()
+                              if k not in ("curve", "trades_list")}
+        out.append("回测统计：" + _ai_tool_json(clean))
+    if res.get("band_note"):
+        out.append("波段：" + str(res.get("band_note")))
+    return "\n".join(out) or "无筹码/评分数据"
+
+
+def _ai_tool_fundamentals(ctx, args):
+    res = ctx.get("res") or {}
+    full = res.get("full_code") or ""
+    rows = fetch_f10_metrics(full, periods=8)
+    out = ["\n".join(fundamentals_summary(full, rows)),
+           "报告期,营收亿,营收同比%,净利亿,净利同比%,扣非同比%,EPS,ROE%,"
+           "毛利率%,净利率%,负债率%"]
+    for r in rows[:8]:
+        out.append(",".join([
+            str(r.get("date_name") or r.get("notice") or "")[:10],
+            _ai_tool_f((r.get("rev") or 0) / 1e8),
+            _ai_tool_f(r.get("rev_yoy")),
+            _ai_tool_f((r.get("np") or 0) / 1e8),
+            _ai_tool_f(r.get("np_yoy")), _ai_tool_f(r.get("kf_yoy")),
+            _ai_tool_f(r.get("eps"), 3), _ai_tool_f(r.get("roe")),
+            _ai_tool_f(r.get("gm")), _ai_tool_f(r.get("nm")),
+            _ai_tool_f(r.get("debt")),
+        ]))
+    return "\n".join(out)
+
+
+def _ai_tool_intraday(ctx, args):
+    res = ctx.get("res") or {}
+    data = fetch_minute_lines(res.get("full_code") or "")
+    rows = data.get("rows") or []
+    vols = data.get("vols") or []
+    avg = data.get("avg") or []
+    points = _ai_tool_int(args.get("points"), 60, 10, 240)
+    out = [f"分时 {data.get('day') or '-'} 昨收 "
+           f"{_ai_tool_f(data.get('prev_close'))}（时间,价格,均价,分钟量）"]
+    for i in range(max(0, len(rows) - points), len(rows)):
+        row = rows[i]
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            t, px = row[0], row[1]
+        elif isinstance(row, dict):
+            t, px = (row.get("t") or row.get("time")), row.get("price")
+        else:
+            continue
+        out.append(f"{t},{_ai_tool_f(px)},"
+                   f"{_ai_tool_f(avg[i] if i < len(avg) else None)},"
+                   f"{_ai_tool_f(vols[i] if i < len(vols) else None, 0)}")
+    return "\n".join(out) if len(out) > 1 else "无分时数据"
+
+
+def _ai_tool_strategy(ctx, args):
+    res = ctx.get("res") or {}
+    strat = res.get("strategy") or {}
+    return _ai_tool_json({
+        "algo": strat.get("algo"), "mode": strat.get("mode"),
+        "label": strat.get("label"), "params": strat.get("params"),
+        "train": strat.get("train"), "val": strat.get("val"),
+        "recent": strat.get("recent"),
+        "risk_mode": res.get("risk_mode"), "sel_algo": res.get("sel_algo"),
+        "band_fit": res.get("band_fit"),
+        "band_score": res.get("band_score"),
+        "band_note": res.get("band_note"),
+    })
+
+
+def _ai_tool_news(ctx, args):
+    search_on = ctx.get("search")
+    if search_on is None:
+        search_on = _ai_web_search_enabled()
+    if not search_on:
+        return "联网检索已在本次会话关闭。"
+    q = str(args.get("query") or "").strip()[:128]
+    count = _ai_tool_int(args.get("count"), 5, 1, 10)
+    if not q:
+        txt = ctx.get("news")
+        if txt is None:
+            txt = ai_stock_news(ctx.get("code") or "", ctx.get("name") or "")
+        return txt or "（近30天未检索到相关资讯）"
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return "当前接口不支持联网检索。"
+    try:
+        rs = deepseek_search(key, q, count=count)
+        if rs and isinstance(ctx.get("usage"), dict):
+            ctx["usage"]["search_calls"] = int(
+                ctx["usage"].get("search_calls", 0)) + 1
+        return _fmt_search_results(rs, limit=count) or "（未检索到结果）"
+    except Exception as e:
+        return f"联网检索失败: {e}"
+
+
+def _ai_tool_show_table(ctx, args):
+    """在 AI 窗口单独渲染一张统计表（结构化事件，不进模型上下文）。"""
+    title = str(args.get("title") or "统计表")[:40]
+    cols = [str(x)[:30] for x in (args.get("columns") or [])][:20]
+    rows = []
+    for r in (args.get("rows") or [])[:200]:
+        if isinstance(r, (list, tuple)):
+            rows.append([str(x)[:80] for x in r][:len(cols)])
+    if not cols or not rows:
+        return "表格为空：需要 columns 与 rows。"
+    table = {"title": title, "columns": cols, "rows": rows}
+    cb = ctx.get("on_table")
+    if callable(cb):
+        try:
+            cb(table)
+        except Exception:
+            log.exception("AI统计表回调失败(忽略)")
+    md = ("| " + " | ".join(cols) + " |\n| "
+          + " | ".join(["---"] * len(cols)) + " |\n")
+    for r in rows[:20]:
+        md += "| " + " | ".join(r) + " |\n"
+    return "已生成统计表并在界面单独展示。\n" + md
+
+
+_AI_TOOL_FUNCS = {
+    "get_kline": _ai_tool_kline,
+    "get_indicators": _ai_tool_indicators,
+    "get_prediction": _ai_tool_prediction,
+    "get_similar_samples": _ai_tool_samples,
+    "get_market": _ai_tool_market,
+    "get_chips_action": _ai_tool_chips,
+    "get_fundamentals": _ai_tool_fundamentals,
+    "get_intraday": _ai_tool_intraday,
+    "get_strategy": _ai_tool_strategy,
+    "search_news": _ai_tool_news,
+    "show_table": _ai_tool_show_table,
+}
+
+
+def ai_tool_specs():
+    """OpenAI 兼容工具定义：让模型按需取数，而不是首轮塞满上下文。"""
+    return [
+        {"type": "function", "function": {
+            "name": "get_kline",
+            "description": "获取该股更多日K线（OHLCV）。判断形态、趋势、"
+                           "支撑压力、量价关系时调用；可用 end 指定截止日期。",
+            "parameters": {"type": "object", "properties": {
+                "days": {"type": "integer", "description": "最近多少根，1-240",
+                         "default": 60},
+                "end": {"type": "string",
+                        "description": "可选截止日期 YYYY-MM-DD"}}}}},
+        {"type": "function", "function": {
+            "name": "get_indicators",
+            "description": "获取技术指标序列（与日K对齐）：ma/macd/kdj/rsi/"
+                           "boll/adx/vol。",
+            "parameters": {"type": "object", "properties": {
+                "names": {"type": "string",
+                          "description": "逗号分隔，默认 ma,macd,kdj,rsi,boll,adx"},
+                "days": {"type": "integer", "description": "最近多少天，1-240",
+                         "default": 30}}}}},
+        {"type": "function", "function": {
+            "name": "get_prediction",
+            "description": "获取形态预测：当日收盘分位/上行概率、T+1 预测、"
+                           "T+1~T+10 多日分位、T+5、相似样本统计。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_similar_samples",
+            "description": "获取相似历史样本明细（T+1~T+3 涨跌/缺口/量比/"
+                           "相似度/权重）。",
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "条数，1-30",
+                          "default": 10}}}}},
+        {"type": "function", "function": {
+            "name": "get_market",
+            "description": "获取大盘指数、三档闸门市场简报与板块环境。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_chips_action",
+            "description": "获取筹码分布、多维综合评分、近期买卖信号与回测统计。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_fundamentals",
+            "description": "获取最近财报关键指标与规则分析（营收/净利/ROE/"
+                           "毛利率/负债率等）。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_intraday",
+            "description": "获取最近交易日分时（价格/均价/分钟量），用于盘中判断。",
+            "parameters": {"type": "object", "properties": {
+                "points": {"type": "integer", "description": "最近多少分钟，10-240",
+                           "default": 60}}}}},
+        {"type": "function", "function": {
+            "name": "get_strategy",
+            "description": "获取当前选中策略（算法/档位/风险参数/训练验证指标）。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "search_news",
+            "description": "联网检索个股近期新闻/公告/业绩；可自定义检索词。",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string",
+                          "description": "检索词，≤128字；留空=默认近30天个股资讯"},
+                "count": {"type": "integer", "description": "结果数，1-10",
+                          "default": 5}}}}},
+        {"type": "function", "function": {
+            "name": "show_table",
+            "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"
+                           "多周期对比、支撑压力清单）。列≤20、行≤200。",
+            "parameters": {"type": "object", "properties": {
+                "title": {"type": "string", "description": "表格标题"},
+                "columns": {"type": "array",
+                            "items": {"type": "string"},
+                            "description": "列名列表"},
+                "rows": {"type": "array",
+                         "items": {"type": "array",
+                                   "items": {"type": "string"}},
+                         "description": "行数据（二维字符串数组）"}},
+                "required": ["title", "columns", "rows"]}}},
+    ]
+
+
+def ai_tool_call(ctx, name, args):
+    """执行模型工具调用，返回字符串（tool message content）。"""
+    fn = _AI_TOOL_FUNCS.get(name)
+    if fn is None:
+        return _ai_tool_json({"error": f"未知工具: {name}"})
+    try:
+        out = fn(ctx or {}, args if isinstance(args, dict) else {})
+        return out if isinstance(out, str) else _ai_tool_json(out)
+    except Exception as e:
+        log.exception("AI工具 %s 调用失败", name)
+        return _ai_tool_json({"error": f"{type(e).__name__}: {e}"[:300]})
+
+
+def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
+                         timeout=120, session="", system=None,
+                         max_rounds=8, on_event=None, usage_sink=None,
+                         thinking=None, effort=None):
+    """带工具调用的多轮 chat（DeepSeek 思考模式）。返回 (content,
+    reasoning_content)。工具轮内必须回传 reasoning_content（官方要求）。"""
+    msgs = [{"role": "system", "content": system or ai_system_prompt()}]
+    msgs += [dict(m) for m in messages]
+    tools = ai_tool_specs()
+    last = ""
+    for rnd in range(max_rounds):
+        if on_event:
+            on_event("round", str(rnd + 1))
+        payload = {
+            "model": model or AI_MODEL,
+            "messages": msgs,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.3,
+        }
+        payload.update(_ai_thinking_params(thinking, effort))
+        d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
+                          session=session)
+        _ai_usage_add(usage_sink, d.get("usage"))
+        try:
+            msg = d["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError(f"接口返回格式异常: {str(d)[:200]}")
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        calls = msg.get("tool_calls") or []
+        last = content or last
+        if on_event and reasoning:
+            on_event("reasoning", reasoning)
+        if not calls:
+            return content, reasoning
+        asst = {"role": "assistant", "content": content,
+                "reasoning_content": reasoning, "tool_calls": calls}
+        msgs.append(asst)
+        for tc in calls:
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            cid = tc.get("id") or name
+            try:
+                targs = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                targs = {}
+            if not isinstance(targs, dict):
+                targs = {}
+            if on_event:
+                on_event("tool", name, targs, cid)
+            result = ai_tool_call(tool_ctx, name, targs)
+            if on_event:
+                on_event("tool_done", name, {"len": len(result)}, cid)
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": result,
+            })
+    return last or "（工具调用轮次已达上限，请重试。）", ""
 
 # ==================== 以下为 CLI 专属 ====================
 

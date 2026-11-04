@@ -5,6 +5,53 @@
 
 ## 版本历史
 
+> **AI Agent 侧栏（嵌入主界面右侧栏，2026-11-04）**：AI 分析不再独立窗口——
+> 主界面右侧栏新增「AI Agent」面板（下拉切换；竖栏约 29% 宽度，Tk 原生聊天）；
+> 侧栏内可**切换股票代码**（触发主程序重新分析并刷新图表）与**切换模型**；
+> **模型/思考强度/工具取数/联网为一次性会话选项**（`AIAgent.set_opts`，不写 ini）；
+> 输入栏下方实时显示输入/输出 token、缓存命中率、预计成本（DeepSeek flash/
+> v4-pro 峰谷价近似，USD/CNY）与联网次数；新增 `show_table` 工具生成独立统计表
+> 卡片；AI 画线仍回传 Tk 主图；工具窗不再设 AI 页签（原入口已删除）；
+> `stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **AI 按需取数 + 深度思考 + 扩展画线（2026-11-04）**：① 设置→AI 接口新增
+> 「深度思考」（默认开、强度 `max`，ini `[deepseek] thinking/reasoning_effort`）
+> 与「工具取数」（默认开，ini `[deepseek] tools`）；仅官方 `api.deepseek.com`
+> 发送思考/工具参数，其他网关自动回退完整上下文；② AI 分析首轮只给核心快照
+> （股票/现价/缺口/量比/板块/策略风控），其余由模型在思考中按需调用工具：
+> `get_kline`/`get_indicators`/`get_prediction`/`get_similar_samples`/
+> `get_market`/`get_chips_action`/`get_fundamentals`/`get_intraday`/
+> `get_strategy`/`search_news`（最多 8 轮，工具轮回传 `reasoning_content`；
+> 工具异常/网关不支持自动回退旧全文模式）；不再一次性塞满上下文；
+> ③ AI 画线扩展：水平价位≤8、斜线/趋势线/射线≤6（`extend` 向右/两端延伸、
+> `dash` 实虚线、按 kind 配色）、文字标注≤6、区间色块≤3，解析/绘制兼容旧
+> `ai-lines`；④ `stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **AI 风险偏好口径修复（2026-11-04）**：此前 AI 首轮上下文把该股策略缓存
+> 档位（`res["risk_mode"]`，可能因消融选型是保守/稳健）当作「当前风险偏好」，
+> 而系统提示词仍按设置档位，同一请求出现两套冲突约束（设置激进却按保守引导）。
+> 现统一由 `ai_risk_mode()` 决定：外部策略 / `test` / `sm701` 模型直出档优先，
+> 其余一律按设置 `CFG.RISK_MODE`；系统提示词与首轮上下文同口径，策略缓存档位
+> 与设置不同时在上下文注明；`stock_predict.py` 重新生成。
+
+> **AI 分析自动联网检索（DeepSeek Search，2026-11-04）**：① 新增 `deepseek_search()`
+> 封装 DeepSeek 官方 `POST /v1/tools/search`（仅 `api.deepseek.com` 生效，其他
+> OpenAI 兼容网关自动跳过）；② 【开始分析】首轮前在后台自动检索该股近 30 天
+> 新闻/公告/业绩（`ai_stock_news`：5 条摘要、同股 30 分钟缓存、失败/空结果缓存
+> 5 分钟），格式化后作为「联网资讯」段拼入首轮上下文，并提示 AI 与行情交叉验证；
+> ③ 设置→AI 接口新增「联网检索」开关（ini `[deepseek] web_search`，默认开）——
+> 关闭后完全离线分析；检索失败/无 Key/非官方接口一律静默跳过，不阻断分析；
+> ④ `stock_predict.py` 重新生成（CLI 同步包含 Search 封装）。
+
+> **键盘精灵修复：失效与不清空（2026-10-25）**：① 全局按键 `root.bind` 改
+> `bind_all`——工具窗/子 Toplevel 有焦点时精灵不再整体失灵（Entry/Text/
+> Combobox 等文本控件仍不劫持）；② 会话判定改以**实际焦点**为准：仅焦点在
+> 搜索框、会话活跃且空闲<30s 才追加，否则一律开新会话清空旧代码——修复
+> `_wiz_active` 滞留导致的按键丢失（失效）与追加在旧代码后（不清空）；
+> ③ 搜索框 FocusOut 的 180ms 延时结束回调改为校验焦点已离开（`_search_end_if_blurred`），
+> 避免刚开启的新会话被延迟回调杀掉；④ 会话加 30s 空闲过期（`_wiz_ts`），
+> 焦点久留搜索框后再次输入也能从头清空。无头冒烟 8 项全过。
+
 > **v7.0.1：多市场正式版——港股/美股/期货/加密并入 + 各市场 sm701 直出 + 工坊按市场应用 + 分市场自选/账本/指标参数（2026-10-25）**：
 > ① **多市场并入（合并桌面 market-sniper）**：代码前缀 `hk00700/usaapl/fugc/
 > cryptobtcusdt` 与 cn 同库同表，复用全部缓存/显示/分时/离线降级链路；

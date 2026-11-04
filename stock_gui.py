@@ -24,10 +24,13 @@ import re
 import signal
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import tkinter as tk
@@ -832,10 +835,16 @@ def _normalize_ai_base(base: str) -> str:
 
 AI_MODEL = _load_ai_model()
 AI_BASE_URL = _normalize_ai_base(_load_ai_base())
+AI_MODEL_CHOICES = ["deepseek-flash", "deepseek-v4-pro",
+                    "deepseek-chat", "deepseek-reasoner"]
 
 
-def _save_ai_conf(model=None, base=None) -> None:
-    """持久化 AI 模型/接口地址到 ini（None 表示不改）。"""
+AI_EFFORTS = ("max", "high", "low")
+
+
+def _save_ai_conf(model=None, base=None, thinking=None, effort=None,
+                  tools=None, web_search=None) -> None:
+    """持久化 AI 模型/接口/思考/工具开关到 ini（None 表示不改）。"""
     global AI_MODEL, AI_BASE_URL
     try:
         cp = configparser.ConfigParser()
@@ -848,6 +857,16 @@ def _save_ai_conf(model=None, base=None) -> None:
         if base is not None:
             AI_BASE_URL = _normalize_ai_base(base)
             cp.set("deepseek", "base_url", AI_BASE_URL)
+        if thinking is not None:
+            cp.set("deepseek", "thinking", "1" if thinking else "0")
+        if effort is not None:
+            e = str(effort).strip().lower()
+            cp.set("deepseek", "reasoning_effort",
+                   e if e in AI_EFFORTS else "max")
+        if tools is not None:
+            cp.set("deepseek", "tools", "1" if tools else "0")
+        if web_search is not None:
+            cp.set("deepseek", "web_search", "1" if web_search else "0")
         with open(INI_PATH, "w", encoding="utf-8") as f:
             cp.write(f)
     except Exception:
@@ -868,6 +887,43 @@ def get_ai_key() -> str:
     """当前可用 Key：环境变量 > ini > 主目录 opencode-go 授权。"""
     return (ENV_API_KEY or _ai_ini_get("deepseek", "api_key", "")
             or _opencode_go_key()).strip()
+
+
+def _ai_web_search_enabled() -> bool:
+    """ini [deepseek] web_search：AI 分析前自动联网检索个股资讯。
+    默认开（仅 DeepSeek 官方 Search API 生效，其他 OpenAI 兼容网关自动跳过）。"""
+    return _ai_ini_get("deepseek", "web_search", "1") != "0"
+
+
+def set_ai_web_search(on: bool) -> None:
+    """持久化「AI 分析自动联网检索」开关到 ini。"""
+    _save_ai_conf(web_search=on)
+
+
+def _ai_thinking_enabled() -> bool:
+    """ini [deepseek] thinking：深度思考默认开（DeepSeek 官方接口生效）。"""
+    return _ai_ini_get("deepseek", "thinking", "1") != "0"
+
+
+def _ai_reasoning_effort() -> str:
+    """ini [deepseek] reasoning_effort：low/high/max，默认 max。"""
+    e = (_ai_ini_get("deepseek", "reasoning_effort", "max") or "max").lower()
+    return e if e in AI_EFFORTS else "max"
+
+
+def set_ai_thinking(on: bool, effort=None) -> None:
+    """持久化深度思考开关/强度。"""
+    _save_ai_conf(thinking=on, effort=effort)
+
+
+def _ai_tools_enabled() -> bool:
+    """ini [deepseek] tools：AI 分析按需调用工具取数（默认开）。"""
+    return _ai_ini_get("deepseek", "tools", "1") != "0"
+
+
+def set_ai_tools(on: bool) -> None:
+    """持久化「AI 按需工具取数」开关。"""
+    _save_ai_conf(tools=on)
 
 
 # ================= 荐股权限（板块/行业，供设置与荐股过滤共用） =================
@@ -15229,6 +15285,9 @@ RISK_AI_GUIDE = {
             " sm701 LightGBM 概率（≥0.55 买入 / <0.50 卖出）。请围绕模型概率"
             "给出结论，并提示这是研究口径的「次日开盘→收盘」日内 alpha，"
             "A 股 T+1 不可当日卖出、样本外 AUC 仅约 0.53，风险自负。",
+    "sm701": "风险偏好=sm701 模型直出档（多市场）：买卖点不做策略消融，直接来自"
+             " sm701 模型概率（≥0.55 买入 / <0.50 卖出，滞回）。请围绕模型概率"
+             "与趋势给结论，仍须给出可执行价位/仓位，不要用『观望』搪塞。",
     "外部策略": "外部策略模式（股票策略工坊）：买卖点来自用户导入的策略规则，"
                 "不适用风险偏好；退出按设置→外部策略中的止损/止盈/最长持有执行。"
                 "请围绕该策略规则与显式风控参数给结论，不要套用内置三档偏好。",
@@ -15239,6 +15298,17 @@ def ai_risk_guide(mode=""):
     """按风险偏好返回 AI 行为约束（未知/空回退稳健）。"""
     return RISK_AI_GUIDE.get(mode or CFG.RISK_MODE,
                              RISK_AI_GUIDE["稳健"])
+
+
+def ai_risk_mode(res=None):
+    """AI 行为约束口径：外部策略/模型直出等特殊档优先，其余用**设置里**
+    的风险偏好（`CFG.RISK_MODE`）。策略缓存档位（`res["risk_mode"]`）是
+    该股消融时选中的回测档，可能和当前设置不同，不能覆盖用户设置。"""
+    rm = ((res or {}).get("risk_mode") or "").strip()
+    if rm in ("外部策略", "test", "sm701"):
+        return rm
+    prefer = CFG.RISK_MODE
+    return prefer if prefer in RISK_AI_GUIDE else "稳健"
 
 
 def ai_system_prompt(mode=""):
@@ -15336,6 +15406,126 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
     return sorted(set(out))
 
 
+# ================= DeepSeek Search（AI 分析自动联网资讯） =================
+# 文档：https://api-docs.deepseek.com/guides/search
+# 仅官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关无此能力时自动跳过。
+AI_SEARCH_COUNT = 5
+AI_SEARCH_TTL = 1800          # 同股资讯缓存 30 分钟（避免重复计费）
+AI_SEARCH_FAIL_TTL = 300      # 失败/空结果缓存 5 分钟，网络恢复后尽快重试
+_AI_SEARCH_CACHE = {}         # code -> {"exp": float, "txt": str}
+_AI_SEARCH_LOCK = threading.Lock()
+
+
+def _ai_is_deepseek(base_url="") -> bool:
+    """当前接口是否 DeepSeek 官方（Search/思考/工具调用仅官方支持）。"""
+    import urllib.parse
+    p = urllib.parse.urlsplit(_normalize_ai_base(base_url or AI_BASE_URL))
+    return (p.hostname or "").lower() == "api.deepseek.com"
+
+
+def _ai_search_url(base_url="") -> str:
+    """DeepSeek 官方 Search API 地址；非官方接口返回空串（不支持）。"""
+    import urllib.parse
+    base = _normalize_ai_base(base_url or AI_BASE_URL)
+    if not _ai_is_deepseek(base):
+        return ""
+    p = urllib.parse.urlsplit(base)
+    return urllib.parse.urlunsplit((p.scheme or "https", p.netloc,
+                                    "/v1/tools/search", "", ""))
+
+
+def _ai_thinking_params(thinking=None, effort=None) -> dict:
+    """DeepSeek 官方思考参数：默认取全局设置；窗口可传一次性覆盖。
+    非官方接口不发送（部分网关会拒绝未知字段）。"""
+    if not _ai_is_deepseek():
+        return {}
+    think = _ai_thinking_enabled() if thinking is None else bool(thinking)
+    if not think:
+        return {"thinking": {"type": "disabled"}}
+    eff = str(effort or _ai_reasoning_effort()).lower()
+    if eff not in AI_EFFORTS:
+        eff = _ai_reasoning_effort()
+    return {"thinking": {"type": "enabled"}, "reasoning_effort": eff}
+
+
+def deepseek_search(api_key, query, count=AI_SEARCH_COUNT, timeout=12,
+                    base_url=""):
+    """DeepSeek Search API（纯标准库）。返回 results 列表；不支持时返回 []。"""
+    url = _ai_search_url(base_url)
+    if not url or not api_key or not (query or "").strip():
+        return []
+    d = _ai_http_json(url, {"query": query.strip(), "count": count},
+                      api_key, timeout)
+    return d.get("results") if isinstance(d, dict) else []
+
+
+def _fmt_search_results(results, limit=None):
+    """把 Search API 结果压成适合塞进 prompt 的短文本。"""
+    lines = []
+    for i, r in enumerate((results or [])[:limit or AI_SEARCH_COUNT], 1):
+        if not isinstance(r, dict):
+            continue
+        title = re.sub(r"\s+", " ", str(r.get("title") or "")).strip()
+        summary = re.sub(r"\s+", " ", str(r.get("summary")
+                                          or r.get("snippet") or "")).strip()
+        if not title and not summary:
+            continue
+        if len(summary) > 360:
+            summary = summary[:360].rstrip() + "…"
+        meta = "，".join(x for x in (str(r.get("date") or "")[:10],
+                                     str(r.get("site_name") or "").strip())
+                         if x)
+        line = f"{i}. {title or summary[:40]}"
+        if meta:
+            line += f"（{meta}）"
+        if summary and summary != title:
+            line += f"：{summary}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def ai_stock_news(code="", name="", timeout=12):
+    """AI 分析前自动检索个股近期资讯（DeepSeek Search）。
+
+    返回可直接拼入 prompt 的格式化文本；未开启/非官方接口/无 Key/失败均返回
+    空串，绝不阻断分析。同股 30 分钟内复用缓存，避免重复请求计费。"""
+    ck = (code or name or "").strip()
+    if not ck or not _ai_web_search_enabled():
+        return ""
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return ""
+    now = time.time()
+    with _AI_SEARCH_LOCK:
+        ent = _AI_SEARCH_CACHE.get(ck)
+        if ent and now < ent.get("exp", 0):
+            return ent.get("txt", "")
+    since = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+    code_q, low = (code or "").strip(), (code or "").strip().lower()
+    if low.startswith("crypto"):
+        code_q = code_q[6:]
+    elif low[:2] in ("sh", "sz", "bj", "hk", "us", "fu"):
+        code_q = code_q[2:]
+    name_q = (name or "").replace('"', "").strip()
+    q = " ".join([x for x in (f'"{name_q}"' if name_q else "", code_q,
+                              "最新消息 公告 业绩", f"after:{since}") if x])
+    txt = ""
+    try:
+        results = deepseek_search(key, q, timeout=timeout)
+        txt = _fmt_search_results(results)
+        log.info("联网检索 %s：%d 条资讯", ck, len(results or []))
+    except Exception as e:
+        log.warning("DeepSeek 联网检索失败(忽略): %s", e)
+    ttl = AI_SEARCH_TTL if txt else AI_SEARCH_FAIL_TTL
+    with _AI_SEARCH_LOCK:
+        _AI_SEARCH_CACHE[ck] = {"exp": now + ttl, "txt": txt}
+        if len(_AI_SEARCH_CACHE) > 200:
+            for k in [k for k, v in _AI_SEARCH_CACHE.items()
+                      if v.get("exp", 0) < now]:
+                _AI_SEARCH_CACHE.pop(k, None)
+    return txt
+
+
 def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
                   session="", system=None):
     """单轮调用 OpenAI 兼容 chat 接口（纯标准库）。model 缺省用 AI_MODEL。
@@ -15344,13 +15534,38 @@ def deepseek_chat(api_key: str, prompt: str, model=None, timeout: int = 90,
                           model, timeout, session=session, system=system)
 
 
+_AI_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                  "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+                  "reasoning_tokens")
+
+
+def _ai_usage_add(sink, usage):
+    """累加 OpenAI usage（DeepSeek 含 cache hit/miss/reasoning 细分）。"""
+    if sink is None or not isinstance(usage, dict):
+        return
+    for k in _AI_USAGE_KEYS:
+        try:
+            sink[k] = int(sink.get(k, 0)) + int(usage.get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        det = usage.get("completion_tokens_details") or {}
+        rt = int(det.get("reasoning_tokens") or 0)
+        if rt:
+            sink["reasoning_tokens"] = int(sink.get("reasoning_tokens", 0)) + rt
+    except (TypeError, ValueError):
+        pass
+
+
 def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
-                   system=None):
+                   system=None, return_message=False, usage_sink=None,
+                   thinking=None, effort=None):
     """多轮调用 OpenAI 兼容 chat 接口。messages 为 [{role,content},...]，
     首条 user 消息应携带完整共享数据上下文，后续追问只追加新问题，
     从而复用同一份数据（不重复拼装）。model 缺省用 ini 配置的 AI_MODEL。
     system 缺省用 ai_system_prompt()（通用要求+当前风险偏好约束）。
-    session 见 _ai_session_id（opencode zen 必需）。"""
+    session 见 _ai_session_id（opencode zen 必需）。
+    return_message=True 时返回原始 message dict（含 reasoning_content）。"""
     payload = {
         "model": model or AI_MODEL,
         "messages": [{"role": "system",
@@ -15358,11 +15573,14 @@ def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
                     + list(messages),
         "temperature": 0.3,
     }
+    payload.update(_ai_thinking_params(thinking, effort))
     d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
                       session=session)
+    _ai_usage_add(usage_sink, d.get("usage"))
     try:
-        return d["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+        msg = d["choices"][0]["message"]
+        return msg if return_message else (msg.get("content") or "")
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise RuntimeError(f"接口返回格式异常: {str(d)[:200]}")
 
 
@@ -15383,36 +15601,76 @@ def _ai_cache_key(code, model=""):
     return f"ai:{code}:{model or AI_MODEL}"
 
 
-# AI画线（v6.5.2）：AI 在正文末尾附机器可读价位块（```ai-lines {...}```），
-# 解析后存 res["ai_lines"]，主图绘制。 kinds 固定6种；segs 为可选趋势段。
+# AI画线（v6.5.2；2026-11-04 扩展）：AI 在正文末尾附机器可读块
+# （```ai-lines {...}```），解析后存 res["ai_lines"]，主图绘制：
+# 水平价位 lines + 斜线段/射线 segs + 文字标注 notes + 区间 zones。
 _AI_LINE_KINDS = ("buy", "sell", "stop", "support", "resistance", "target")
-_AI_LINES_MAX = 6
-_AI_SEGS_MAX = 2
+_AI_SEG_KINDS = ("trend", "support", "resistance", "channel", "ray")
+_AI_NOTE_KINDS = ("note", "buy", "sell", "warning", "target")
+_AI_ZONE_KINDS = ("zone", "channel", "risk", "target")
+_AI_LINES_MAX = 8
+_AI_SEGS_MAX = 6
+_AI_NOTES_MAX = 6
+_AI_ZONES_MAX = 3
+_AI_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+AI_DRAW_SCHEMA = (
+    "\n【画线/标注输出：正文结束后另起一段，只输出以下代码块，无其它文字】\n"
+    "```ai-lines\n"
+    '{"lines": [{"price": 5.32, "label": "买点", "kind": "buy"}],\n'
+    ' "segs": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
+    '           "b": {"date": "2026-10-20", "price": 5.60},\n'
+    '           "label": "上升趋势", "kind": "trend",\n'
+    '           "extend": true, "dash": true}],\n'
+    ' "notes": [{"date": "2026-10-20", "price": 5.60,\n'
+    '            "text": "放量突破", "kind": "note"}],\n'
+    ' "zones": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
+    '            "b": {"date": "2026-10-20", "price": 5.60},\n'
+    '            "label": "震荡区间", "kind": "zone"}]}\n'
+    "```\n"
+    "规则：lines≤8（buy/sell/stop/support/resistance/target）；"
+    "segs≤6（斜线/趋势线/通道线，kind=trend/support/resistance/channel/ray，"
+    "extend=true 向右延伸、\"both\" 向两端延伸，dash=false 实线）；"
+    "notes≤6（在图上日期+价位处加文字标注，text≤20字，"
+    "kind=note/buy/sell/warning/target）；zones≤3（矩形区间，"
+    "kind=zone/channel/risk/target）；日期用 YYYY-MM-DD 且须在最近60个"
+    "交易日（当前图可见范围）内；价位须在近60日区间正负30%内；必须是合法JSON"
+    "（数字不加引号、无注释、无尾逗号）。"
+)
+
+
+def _ai_date_ok(s):
+    return bool(_AI_DATE_RE.match((s or "").strip()))
 
 
 def parse_ai_lines(text, lo, hi):
-    """解析AI画线块，返回 (levels, segs)。非法/越界条目静默丢弃。
-    levels: [{"price","label","kind"}]；segs: [{"a":{"date","price"},
-    "b":{"date","price"},"label"}]。lo/hi 为允许的价格区间。"""
-    levels, segs = [], []
+    """解析AI画线块，返回 (levels, segs, notes, zones)。非法/越界静默丢弃。
+    levels: [{"price","label","kind"}]
+    segs:   [{"a":{"date","price"},"b":{...},"label","kind","extend",
+              "extend_both","dash"}]
+    notes:  [{"date","price","text","kind"}]
+    zones:  [{"a":{"date","price"},"b":{...},"label","kind"}]
+    lo/hi 为允许的价格区间。"""
+    levels, segs, notes, zones = [], [], [], []
     if not text or not (lo and hi) or hi <= 0 or lo <= 0:
-        return levels, segs
+        return levels, segs, notes, zones
     try:
         m = re.search(r"```ai-lines\s*(\{.*?\})\s*```", text, re.S)
         raw = m.group(1) if m else None
         if raw is None:
             m2 = None
-            for m2 in re.finditer(r"\{[^{}]*\"lines\"[^{}]*\}", text):
+            for m2 in re.finditer(
+                    r'\{[^{}]*"(?:lines|segs|notes|zones)"[^{}]*\}', text):
                 pass
             raw = m2.group(0) if m2 else None
         if not raw:
-            return levels, segs
+            return levels, segs, notes, zones
         try:
             d = json.loads(raw)
         except Exception:
-            return levels, segs  # AI常输出残缺JSON，静默丢弃不刷日志
+            return levels, segs, notes, zones  # 残缺JSON静默丢弃
         if not isinstance(d, dict):
-            return levels, segs
+            return levels, segs, notes, zones
         for e in (d.get("lines") or [])[:_AI_LINES_MAX]:
             try:
                 px = float(e.get("price"))
@@ -15436,16 +15694,65 @@ def parse_ai_lines(text, lo, hi):
                     continue
                 if not (lo <= pa <= hi and lo <= pb <= hi):
                     continue
-                if len(da) < 10 or len(db) < 10:
+                if not (_ai_date_ok(da) and _ai_date_ok(db)):
                     continue
+                kind = str(s.get("kind") or "trend").lower()
+                if kind not in _AI_SEG_KINDS:
+                    kind = "trend"
+                ext = s.get("extend", False)
+                if isinstance(ext, str):
+                    ext_l = ext.strip().lower()
+                    extend = ext_l in ("1", "true", "yes", "right", "both")
+                    extend_both = ext_l == "both"
+                else:
+                    extend = bool(ext)
+                    extend_both = False
                 segs.append({"a": {"date": da[:10], "price": round(pa, 2)},
                              "b": {"date": db[:10], "price": round(pb, 2)},
-                             "label": lab})
+                             "label": lab, "kind": kind, "extend": extend,
+                             "extend_both": extend_both,
+                             "dash": bool(s.get("dash", True))})
+            except (ValueError, TypeError, AttributeError):
+                continue
+        for n in (d.get("notes") or [])[:_AI_NOTES_MAX]:
+            try:
+                da = str(n.get("date") or "")
+                px = float(n.get("price"))
+                txt = re.sub(r"\s+", " ", str(n.get("text") or "")).strip()[:20]
+                kind = str(n.get("kind") or "note").lower()
+                if kind not in _AI_NOTE_KINDS:
+                    kind = "note"
+                if not txt or not _ai_date_ok(da):
+                    continue
+                if not (math.isfinite(px) and lo <= px <= hi):
+                    continue
+                notes.append({"date": da[:10], "price": round(px, 2),
+                              "text": txt, "kind": kind})
+            except (ValueError, TypeError, AttributeError):
+                continue
+        for z in (d.get("zones") or [])[:_AI_ZONES_MAX]:
+            try:
+                a, b = z.get("a") or {}, z.get("b") or {}
+                pa, pb = float(a.get("price")), float(b.get("price"))
+                da, db = str(a.get("date") or ""), str(b.get("date") or "")
+                lab = str(z.get("label") or "")[:10]
+                kind = str(z.get("kind") or "zone").lower()
+                if kind not in _AI_ZONE_KINDS:
+                    kind = "zone"
+                if not (math.isfinite(pa) and math.isfinite(pb)):
+                    continue
+                if not (lo <= pa <= hi and lo <= pb <= hi):
+                    continue
+                if not (_ai_date_ok(da) and _ai_date_ok(db)):
+                    continue
+                zones.append({"a": {"date": da[:10], "price": round(pa, 2)},
+                              "b": {"date": db[:10], "price": round(pb, 2)},
+                              "label": lab, "kind": kind})
             except (ValueError, TypeError, AttributeError):
                 continue
     except Exception:
         log.exception("AI画线块解析失败(忽略)")
-    return levels, segs
+    return levels, segs, notes, zones
 
 
 def ai_session_load(code, model=""):
@@ -15659,6 +15966,510 @@ def ai_choose_tier(model="", pref="均衡", timeout=60):
         return pref, f"AI 选档失败，回退 {pref}（{e}）"
 
 
+# ================= AI 工具取数（按需调用，不预塞全文） =================
+# 仅 DeepSeek 官方接口（思考模式支持 tool calls）；其他网关回退完整上下文。
+
+def _ai_tool_int(v, dflt, lo, hi):
+    try:
+        return max(lo, min(hi, int(float(v))))
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _ai_tool_f(v, nd=2):
+    try:
+        f = float(v)
+        return f"{f:.{nd}f}" if math.isfinite(f) else "-"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_pct(v, nd=2):
+    try:
+        return f"{float(v) * 100:.{nd}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_spct(v, nd=2):
+    try:
+        return f"{float(v):+.{nd}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _ai_tool_json(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"),
+                      default=str)
+
+
+def _ai_tool_rows(res, days, end=None):
+    code = res.get("full_code") or ""
+    disp = res.get("disp_rows") or []
+    rows = disp
+    _end = str(end or "").strip()[:10]
+    if days > len(disp) or (_end and disp
+                            and _end < (disp[0].get("date") or "")):
+        try:
+            more = get_daily(code, min_bars=max(100, days)) or []
+        except Exception:
+            more = []
+        if more:
+            rows = more
+            if disp and (disp[-1].get("date") or "") > \
+                    (rows[-1].get("date") or ""):
+                rows = list(rows) + [disp[-1]]
+    if _end:
+        rows = [r for r in rows if (r.get("date") or "") <= _end]
+    return rows[-days:]
+
+
+def _ai_tool_kline(ctx, args):
+    days = _ai_tool_int(args.get("days"), 60, 1, 240)
+    rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+    if not rows:
+        return "无日K数据"
+    out = [f"日K {rows[0]['date']}~{rows[-1]['date']} 共{len(rows)}根"
+           "（列：日期,开,高,低,收,量）"]
+    out.extend(
+        f"{r['date']},{_ai_tool_f(r.get('open'))},"
+        f"{_ai_tool_f(r.get('high'))},{_ai_tool_f(r.get('low'))},"
+        f"{_ai_tool_f(r.get('close'))},{_ai_tool_f(r.get('vol'), 0)}"
+        for r in rows)
+    return "\n".join(out)
+
+
+_AI_IND_COLS = {
+    "ma": lambda ind: [(f"MA{k}", (ind.get("ma") or {}).get(k))
+                       for k in sorted(ind.get("ma") or {})],
+    "macd": lambda ind: [("DIF", ind.get("dif")), ("DEA", ind.get("dea")),
+                         ("HIST", ind.get("mhist"))],
+    "kdj": lambda ind: [("K", ind.get("k")), ("D", ind.get("d")),
+                        ("J", ind.get("j"))],
+    "rsi": lambda ind: [("RSI6", ind.get("rsi6")),
+                        ("RSI12", ind.get("rsi12"))],
+    "boll": lambda ind: [("UP", ind.get("boll_up")),
+                         ("MID", ind.get("boll_mid")),
+                         ("LOW", ind.get("boll_low"))],
+    "adx": lambda ind: [("ADX", ind.get("adx")), ("PDI", ind.get("pdi")),
+                        ("MDI", ind.get("mdi"))],
+}
+
+
+def _ai_tool_indicators(ctx, args):
+    res = ctx.get("res") or {}
+    ind = res.get("ind") or {}
+    rows = res.get("disp_rows") or []
+    days = _ai_tool_int(args.get("days"), 30, 1, 240)
+    names = [x.strip().lower() for x in
+             str(args.get("names") or "ma,macd,kdj,rsi,boll,adx").split(",")
+             if x.strip()]
+    cols = []
+    for nm in names:
+        if nm == "vol":
+            cols.append(("VOL", [r.get("vol") for r in rows]))
+        elif nm in _AI_IND_COLS:
+            cols.extend((h, arr) for h, arr in _AI_IND_COLS[nm](ind) if arr)
+    if not cols or not rows:
+        return "无可返回指标"
+    n = min([len(rows)] + [len(a) for _, a in cols if a])
+    out = ["日期," + ",".join(h for h, _ in cols)]
+    for i in range(max(0, n - days), n):
+        vals = [_ai_tool_f((a[i] if a and i < len(a) else None), 3)
+                for _, a in cols]
+        out.append(f"{rows[i]['date']}," + ",".join(vals))
+    return "\n".join(out)
+
+
+def _ai_tool_prediction(ctx, args):
+    res = ctx.get("res") or {}
+    tp = res.get("t_pred") or {}
+    sm = res.get("samples") or []
+    vals = [s.get("n1_cl") for s in sm if s.get("n1_cl") is not None]
+    vs = sorted(vals)
+    stats = {
+        "n": len(vals),
+        "avg_n1_pct": round(sum(vals) / len(vals) * 100, 2) if vals else None,
+        "up_rate_pct": (round(len([v for v in vals if v > 0]) / len(vals)
+                              * 100, 1) if vals else None),
+        "n1_p25_pct": (round(vs[len(vs) // 4] * 100, 2)
+                       if len(vs) >= 4 else None),
+        "n1_p75_pct": (round(vs[(len(vs) * 3) // 4] * 100, 2)
+                       if len(vs) >= 4 else None),
+    }
+    multi = []
+    for d in (res.get("multi_pred") or []):
+        try:
+            multi.append({
+                "label": d.get("label"),
+                "cl50": round(d["cl"][50], 2),
+                "hi75": round(d["hi"][75], 2),
+                "lo25": round(d["lo"][25], 2),
+                "up_prob": round(d.get("up_prob") or 0, 3),
+                "cum_cl_pct": round((d.get("cum_cl") or 0) * 100, 2),
+                "price_cl": round(d.get("price_cl") or 0, 2),
+            })
+        except (KeyError, TypeError):
+            continue
+    return _ai_tool_json({
+        "anchor": res.get("anchor"),
+        "next_label": res.get("next_label"),
+        "today_close": tp.get("cl"),
+        "today_up_prob": tp.get("up_prob"),
+        "next_day": res.get("pred"),
+        "t5": res.get("t5_pred"),
+        "multi_day": multi,
+        "ghosts": res.get("ghosts"),
+        "sample_stats": stats,
+    })
+
+
+def _ai_tool_samples(ctx, args):
+    res = ctx.get("res") or {}
+    limit = _ai_tool_int(args.get("limit"), 10, 1, 30)
+    rows = (res.get("samples") or [])[:limit]
+    out = ["T日,T+1日,次日%,T+2%,T+3%,缺口%,量比,相似度,权重,量能状态"]
+    for s in rows:
+        out.append(",".join([
+            str(s.get("t_date") or ""), str(s.get("n1_date") or ""),
+            _ai_tool_pct(s.get("n1_cl")), _ai_tool_pct(s.get("n2_cl")),
+            _ai_tool_pct(s.get("n3_cl")), _ai_tool_pct(s.get("gap")),
+            _ai_tool_f(s.get("vr"), 2),
+            _ai_tool_f(s.get("similarity_score"), 3),
+            _ai_tool_f(s.get("weight"), 2), str(s.get("regime") or ""),
+        ]))
+    return "\n".join(out) if len(out) > 1 else "无相似样本"
+
+
+def _ai_tool_market(ctx, args):
+    res = ctx.get("res") or {}
+    try:
+        brief = _ai_market_brief_full()
+    except Exception as e:
+        brief = f"市场简报构建失败: {e}"
+    head = (f"上证今日 {_ai_tool_spct(res.get('idx_chg_today'))}；"
+            f"板块 {res.get('sector_name') or '-'} "
+            f"{_ai_tool_spct(res.get('sector_chg_today'))}；"
+            f"量比 {_ai_tool_f(res.get('vr_now'), 2)}"
+            f"（{res.get('cur_regime') or '-'}）")
+    return head + "\n" + brief
+
+
+def _ai_tool_chips(ctx, args):
+    res = ctx.get("res") or {}
+    out = []
+    cp = res.get("chips")
+    if cp:
+        out.append(
+            f"筹码：平均成本{_ai_tool_f(cp.get('avg_cost'))} "
+            f"获利盘{_ai_tool_f((cp.get('profit') or 0) * 100, 0)}% "
+            f"90%区间{_ai_tool_f(cp.get('p5'))}~{_ai_tool_f(cp.get('p95'))}"
+            + (f" 支撑{_ai_tool_f(cp.get('sup'))}" if cp.get("sup") else "")
+            + (f" 压力{_ai_tool_f(cp.get('res'))}" if cp.get("res") else ""))
+    act = res.get("action")
+    if act:
+        items = "; ".join(f"{lab}{sc:+d}({note})"
+                          for lab, sc, note in (act.get("items") or []))
+        out.append(f"多维评分 {int(act.get('score') or 0):+d} "
+                   f"{act.get('verdict')} [{items}]")
+    sigs = res.get("signals") or []
+    if sigs:
+        out.append("近期信号：" + "; ".join(
+            f"{d}[{t}]{x}" for _, d, t, x in sigs[-12:]))
+    bt = res.get("bt_stats") or {}
+    if bt:
+        clean = {k: v for k, v in bt.items()
+                 if k not in ("curve", "trades_list", "train", "val")}
+        for seg in ("train", "val"):
+            if isinstance(bt.get(seg), dict):
+                clean[seg] = {k: v for k, v in bt[seg].items()
+                              if k not in ("curve", "trades_list")}
+        out.append("回测统计：" + _ai_tool_json(clean))
+    if res.get("band_note"):
+        out.append("波段：" + str(res.get("band_note")))
+    return "\n".join(out) or "无筹码/评分数据"
+
+
+def _ai_tool_fundamentals(ctx, args):
+    res = ctx.get("res") or {}
+    full = res.get("full_code") or ""
+    rows = fetch_f10_metrics(full, periods=8)
+    out = ["\n".join(fundamentals_summary(full, rows)),
+           "报告期,营收亿,营收同比%,净利亿,净利同比%,扣非同比%,EPS,ROE%,"
+           "毛利率%,净利率%,负债率%"]
+    for r in rows[:8]:
+        out.append(",".join([
+            str(r.get("date_name") or r.get("notice") or "")[:10],
+            _ai_tool_f((r.get("rev") or 0) / 1e8),
+            _ai_tool_f(r.get("rev_yoy")),
+            _ai_tool_f((r.get("np") or 0) / 1e8),
+            _ai_tool_f(r.get("np_yoy")), _ai_tool_f(r.get("kf_yoy")),
+            _ai_tool_f(r.get("eps"), 3), _ai_tool_f(r.get("roe")),
+            _ai_tool_f(r.get("gm")), _ai_tool_f(r.get("nm")),
+            _ai_tool_f(r.get("debt")),
+        ]))
+    return "\n".join(out)
+
+
+def _ai_tool_intraday(ctx, args):
+    res = ctx.get("res") or {}
+    data = fetch_minute_lines(res.get("full_code") or "")
+    rows = data.get("rows") or []
+    vols = data.get("vols") or []
+    avg = data.get("avg") or []
+    points = _ai_tool_int(args.get("points"), 60, 10, 240)
+    out = [f"分时 {data.get('day') or '-'} 昨收 "
+           f"{_ai_tool_f(data.get('prev_close'))}（时间,价格,均价,分钟量）"]
+    for i in range(max(0, len(rows) - points), len(rows)):
+        row = rows[i]
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            t, px = row[0], row[1]
+        elif isinstance(row, dict):
+            t, px = (row.get("t") or row.get("time")), row.get("price")
+        else:
+            continue
+        out.append(f"{t},{_ai_tool_f(px)},"
+                   f"{_ai_tool_f(avg[i] if i < len(avg) else None)},"
+                   f"{_ai_tool_f(vols[i] if i < len(vols) else None, 0)}")
+    return "\n".join(out) if len(out) > 1 else "无分时数据"
+
+
+def _ai_tool_strategy(ctx, args):
+    res = ctx.get("res") or {}
+    strat = res.get("strategy") or {}
+    return _ai_tool_json({
+        "algo": strat.get("algo"), "mode": strat.get("mode"),
+        "label": strat.get("label"), "params": strat.get("params"),
+        "train": strat.get("train"), "val": strat.get("val"),
+        "recent": strat.get("recent"),
+        "risk_mode": res.get("risk_mode"), "sel_algo": res.get("sel_algo"),
+        "band_fit": res.get("band_fit"),
+        "band_score": res.get("band_score"),
+        "band_note": res.get("band_note"),
+    })
+
+
+def _ai_tool_news(ctx, args):
+    search_on = ctx.get("search")
+    if search_on is None:
+        search_on = _ai_web_search_enabled()
+    if not search_on:
+        return "联网检索已在本次会话关闭。"
+    q = str(args.get("query") or "").strip()[:128]
+    count = _ai_tool_int(args.get("count"), 5, 1, 10)
+    if not q:
+        txt = ctx.get("news")
+        if txt is None:
+            txt = ai_stock_news(ctx.get("code") or "", ctx.get("name") or "")
+        return txt or "（近30天未检索到相关资讯）"
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return "当前接口不支持联网检索。"
+    try:
+        rs = deepseek_search(key, q, count=count)
+        if rs and isinstance(ctx.get("usage"), dict):
+            ctx["usage"]["search_calls"] = int(
+                ctx["usage"].get("search_calls", 0)) + 1
+        return _fmt_search_results(rs, limit=count) or "（未检索到结果）"
+    except Exception as e:
+        return f"联网检索失败: {e}"
+
+
+def _ai_tool_show_table(ctx, args):
+    """在 AI 窗口单独渲染一张统计表（结构化事件，不进模型上下文）。"""
+    title = str(args.get("title") or "统计表")[:40]
+    cols = [str(x)[:30] for x in (args.get("columns") or [])][:20]
+    rows = []
+    for r in (args.get("rows") or [])[:200]:
+        if isinstance(r, (list, tuple)):
+            rows.append([str(x)[:80] for x in r][:len(cols)])
+    if not cols or not rows:
+        return "表格为空：需要 columns 与 rows。"
+    table = {"title": title, "columns": cols, "rows": rows}
+    cb = ctx.get("on_table")
+    if callable(cb):
+        try:
+            cb(table)
+        except Exception:
+            log.exception("AI统计表回调失败(忽略)")
+    md = ("| " + " | ".join(cols) + " |\n| "
+          + " | ".join(["---"] * len(cols)) + " |\n")
+    for r in rows[:20]:
+        md += "| " + " | ".join(r) + " |\n"
+    return "已生成统计表并在界面单独展示。\n" + md
+
+
+_AI_TOOL_FUNCS = {
+    "get_kline": _ai_tool_kline,
+    "get_indicators": _ai_tool_indicators,
+    "get_prediction": _ai_tool_prediction,
+    "get_similar_samples": _ai_tool_samples,
+    "get_market": _ai_tool_market,
+    "get_chips_action": _ai_tool_chips,
+    "get_fundamentals": _ai_tool_fundamentals,
+    "get_intraday": _ai_tool_intraday,
+    "get_strategy": _ai_tool_strategy,
+    "search_news": _ai_tool_news,
+    "show_table": _ai_tool_show_table,
+}
+
+
+def ai_tool_specs():
+    """OpenAI 兼容工具定义：让模型按需取数，而不是首轮塞满上下文。"""
+    return [
+        {"type": "function", "function": {
+            "name": "get_kline",
+            "description": "获取该股更多日K线（OHLCV）。判断形态、趋势、"
+                           "支撑压力、量价关系时调用；可用 end 指定截止日期。",
+            "parameters": {"type": "object", "properties": {
+                "days": {"type": "integer", "description": "最近多少根，1-240",
+                         "default": 60},
+                "end": {"type": "string",
+                        "description": "可选截止日期 YYYY-MM-DD"}}}}},
+        {"type": "function", "function": {
+            "name": "get_indicators",
+            "description": "获取技术指标序列（与日K对齐）：ma/macd/kdj/rsi/"
+                           "boll/adx/vol。",
+            "parameters": {"type": "object", "properties": {
+                "names": {"type": "string",
+                          "description": "逗号分隔，默认 ma,macd,kdj,rsi,boll,adx"},
+                "days": {"type": "integer", "description": "最近多少天，1-240",
+                         "default": 30}}}}},
+        {"type": "function", "function": {
+            "name": "get_prediction",
+            "description": "获取形态预测：当日收盘分位/上行概率、T+1 预测、"
+                           "T+1~T+10 多日分位、T+5、相似样本统计。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_similar_samples",
+            "description": "获取相似历史样本明细（T+1~T+3 涨跌/缺口/量比/"
+                           "相似度/权重）。",
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "条数，1-30",
+                          "default": 10}}}}},
+        {"type": "function", "function": {
+            "name": "get_market",
+            "description": "获取大盘指数、三档闸门市场简报与板块环境。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_chips_action",
+            "description": "获取筹码分布、多维综合评分、近期买卖信号与回测统计。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_fundamentals",
+            "description": "获取最近财报关键指标与规则分析（营收/净利/ROE/"
+                           "毛利率/负债率等）。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "get_intraday",
+            "description": "获取最近交易日分时（价格/均价/分钟量），用于盘中判断。",
+            "parameters": {"type": "object", "properties": {
+                "points": {"type": "integer", "description": "最近多少分钟，10-240",
+                           "default": 60}}}}},
+        {"type": "function", "function": {
+            "name": "get_strategy",
+            "description": "获取当前选中策略（算法/档位/风险参数/训练验证指标）。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "search_news",
+            "description": "联网检索个股近期新闻/公告/业绩；可自定义检索词。",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string",
+                          "description": "检索词，≤128字；留空=默认近30天个股资讯"},
+                "count": {"type": "integer", "description": "结果数，1-10",
+                          "default": 5}}}}},
+        {"type": "function", "function": {
+            "name": "show_table",
+            "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"
+                           "多周期对比、支撑压力清单）。列≤20、行≤200。",
+            "parameters": {"type": "object", "properties": {
+                "title": {"type": "string", "description": "表格标题"},
+                "columns": {"type": "array",
+                            "items": {"type": "string"},
+                            "description": "列名列表"},
+                "rows": {"type": "array",
+                         "items": {"type": "array",
+                                   "items": {"type": "string"}},
+                         "description": "行数据（二维字符串数组）"}},
+                "required": ["title", "columns", "rows"]}}},
+    ]
+
+
+def ai_tool_call(ctx, name, args):
+    """执行模型工具调用，返回字符串（tool message content）。"""
+    fn = _AI_TOOL_FUNCS.get(name)
+    if fn is None:
+        return _ai_tool_json({"error": f"未知工具: {name}"})
+    try:
+        out = fn(ctx or {}, args if isinstance(args, dict) else {})
+        return out if isinstance(out, str) else _ai_tool_json(out)
+    except Exception as e:
+        log.exception("AI工具 %s 调用失败", name)
+        return _ai_tool_json({"error": f"{type(e).__name__}: {e}"[:300]})
+
+
+def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
+                         timeout=120, session="", system=None,
+                         max_rounds=8, on_event=None, usage_sink=None,
+                         thinking=None, effort=None):
+    """带工具调用的多轮 chat（DeepSeek 思考模式）。返回 (content,
+    reasoning_content)。工具轮内必须回传 reasoning_content（官方要求）。"""
+    msgs = [{"role": "system", "content": system or ai_system_prompt()}]
+    msgs += [dict(m) for m in messages]
+    tools = ai_tool_specs()
+    last = ""
+    for rnd in range(max_rounds):
+        if on_event:
+            on_event("round", str(rnd + 1))
+        payload = {
+            "model": model or AI_MODEL,
+            "messages": msgs,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.3,
+        }
+        payload.update(_ai_thinking_params(thinking, effort))
+        d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
+                          session=session)
+        _ai_usage_add(usage_sink, d.get("usage"))
+        try:
+            msg = d["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError(f"接口返回格式异常: {str(d)[:200]}")
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        calls = msg.get("tool_calls") or []
+        last = content or last
+        if on_event and reasoning:
+            on_event("reasoning", reasoning)
+        if not calls:
+            return content, reasoning
+        asst = {"role": "assistant", "content": content,
+                "reasoning_content": reasoning, "tool_calls": calls}
+        msgs.append(asst)
+        for tc in calls:
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            cid = tc.get("id") or name
+            try:
+                targs = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                targs = {}
+            if not isinstance(targs, dict):
+                targs = {}
+            if on_event:
+                on_event("tool", name, targs, cid)
+            result = ai_tool_call(tool_ctx, name, targs)
+            if on_event:
+                on_event("tool_done", name, {"len": len(result)}, cid)
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": result,
+            })
+    return last or "（工具调用轮次已达上限，请重试。）", ""
+
+
 class App:
     PANEL_H = {"main": 400, "vol": 110, "ind": 160}
     REFRESH_MS = 15 * 60 * 1000     # 完整重分析间隔
@@ -15695,9 +16506,10 @@ class App:
             root.bind("<F11>", self._toggle_fullscreen)
             root.bind("<Escape>", lambda e: self._exit_fullscreen())
         # 任意位置按下可打印字符 → 自动聚焦搜索框（输入类控件除外）
-        root.bind("<KeyPress>", self._global_key)
+        root.bind_all("<KeyPress>", self._global_key)
         # 文本区比例：右侧参考面板宽度 / 自选池宽度 / 底部日志行数随屏幕缩放
         self._rt_chars = 38 if self.compact else max(32, min(56, sw // 45))
+        self._rt_width = max(360, min(540, int(sw * 0.29)))
         self._wf_width = max(160, min(230, sw // 10))
         self._bottom_lines = (5 if self.compact
                               else max(6, min(12, sh // 130)))
@@ -15954,7 +16766,9 @@ class App:
         self.ent_query.bind("<Up>", lambda e: self._search_move(-1))
         self.ent_query.bind("<Escape>", lambda e: self._search_end())
         self.ent_query.bind(
-            "<FocusOut>", lambda e: self._safe_after(180, self._search_end))
+            "<FocusOut>",
+            lambda e: self._safe_after(
+                180, self._search_end_if_blurred))
         self.btn_run = ttk.Button(top, text="分析预测", style="Tool.TButton",
                                   command=self.run)
         self.btn_run.pack(side="left", padx=3)
@@ -16131,8 +16945,9 @@ class App:
         # ---- 右侧：预测参考 / 插件面板（先pack，防止遮挡图表；小屏省略）----
         right = None
         if not self.compact:
-            rt_col = tk.Frame(body, bg=DARK_BG)
+            rt_col = tk.Frame(body, bg=DARK_BG, width=self._rt_width)
             rt_col.pack(side="right", fill="y", padx=(2, 8), pady=6)
+            rt_col.pack_propagate(False)
             right = ttk.LabelFrame(rt_col, text=" 预测参考 ", padding=4)
             right.pack(fill="both", expand=True)
             self._w_right = right
@@ -16165,6 +16980,12 @@ class App:
                                     padx=6, pady=4, spacing1=1, spacing3=1)
             self.side_txt.pack(fill="both", expand=True)
             self._rt_panels["预测参考"] = pred
+
+            # AI Agent 侧栏（嵌入主界面右侧栏；不用独立窗口）
+            ai = tk.Frame(self._rt_content, bg=PANEL_BG)
+            self._rt_panels["AI Agent"] = ai
+            self._rt_names.append("AI Agent")
+            self._build_ai_sidebar(ai)
 
             self._mount_plugins()
             if len(self._rt_names) > 1:
@@ -16648,6 +17469,486 @@ class App:
             except Exception:
                 pass
 
+    # ---------- AI Agent 侧栏（嵌入右侧栏；不用独立窗口） ----------
+
+    def _build_ai_sidebar(self, parent):
+        """主界面右侧栏的 AI Agent（Tk 原生；模型/思考等仅本次会话生效）。"""
+        self._ai_panel = parent
+        self._ai_agent = None
+        self._ai_agent_code = ""
+        self._ai_event_last = 0
+        self._ai_tool_marks = {}
+        self._ai_reason_state = {}
+        self._ai_reason_seq = 0
+        bg = PANEL_BG
+        head = tk.Frame(parent, bg=bg)
+        head.pack(fill="x", padx=6, pady=(6, 2))
+        tk.Label(head, text="AI Agent", bg=bg, fg=ACCENT,
+                 font=("Microsoft YaHei", 11, "bold")).pack(side="left")
+        tk.Button(head, text="新对话", command=self._ai_clear,
+                  bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+                  activeforeground=BTN_FG, relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="right")
+
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", padx=6, pady=2)
+        tk.Label(row, text="代码", bg=bg, fg=AXIS_TXT,
+                 font=("Microsoft YaHei", 8)).pack(side="left")
+        self._ai_code_var = tk.StringVar(
+            value=((self.res or {}).get("full_code") or ""))
+        ent = tk.Entry(row, textvariable=self._ai_code_var, width=10,
+                       bg=LOG_BG, fg=FG_MAIN, insertbackground=FG_MAIN,
+                       relief="flat", font=("Consolas", 9))
+        ent.pack(side="left", fill="x", expand=True, padx=4)
+        ent.bind("<Return>", lambda e: self._ai_switch_stock())
+        tk.Button(row, text="切换", command=self._ai_switch_stock,
+                  bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+                  activeforeground=BTN_FG, relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="left")
+
+        row2 = tk.Frame(parent, bg=bg)
+        row2.pack(fill="x", padx=6, pady=2)
+        tk.Label(row2, text="模型", bg=bg, fg=AXIS_TXT,
+                 font=("Microsoft YaHei", 8)).pack(side="left")
+        vals = list(dict.fromkeys(AI_MODEL_CHOICES + [AI_MODEL]))
+        self._ai_model_var = tk.StringVar(value=AI_MODEL)
+        self._ai_model_cmb = ttk.Combobox(
+            row2, textvariable=self._ai_model_var, values=vals,
+            width=16, state="readonly")
+        self._ai_model_cmb.pack(side="left", fill="x", expand=True, padx=4)
+        self._ai_model_cmb.bind("<<ComboboxSelected>>",
+                                lambda e: self._ai_opts_changed())
+        tk.Button(row2, text="刷新", command=self._ai_refresh_models,
+                  bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+                  activeforeground=BTN_FG, relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="left")
+
+        self._ai_status_var = tk.StringVar(
+            value=("就绪 · 直接发送=开始分析" if self.res
+                   else "先分析或切换一只股票"))
+        tk.Label(parent, textvariable=self._ai_status_var, bg=bg,
+                 fg=AXIS_TXT, anchor="w",
+                 font=("Microsoft YaHei", 8)).pack(fill="x", padx=6)
+
+        cf = tk.Frame(parent, bg=bg)
+        cf.pack(fill="both", expand=True, padx=6, pady=4)
+        self._ai_chat = tk.Text(
+            cf, wrap="word", state="disabled", bg=LOG_BG, fg=FG_MAIN,
+            insertbackground=FG_MAIN, selectbackground=SEL_BG,
+            relief="flat", padx=4, pady=4,
+            font=("Microsoft YaHei", 9), spacing1=2, spacing3=2)
+        sb = ttk.Scrollbar(cf, command=self._ai_chat.yview)
+        self._ai_chat.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._ai_chat.pack(side="left", fill="both", expand=True)
+        self._ai_chat.tag_configure(
+            "user", background=SEL_BG, foreground=FG_MAIN,
+            justify="right", lmargin1=16, lmargin2=16, rmargin=16,
+            spacing1=6, spacing3=6)
+        self._ai_chat.tag_configure(
+            "ai", background=PANEL_BG, foreground=FG_MAIN,
+            lmargin1=8, lmargin2=8, rmargin=8, spacing1=6, spacing3=6)
+        self._ai_chat.tag_configure("meta", foreground=AXIS_TXT,
+                                    font=("Microsoft YaHei", 8))
+        self._ai_chat.tag_configure("tool", foreground=ACCENT,
+                                    font=("Consolas", 8))
+        self._ai_chat.tag_configure("tool_done", foreground=DOWN,
+                                    font=("Consolas", 8))
+        self._ai_chat.tag_configure("reason", foreground=AXIS_TXT,
+                                    font=("Consolas", 8))
+        self._ai_chat.tag_configure("error", foreground=UP,
+                                    font=("Microsoft YaHei", 9))
+        self._ai_chat.tag_configure("table", font=("Consolas", 8))
+
+        opt = tk.Frame(parent, bg=bg)
+        opt.pack(fill="x", padx=6, pady=(2, 0))
+        self._ai_think_var = tk.BooleanVar(value=_ai_thinking_enabled())
+        self._ai_effort_var = tk.StringVar(value=_ai_reasoning_effort())
+        self._ai_tools_var = tk.BooleanVar(value=_ai_tools_enabled())
+        self._ai_search_var = tk.BooleanVar(value=_ai_web_search_enabled())
+
+        def _cb(text, var):
+            return tk.Checkbutton(
+                opt, text=text, variable=var, command=self._ai_opts_changed,
+                bg=bg, fg=FG_MAIN, selectcolor=BTN_BG,
+                activebackground=bg, activeforeground=FG_MAIN,
+                relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                font=("Microsoft YaHei", 8))
+
+        _cb("思考", self._ai_think_var).pack(side="left")
+        cmb_eff = ttk.Combobox(opt, textvariable=self._ai_effort_var,
+                               values=list(AI_EFFORTS), width=5,
+                               state="readonly")
+        cmb_eff.pack(side="left", padx=(2, 6))
+        cmb_eff.bind("<<ComboboxSelected>>",
+                     lambda e: self._ai_opts_changed())
+        _cb("工具", self._ai_tools_var).pack(side="left")
+        _cb("联网", self._ai_search_var).pack(side="left")
+        tk.Label(opt, text="仅本次", bg=bg, fg=AXIS_TXT,
+                 font=("Microsoft YaHei", 7)).pack(side="right")
+
+        inp = tk.Frame(parent, bg=bg)
+        inp.pack(fill="x", padx=6, pady=(2, 2))
+        self._ai_input = tk.Text(
+            inp, height=3, wrap="word", bg=LOG_BG, fg=FG_MAIN,
+            insertbackground=FG_MAIN, selectbackground=SEL_BG,
+            relief="flat", padx=6, pady=4,
+            font=("Microsoft YaHei", 9))
+        self._ai_input.pack(side="left", fill="both", expand=True)
+        self._ai_input.bind("<Return>", self._ai_on_enter)
+        self._ai_send_btn = tk.Button(
+            inp, text="发送", command=self._ai_send,
+            bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+            activeforeground=BTN_FG, relief="flat", cursor="hand2",
+            font=("Microsoft YaHei", 9, "bold"))
+        self._ai_send_btn.pack(side="right", fill="y", padx=(4, 0))
+
+        self._ai_usage_var = tk.StringVar(value="")
+        tk.Label(parent, textvariable=self._ai_usage_var, bg=bg,
+                 fg=AXIS_TXT, anchor="w", justify="left",
+                 wraplength=max(200, self._rt_width - 26),
+                 font=("Consolas", 8)).pack(fill="x", padx=6, pady=(0, 4))
+        self._ai_chat_welcome(self.res)
+        self.root.after(300, self._ai_poll)
+
+    def _ai_chat_clear(self):
+        try:
+            for name in self._ai_chat.window_names():
+                try:
+                    self._ai_chat.nametowidget(name).destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._ai_chat.config(state="normal")
+        self._ai_chat.delete("1.0", "end")
+        self._ai_chat.config(state="disabled")
+        self._ai_tool_marks = {}
+        self._ai_reason_state = {}
+
+    def _ai_chat_welcome(self, res=None):
+        self._ai_chat_clear()
+        if not res:
+            self._ai_insert("先分析或切换一只股票，再开始对话。\n",
+                            ("meta",))
+            return
+        q = res.get("quote") or {}
+        self._ai_insert(
+            f"AI Agent · {q.get('name') or ''} "
+            f"({res.get('full_code') or ''})\n"
+            "可直接输入问题；空输入点发送=开始分析。\n", ("meta",))
+
+    def _ai_insert(self, text, tags=()):
+        self._ai_chat.config(state="normal")
+        self._ai_chat.insert("end", text, tags)
+        self._ai_chat.config(state="disabled")
+        self._ai_chat.see("end")
+
+    def _ai_toggle_reason(self, tag):
+        on = not self._ai_reason_state.get(tag, True)
+        self._ai_reason_state[tag] = on
+        self._ai_chat.tag_configure(tag, elide=on)
+
+    def _ai_new_agent(self, res, reset=True):
+        if not res:
+            self._ai_agent = None
+            self._ai_chat_welcome(None)
+            return
+        try:
+            brief = self._ai_prompt_brief()
+        except Exception:
+            log.exception("构建AI简要上下文失败")
+            brief = ""
+        try:
+            full = self._ai_prompt()
+        except Exception:
+            log.exception("构建AI完整上下文失败")
+            full = brief
+
+        def on_lines(text):
+            if getattr(self, "res", None) is not res:
+                return
+
+            def _apply():
+                if not text:
+                    res.pop("ai_lines", None)
+                    self._rerender()
+                    return
+                self._apply_ai_lines(text)
+            self._safe_after(0, _apply)
+
+        agent = AIAgent(res, brief, full, on_lines)
+        agent.set_opts(thinking=self._ai_think_var.get(),
+                       effort=self._ai_effort_var.get(),
+                       tools=self._ai_tools_var.get(),
+                       search=self._ai_search_var.get(),
+                       model=self._ai_model_var.get())
+        self._ai_agent = agent
+        self._ai_agent_code = res.get("full_code") or ""
+        self._ai_event_last = 0
+        if reset:
+            self._ai_chat_welcome(res)
+        self._ai_update_usage(agent.snapshot().get("usage"))
+        self._ai_status_var.set("就绪 · 直接发送=开始分析")
+        self._ai_send_btn.config(state="normal")
+
+    def _ai_on_res_loaded(self, res):
+        if not getattr(self, "_ai_panel", None):
+            return
+        try:
+            if not self._ai_panel.winfo_exists():
+                return
+        except Exception:
+            return
+        code = res.get("full_code") or ""
+        self._ai_code_var.set(code)
+        if self._ai_agent is not None and self._ai_agent_code == code:
+            try:
+                brief = self._ai_prompt_brief()
+                full = self._ai_prompt()
+            except Exception:
+                brief = full = ""
+            self._ai_agent.bind_res(res, brief, full)
+            self._ai_status_var.set("数据已更新（对话保留）")
+            return
+        self._ai_new_agent(res, reset=True)
+
+    def _ai_switch_stock(self):
+        txt = (self._ai_code_var.get() or "").strip()
+        if not txt:
+            return
+        try:
+            full = normalize_code(txt)
+        except ValueError as e:
+            messagebox.showwarning("股票代码", str(e), parent=self.root)
+            return
+        if self.res and full == self.res.get("full_code"):
+            self._ai_status_var.set("已是当前股票")
+            return
+        self._ai_code_var.set(full)
+        self.code_var.set(full)
+        self._ai_agent = None
+        self._ai_chat_welcome(None)
+        self._ai_send_btn.config(state="disabled")
+        self._ai_status_var.set(f"正在分析 {full} ...")
+        self.progress_var.set(f"AI 侧栏切换：{full} ...")
+        self.run()
+
+    def _ai_refresh_models(self):
+        key = get_ai_key()
+        if not key:
+            messagebox.showinfo("模型列表", "请先在设置中配置 AI Key",
+                                parent=self.root)
+            return
+
+        def done(models, err):
+            if err:
+                self._ai_status_var.set(f"模型列表失败: {err}")
+                return
+            vals = list(dict.fromkeys((models or []) + AI_MODEL_CHOICES))
+            self._ai_model_cmb["values"] = vals
+            self._ai_status_var.set(f"模型列表 {len(vals)} 个")
+
+        self._ai_status_var.set("获取模型列表中...")
+        self._run_bg(lambda: fetch_ai_models(key, AI_BASE_URL), done)
+
+    def _ai_send(self):
+        if self._ai_agent is None:
+            res = getattr(self, "res", None)
+            if not res:
+                self._ai_status_var.set("先分析或切换一只股票")
+                return
+            try:
+                cur = normalize_code(self._ai_code_var.get())
+            except ValueError:
+                cur = ""
+            if cur and cur != res.get("full_code"):
+                self._ai_status_var.set("正在切换股票，请稍候...")
+                return
+            self._ai_new_agent(res, reset=True)
+        text = self._ai_input.get("1.0", "end").strip()
+        self._ai_input.delete("1.0", "end")
+        if self._ai_agent.send(text):
+            self._ai_status_var.set("思考中...")
+            self._ai_send_btn.config(state="disabled")
+
+    def _ai_on_enter(self, event):
+        if event.state & 0x1:       # Shift+Enter 换行
+            return None
+        self._ai_send()
+        return "break"
+
+    def _ai_clear(self):
+        if self._ai_agent is not None:
+            self._ai_agent.clear()
+        else:
+            self._ai_chat_welcome(self.res)
+
+    def _ai_opts_changed(self):
+        if self._ai_agent is None:
+            return
+        self._ai_agent.set_opts(
+            thinking=self._ai_think_var.get(),
+            effort=self._ai_effort_var.get(),
+            tools=self._ai_tools_var.get(),
+            search=self._ai_search_var.get(),
+            model=self._ai_model_var.get())
+        self._ai_status_var.set("选项已更新（仅本次会话）")
+
+    def _ai_poll(self):
+        if not getattr(self, "_ai_panel", None):
+            return
+        try:
+            if not self._ai_panel.winfo_exists():
+                return
+        except Exception:
+            return
+        agent = self._ai_agent
+        if agent is not None:
+            try:
+                for ev in agent.poll(self._ai_event_last):
+                    self._ai_event_last = max(self._ai_event_last,
+                                              ev.get("id") or 0)
+                    self._ai_handle_event(ev)
+            except Exception:
+                log.exception("AI 侧栏事件处理失败")
+        self.root.after(300, self._ai_poll)
+
+    def _ai_handle_event(self, ev):
+        typ = ev.get("type")
+        d = ev.get("data") or {}
+        if typ == "user":
+            self._ai_insert(f"\n你\n{d.get('text') or ''}\n", ("user",))
+        elif typ == "status":
+            self._ai_status_var.set(d.get("text") or "")
+        elif typ == "tool":
+            cid = d.get("id") or d.get("name") or "tool"
+            self._ai_chat.config(state="normal")
+            self._ai_chat.insert("end", f"· {d.get('name') or 'tool'}",
+                                 ("tool",))
+            end = self._ai_chat.index("end-1c")
+            self._ai_chat.insert("end", "\n")
+            self._ai_chat.config(state="disabled")
+            self._ai_tool_marks[cid] = end
+            self._ai_chat.see("end")
+        elif typ == "tool_done":
+            cid = d.get("id") or d.get("name") or "tool"
+            end = self._ai_tool_marks.pop(cid, None)
+            if end:
+                self._ai_chat.config(state="normal")
+                self._ai_chat.insert(end, " ✓", ("tool_done",))
+                self._ai_chat.config(state="disabled")
+                self._ai_chat.see("end")
+        elif typ == "table":
+            self._ai_add_table(d)
+        elif typ == "assistant":
+            self._ai_add_assistant(d)
+        elif typ == "usage":
+            self._ai_update_usage(d)
+        elif typ == "error":
+            self._ai_insert(f"\n[失败] {d.get('text') or ''}\n", ("error",))
+            self._ai_status_var.set("失败")
+            self._ai_send_btn.config(state="normal")
+        elif typ == "done":
+            self._ai_status_var.set("就绪")
+            self._ai_send_btn.config(state="normal")
+        elif typ == "cleared":
+            self._ai_chat_welcome(self.res)
+            self._ai_status_var.set("就绪")
+            self._ai_send_btn.config(state="normal")
+
+    def _ai_add_assistant(self, d):
+        text = self._ai_plain(d.get("content") or "")
+        if text:
+            self._ai_insert(f"\nAI\n{text}\n", ("ai",))
+        reason = d.get("reasoning") or ""
+        if reason:
+            self._ai_reason_seq += 1
+            body = f"ai_reason_{self._ai_reason_seq}"
+            tog = f"ai_rtog_{self._ai_reason_seq}"
+            self._ai_chat.tag_configure(body, elide=True)
+            self._ai_chat.tag_configure(tog, foreground=ACCENT,
+                                        font=("Microsoft YaHei", 8))
+            self._ai_reason_state[body] = True
+            self._ai_chat.config(state="normal")
+            self._ai_chat.insert("end", "▸ 思考过程（点击展开）\n",
+                                 ("meta", tog))
+            self._ai_chat.insert("end", reason + "\n", ("reason", body))
+            self._ai_chat.tag_bind(
+                tog, "<Button-1>",
+                lambda e, t=body: self._ai_toggle_reason(t))
+            self._ai_chat.config(state="disabled")
+            self._ai_chat.see("end")
+        if d.get("has_lines"):
+            self._ai_insert("已绘制到 K 线主图\n", ("meta",))
+        u = d.get("usage") or {}
+        if u:
+            self._ai_insert(
+                f"本轮 {u.get('prompt_tokens', 0):,} 输入 / "
+                f"{u.get('completion_tokens', 0):,} 输出 · "
+                f"缓存 {u.get('cache_rate', 0):.1f}% · "
+                f"${u.get('cost_usd', 0):.6f}\n", ("meta",))
+        self._ai_update_usage((self._ai_agent.snapshot().get("usage")
+                               if self._ai_agent else {}))
+
+    def _ai_add_table(self, t):
+        cols = [str(c) for c in (t.get("columns") or [])][:20]
+        rows = (t.get("rows") or [])[:200]
+        if not cols:
+            return
+        card = tk.Frame(self._ai_chat, bg=PANEL_BG, bd=0,
+                        highlightthickness=1, highlightbackground=BORDER)
+        card.pack_propagate(False)
+        card.configure(width=max(220, self._rt_width - 28),
+                       height=min(260, 34 + 24 * min(8, max(2, len(rows)))))
+        tk.Label(card, text=(t.get("title") or "统计表"), bg=PANEL_BG,
+                 fg=FG_MAIN, anchor="w",
+                 font=("Microsoft YaHei", 8, "bold")).pack(
+                     fill="x", padx=6, pady=(4, 2))
+        tvf = tk.Frame(card, bg=PANEL_BG)
+        tvf.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        tv = ttk.Treeview(tvf, columns=cols, show="headings",
+                          height=min(8, max(2, len(rows))))
+        w = max(44, int((self._rt_width - 50) / max(1, len(cols))))
+        for c in cols:
+            tv.heading(c, text=c)
+            tv.column(c, width=w, minwidth=40, stretch=True, anchor="w")
+        for r in rows:
+            tv.insert("", "end",
+                      values=[str(x) for x in (r or [])][:len(cols)])
+        sb = ttk.Scrollbar(tvf, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+        self._ai_chat.config(state="normal")
+        self._ai_chat.window_create("end", window=card, padx=4, pady=4)
+        self._ai_chat.insert("end", "\n")
+        self._ai_chat.config(state="disabled")
+        self._ai_chat.see("end")
+
+    def _ai_plain(self, text):
+        s = text or ""
+        s = re.sub(r"```.*?```", "", s, flags=re.S)
+        s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
+        s = s.replace("**", "").replace("`", "")
+        s = re.sub(r"^\s*[-*]\s+", "• ", s, flags=re.M)
+        return s.strip()
+
+    def _ai_update_usage(self, u):
+        u = u or {}
+        if not u:
+            self._ai_usage_var.set("")
+            return
+        self._ai_usage_var.set(
+            f"输入 {u.get('prompt_tokens', 0):,}"
+            f"（命中 {u.get('cache_hit', 0):,} / "
+            f"未命中 {u.get('cache_miss', 0):,}）\n"
+            f"输出 {u.get('completion_tokens', 0):,} · "
+            f"缓存 {u.get('cache_rate', 0):.1f}% · "
+            f"${u.get('cost_usd', 0):.6f} / "
+            f"¥{u.get('cost_cny', 0):.6f} · "
+            f"联网 {u.get('search_calls', 0)} 次")
+
     def _notify_plugins(self, hook, *args):
         """按钩子名回调所有插件，单个失败不影响其它。"""
         for p in getattr(self, "_plugins", []) or []:
@@ -17122,6 +18423,7 @@ class App:
         self._search_lb = None
         self._search_open = False
         self._wiz_active = False
+        self._wiz_ts = 0.0
 
         def load():
             try:
@@ -17155,6 +18457,16 @@ class App:
         """结束键盘精灵本次搜索会话（下次输入从空搜索栏开始）。"""
         self._wiz_active = False
         self._search_hide()
+
+    def _search_end_if_blurred(self):
+        """FocusOut 延时回调：180ms 内焦点若已回到搜索框（如
+        _global_key 刚开的新会话），则不结束会话。"""
+        try:
+            if self.root.focus_get() is self.ent_query:
+                return
+        except Exception:
+            pass
+        self._search_end()
 
     def _search_hide(self):
         self._search_open = False
@@ -17210,6 +18522,7 @@ class App:
             return
         if self.code_var.get():
             self._wiz_active = True
+            self._wiz_ts = time.time()
         self._search_show(self._search_filter(self.code_var.get()))
 
     def _search_move(self, delta):
@@ -17265,7 +18578,12 @@ class App:
         if cls in ("Entry", "TEntry", "Text", "Listbox", "TCombobox",
                    "Spinbox", "TSpinbox") and w is not self.ent_query:
             return None
-        if getattr(self, "_wiz_active", False):
+        # 会话判定以实际焦点为准：焦点在搜索框、会话未结束且空闲未超时
+        # 才正常追加；否则一律开新会话（清空旧代码重写）——避免
+        # _wiz_active 滞留导致按键丢失（失效）或追加在旧代码后（不清空）。
+        if (w is self.ent_query and getattr(self, "_wiz_active", False)
+                and time.time() - getattr(self, "_wiz_ts", 0.0) < 30):
+            self._wiz_ts = time.time()
             return None
         try:
             self.ent_query.focus_set()
@@ -17273,6 +18591,7 @@ class App:
                 self.ent_query.delete(0, "end")
             self.ent_query.insert("end", ch)
             self._wiz_active = True
+            self._wiz_ts = time.time()
             self._search_show(self._search_filter(self.code_var.get()))
         except Exception:
             pass
@@ -18734,6 +20053,10 @@ class App:
         self._set_info()
         self._rerender()
         self._notify_plugins("on_analysis", res)
+        try:
+            self._ai_on_res_loaded(res)
+        except Exception:
+            log.exception("AI 侧栏绑定失败(忽略)")
 
     def _set_info(self, q=None):
         """顶栏信息行（盘前不显示过期今开，锚定提示在图表右下角）。
@@ -19338,12 +20661,47 @@ class App:
                 cv.create_text(tx, ly, text=txt, anchor="e", fill=colr,
                                font=("Microsoft YaHei", 8))
 
-        # AI画线（v6.5.2）：AI价位块落图，ACCENT虚线+左侧AI标签；
-        # 越界不画（同支撑/压力逻辑），趋势段按日期映射到当前视野。
+        # AI画线（v6.5.2；2026-11-04 扩展）：水平价位 + 斜线/射线 +
+        # 文字标注 + 区间色块。越界不画（同支撑/压力逻辑），日期映射
+        # 到当前视野；斜线可向右/两端延伸，标注/区间同用日期定位。
         ai_ln = (self.res.get("ai_lines")
                  if getattr(self, "res", None) else None)
         if ai_ln and self.show_ai_lines.get():
             _ax = g["w"] - (CFG.CHIP_AXIS_STRIP if g["R"] >= 100 else 6)
+            _bot = g["h"] - g["B"]
+            _didx = {d: k for k, d in enumerate(v["dates"])}
+            _seg_c = {"trend": C_GOLD, "support": DOWN, "resistance": UP,
+                      "channel": C_PURPLE, "ray": C_GOLD}
+            _note_c = {"note": ACCENT, "buy": UP, "sell": DOWN,
+                       "warning": C_GOLD, "target": PRED_C}
+            _zone_c = {"zone": ACCENT, "channel": C_PURPLE,
+                       "risk": DOWN, "target": PRED_C}
+            _font = ("Microsoft YaHei", 8)
+
+            # 区间先画（半透明点阵，压在K线上但不遮死）
+            for z in (ai_ln.get("zones") or []):
+                a, b = (z or {}).get("a") or {}, (z or {}).get("b") or {}
+                ia, ib = _didx.get(a.get("date")), _didx.get(b.get("date"))
+                if ia is None or ib is None:
+                    continue
+                try:
+                    pa, pb = float(a["price"]), float(b["price"])
+                    x1, x2 = sorted((xs(ia), xs(ib)))
+                    y1, y2 = sorted((ymap(pa), ymap(pb)))
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if x2 - x1 < 2 or y2 - y1 < 2:
+                    continue
+                col = _zone_c.get(z.get("kind"), ACCENT)
+                cv.create_rectangle(x1, y1, x2, y2, fill=col,
+                                    stipple="gray25", outline=col,
+                                    width=ind_w())
+                if z.get("label"):
+                    cv.create_text(x1 + 4, y1 + 9,
+                                   text=f"AI·{z['label']}", anchor="w",
+                                   fill=col, font=_font)
+
+            # 水平价位
             for lv in (ai_ln.get("levels") or []):
                 pv = (lv or {}).get("price")
                 if not (pv and lo < pv < hi):
@@ -19358,8 +20716,9 @@ class App:
                 cv.create_rectangle(g["L"] + 2, aly - 8, atx + 4, aly + 8,
                                     fill=PANEL_BG, outline=ACCENT)
                 cv.create_text(atx, aly, text=atxt, anchor="e",
-                               fill=ACCENT, font=("Microsoft YaHei", 8))
-            _didx = {d: k for k, d in enumerate(v["dates"])}
+                               fill=ACCENT, font=_font)
+
+            # 斜线段 / 延伸射线
             for sg_ in (ai_ln.get("segs") or []):
                 a, b = (sg_ or {}).get("a") or {}, (sg_ or {}).get("b") or {}
                 ia, ib = _didx.get(a.get("date")), _didx.get(b.get("date"))
@@ -19368,16 +20727,59 @@ class App:
                 if not (0 <= ia < len(bars) and 0 <= ib < len(bars)):
                     continue
                 try:
-                    cv.create_line(xs(ia), ymap(a["price"]),
-                                   xs(ib), ymap(b["price"]), fill=ACCENT,
-                                   dash=(5, 3), width=ind_w())
-                except (ValueError, TypeError):
+                    x1, y1 = xs(ia), ymap(a["price"])
+                    x2, y2 = xs(ib), ymap(b["price"])
+                except (KeyError, ValueError, TypeError):
                     continue
+                col = _seg_c.get(sg_.get("kind"), ACCENT)
+                kw = {"fill": col, "width": ind_w()}
+                if sg_.get("dash", True):
+                    kw["dash"] = (5, 3)
+                lx, ly = x2, y2
+                if sg_.get("extend") and x2 != x1:
+                    t = (_ax - x1) / (x2 - x1)
+                    xe, ye = _ax, y1 + t * (y2 - y1)
+                    if sg_.get("extend_both"):
+                        t0 = (g["L"] - x1) / (x2 - x1)
+                        cv.create_line(g["L"], y1 + t0 * (y2 - y1),
+                                       xe, ye, **kw)
+                    else:
+                        cv.create_line(x1, y1, xe, ye, **kw)
+                    lx, ly = xe, ye
+                else:
+                    cv.create_line(x1, y1, x2, y2, **kw)
                 if sg_.get("label"):
-                    cv.create_text(xs(ib) + 4, ymap(b["price"]) - 9,
-                                   text=f"AI·{sg_['label']}", anchor="w",
-                                   fill=ACCENT,
+                    stxt = f"AI·{sg_['label']}"
+                    stw = self._text_px(cv, stxt, 8, "Microsoft YaHei")
+                    stx = min(lx + 4, _ax - stw - 4)
+                    sty = max(g["T"] + 8, min(ly - 9, _bot - 8))
+                    cv.create_text(stx, sty, text=stxt, anchor="w",
+                                   fill=col,
                                    font=("Microsoft YaHei", 8, "bold"))
+
+            # 日期+价位文字标注（带引线/底色框）
+            for nt in (ai_ln.get("notes") or []):
+                i = _didx.get((nt or {}).get("date"))
+                if i is None or not (0 <= i < len(bars)):
+                    continue
+                try:
+                    x, y = xs(i), ymap(nt["price"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                col = _note_c.get(nt.get("kind"), ACCENT)
+                txt = f"AI·{nt.get('text') or ''}"
+                tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
+                tx = x + 6
+                if tx + tw + 6 > _ax:
+                    tx = x - tw - 10
+                tx = max(g["L"] + 2, tx)
+                ty = min(max(y - 12, g["T"] + 10), _bot - 8)
+                anchor_x = tx if tx > x else tx + tw
+                cv.create_line(x, y, anchor_x, ty, fill=col, dash=(2, 2))
+                cv.create_rectangle(tx - 2, ty - 8, tx + tw + 4, ty + 8,
+                                    fill=PANEL_BG, outline=col)
+                cv.create_text(tx + tw / 2, ty, text=txt, fill=col,
+                               font=_font)
 
         # 现价标签挂在最后一根真实K线上（跳过幽灵K线）
         pb_i = len(bars) - 1
@@ -20418,7 +21820,7 @@ class App:
 
     # ---------- AI 分析（DeepSeek） ----------
 
-    def _ai_prompt(self):
+    def _ai_prompt(self, news=""):
         res, tp, pred = self.res, self.res["t_pred"], self.res["pred"]
         q = res["quote"]
         cur_px = q["price"]
@@ -20472,13 +21874,20 @@ class App:
         sec_txt = (f"{res['sector_name']}今日 {res['sector_chg_today']:+.2f}%"
                    if res["sector_name"] and res["sector_chg_today"] is not None
                    else "板块数据不足")
+        ai_mode = ai_risk_mode(res)
+        strat_mode = (res.get("risk_mode") or "").strip()
+        strat_note = ""
+        if (strat_mode and strat_mode != ai_mode
+                and strat_mode in ("保守", "稳健", "激进")):
+            strat_note = (f"（该股买卖点策略缓存档位={strat_mode}；"
+                          f"AI 行为按设置的风险偏好={ai_mode}）\n")
         txt = (
             f"你是专业A股短线分析师。请给出果断、可执行的结论（禁止模棱两可）："
             f"首行必须明确操作（买入/持有/卖出/观望）与仓位建议，"
             f"随后给具体买点/卖点/止损价位（参考下方支撑/压力），"
             f"再用不超过3条依据支撑，最后一行风险提示。用中文，300字内。\n"
-            f"当前风险偏好：{res.get('risk_mode') or CFG.RISK_MODE}｜"
-            f"{ai_risk_guide(res.get('risk_mode') or CFG.RISK_MODE)}\n"
+            f"当前风险偏好：{ai_mode}｜{ai_risk_guide(ai_mode)}\n"
+            f"{strat_note}"
             f"（必须按该风险偏好给结论：低档可等确认，激进 禁止用"
             f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
             f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
@@ -20532,18 +21941,62 @@ class App:
                             for lab, sc, note in act["items"])
             txt += (f"多维综合评估：合计{act['score']:+d}，{act['verdict']}"
                     f" [{det}]\n")
-        txt += (
-            "\n【画线输出：正文结束后另起一段，只输出以下代码块，无其它文字】\n"
-            "```ai-lines\n"
-            '{"lines": [{"price": 5.32, "label": "买点", "kind": "buy"}, '
-            '{"price": 5.78, "label": "压力", "kind": "resistance"}], '
-            '"segs": []}\n'
-            "```\n"
-            "规则：lines最多6条，取自正文已给出的买点/卖点/止损/支撑/压力/目标价"
-            "（kind只能是buy/sell/stop/support/resistance/target六选一，"
-            "label不超过6个字）；价位须在近60日区间正负30%内；segs可空，"
-            "如给趋势段则填起止日期与价格（YYYY-MM-DD），最多2段；"
-            "必须是合法JSON（数字不加引号、无注释、无尾逗号）。"
+        if news:
+            txt += (
+                "\n【联网资讯（DeepSeek Search 自动检索，仅作参考；"
+                "可能含过时/无关/营销内容，请与行情数据交叉验证，勿盲从）】\n"
+                + news + "\n"
+            )
+        txt += AI_DRAW_SCHEMA
+        return txt
+
+    def _ai_prompt_brief(self):
+        """工具模式首轮 prompt：只给核心快照+策略参数，其余由 AI 按需
+        调用工具获取（不预塞全文）。"""
+        res = self.res
+        q = res["quote"]
+        ai_mode = ai_risk_mode(res)
+        strat = res.get("strategy") or {}
+        params = strat.get("params") or CFG.risk_params()
+        strat_mode = (res.get("risk_mode") or "").strip()
+        strat_note = ""
+        if (strat_mode and strat_mode != ai_mode
+                and strat_mode in ("保守", "稳健", "激进")):
+            strat_note = (f"（该股买卖点策略缓存档位={strat_mode}；"
+                          f"AI 行为按设置的风险偏好={ai_mode}）\n")
+        risk_txt = (f"ATR止损×{params.get('atr_mult', '-')}，"
+                    f"移动止盈触发+{((params.get('trail_trigger') or 1)
+                                   - 1) * 100:.1f}%/回落"
+                    f"{((1 - (params.get('trail_ratio') or 1)) * 100):.0f}%，"
+                    f"买入阈值{params.get('buy_th', '-')}，"
+                    f"冷却{params.get('cooldown', '-')}日")
+        txt = (
+            "你是专业A股短线分析师。数据不会一次性全部提供：请先调用工具"
+            "获取你需要的行情、指标、预测、样本、市场、筹码、财报、分时与"
+            "资讯，再下结论；未取得的数据不要臆测。尽可能多调用工具补齐证据。\n"
+            f"当前风险偏好：{ai_mode}｜{ai_risk_guide(ai_mode)}\n"
+            f"{strat_note}"
+            f"（必须按该风险偏好给结论：低档可等确认，激进禁止用"
+            f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
+            f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
+            f"昨收{res['prev_close']:.2f} 今开{q['open']:.2f} "
+            f"现价{q['price']:.2f} 缺口{res['gap_today']:+.2f}%"
+            f" 最高{q.get('high', 0):.2f} 最低{q.get('low', 0):.2f}\n"
+            f"量比{_ai_tool_f(res.get('vr_now'))}"
+            f"（{res.get('cur_regime') or '-'}）；"
+            f"上证今日{_ai_tool_spct(res.get('idx_chg_today'))}；"
+            f"板块{res.get('sector_name') or '-'} "
+            f"{_ai_tool_spct(res.get('sector_chg_today'))}\n"
+            f"当前策略：{strat.get('label') or '多维评分'}"
+            f"（{strat.get('algo') or res.get('sel_algo') or 'composite'}）；"
+            f"风控：{risk_txt}\n\n"
+            "可用工具：get_kline（更多日K）、get_indicators（指标序列）、"
+            "get_prediction（预测分位/多日）、get_similar_samples（相似样本）、"
+            "get_market（大盘/闸门）、get_chips_action（筹码/评分/信号/回测）、"
+            "get_fundamentals（财报）、get_intraday（分时）、get_strategy"
+            "（策略参数）、search_news（联网资讯）。至少获取日K、指标、预测与"
+            "资讯后再给最终结论；画线前确认日期在最近60个交易日内、价位在近60日区间±30%内。\n"
+            + AI_DRAW_SCHEMA
         )
         return txt
 
@@ -20568,14 +22021,16 @@ class App:
             hi60, lo60 = max(his), min(los)
             if hi60 <= lo60 or lo60 <= 0:
                 return
-            levels, segs = parse_ai_lines(text, lo60 * 0.7, hi60 * 1.3)
-            if not levels and not segs:
+            levels, segs, notes, zones = parse_ai_lines(
+                text, lo60 * 0.7, hi60 * 1.3)
+            if not (levels or segs or notes or zones):
                 if clear_first:
                     self._rerender()
                 return
-            res["ai_lines"] = {"levels": levels, "segs": segs}
-            log.info("AI画线落图：%d水平线+%d趋势段", len(levels),
-                     len(segs))
+            res["ai_lines"] = {"levels": levels, "segs": segs,
+                               "notes": notes, "zones": zones}
+            log.info("AI画线落图：%d水平线+%d斜线段+%d标注+%d区间",
+                     len(levels), len(segs), len(notes), len(zones))
             self._rerender()
         except Exception:
             log.exception("AI画线落图失败(忽略)")
@@ -21315,172 +22770,6 @@ class App:
         # 打开即算一次，省得用户再点
         self.root.after(80, run_bt)
 
-        # ── AI 分析（多轮对话，共享同一份数据上下文，带会话缓存） ──
-        f_ai = ttk.Frame(nb, padding=10)
-        nb.add(f_ai, text=" AI 分析 ")
-        ai_market_brief()   # 打开AI页即预热闸门缓存（UI安全：冷缓存自动派后台线程）
-
-        bar = ttk.Frame(f_ai)
-        bar.pack(side="bottom", fill="x", pady=6)   # 先占底部，避免被 Text 挤没
-        ai_result = tk.Text(f_ai, height=12, bg=PANEL_BG, fg=FG_MAIN,
-                            font=("Microsoft YaHei", 10), relief="flat",
-                            wrap="word", state="disabled",
-                            insertbackground=FG_MAIN, selectbackground=SEL_BG,
-                            padx=8, pady=5, spacing1=1, spacing3=2)
-        ai_scroll = ttk.Scrollbar(f_ai, command=ai_result.yview)
-        ai_result.configure(yscrollcommand=ai_scroll.set)
-        ai_scroll.pack(side="right", fill="y")
-        ai_result.pack(fill="both", expand=True)
-
-        # 会话缓存：同股票同模型复用历史（内存 + SQLite meta）
-        code = (self.res or {}).get("full_code") or ""
-        ses_key = (code, AI_MODEL)
-        ses = self._ai_sessions.get(ses_key) or ai_session_load(code)
-        if ses:
-            self._ai_sessions[ses_key] = ses
-            self._ai_msgs = list(ses.get("msgs") or [])
-        else:
-            self._ai_msgs = []
-        ctx_hash = {"v": (ses or {}).get("hash", "")}
-
-        def _save_session():
-            self._ai_sessions[ses_key] = {"hash": ctx_hash["v"],
-                                          "msgs": list(self._ai_msgs)}
-            ai_session_save(code, self._ai_msgs, ctx_hash["v"])
-
-        def _ensure_key():
-            key = get_ai_key() or getattr(self, "api_key", "")
-            if key:
-                return key
-            key = simpledialog.askstring(
-                "AI API Key",
-                "首次使用请输入 API Key（支持 DeepSeek/智谱/opencode 等\n"
-                "OpenAI 兼容平台，接口地址在设置中配置）：",
-                show="*", parent=win)
-            if not key:
-                return None
-            self.api_key = key.strip()
-            self._save_ini()
-            return self.api_key
-
-        def _render():
-            ai_result.config(state="normal")
-            ai_result.delete("1.0", "end")
-            if not self._ai_msgs:
-                ai_result.insert("end", "点击【开始分析】，可连续追问。\n"
-                                        "（数据未变时自动复用缓存对话，不重复计费）")
-            else:
-                for m in self._ai_msgs:
-                    who = "你" if m["role"] == "user" else "AI"
-                    ai_result.insert("end", f"── {who} ──\n{m['content']}\n\n")
-            ai_result.config(state="disabled")
-            ai_result.see("end")
-
-        def _send():
-            key = _ensure_key()
-            if not key:
-                return
-            msgs = _ai_trim_msgs(self._ai_msgs)
-            _render()
-            ai_result.config(state="normal")
-            ai_result.insert("end", "\nAI 思考中...\n")
-            ai_result.config(state="disabled")
-            ask_var.set("")
-            follow_btn.config(state="disabled")
-
-            def bg():
-                return _deepseek_chat(key, msgs,
-                                      session=_ai_session_id(code, AI_MODEL))
-
-            def done(text, err):
-                follow_btn.config(state="normal")
-                if err:
-                    if self._ai_msgs and self._ai_msgs[-1]["role"] == "user":
-                        self._ai_msgs = self._ai_msgs[:-1]  # 回滚失败的那条
-                    ai_result.config(state="normal")
-                    ai_result.insert(
-                        "end", f"\n[AI 分析失败：{err}\n请检查 API Key 与网络。]\n")
-                    ai_result.config(state="disabled")
-                else:
-                    self._ai_msgs.append({"role": "assistant", "content": text})
-                    self._ai_msgs = _ai_trim_msgs(self._ai_msgs)
-                    self.ai_text = text
-                    _save_session()
-                    self._write_side()
-                    self._apply_ai_lines(text)
-                    _render()
-                ai_result.see("end")
-
-            self._run_bg(bg, done)
-
-        def run_ai():
-            # 首轮：完整共享数据上下文放进首条 user 消息；数据未变复用缓存
-            p = self._ai_prompt()
-            h = _ai_prompt_hash(p)
-            if (self._ai_msgs and ctx_hash["v"] == h
-                    and self._ai_msgs[-1]["role"] == "assistant"):
-                self.progress_var.set("AI 分析：已复用缓存对话（数据未变）")
-                self._apply_ai_lines(self._ai_msgs[-1].get("content") or "")
-                _render()
-                return
-            ctx_hash["v"] = h
-            self._ai_msgs = [{"role": "user", "content": p}]
-            if getattr(self, "res", None):
-                self.res.pop("ai_lines", None)
-            _send()
-
-        def follow_ai():
-            q = ask_var.get().strip()
-            if not q:
-                return
-            if not self._ai_msgs:
-                run_ai()
-                return
-            self._ai_msgs.append({"role": "user", "content": q})
-            _send()
-
-        def clear_ai():
-            self._ai_msgs = []
-            ctx_hash["v"] = ""
-            self._ai_sessions.pop(ses_key, None)
-            if getattr(self, "res", None):
-                self.res.pop("ai_lines", None)
-                try:
-                    self._rerender()
-                except Exception:
-                    log.exception("清除AI画线重绘失败(忽略)")
-            try:
-                with db_conn(commit=True) as conn:
-                    conn.execute("delete from meta where key=?",
-                                 (_ai_cache_key(code),))
-            except Exception:
-                log.exception("清除AI对话缓存失败")
-            _render()
-
-        tk.Button(bar, text="开始分析", command=run_ai,
-                  bg=BTN_BG, fg=BTN_FG,
-                  activebackground=BTN_HOVER, activeforeground=BTN_FG,
-                  relief="flat", cursor="hand2",
-                  font=("Microsoft YaHei", 10, "bold")).pack(
-                      side="left", padx=(0, 6), ipadx=10, ipady=4)
-        ask_var = tk.StringVar()
-        ask = ttk.Entry(bar, textvariable=ask_var)
-        ask.pack(side="left", fill="x", expand=True, ipady=3)
-        ask.bind("<Return>", lambda e: follow_ai())
-        follow_btn = tk.Button(bar, text="追问", command=follow_ai,
-                               bg=BTN_BG, fg=BTN_FG,
-                               activebackground=BTN_HOVER, activeforeground=BTN_FG,
-                               relief="flat", cursor="hand2",
-                               font=("Microsoft YaHei", 10, "bold"))
-        follow_btn.pack(side="left", padx=(6, 0), ipadx=10, ipady=4)
-        tk.Button(bar, text="清空对话", command=clear_ai,
-                  bg=BTN_BG, fg=BTN_FG,
-                  activebackground=BTN_HOVER, activeforeground=BTN_FG,
-                  relief="flat", cursor="hand2",
-                  font=("Microsoft YaHei", 10, "bold")).pack(
-                      side="left", padx=(6, 0), ipadx=10, ipady=4)
-        _render()
-
         # ── 基本面（v6.2.1：历史财报关键数据 + 规则分析）──
         f_fund = ttk.Frame(nb, padding=10)
         nb.add(f_fund, text=" 基本面 ")
@@ -21497,8 +22786,7 @@ class App:
         self._build_studio_frame(f_studio, win)
         if not res_ok:                   # 未分析股票时只开放 基本面/数据工具
             nb.tab(0, state="disabled")
-            nb.tab(1, state="disabled")
-            nb.select(2)
+            nb.select(1)
 
     # ---------- 数据工具（清洗/回填/回测导出） ----------
 
@@ -22414,6 +23702,47 @@ class App:
         ent_px = ttk.Entry(frm, textvariable=proxy_var, width=42)
         ent_px.grid(row=5, column=1, columnspan=2, sticky="we", pady=4)
 
+        ttk.Label(frm, text="联网检索").grid(row=6, column=0, sticky="w",
+                                            pady=4)
+        search_var = tk.BooleanVar(value=_ai_web_search_enabled())
+        ttk.Checkbutton(
+            frm, text="AI 分析前自动检索个股最新资讯（DeepSeek Search）",
+            variable=search_var).grid(row=6, column=1, columnspan=2,
+                                      sticky="w", pady=4)
+        ttk.Label(frm, text="仅官方 api.deepseek.com 生效；约 $0.75/千次，"
+                            "失败自动跳过，不影响分析",
+                  foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8)).grid(
+                      row=7, column=1, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="深度思考").grid(row=8, column=0, sticky="w",
+                                            pady=4)
+        think_var = tk.BooleanVar(value=_ai_thinking_enabled())
+        ttk.Checkbutton(frm, text="开启（默认 max）",
+                        variable=think_var).grid(row=8, column=1,
+                                                 sticky="w", pady=4)
+        effort_var = tk.StringVar(value=_ai_reasoning_effort())
+        ttk.Combobox(frm, textvariable=effort_var, width=6, state="readonly",
+                     values=list(AI_EFFORTS)).grid(row=8, column=2,
+                                                   sticky="w", pady=4)
+        ttk.Label(frm, text="max=最大推理；仅官方 api.deepseek.com 生效",
+                  foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8)).grid(
+                      row=9, column=1, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text="工具取数").grid(row=10, column=0, sticky="w",
+                                            pady=4)
+        tools_var = tk.BooleanVar(value=_ai_tools_enabled())
+        ttk.Checkbutton(
+            frm, text="AI 自行调用工具（K线/指标/预测/样本/市场/财报/分时/资讯）",
+            variable=tools_var).grid(row=10, column=1, columnspan=2,
+                                     sticky="w", pady=4)
+        ttk.Label(frm, text="先给核心快照，其余由 AI 思考中按需调用；"
+                            "非官方接口自动回退完整上下文",
+                  foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8)).grid(
+                      row=11, column=1, columnspan=2, sticky="w")
+
         # ---- 预测参数（存 ini [predict]，下次启动生效）----
         frm = sec_pred
         ttk.Separator(frm, orient="horizontal").grid(
@@ -23071,6 +24400,9 @@ class App:
                 set_proxy(self.proxy_url)
                 set_ai_model(model_var.get().strip())
                 set_ai_base(base_var.get().strip())
+                set_ai_web_search(bool(search_var.get()))
+                set_ai_thinking(bool(think_var.get()), effort_var.get())
+                set_ai_tools(bool(tools_var.get()))
                 self._save_ini()
             apply_theme(self.settings["theme"], self.settings["updown"],
                        ma_colors=ma_store, boll_colors=boll_store)
@@ -23359,6 +24691,351 @@ class App:
         self._update_sectors()
 
 
+# ================= AI Agent（主界面右侧栏会话/工具/用量/成本） =================
+# 侧栏在 class App 内构建；本块提供 AIAgent 会话、费用估算与事件队列。
+# 本块位于 class App 之后，不参与 build_cli.py 的 CLI 生成。
+
+_AI_PRICE = {
+    "flash": {"hit_off": 0.003, "hit_peak": 0.006,
+              "miss_off": 0.15, "miss_peak": 0.3,
+              "out_off": 0.6, "out_peak": 1.2},
+    "pro": {"hit_off": 0.022, "hit_peak": 0.044,
+            "miss_off": 0.66, "miss_peak": 1.32,
+            "out_off": 1.98, "out_peak": 3.96},
+}
+_AI_USD_CNY = 7.2
+
+
+def _ai_is_peak():
+    """DeepSeek 峰时近似：UTC 周一~周五 01:00-04:00 / 06:00-10:00
+    （未排除中国节假日，仅用于成本估算）。"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return (60 <= hm < 240) or (360 <= hm < 600)
+
+
+def _ai_cost_info(usage, model=""):
+    """按 DeepSeek 官方价估算 token/搜索成本（USD + CNY）。"""
+    m = (model or AI_MODEL or "").lower()
+    p = _AI_PRICE["pro"] if "v4-pro" in m else _AI_PRICE["flash"]
+    peak = _ai_is_peak()
+    hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+    miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+    if not hit and not miss:
+        miss = int(usage.get("prompt_tokens") or 0)
+    out = int(usage.get("completion_tokens") or 0)
+    cost = (hit / 1e6 * p["hit_peak" if peak else "hit_off"]
+            + miss / 1e6 * p["miss_peak" if peak else "miss_off"]
+            + out / 1e6 * p["out_peak" if peak else "out_off"])
+    cost += int(usage.get("search_calls") or 0) * 0.00075
+    rate = (hit / (hit + miss)) if (hit + miss) else 0.0
+    return {"prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": out,
+            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+            "cache_hit": hit, "cache_miss": miss,
+            "cache_rate": round(rate * 100, 1),
+            "search_calls": int(usage.get("search_calls") or 0),
+            "peak": peak, "cost_usd": round(cost, 6),
+            "cost_cny": round(cost * _AI_USD_CNY, 6),
+            "model": model or AI_MODEL}
+
+
+def _ai_strip_lines_block(text):
+    """聊天显示用：去掉 ai-lines 代码块（仍回传主图解析）。"""
+    if not text:
+        return text or ""
+    return re.sub(r"```ai-lines.*?```", "", text, flags=re.S).strip()
+
+
+def _ai_tool_fallback_error(e):
+    es = str(e).lower()
+    return any(k in es for k in ("tool", "function", "400", "thinking",
+                                 "reasoning", "unsupported"))
+
+
+class AIAgent:
+    """单会话 AI Agent：工具取数、思考、统计表、用量统计与事件队列。"""
+
+    def __init__(self, res, brief_prompt, full_prompt, on_lines=None):
+        self.res = res or {}
+        self.code = self.res.get("full_code") or ""
+        self.name = ((self.res.get("quote") or {}).get("name") or "")
+        self.brief_prompt = brief_prompt or ""
+        self.full_prompt = full_prompt or ""
+        self.on_lines = on_lines
+        self.lock = threading.Lock()
+        self.api_msgs = []
+        self.ui_msgs = []
+        self.tables = []
+        self.events = []
+        self.next_id = 1
+        self.usage = {}
+        self._usage0 = {}
+        self.busy = False
+        self.status = "idle"
+        self.error = ""
+        self.opts = {
+            "thinking": _ai_thinking_enabled(),
+            "effort": _ai_reasoning_effort(),
+            "tools": _ai_tools_enabled(),
+            "search": _ai_web_search_enabled(),
+        }
+        self.model = ""
+        self.use_tools = bool(self.opts["tools"] and _ai_is_deepseek())
+        self.fallback = False
+        self._q = ""
+        self.settings = {}
+        self.refresh_settings()
+
+    def refresh_settings(self):
+        self.settings = {
+            "thinking": bool(self.opts["thinking"]),
+            "effort": self.opts["effort"],
+            "tools": bool(self.opts["tools"]),
+            "search": bool(self.opts["search"]),
+            "deepseek": _ai_is_deepseek(),
+            "model": self.model or AI_MODEL, "base": AI_BASE_URL,
+        }
+        return self.settings
+
+    def _push(self, typ, data=None):
+        with self.lock:
+            ev = {"id": self.next_id, "type": typ,
+                  "data": data or {}, "ts": time.time()}
+            self.next_id += 1
+            self.events.append(ev)
+            if len(self.events) > 600:
+                self.events = self.events[-300:]
+            return ev
+
+    def poll(self, after=0):
+        with self.lock:
+            return [e for e in self.events if e["id"] > after]
+
+    def snapshot(self):
+        with self.lock:
+            msgs = list(self.ui_msgs)
+            tables = list(self.tables)
+            usage = dict(self.usage)
+            busy = self.busy
+            status = self.status
+            error = self.error
+            last_id = self.next_id - 1
+        q = self.res.get("quote") or {}
+        return {
+            "stock": {"code": self.code, "name": self.name,
+                      "price": q.get("price"), "time": q.get("time"),
+                      "risk": ai_risk_mode(self.res),
+                      "strategy": ((self.res.get("strategy") or {}).get("label")
+                                   or self.res.get("sel_algo") or "")},
+            "messages": msgs, "tables": tables,
+            "usage": _ai_cost_info(usage, self.model or AI_MODEL),
+            "busy": busy, "status": status, "error": error,
+            "settings": self.refresh_settings(), "last_event": last_id,
+            "peak_note": "峰时/谷时按 UTC 工作日 01-04、06-10 近似判断",
+        }
+
+    def set_opts(self, thinking=None, effort=None, tools=None,
+                 search=None, model=None):
+        """会话内一次性选项（不写 ini）：模型/思考/工具/联网。"""
+        if thinking is not None:
+            self.opts["thinking"] = bool(thinking)
+        if effort is not None:
+            e = str(effort).lower()
+            self.opts["effort"] = e if e in AI_EFFORTS else "max"
+        if tools is not None:
+            self.opts["tools"] = bool(tools)
+        if search is not None:
+            self.opts["search"] = bool(search)
+        if model is not None:
+            self.model = str(model or "").strip()
+        self.use_tools = bool(self.opts["tools"] and _ai_is_deepseek())
+        if not self.use_tools:
+            self.fallback = True
+        self.refresh_settings()
+        self._push("settings", self.settings)
+        return self.settings
+
+    def bind_res(self, res, brief_prompt, full_prompt):
+        """同股数据刷新：更新 res/上下文，保留对话。"""
+        self.res = res or {}
+        self.code = self.res.get("full_code") or ""
+        self.name = ((self.res.get("quote") or {}).get("name") or "")
+        self.brief_prompt = brief_prompt or ""
+        self.full_prompt = full_prompt or ""
+
+    def clear(self):
+        with self.lock:
+            self.api_msgs = []
+            self.ui_msgs = []
+            self.tables = []
+            self.usage = {}
+            self.busy = False
+            self.error = ""
+            self.status = "idle"
+            self.fallback = False
+        if self.on_lines:
+            try:
+                self.on_lines("")
+            except Exception:
+                log.exception("清理AI画线失败(忽略)")
+        self._push("cleared", {})
+        self._push("usage", _ai_cost_info({}, self.model or AI_MODEL))
+        return True
+
+    def send(self, text):
+        text = (text or "").strip()
+        with self.lock:
+            if self.busy:
+                return False
+            self.busy = True
+            self.error = ""
+            self.status = "思考中..."
+            self._usage0 = dict(self.usage)
+            first = not self.api_msgs
+            self._q = text
+            display = text or "开始分析"
+            if first:
+                ctx = (self.brief_prompt if self.use_tools
+                       else self.full_prompt)
+                api_user = ctx
+                if text:
+                    api_user += "\n\n【用户问题】\n" + text
+            else:
+                api_user = text
+            self.api_msgs.append({"role": "user", "content": api_user})
+            self.api_msgs = _ai_trim_msgs(self.api_msgs)
+            self.ui_msgs.append({"role": "user", "content": display})
+        self._push("user", {"text": display})
+        self._push("status", {"text": self.status})
+        threading.Thread(target=self._run_turn, daemon=True,
+                         name=f"ai-agent-{self.code}").start()
+        return True
+
+    def _run_turn(self):
+        try:
+            text, reasoning, reasons = self._chat(self.use_tools)
+            self._finish(text, reasoning, reasons)
+        except Exception as e:
+            if (self.use_tools and not self.fallback
+                    and _ai_tool_fallback_error(e)):
+                log.warning("AI Agent 工具模式失败，回退全文: %s", e)
+                self.use_tools = False
+                self.fallback = True
+                with self.lock:
+                    self.api_msgs = [{
+                        "role": "user",
+                        "content": self.full_prompt + (
+                            "\n\n【用户问题】\n" + self._q if self._q else ""),
+                    }]
+                try:
+                    text, reasoning, reasons = self._chat(False)
+                    self._finish(text, reasoning, reasons)
+                    return
+                except Exception as e2:
+                    self._fail(e2)
+                    return
+            self._fail(e)
+
+    def _chat(self, use_tools):
+        key = get_ai_key()
+        if not key:
+            raise RuntimeError("未配置 API Key（设置→AI 接口）")
+        system = ai_system_prompt(ai_risk_mode(self.res))
+        msgs = _ai_trim_msgs(self.api_msgs)
+        reasons = []
+        if use_tools:
+            ctx = {"res": self.res, "code": self.code, "name": self.name,
+                   "news": None, "usage": self.usage,
+                   "search": self.opts["search"],
+                   "on_table": self._on_table}
+
+            def ev(kind, name="", args=None, cid=""):
+                if kind == "round":
+                    self._set_status(f"深度思考中（第{name}轮）...")
+                elif kind == "tool":
+                    self._push("tool", {"id": cid or name, "name": name,
+                                        "args": args or {},
+                                        "state": "running"})
+                elif kind == "tool_done":
+                    self._push("tool_done", {"id": cid or name, "name": name,
+                                             "len": (args or {}).get("len")})
+                elif kind == "reasoning" and name:
+                    reasons.append(str(name))
+
+            text, reasoning = _deepseek_chat_tools(
+                key, msgs, ctx, model=self.model or AI_MODEL,
+                system=system,
+                session=_ai_session_id(self.code, self.model or AI_MODEL),
+                on_event=ev, usage_sink=self.usage,
+                thinking=self.opts["thinking"],
+                effort=self.opts["effort"])
+        else:
+            m = _deepseek_chat(
+                key, msgs, model=self.model or AI_MODEL,
+                system=system,
+                session=_ai_session_id(self.code, self.model or AI_MODEL),
+                return_message=True, usage_sink=self.usage,
+                thinking=self.opts["thinking"],
+                effort=self.opts["effort"])
+            text = m.get("content") or ""
+            reasoning = m.get("reasoning_content") or ""
+            if reasoning:
+                reasons.append(reasoning)
+        return text or "", reasoning or "", reasons
+
+    def _set_status(self, st):
+        with self.lock:
+            self.status = st
+        self._push("status", {"text": st})
+
+    def _on_table(self, table):
+        with self.lock:
+            self.tables.append(table)
+        self._push("table", table)
+
+    def _finish(self, text, reasoning, reasons):
+        display = _ai_strip_lines_block(text or "")
+        has_lines = "```ai-lines" in (text or "")
+        joined = "\n\n".join(dict.fromkeys([r for r in reasons if r]))
+        delta = {k: int(self.usage.get(k, 0)) - int(self._usage0.get(k, 0))
+                 for k in set(self.usage) | set(self._usage0)}
+        turn_usage = _ai_cost_info(delta, self.model or AI_MODEL)
+        with self.lock:
+            self.api_msgs.append({"role": "assistant",
+                                  "content": text or "",
+                                  "reasoning_content": reasoning or ""})
+            self.api_msgs = _ai_trim_msgs(self.api_msgs)
+            self.ui_msgs.append({
+                "role": "assistant", "content": display,
+                "reasoning": joined, "has_lines": has_lines,
+                "usage": turn_usage})
+            self.busy = False
+            self.status = "idle"
+        if has_lines and self.on_lines:
+            try:
+                self.on_lines(text or "")
+            except Exception:
+                log.exception("AI Agent 回传画线失败(忽略)")
+        usage = _ai_cost_info(self.usage, self.model or AI_MODEL)
+        self._push("assistant", {"content": display, "reasoning": joined,
+                                 "has_lines": has_lines,
+                                 "usage": turn_usage})
+        self._push("usage", usage)
+        self._push("done", {})
+
+    def _fail(self, e):
+        log.exception("AI Agent 分析失败")
+        with self.lock:
+            self.busy = False
+            self.status = "失败"
+            self.error = str(e)
+        self._push("error", {"text": str(e)})
+        self._push("done", {})
+
+
 def _cleanup():
     """程序退出时清理线程池，避免僵尸线程。"""
     try:
@@ -23369,6 +25046,7 @@ def _cleanup():
         _BG_EX.shutdown(wait=False)
     except Exception:
         pass
+
 
 
 atexit.register(_cleanup)
