@@ -1,6 +1,6 @@
 # 架构说明 · 股票形态相似度预测系统
 
-> **版本 v7.0.1　更新于 2026-10-25（多市场正式版）**
+> **版本 v7.0.2　更新于 2026-11-06（全量消融加载修复 + 备选 Ollama + 盘口/集合竞价）**
 > 配套：《README.md》（用户向：功能/快速开始/回测摘要/数据）、`CHANGELOG.md`（版本变更史）、
 > `reports/回测复核报告_20260913.md`（审计报告）。
 > 本文只讲两件事：**这套东西的架构**、**每个环节用的什么算法**。历史版本（v3.2/v3.3）的架构描述已被本文取代。
@@ -670,6 +670,11 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
 
 ### 3.9 AI 分析（可选，OpenAI 兼容）
 - **任意 OpenAI 格式平台**：设置内填 `base_url`（DeepSeek/智谱/opencode 等），自动补 `/chat/completions` 与 `/models`；
+- **备选 AI 供应商（2026-11-06）**：设置→AI 接口新增 `[ollama]` 节
+  （`enabled/base_url/model/api_key`，默认本地 `http://localhost:11434/v1` +
+  `qwen3:4b`）；`_ai_chat_json()` 在主接口抛错（网络/401/5xx/格式异常）时自动
+  重试备选，去掉 DeepSeek 专属 `thinking/reasoning_effort` 字段；普通对话与
+  工具调用均生效，主备都失败才把两段错误一起抛出；
 - **网关兼容**：请求带自有 UA `stock-analyzer/<版本>`（Cloudflare 会以 1010 拦截通用库 UA），
   并带稳定会话头 `x-opencode-session`（opencode zen 必需，缺失报 400 MissingSessionID；同股同模型复用，
   换股/换模型/换用途区分）；其他平台忽略该头；
@@ -680,13 +685,29 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   `[deepseek] tools`（默认开）时 AI 分析首轮只发核心快照，模型在思考中通过
   OpenAI 兼容 `tools` 调用 `get_kline`/`get_indicators`/`get_prediction`/
   `get_similar_samples`/`get_market`/`get_chips_action`/`get_fundamentals`/
-  `get_intraday`/`get_strategy`/`search_news` 按需取数（`_deepseek_chat_tools`
-  最多 8 轮，工具轮 `reasoning_content` 必须回传）；工具异常/网关不支持自动回退
-  完整上下文；非官方接口不发送思考/工具参数，仍走旧全文 prompt；
+  `get_intraday`/`get_strategy`/`search_news`/`get_etf_constituents` 按需取数
+  （`_deepseek_chat_tools` 最多 8 轮，工具轮 `reasoning_content` 必须回传）；
+  工具异常/网关不支持自动回退完整上下文；非官方接口不发送思考/工具参数，
+  仍走旧全文 prompt；
 - **提示词（v6.1.8 按风险偏好动态生成；v6.4.1 增 test）**：通用要求「直接给买/卖/观望 + 唯一首选方向 + 价位区间 + 建议仓位，禁止模棱两可，结论先行、≤3 条依据、末行风险提示」+ `RISK_AI_GUIDE` 行为约束——保守=等确认/轻仓，稳健=兼顾但须可执行，激进=突破即进攻、禁用「等企稳/观望」搪塞，**激进（最高档）=板块轮动进攻、接受大波动、可直接给打板（涨停价）与集中仓位建议、禁止等企稳措辞**；**`test`=sm701 模型直出**（围绕模型概率给结论，并明确提示「次日开盘→收盘」日内口径、A股 T+1 不可当日卖出、样本外 AUC≈0.53）；系统提示词（`ai_system_prompt`）与首条用户上下文都带该约束（风险偏好变化 → 上下文 hash 变化 → 自动重新提问，不复用旧风险口径的缓存回答）；**AI 风险口径统一（2026-11-04）**：`ai_risk_mode()` 决定行为档——外部策略 / `test` / `sm701` 模型直出优先，其余用设置 `CFG.RISK_MODE`（不再被该股策略缓存档位覆盖）；`_send` 把同一档位传给 `ai_system_prompt`，系统提示词与首轮上下文一致；缓存档位≠设置时在首轮上下文注明；
 - **数据上下文（旧/回退模式）**：快照/缺口/量比/板块、5/20/60 日收益与 60 日位置、20 日均额与波动、近 15 日 OHLCV、
   MA/MACD/KDJ/RSI/布林/ADX、形态预测分位与上行概率、近期信号、市场简报（含三档闸门+科创50）、筹码分布、多维评估；
   工具模式下不再预塞全文，改为由模型按需调用上述工具获取；
+- **ETF成分股 / 当日分时（2026-11-05）**：`fetch_etf_holdings()` 调东财 F10
+  基金持仓（`fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc`，带 UA/Referer，
+  复用 `_http_get` 限流/熔断/代理），解析响应内各报告期；优先取行数最多的
+  年报/中报完整持仓，另存最新季报前 10；内存 6h + SQLite `meta` 24h 缓存
+  （`etf_hold2:<code>`），网络失败降级旧缓存。`etf_constituent_perf()` 对前 N 大
+  成分股批量取行情 + 日K计算当日/5日/20日/量比并加权汇总；
+  `get_etf_constituents` 工具输出统计表；`get_kline`/`get_indicators`/
+  `get_intraday` 增加可选 `code`，可查成分股等其它标的（`get_intraday` 即
+  当日/最近交易日分时）。
+- **外部环境搜索（2026-11-05）**：`get_external_env` **仅调用 DeepSeek 官方
+  Search API**（`deepseek_search` / `/v1/tools/search`）；默认两路查询——
+  「黄金/原油/美股/港股/A股/美元/美债 最新走势」与「特朗普/关税/地缘政治/
+  市场影响」，均带 `after:` 近 N 天，合并按 title+url 去重后给摘要；支持
+  `query` 聚焦、15 分钟内存缓存；成功请求计入 `usage.search_calls`；
+  AI 提示词要求涉及外部环境先调用、不得臆测。
 - **联网资讯（2026-11-04）**：`deepseek_search()` 封装 DeepSeek 官方
   `POST /v1/tools/search`（仅 `api.deepseek.com`；其他 OpenAI 兼容网关无此能力，
   自动跳过）；`ai_stock_news()` 在【开始分析】首轮前于后台检索个股近 30 天
@@ -714,6 +735,10 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   `_deepseek_chat_tools` 增加 `usage_sink`、工具事件与 thinking/effort 覆盖；
   `show_table` 生成结构化统计表卡片；输入栏下方显示 token（缓存命中/未命中）、
   输出 token、缓存命中率、预计成本（DeepSeek flash/v4-pro 峰谷价近似）与联网次数。
+  **数据区（2026-11-05）**：分析完成自动后台加载当前标的分时 Mini 图；ETF 自动
+  加载成分股前 20（与 `get_etf_constituents` 共用持仓/行情缓存）；「数据▾」按钮
+  可完全收起/展开（收起后聊天区扩高），数据加载走独立 daemon 线程、切换股票按
+  代号丢弃旧结果。
 - **AI画线（v6.5.2；2026-11-04 扩展）**：prompt 追加机器可读画线块（```ai-lines JSON：
   水平价位≤8（buy/sell/stop/support/resistance/target）+ 斜线/趋势线/通道线/射线≤6
   （起止日期价格，`extend` 向右/`"both"` 两端延伸、`dash=false` 实线、按 kind 配色）
@@ -782,7 +807,9 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   **日志回流不卡主界面（v6.5.7）**：`_ext_poll` 每轮最多抽 400 行/占用 ≤30ms，
   积压 1ms 续批、空闲 150ms 轮询，`_ext_log_many` 单次 insert 且控件只留末尾
   约 4000 行；重开工具页时保留运行中子进程句柄与队列并自动续轮询；
-  **全量策略消融（v6.5.5/v6.5.6）**：表单（并发 0=自动/限制只数 0=全部）启动
+  **全量策略消融（v6.5.5/v6.5.6；v7.0.2 加载提速）**：`load_stocks()` 改为按
+  `code` 逐只取最近 1000 根（`idx_bars_code`），避免一次性拉 2000 万行导致
+  长时间卡在「加载全缓存对象」；实测加载 49s、10559 个对象全量约 111 分钟。表单（并发 0=自动/限制只数 0=全部）启动
   `backtests/backtest_strategy_ablation.py` 全市场逐只消融，勾选「跑完刷新 GUI
   策略缓存」串联 `backtests/tier_picks_from_ablation.py`（bash `&&` 链 + 独立进程组，
   【停止】按进程组 kill 避免孤儿写库）；**进度查询**：脚本每 ≤2s 原子写
@@ -830,6 +857,17 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   打开前先销毁旧实例防堆叠；**v6.5.8 起工具窗去掉 `transient`**——多数窗口管理器
   不给 transient 子窗最小化按钮，现为独立顶层窗（可最小化、任务栏独立、可切回主界面），
   其余三窗保持 transient 置顶与居中/聚焦。
+
+- **分时视图（2026-11-05）**：分时主图价格线/VWAP/昨收基准 + 右侧涨跌幅轴；
+  `cv_vol` 分钟量；`cv_ind` 自动切换为分时 MACD（DIF/DEA/柱）+ 累计量比
+  （5 日均量 × 已交易分钟/240，阈值 0.8/1.0/1.2）；`_minute_motion` 同步
+  三图垂直光标 + 悬停图水平光标，读数含时间/价/涨幅/均价/分钟量/量比/MACD；
+  时间刻度 09:30/10:30/13:00/14:00/15:00；不跟随日线指标下拉。
+  **盘口/集合竞价（v7.0.2）**：右侧栏新增「盘口」面板，`fetch_order_book()`
+  走腾讯五档（`qt.gtimg.cn` 字段 9~28）+ 新浪兜底，3s 缓存；按行情时间判定
+  集合竞价/竞价撮合/连续竞价/收盘竞价，显示竞价参考价、匹配量、今开、买卖
+  五档与委比；切到分时视图时 `_toggle_minute()` 自动把右侧栏切到「盘口」并
+  开始刷新，切股时同步重拉；指数无五档时给出提示。
 
 ### 3.14 18 策略共振综合荐股（v6.1.6）
 - **来源**：移植 `chaodi_strategies/et_engine`（通达信口径）进 `stock_gui.py` 算法区，
@@ -1090,7 +1128,8 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
-| **AI Agent 侧栏/工具取数/思考/画线**<br>（2026-11-04） | **AI 分析嵌入主界面右侧栏**：①右侧栏新增「AI Agent」（竖栏约 29%，Tk 原生，不再独立窗口）；`AIAgent` 事件轮询；侧栏可切换股票/模型；②模型/思考/工具/联网为一次性会话选项（`set_opts`，不写 ini）；输入栏下方 token/缓存命中率/预计成本/联网次数；③`_deepseek_chat_tools` + 11 个工具（10 数据 + `show_table`），首轮核心快照、最多 8 轮、用量 `usage_sink`、工具事件；④`parse_ai_lines`/绘制扩展：水平线≤8、斜线/射线≤6、标注≤6、区间≤3；3.9 节更新 |
+| **v7.0.2**<br>（2026-11-06） | **全量消融加载修复 + 备选 Ollama + 盘口/集合竞价**：①`load_stocks()` 按代码逐只取最近 1000 根，2145 万行全表扫描（~255s）降至 ~49s，全量 10559 对象/10472 有效跑通；②设置→AI 接口新增 `[ollama]` 备选供应商（默认 `http://localhost:11434/v1` + `qwen3:4b`），`_ai_chat_json()` 主接口失败自动回退（对话/工具均生效）；③右侧栏「盘口」面板：腾讯五档+集合竞价+委比，3s 刷新、新浪兜底；分时视图自动切侧栏、切股重拉；④`APP_VERSION=7.0.2`；3.9/3.13 节与 README/CHANGELOG 同步 |
+| **AI Agent 侧栏/工具取数/思考/画线**<br>（2026-11-04） | **AI 分析嵌入主界面右侧栏**：①右侧栏新增「AI Agent」（竖栏约 29%，Tk 原生，不再独立窗口）；`AIAgent` 事件轮询；侧栏可切换股票/模型；②模型/思考/工具/联网为一次性会话选项（`set_opts`，不写 ini）；输入栏下方 token/缓存命中率/预计成本/联网次数；③`_deepseek_chat_tools` + 13 个工具（12 数据 + `show_table`；含 ETF 成分股/外部环境），首轮核心快照、最多 8 轮、用量 `usage_sink`、工具事件；④`parse_ai_lines`/绘制扩展：水平线≤8、斜线/射线≤6、标注≤6、区间≤3；3.9 节更新 |
 | **DeepSeek 联网检索**<br>（2026-11-04） | **AI 分析自动联网资讯**：`deepseek_search()` 封装官方 `/v1/tools/search`（仅 `api.deepseek.com`），`ai_stock_news()` 首轮前后台检索个股近 30 天新闻/公告/业绩（5 条、30 分钟缓存、失败 5 分钟）并注入上下文；设置开关 `[deepseek] web_search`（默认开）；检索失败不阻断分析；**同轮修复 AI 风险偏好口径**：`ai_risk_mode()` 设置优先（外部策略/test/sm701 除外），系统提示词与首轮上下文统一，缓存档位不同时注明；3.9 节更新 |
 | **v7.0.1**<br>（2026-10-25） | **多市场正式版（合并 market-sniper）**：①市场前缀代码（hk/us/fu/crypto）与 cn 同库同表，顶栏市场下拉+模式感知 normalize；②sm701 多市场直出（副本库同源行情 + 各市场生产三模型 + 样本外概率文件，`_sm701_live_one` 单股复算，策略链 工坊绑定>sm701>多维）；③工坊按市场应用（`[studio] bind_*`）；④交易插件分市场账本+杠杆+T+0（`{市场}:{实盘|模拟}`，`leverage_市场`）；⑤指标参数分市场（`[inds_市场]` 覆盖 + `INDP()` 线程上下文）；⑥自选池按市场分开；⑦`backtest_sm701_markets.py` 三市场回测（hk 胜率60%/us 55.6%/fut 53.1%）+ 网页面板「多市场 sm701 信号概览」节；⑧`APP_VERSION=7.0.1`；2.0 节新增 |
 | **v6.6.5**<br>（2026-10-24） | **日K 同花顺第三梯队源 + 源链可配置 + 回填多源兜底 + 增量瘦身 + 基期检测缺陷修复**：①`_fetch_ths`（`d.10jqka.com.cn/v6/line` JSONP，last.js 近140根 + 按年文件回拼~20年，`_ths_symbol` 映射个股/ETF/科创板/深指、上证指数无映射）——**完整前复权口径原样入库不乘因子**，排新浪后东财前；同轮对拍澄清新浪源口径与库内一致（0.000%）；②源链注册层 `_kline_builtin_defs/_kline_sources/_reload_kline_srcs/_load_kline_src_cfg/_apply_kline_src_cfg/_probe_kline_src`（ini `[data] kline_srcs/custom_kline`），设置新增「数据源」分区（内置源启停/排序/测试 + 自定义源增删测，类型 tx/ths/em/sina/163），同 URL 去重、全停用回默认、急救箱联动；③`_bf_fetch_one` 腾讯→同花顺→东财三级兜底（`_bf_hint_set` 复用）；④`get_daily` 增量只拉 120 根小窗、漂移时自动升级全量重定基；⑤**修复 P0**：基期漂移检测 break-early 缺陷（口径级差异 checked 恒=1 误判重叠不足→混写接缝，实测 +95.7% 跳变），`get_daily`/`backfill_full_market` 均改扫完再判；⑥`_DOMESTIC_SUFFIX`+`10jqka.com.cn`，firstaid 增同花顺套件；⑦**修复「分析后 K 线长时间不显示」**：`_SM701_CACHE` 三个缓存 key 由库文件 mtime 改为数据内容指纹（`_db_latest_date()` + 当日 30 分钟桶 `_sm701_cache_epoch`）——mtime 随每轮预取写库必变，致 sm701 选型股（全库 ~4200 只）每次分析都触发 ~110s 全市场实时复算、主图空白（实测首算 115s→二次 5.3s→模拟写库后 2.4s）；⑧**买卖点懒加载**：`analyze(defer_signals=)` + `analyze_finish_signals()`——GUI 五入口先渲染K线（实测首屏 1.2s）、sm701/lgbm 信号后台补算后 `_signals_done` 重绘叠画，CLI 默认不 defer 口径零变化；`APP_VERSION=6.6.5`，`stock_predict.py` 重新生成；2.1/2.5 节与 README/CHANGELOG 同步 |

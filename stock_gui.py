@@ -113,8 +113,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-25 升 7.0.1 多市场）
-APP_VERSION = "7.0.1"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
+APP_VERSION = "7.0.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -3546,6 +3546,236 @@ def backfill_etf_history(codes=None, progress=None, workers=6,
     return stat
 
 
+# ---- ETF/LOF 成分股（2026-11-05）：东财 F10 基金持仓 ----
+# 数据源：fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc
+# 返回最新报告期前 N 大股票持仓（代码/名称/权重/持股数/市值）。
+# 内存 6h + SQLite meta 24h 缓存；网络失败降级旧缓存。
+_ETF_HOLD_CACHE = {}
+_ETF_HOLD_LOCK = threading.Lock()
+_ETF_HOLD_TTL = 6 * 3600
+_ETF_HOLD_DB_TTL = 24 * 3600
+
+
+def _etf_hold_db_get(code6):
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "select value from meta where key=?",
+                (f"etf_hold2:{code6}",)).fetchone()
+        if row:
+            d = json.loads(row[0])
+            if isinstance(d, dict) and isinstance(d.get("rows"), list):
+                return d
+    except Exception:
+        log.debug("ETF成分股缓存读取失败", exc_info=True)
+    return None
+
+
+def _etf_hold_db_set(code6, data):
+    try:
+        with db_conn(commit=True) as conn:
+            conn.execute(
+                "insert or replace into meta(key,value) values(?,?)",
+                (f"etf_hold2:{code6}",
+                 json.dumps(data, ensure_ascii=False)))
+    except Exception:
+        log.debug("ETF成分股缓存写入失败", exc_info=True)
+
+
+def _strip_html_cell(s):
+    s = re.sub(r"<[^>]+>", "", s or "")
+    return (s.replace("&nbsp;", " ").replace("&amp;", "&")
+             .replace("&lt;", "<").replace("&gt;", ">").strip())
+
+
+def _parse_etf_holdings(txt):
+    """解析东财 F10 持仓 JS/HTML：返回各报告期 [{period,date,rows}]。"""
+    out = []
+    parts = re.split(r"<div class=['\"]boxitem", txt or "")
+    for part in parts[1:]:
+        pm = re.search(r"(\d{4}年\d季度)股票投资明细", part)
+        dm = re.search(r"截止至：<font[^>]*>([0-9-]+)</font>", part)
+        tm = re.search(r"<table[^>]*>(.*?)</table>", part, re.S)
+        if not tm:
+            continue
+        rows = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tm.group(1), re.S):
+            cells = [_strip_html_cell(c) for c in
+                     re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+            if len(cells) < 5:
+                continue
+            code6 = cells[1].strip()
+            name = cells[2].strip()
+            if not re.fullmatch(r"\d{5,6}", code6):
+                continue
+            weight = None
+            for c in cells[3:]:
+                if c.endswith("%"):
+                    try:
+                        weight = float(c.rstrip("%"))
+                    except ValueError:
+                        pass
+                    break
+            if weight is None:
+                continue
+            try:
+                shares = float(cells[-2].replace(",", ""))
+            except (ValueError, IndexError):
+                shares = None
+            try:
+                value = float(cells[-1].replace(",", ""))
+            except (ValueError, IndexError):
+                value = None
+            try:
+                full = (normalize_code(code6) if len(code6) == 6
+                        else "hk" + code6.zfill(5))
+            except ValueError:
+                continue
+            rows.append({"code": full, "code6": code6, "name": name,
+                         "weight": weight, "shares_wan": shares,
+                         "value_wan": value})
+        if rows:
+            out.append({"period": pm.group(1) if pm else "",
+                        "date": dm.group(1) if dm else "", "rows": rows})
+    return out
+
+
+def fetch_etf_holdings(full, refresh=False):
+    """ETF/LOF 成分股（最新季报前10 + 最近年报/中报完整持仓）。
+
+    数据源：东财 F10 基金持仓。优先取行数最多的报告期作为完整成分股，
+    同时保留最新季报前10；内存 6h + SQLite meta 24h 缓存。
+    返回 {period,date,rows,latest_period,latest_date,latest_rows,...}。
+    """
+    full = normalize_code(full)
+    if _market_of(full) != "cn" or not _is_etf(full):
+        raise ValueError("仅支持 A 股 ETF/LOF")
+    code6 = full[2:]
+    now = time.time()
+    with _ETF_HOLD_LOCK:
+        hit = _ETF_HOLD_CACHE.get(code6)
+    if hit and not refresh and now - hit.get("ts", 0) < _ETF_HOLD_TTL:
+        return hit
+    db = None if refresh else _etf_hold_db_get(code6)
+    if db and now - db.get("ts", 0) < _ETF_HOLD_DB_TTL:
+        with _ETF_HOLD_LOCK:
+            _ETF_HOLD_CACHE[code6] = db
+        return db
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Referer": f"https://fundf10.eastmoney.com/ccmx_{code6}.html",
+    }
+    tables = {}
+    last = None
+    this_year = datetime.date.today().year
+    for year in (this_year, this_year - 1, this_year - 2):
+        url = ("https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+               f"?type=jjcc&code={code6}&topline=200&year={year}&month=12"
+               f"&rt={random.random():.6f}")
+        try:
+            txt = _http_get(url, retries=2, timeout=20, headers=headers,
+                            src_name="em_etf_hold")
+            for t in _parse_etf_holdings(txt):
+                key = (t.get("period") or "", t.get("date") or "")
+                if key not in tables:
+                    tables[key] = t
+            # 找到完整持仓（年报/中报通常 >20 行）即可停止补年份
+            if tables and max(len(t["rows"]) for t in tables.values()) >= 20:
+                break
+        except Exception as e:
+            last = e
+    if not tables:
+        if db:
+            log.warning("ETF成分股网络失败，降级旧缓存 %s: %s", full, last)
+            return db
+        raise RuntimeError(f"ETF成分股获取失败 {full}: {last}")
+    latest = max(tables.values(), key=lambda t: (t.get("date") or "",
+                                                 len(t["rows"])))
+    full_t = max(tables.values(), key=lambda t: (len(t["rows"]),
+                                                 t.get("date") or ""))
+    data = {"ts": now, "period": full_t.get("period") or "",
+            "date": full_t.get("date") or "", "rows": full_t["rows"],
+            "latest_period": latest.get("period") or "",
+            "latest_date": latest.get("date") or "",
+            "latest_rows": latest["rows"]}
+    with _ETF_HOLD_LOCK:
+        _ETF_HOLD_CACHE[code6] = data
+    _etf_hold_db_set(code6, data)
+    log.info("ETF成分股 %s: 完整 %s %s %d只 / 最新 %s 前%d",
+             full, data["period"], data["date"], len(data["rows"]),
+             data["latest_period"], len(data["latest_rows"]))
+    return data
+
+
+def etf_constituent_perf(full, limit=20, refresh=False):
+    """ETF前N大成分股 + 现价/当日/5日/20日涨跌/量比 + 加权汇总。
+
+    返回 (meta, rows)；meta 含 period/date/name/code。
+    """
+    full = normalize_code(full)
+    data = fetch_etf_holdings(full, refresh=refresh)
+    all_rows = sorted(data.get("rows") or [],
+                      key=lambda r: r.get("weight") or 0, reverse=True)
+    rows = all_rows[:max(1, int(limit))]
+    codes = [r["code"] for r in rows]
+    quotes = {}
+    if codes:
+        try:
+            quotes = fetch_batch_quotes(codes) or {}
+        except Exception:
+            log.warning("ETF成分股批量行情失败(忽略)", exc_info=True)
+    out = []
+    for r in rows:
+        code = r["code"]
+        q = quotes.get(code) or {}
+        bars = []
+        try:
+            bars = get_daily(code, min_bars=30) or []
+        except Exception:
+            pass
+        closes = [b.get("close") for b in bars if b.get("close")]
+        chg = None
+        px = q.get("price")
+        pc = q.get("prev_close")
+        if px and pc:
+            chg = (px / pc - 1.0) * 100
+        elif len(closes) >= 2 and closes[-2]:
+            chg = (closes[-1] / closes[-2] - 1.0) * 100
+        ret5 = ((closes[-1] / closes[-6] - 1.0) * 100
+                if len(closes) >= 6 and closes[-6] else None)
+        ret20 = ((closes[-1] / closes[-21] - 1.0) * 100
+                 if len(closes) >= 21 and closes[-21] else None)
+        vr = None
+        if bars:
+            vols = [b.get("vol") or 0 for b in bars]
+            if len(vols) >= 20:
+                vr = vol_ratio_at(vols, len(vols) - 1)
+        out.append({"code": code, "name": r.get("name") or "",
+                    "weight": r.get("weight"),
+                    "price": px if px is not None else
+                    (closes[-1] if closes else None),
+                    "chg": chg, "ret5": ret5, "ret20": ret20, "vr": vr})
+    wsum = sum((r.get("weight") or 0) for r in out
+               if r.get("chg") is not None)
+    wchg = (sum((r.get("weight") or 0) * r["chg"] for r in out
+                if r.get("chg") is not None) / wsum) if wsum else None
+    up = sum(1 for r in out if (r.get("chg") or 0) > 0)
+    down = sum(1 for r in out if (r.get("chg") or 0) < 0)
+    info = get_stock_info(full) or {}
+    meta = {"code": full, "name": info.get("name") or full,
+            "period": data.get("period") or "",
+            "date": data.get("date") or "",
+            "latest_period": data.get("latest_period") or "",
+            "latest_date": data.get("latest_date") or "",
+            "latest_count": len(data.get("latest_rows") or []),
+            "total": len(all_rows), "shown": len(out),
+            "weight_sum": sum((r.get("weight") or 0) for r in out),
+            "weighted_chg": wchg, "up": up, "down": down}
+    return meta, out
+
+
 def get_stock_info(full: str):
     """股票基础信息（含 v6.2.4 起的换手率/动态PE/PB 快照；缺失为 None）。"""
     with db_conn() as conn:
@@ -4504,6 +4734,131 @@ def fetch_quote(full):
             last = e
             log.debug("%s失败 %s: %s", name, full, e)
     raise RuntimeError(f"所有行情源均失败: {last}")
+
+
+# ---- 盘口 / 集合竞价（v7.0.2）：腾讯五档 + 新浪兜底 ----
+_ORDER_BOOK_CACHE = {}
+_ORDER_BOOK_LOCK = threading.Lock()
+_ORDER_BOOK_TTL = 3.0
+
+
+def _parse_cn_phase(txt, open_px):
+    """根据行情时间判定交易阶段；返回 (phase, auction)。"""
+    s = (txt or "").strip()
+    hhmm = s[8:12] if len(s) >= 12 else ""
+    if not hhmm:
+        hhmm = time.strftime("%H%M")
+    if "0915" <= hhmm < "0925":
+        return "集合竞价", True
+    if "0925" <= hhmm < "0930":
+        return "竞价撮合", True
+    if "1457" <= hhmm <= "1500":
+        return "收盘竞价", True
+    if "0930" <= hhmm < "1130" or "1300" <= hhmm < "1457":
+        return "连续竞价", False
+    if "1130" <= hhmm < "1300":
+        return "午间休市", False
+    return ("开盘前" if (open_px or 0) <= 0 else "已收盘"), False
+
+
+def _order_book_tencent(full):
+    txt = http_get(QT_URL + full, retries=1)
+    body = txt.split('"')[1] if '"' in txt else ""
+    f = body.split("~")
+    if len(f) < 30 or not f[3]:
+        raise ValueError("腾讯盘口为空")
+
+    def fv(i):
+        try:
+            v = f[i].strip()
+            return float(v) if v and v != "-" else 0.0
+        except (ValueError, IndexError):
+            return 0.0
+
+    bids = [(fv(9 + i * 2), fv(10 + i * 2)) for i in range(5)]
+    asks = [(fv(19 + i * 2), fv(20 + i * 2)) for i in range(5)]
+    bids = [x for x in bids if x[0] > 0]
+    asks = [x for x in asks if x[0] > 0]
+    price, prev = fv(3), fv(4)
+    open_px = fv(5)
+    phase, auction = _parse_cn_phase(f[30] if len(f) > 30 else "", open_px)
+    bv = sum(v for _p, v in bids)
+    av = sum(v for _p, v in asks)
+    wei = (bv - av) / (bv + av) * 100 if (bv + av) else 0.0
+    return {
+        "code": full, "name": f[1], "price": price, "prev_close": prev,
+        "open": open_px, "high": fv(33), "low": fv(34),
+        "time": f[30] if len(f) > 30 else "", "phase": phase,
+        "auction": auction, "bids": bids, "asks": asks,
+        "bid_vol": bv, "ask_vol": av, "wei_bi": wei,
+        "vol": fv(6), "amount": fv(37),
+        "limit_up": fv(47), "limit_down": fv(48),
+    }
+
+
+def _order_book_sina(full):
+    txt = _http_get("https://hq.sinajs.cn/list=" + full, retries=1, timeout=6,
+                    decode="gbk",
+                    headers={"Referer": "https://finance.sina.com.cn/"},
+                    src_name="新浪盘口")
+    body = txt.split('"')[1] if '"' in txt else ""
+    f = body.split(",")
+    if len(f) < 30 or not f[3] or float(f[3] or 0) <= 0:
+        raise ValueError("新浪盘口为空")
+
+    def fv(i):
+        try:
+            return float(f[i] or 0)
+        except (ValueError, IndexError):
+            return 0.0
+
+    bids = [(fv(11 + i * 2), fv(10 + i * 2)) for i in range(5)]
+    asks = [(fv(21 + i * 2), fv(20 + i * 2)) for i in range(5)]
+    bids = [x for x in bids if x[0] > 0]
+    asks = [x for x in asks if x[0] > 0]
+    price, prev = fv(3), fv(2)
+    open_px = fv(1)
+    phase, auction = _parse_cn_phase(f[31] if len(f) > 31 else "", open_px)
+    bv = sum(v for _p, v in bids)
+    av = sum(v for _p, v in asks)
+    return {
+        "code": full, "name": f[0], "price": price, "prev_close": prev,
+        "open": open_px, "high": fv(4), "low": fv(5),
+        "time": f[31] if len(f) > 31 else "", "phase": phase,
+        "auction": auction, "bids": bids, "asks": asks,
+        "bid_vol": bv, "ask_vol": av,
+        "wei_bi": (bv - av) / (bv + av) * 100 if (bv + av) else 0.0,
+        "vol": fv(8), "amount": fv(9),
+        "limit_up": 0.0, "limit_down": 0.0,
+    }
+
+
+def fetch_order_book(full, ttl=_ORDER_BOOK_TTL):
+    """A 股五档盘口 + 集合竞价状态（腾讯优先、新浪兜底，3s 缓存）。
+
+    auction=True 时 price 为竞价参考价、open 可能仍为 0；盘中 open 即
+    当日开盘集合竞价成交价，vol 为集合竞价成交量（手）。"""
+    full = normalize_code(full)
+    if _market_of(full) != "cn":
+        raise ValueError("盘口仅支持 A 股")
+    now = time.time()
+    with _ORDER_BOOK_LOCK:
+        hit = _ORDER_BOOK_CACHE.get(full)
+        if hit and now - hit.get("ts", 0) < ttl:
+            return hit
+    last = None
+    for fn in (_order_book_tencent, _order_book_sina):
+        try:
+            d = fn(full)
+            d["ts"] = now
+            with _ORDER_BOOK_LOCK:
+                _ORDER_BOOK_CACHE[full] = d
+            return d
+        except Exception as e:
+            last = e
+    if hit:
+        return hit
+    raise RuntimeError(f"盘口获取失败: {last}")
 
 
 def _batch_tencent(codes):
@@ -15392,6 +15747,42 @@ def _ai_http_json(url, payload=None, api_key="", timeout=60, session=""):
     raise last or RuntimeError("AI 请求失败")
 
 
+def ai_fallback_config():
+    """备选 AI 供应商（默认本地 Ollama）：(enabled, base_url, model, key)。"""
+    enabled = _ai_ini_get("ollama", "enabled", "1") != "0"
+    base = (_ai_ini_get("ollama", "base_url",
+                        "http://localhost:11434/v1") or "").strip()
+    model = (_ai_ini_get("ollama", "model", "qwen3:4b") or "").strip()
+    key = (_ai_ini_get("ollama", "api_key", "") or "").strip()
+    return enabled, base, model, key
+
+
+def _ai_chat_json(payload, api_key, timeout=90, session="", allow_fallback=True):
+    """主 AI 接口调用；失败自动切备选供应商（Ollama 等 OpenAI 兼容）。
+
+    备选请求会去掉 DeepSeek 专属 thinking/reasoning_effort 字段，避免本地
+    模型拒绝未知参数；主接口 401/格式异常同样会尝试备选（本地兜底）。"""
+    try:
+        return _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
+                             session=session)
+    except Exception as exc:
+        enabled, base, model, key = ai_fallback_config()
+        if not allow_fallback or not enabled or not base or not model:
+            raise
+        p2 = dict(payload)
+        p2["model"] = model
+        for k in ("thinking", "reasoning_effort"):
+            p2.pop(k, None)
+        log.warning("主 AI 接口失败，切换备选供应商 %s (%s): %s",
+                    base, model, exc)
+        try:
+            return _ai_http_json(_ai_chat_url(base), p2, key,
+                                 max(120, int(timeout or 0)))
+        except Exception as exc2:
+            raise RuntimeError(
+                f"主接口失败（{exc}）；备选 {model} 也失败（{exc2}）") from exc2
+
+
 def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list:
     """获取 OpenAI 兼容接口模型列表（GET {base}/models）。"""
     d = _ai_http_json(_ai_models_url(base_url), None, api_key, timeout)
@@ -15574,8 +15965,7 @@ def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
         "temperature": 0.3,
     }
     payload.update(_ai_thinking_params(thinking, effort))
-    d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
-                      session=session)
+    d = _ai_chat_json(payload, api_key, timeout, session=session)
     _ai_usage_add(usage_sink, d.get("usage"))
     try:
         msg = d["choices"][0]["message"]
@@ -16024,13 +16414,36 @@ def _ai_tool_rows(res, days, end=None):
     return rows[-days:]
 
 
+def _ai_tool_rows_code(code, days, end=None):
+    try:
+        rows = get_daily(code, min_bars=max(100, days)) or []
+    except Exception:
+        rows = []
+    _end = str(end or "").strip()[:10]
+    if _end:
+        rows = [r for r in rows if (r.get("date") or "") <= _end]
+    return rows[-days:]
+
+
 def _ai_tool_kline(ctx, args):
     days = _ai_tool_int(args.get("days"), 60, 1, 240)
-    rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+    code = str(args.get("code") or "").strip()
+    cur = (ctx.get("res") or {}).get("full_code") or ""
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+        rows = (_ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+                if code == cur
+                else _ai_tool_rows_code(code, days, args.get("end")))
+    else:
+        code = cur
+        rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
     if not rows:
-        return "无日K数据"
-    out = [f"日K {rows[0]['date']}~{rows[-1]['date']} 共{len(rows)}根"
-           "（列：日期,开,高,低,收,量）"]
+        return f"无日K数据 {code}"
+    out = [f"{code} 日K {rows[0]['date']}~{rows[-1]['date']} "
+           f"共{len(rows)}根（列：日期,开,高,低,收,量）"]
     out.extend(
         f"{r['date']},{_ai_tool_f(r.get('open'))},"
         f"{_ai_tool_f(r.get('high'))},{_ai_tool_f(r.get('low'))},"
@@ -16056,11 +16469,42 @@ _AI_IND_COLS = {
 }
 
 
+def _ai_build_ind(rows):
+    """任意代码的指标序列（与 get_daily 行对齐）。"""
+    closes = [r.get("close") for r in rows if r.get("close") is not None]
+    ma = {n: sma_period(closes, n) for n in MA_COLORS}
+    dif, dea, mhist = calc_macd(closes)
+    k, d, j = calc_kdj(rows)
+    rsi6 = calc_rsi(closes, INDP("RSI_SHORT"))
+    rsi12 = calc_rsi(closes, INDP("RSI_LONG"))
+    bmid, bup, blow = calc_boll(closes)
+    pdi, mdi, adx = calc_adx(rows)
+    return {"ma": ma, "dif": dif, "dea": dea, "mhist": mhist,
+            "k": k, "d": d, "j": j, "rsi6": rsi6, "rsi12": rsi12,
+            "boll_up": bup, "boll_mid": bmid, "boll_low": blow,
+            "pdi": pdi, "mdi": mdi, "adx": adx}
+
+
 def _ai_tool_indicators(ctx, args):
     res = ctx.get("res") or {}
-    ind = res.get("ind") or {}
-    rows = res.get("disp_rows") or []
+    cur = res.get("full_code") or ""
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        code = cur
     days = _ai_tool_int(args.get("days"), 30, 1, 240)
+    if code != cur:
+        rows = _ai_tool_rows_code(code, max(days, 120))
+        ind = _ai_build_ind(rows) if rows else {}
+    else:
+        rows = res.get("disp_rows") or []
+        ind = res.get("ind") or {}
+    if not rows or not ind:
+        return f"无指标数据 {code}"
     names = [x.strip().lower() for x in
              str(args.get("names") or "ma,macd,kdj,rsi,boll,adx").split(",")
              if x.strip()]
@@ -16070,10 +16514,10 @@ def _ai_tool_indicators(ctx, args):
             cols.append(("VOL", [r.get("vol") for r in rows]))
         elif nm in _AI_IND_COLS:
             cols.extend((h, arr) for h, arr in _AI_IND_COLS[nm](ind) if arr)
-    if not cols or not rows:
+    if not cols:
         return "无可返回指标"
     n = min([len(rows)] + [len(a) for _, a in cols if a])
-    out = ["日期," + ",".join(h for h, _ in cols)]
+    out = [f"指标 {code}", "日期," + ",".join(h for h, _ in cols)]
     for i in range(max(0, n - days), n):
         vals = [_ai_tool_f((a[i] if a and i < len(a) else None), 3)
                 for _, a in cols]
@@ -16212,14 +16656,25 @@ def _ai_tool_fundamentals(ctx, args):
 
 
 def _ai_tool_intraday(ctx, args):
-    res = ctx.get("res") or {}
-    data = fetch_minute_lines(res.get("full_code") or "")
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        code = (ctx.get("res") or {}).get("full_code") or ""
+    try:
+        data = fetch_minute_lines(code)
+    except Exception as e:
+        return f"分时获取失败 {code}: {e}"
     rows = data.get("rows") or []
     vols = data.get("vols") or []
     avg = data.get("avg") or []
     points = _ai_tool_int(args.get("points"), 60, 10, 240)
-    out = [f"分时 {data.get('day') or '-'} 昨收 "
-           f"{_ai_tool_f(data.get('prev_close'))}（时间,价格,均价,分钟量）"]
+    out = [f"分时 {code} {data.get('day') or '-'} 昨收 "
+           f"{_ai_tool_f(data.get('prev_close'))}"
+           "（时间,价格,均价,分钟量）"]
     for i in range(max(0, len(rows) - points), len(rows)):
         row = rows[i]
         if isinstance(row, (list, tuple)) and len(row) >= 2:
@@ -16231,7 +16686,7 @@ def _ai_tool_intraday(ctx, args):
         out.append(f"{t},{_ai_tool_f(px)},"
                    f"{_ai_tool_f(avg[i] if i < len(avg) else None)},"
                    f"{_ai_tool_f(vols[i] if i < len(vols) else None, 0)}")
-    return "\n".join(out) if len(out) > 1 else "无分时数据"
+    return "\n".join(out) if len(out) > 1 else f"无分时数据 {code}"
 
 
 def _ai_tool_strategy(ctx, args):
@@ -16299,6 +16754,138 @@ def _ai_tool_show_table(ctx, args):
     return "已生成统计表并在界面单独展示。\n" + md
 
 
+_AI_EXT_CACHE = {}
+_AI_EXT_LOCK = threading.Lock()
+_AI_EXT_TTL = 900
+
+
+def _ai_ext_query(q, days):
+    q = (q or "").strip()[:100]
+    if "after:" in q or "before:" in q:
+        return q
+    since = (datetime.date.today()
+             - datetime.timedelta(days=max(1, days))).isoformat()
+    return f"{q} after:{since}"
+
+
+def _ai_tool_external(ctx, args):
+    """外部宏观/地缘环境：仅用 DeepSeek 官方 Search API。"""
+    search_on = ctx.get("search")
+    if search_on is None:
+        search_on = _ai_web_search_enabled()
+    if not search_on:
+        return "联网检索已在本次会话关闭。"
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return "当前接口不支持 DeepSeek 官方联网搜索。"
+    q = str(args.get("query") or "").strip()[:128]
+    days = _ai_tool_int(args.get("days"), 7, 1, 30)
+    count = _ai_tool_int(args.get("count"), 10, 5, 15)
+    ck = (q or "__default__", days, count)
+    now = time.time()
+    with _AI_EXT_LOCK:
+        hit = _AI_EXT_CACHE.get(ck)
+        if hit and now - hit.get("ts", 0) < _AI_EXT_TTL:
+            return hit.get("txt", "")
+    if q:
+        queries = [(f"聚焦：{q[:24]}", _ai_ext_query(q, days))]
+    else:
+        queries = [
+            ("全球市场/商品",
+             _ai_ext_query("黄金 原油 美股 港股 A股 美元 美债 最新 走势 宏观",
+                           days)),
+            ("地缘政治/特朗普",
+             _ai_ext_query("特朗普 最新 政策 关税 地缘政治 市场影响", days)),
+        ]
+    sections = []
+    seen = set()
+    n_ok = 0
+    for title, query in queries:
+        try:
+            rs = deepseek_search(key, query, count=count)
+        except Exception as e:
+            sections.append(f"【{title}】检索失败: {e}")
+            continue
+        uniq = []
+        for r in rs or []:
+            k = ((r.get("title") or "") + "|" + (r.get("url") or ""))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(r)
+        if not uniq:
+            sections.append(f"【{title}】近{days}天未检索到结果")
+            continue
+        n_ok += 1
+        txt = _fmt_search_results(uniq, limit=count)
+        if txt:
+            sections.append(f"【{title}】\n{txt}")
+    if n_ok and isinstance(ctx.get("usage"), dict):
+        ctx["usage"]["search_calls"] = int(
+            ctx["usage"].get("search_calls", 0)) + n_ok
+    out = f"DeepSeek 官方联网搜索（近{days}天）\n" + "\n\n".join(sections)
+    with _AI_EXT_LOCK:
+        _AI_EXT_CACHE[ck] = {"ts": now, "txt": out}
+        if len(_AI_EXT_CACHE) > 100:
+            for k in [k for k, v in _AI_EXT_CACHE.items()
+                      if now - v.get("ts", 0) > _AI_EXT_TTL]:
+                _AI_EXT_CACHE.pop(k, None)
+    return out
+
+
+def _ai_tool_etf(ctx, args):
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            full = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        full = (ctx.get("res") or {}).get("full_code") or ""
+    if not full or _market_of(full) != "cn" or not _is_etf(full):
+        return "当前不是 ETF/LOF；可传 code 指定，如 510300。"
+    limit = _ai_tool_int(args.get("limit"), 20, 5, 50)
+    try:
+        meta, rows = etf_constituent_perf(full, limit)
+    except Exception as e:
+        return f"ETF成分股获取失败 {full}: {e}"
+    cols = ["代码", "名称", "权重%", "现价", "当日%", "5日%", "20日%",
+            "量比"]
+    trows = []
+    for r in rows:
+        trows.append([
+            r.get("code") or "", r.get("name") or "",
+            _ai_tool_f(r.get("weight")), _ai_tool_f(r.get("price")),
+            _ai_tool_spct(r.get("chg")), _ai_tool_spct(r.get("ret5")),
+            _ai_tool_spct(r.get("ret20")), _ai_tool_f(r.get("vr")),
+        ])
+    title = (f"{meta['name']} 成分股 · {meta['period']} {meta['date']} "
+             f"（前{meta['shown']}大权重）")
+    cb = ctx.get("on_table")
+    if callable(cb):
+        try:
+            cb({"title": title, "columns": cols, "rows": trows})
+        except Exception:
+            log.exception("ETF成分股表格回传失败(忽略)")
+    latest = ""
+    if (meta.get("latest_period")
+            and meta.get("latest_period") != meta.get("period")):
+        latest = (f"；最新季报 {meta['latest_period']} "
+                  f"{meta.get('latest_date') or ''} 仅前"
+                  f"{meta.get('latest_count', 0)}")
+    header = (f"ETF {meta['name']} ({meta['code']}) 成分股：完整持仓 "
+              f"{meta['period']} {meta['date']} 共{meta['total']}只{latest}。"
+              f"展示前{meta['shown']}大权重"
+              f"（合计{meta['weight_sum']:.2f}%）。")
+    summary = (f"前{meta['shown']}大加权当日 "
+               f"{_ai_tool_spct(meta.get('weighted_chg'))}"
+               f" · 上涨{meta['up']}/下跌{meta['down']}")
+    lines = [header, summary, "序号," + ",".join(cols)]
+    for i, r in enumerate(trows, 1):
+        lines.append(str(i) + "," + ",".join(r))
+    return "\n".join(lines)
+
+
 _AI_TOOL_FUNCS = {
     "get_kline": _ai_tool_kline,
     "get_indicators": _ai_tool_indicators,
@@ -16310,6 +16897,8 @@ _AI_TOOL_FUNCS = {
     "get_intraday": _ai_tool_intraday,
     "get_strategy": _ai_tool_strategy,
     "search_news": _ai_tool_news,
+    "get_external_env": _ai_tool_external,
+    "get_etf_constituents": _ai_tool_etf,
     "show_table": _ai_tool_show_table,
 }
 
@@ -16319,22 +16908,27 @@ def ai_tool_specs():
     return [
         {"type": "function", "function": {
             "name": "get_kline",
-            "description": "获取该股更多日K线（OHLCV）。判断形态、趋势、"
-                           "支撑压力、量价关系时调用；可用 end 指定截止日期。",
+            "description": "获取任意股票/ETF日K线（默认当前标的，可用 code "
+                           "指定成分股等其它代码）。判断形态、趋势、支撑压力、"
+                           "量价关系时调用；可用 end 指定截止日期。",
             "parameters": {"type": "object", "properties": {
                 "days": {"type": "integer", "description": "最近多少根，1-240",
                          "default": 60},
                 "end": {"type": "string",
-                        "description": "可选截止日期 YYYY-MM-DD"}}}}},
+                        "description": "可选截止日期 YYYY-MM-DD"},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_indicators",
             "description": "获取技术指标序列（与日K对齐）：ma/macd/kdj/rsi/"
-                           "boll/adx/vol。",
+                           "boll/adx/vol；可用 code 指定其它代码（如成分股）。",
             "parameters": {"type": "object", "properties": {
                 "names": {"type": "string",
                           "description": "逗号分隔，默认 ma,macd,kdj,rsi,boll,adx"},
                 "days": {"type": "integer", "description": "最近多少天，1-240",
-                         "default": 30}}}}},
+                         "default": 30},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_prediction",
             "description": "获取形态预测：当日收盘分位/上行概率、T+1 预测、"
@@ -16362,10 +16956,13 @@ def ai_tool_specs():
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {
             "name": "get_intraday",
-            "description": "获取最近交易日分时（价格/均价/分钟量），用于盘中判断。",
+            "description": "获取当日/最近交易日分时（价格/均价/分钟量），"
+                           "可用 code 指定成分股等其它代码；用于盘中判断。",
             "parameters": {"type": "object", "properties": {
                 "points": {"type": "integer", "description": "最近多少分钟，10-240",
-                           "default": 60}}}}},
+                           "default": 60},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_strategy",
             "description": "获取当前选中策略（算法/档位/风险参数/训练验证指标）。",
@@ -16378,6 +16975,30 @@ def ai_tool_specs():
                           "description": "检索词，≤128字；留空=默认近30天个股资讯"},
                 "count": {"type": "integer", "description": "结果数，1-10",
                           "default": 5}}}}},
+        {"type": "function", "function": {
+            "name": "get_external_env",
+            "description": "查询外部宏观/地缘环境（黄金/原油/美股/港股/A股/美元/"
+                           "美债/特朗普/关税/美联储等），仅使用 DeepSeek 官方"
+                           "联网搜索，返回近N天新闻摘要。可传 query 聚焦事件，"
+                           "如“特朗普 关税”。",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string",
+                          "description": "可选聚焦检索词，≤128字"},
+                "days": {"type": "integer", "description": "近N天，1-30",
+                         "default": 7},
+                "count": {"type": "integer", "description": "每类结果数，5-15",
+                          "default": 10}}}}},
+        {"type": "function", "function": {
+            "name": "get_etf_constituents",
+            "description": "获取ETF/LOF成分股（最近年报/中报完整持仓 + 最新"
+                           "季报前10）及权重、现价、当日/5日/20日涨跌、量比，"
+                           "并自动在界面生成统计表。分析ETF时优先调用；可用 "
+                           "code 指定其他ETF，如 510300。",
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "前N大权重，5-50",
+                          "default": 20},
+                "code": {"type": "string",
+                         "description": "可选ETF代码，如 510300"}}}}},
         {"type": "function", "function": {
             "name": "show_table",
             "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"
@@ -16429,8 +17050,7 @@ def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
             "temperature": 0.3,
         }
         payload.update(_ai_thinking_params(thinking, effort))
-        d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
-                          session=session)
+        d = _ai_chat_json(payload, api_key, timeout, session=session)
         _ai_usage_add(usage_sink, d.get("usage"))
         try:
             msg = d["choices"][0]["message"]
@@ -16510,6 +17130,9 @@ class App:
         # 文本区比例：右侧参考面板宽度 / 自选池宽度 / 底部日志行数随屏幕缩放
         self._rt_chars = 38 if self.compact else max(32, min(56, sw // 45))
         self._rt_width = max(360, min(540, int(sw * 0.29)))
+        self._rt_collapsed = False
+        self._rt_col = None
+        self._rt_handle_btn = None
         self._wf_width = max(160, min(230, sw // 10))
         self._bottom_lines = (5 if self.compact
                               else max(6, min(12, sh // 130)))
@@ -16945,9 +17568,20 @@ class App:
         # ---- 右侧：预测参考 / 插件面板（先pack，防止遮挡图表；小屏省略）----
         right = None
         if not self.compact:
+            handle = tk.Frame(body, bg=DARK_BG, width=18)
+            handle.pack(side="right", fill="y")
+            handle.pack_propagate(False)
+            self._rt_handle_btn = tk.Button(
+                handle, text="▶", command=self._toggle_rt_sidebar,
+                bg=BTN_BG, fg=FG_MAIN, activebackground=BTN_HOVER,
+                activeforeground=FG_MAIN, relief="flat", cursor="hand2",
+                font=("Consolas", 9))
+            self._rt_handle_btn.pack(side="top", fill="y", expand=True)
+            self._rt_collapsed = False
             rt_col = tk.Frame(body, bg=DARK_BG, width=self._rt_width)
             rt_col.pack(side="right", fill="y", padx=(2, 8), pady=6)
             rt_col.pack_propagate(False)
+            self._rt_col = rt_col
             right = ttk.LabelFrame(rt_col, text=" 预测参考 ", padding=4)
             right.pack(fill="both", expand=True)
             self._w_right = right
@@ -16955,10 +17589,11 @@ class App:
             rt = tk.Frame(right, bg=DARK_BG)
             rt.pack(fill="x")
             self._rt_fold = tk.BooleanVar(value=True)
-            self._rt_btn = tk.Label(rt, text="▼", font=("Consolas", 9),
+            self._rt_btn = tk.Label(rt, text="▶", font=("Consolas", 9),
                                     fg=TITLE_TXT, bg=DARK_BG, cursor="hand2")
             self._rt_btn.pack(side="right")
-            self._rt_btn.bind("<Button-1>", lambda e: self._toggle_rt())
+            self._rt_btn.bind("<Button-1>",
+                              lambda e: self._toggle_rt_sidebar())
 
             # 面板选择器：预测参考 / 已加载插件（无插件时不显示）
             self._rt_panels = {}
@@ -16980,6 +17615,12 @@ class App:
                                     padx=6, pady=4, spacing1=1, spacing3=1)
             self.side_txt.pack(fill="both", expand=True)
             self._rt_panels["预测参考"] = pred
+
+            # 盘口 / 集合竞价侧栏（分时视图自动切到这里；v7.0.2）
+            ob = tk.Frame(self._rt_content, bg=PANEL_BG)
+            self._rt_panels["盘口"] = ob
+            self._rt_names.append("盘口")
+            self._build_order_book_panel(ob)
 
             # AI Agent 侧栏（嵌入主界面右侧栏；不用独立窗口）
             ai = tk.Frame(self._rt_content, bg=PANEL_BG)
@@ -17416,6 +18057,22 @@ class App:
         y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
         m.tk_popup(x, y)
 
+    def _toggle_rt_sidebar(self):
+        """折叠/展开整个右侧栏（AI/预测参考），中间图表自动扩宽。"""
+        col = getattr(self, "_rt_col", None)
+        if col is None:
+            return
+        if getattr(self, "_rt_collapsed", False):
+            col.pack(side="right", fill="y", padx=(2, 8), pady=6)
+            self._rt_collapsed = False
+            if getattr(self, "_rt_handle_btn", None) is not None:
+                self._rt_handle_btn.config(text="▶")
+        else:
+            col.pack_forget()
+            self._rt_collapsed = True
+            if getattr(self, "_rt_handle_btn", None) is not None:
+                self._rt_handle_btn.config(text="◀")
+
     def _toggle_rt(self):
         v = not self._rt_fold.get()
         self._rt_fold.set(v)
@@ -17469,6 +18126,138 @@ class App:
             except Exception:
                 pass
 
+    # ---------- 盘口 / 集合竞价侧栏（v7.0.2） ----------
+
+    def _build_order_book_panel(self, parent):
+        """右侧栏「盘口」：五档挂单 + 集合竞价状态，3s 自动刷新。"""
+        self._ob_data = None
+        self._ob_busy = False
+        self._ob_code = ""
+        box = tk.Frame(parent, bg=PANEL_BG)
+        box.pack(fill="both", expand=True)
+        self._ob_txt = tk.Text(
+            box, width=18, height=18, wrap="none", relief="flat",
+            bg=PANEL_BG, fg=FG_MAIN, insertbackground=FG_MAIN,
+            font=("Consolas", 9), padx=6, pady=4, state="disabled",
+            cursor="arrow")
+        self._ob_txt.pack(fill="both", expand=True)
+        self._ob_txt.tag_configure("title", foreground=TITLE_TXT,
+                                   font=("Microsoft YaHei", 9, "bold"))
+        self._ob_txt.tag_configure("up", foreground=UP)
+        self._ob_txt.tag_configure("down", foreground=DOWN)
+        self._ob_txt.tag_configure("dim", foreground=AXIS_TXT)
+        self._ob_txt.tag_configure("auction", foreground=ACCENT,
+                                   font=("Microsoft YaHei", 9, "bold"))
+        self._ob_set_text("盘口\n加载中...")
+        self._safe_after(600, self._ob_tick)
+
+    def _ob_set_text(self, txt):
+        w = getattr(self, "_ob_txt", None)
+        if w is None:
+            return
+        try:
+            w.config(state="normal")
+            w.delete("1.0", "end")
+            for line in (txt or "").split("\n"):
+                tag = None
+                if line.startswith("【") or line.startswith("盘口"):
+                    tag = "title"
+                elif line.startswith("买"):
+                    tag = "up"
+                elif line.startswith("卖"):
+                    tag = "down"
+                elif line.startswith("委比"):
+                    tag = "up" if "+" in line else "down"
+                elif "集合竞价" in line or "竞价撮合" in line:
+                    tag = "auction"
+                elif line.strip():
+                    tag = "dim"
+                w.insert("end", line + "\n", tag or ())
+            w.config(state="disabled")
+        except Exception:
+            log.debug("盘口文本刷新失败", exc_info=True)
+
+    def _ob_tick(self):
+        try:
+            w = getattr(self, "_ob_txt", None)
+            if w is None or not w.winfo_exists():
+                return
+            if (getattr(self, "_rt_choice", "") == "盘口"
+                    and w.winfo_ismapped()):
+                self._refresh_order_book()
+        except Exception:
+            log.debug("盘口轮询异常", exc_info=True)
+        try:
+            self.root.after(3000, self._ob_tick)
+        except Exception:
+            pass
+
+    def _refresh_order_book(self):
+        if getattr(self, "_ob_busy", False):
+            return
+        full = (self.res or {}).get("full_code") or self.code_var.get()
+        try:
+            full = normalize_code(full)
+        except ValueError:
+            return
+        if _market_of(full) != "cn":
+            self._ob_data = None
+            self._ob_set_text("盘口\n仅支持 A 股")
+            return
+        if full != getattr(self, "_ob_code", ""):
+            self._ob_data = None
+        self._ob_busy = True
+        self._ob_code = full
+        self._run_bg(lambda: fetch_order_book(full), self._ob_done)
+
+    def _ob_done(self, data, err):
+        self._ob_busy = False
+        if err or not data:
+            if getattr(self, "_ob_data", None) is None:
+                self._ob_set_text("盘口\n获取失败（收盘后显示最近缓存）")
+            return
+        if data.get("code") != getattr(self, "_ob_code", ""):
+            return
+        self._ob_data = data
+        self._render_order_book()
+
+    def _render_order_book(self):
+        d = getattr(self, "_ob_data", None)
+        if not d:
+            return
+        name = d.get("name") or ""
+        code = d.get("code") or ""
+        price = d.get("price") or 0.0
+        prev = d.get("prev_close") or 0.0
+        pct = (price / prev - 1) * 100 if prev else 0.0
+        arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+        lines = [f"【盘口 {name} {code}】",
+                 f"{d.get('phase') or '-'}  {d.get('time') or ''}",
+                 f"现价 {price:.2f}  {arrow}{pct:+.2f}%",
+                 f"昨收 {prev:.2f}  今开 {(d.get('open') or 0):.2f}"]
+        if d.get("auction"):
+            lines.append(f"集合竞价 参考 {price:.2f}  "
+                         f"匹配 {(d.get('vol') or 0):.0f}手")
+        else:
+            lines.append(f"开盘竞价 {(d.get('open') or 0):.2f}  "
+                         f"总量 {(d.get('vol') or 0):.0f}手")
+        lines.append("-" * 18)
+        asks = list(d.get("asks") or [])
+        bids = list(d.get("bids") or [])
+        if not asks and not bids:
+            lines.append("（指数/该标的无五档盘口）")
+        for i in range(len(asks) - 1, -1, -1):
+            p, v = asks[i]
+            lines.append(f"卖{i + 1} {p:>8.2f} {v:>8.0f}")
+        lines.append("─" * 18)
+        for i, (p, v) in enumerate(bids):
+            lines.append(f"买{i + 1} {p:>8.2f} {v:>8.0f}")
+        lines.append("-" * 18)
+        lines.append(f"委比 {d.get('wei_bi', 0):+.1f}%  "
+                     f"买{(d.get('bid_vol') or 0):.0f}/"
+                     f"卖{(d.get('ask_vol') or 0):.0f}")
+        self._ob_set_text("\n".join(lines))
+
     # ---------- AI Agent 侧栏（嵌入右侧栏；不用独立窗口） ----------
 
     def _build_ai_sidebar(self, parent):
@@ -17489,6 +18278,13 @@ class App:
                   bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
                   activeforeground=BTN_FG, relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 8)).pack(side="right")
+        self._ai_data_fold = False
+        self._ai_data_btn = tk.Button(
+            head, text="数据▾", command=self._toggle_ai_data,
+            bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+            activeforeground=BTN_FG, relief="flat", cursor="hand2",
+            font=("Microsoft YaHei", 8))
+        self._ai_data_btn.pack(side="right", padx=(0, 4))
 
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", padx=6, pady=2)
@@ -17523,6 +18319,19 @@ class App:
                   activeforeground=BTN_FG, relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 8)).pack(side="left")
 
+        qrow = tk.Frame(parent, bg=bg)
+        qrow.pack(fill="x", padx=6, pady=(0, 2))
+        for _txt, _cmd in (
+                ("ETF成分", self._ai_etf_quick),
+                ("当日分时", self._ai_minute_quick),
+                ("外部环境", self._ai_external_quick),
+                ("开始分析", lambda: self._ai_quick(""))):
+            tk.Button(qrow, text=_txt, command=_cmd,
+                      bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+                      activeforeground=BTN_FG, relief="flat",
+                      cursor="hand2",
+                      font=("Microsoft YaHei", 8)).pack(side="left", padx=2)
+
         self._ai_status_var = tk.StringVar(
             value=("就绪 · 直接发送=开始分析" if self.res
                    else "先分析或切换一只股票"))
@@ -17530,12 +18339,60 @@ class App:
                  fg=AXIS_TXT, anchor="w",
                  font=("Microsoft YaHei", 8)).pack(fill="x", padx=6)
 
+        self._ai_data_box = tk.Frame(parent, bg=bg)
+        self._ai_data_box.pack(fill="x", padx=6, pady=(2, 2))
+        dh = tk.Frame(self._ai_data_box, bg=bg)
+        dh.pack(fill="x")
+        tk.Label(dh, text="数据", bg=bg, fg=ACCENT,
+                 font=("Microsoft YaHei", 8, "bold")).pack(side="left")
+        self._ai_data_info_var = tk.StringVar(value="等待分析...")
+        tk.Label(dh, textvariable=self._ai_data_info_var, bg=bg,
+                 fg=AXIS_TXT, anchor="w",
+                 font=("Microsoft YaHei", 8)).pack(
+                     side="left", padx=4, fill="x", expand=True)
+        tk.Button(dh, text="刷新", command=self._ai_data_refresh,
+                  bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+                  activeforeground=BTN_FG, relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="right")
+
+        self._ai_data_nb = ttk.Notebook(self._ai_data_box)
+        self._ai_data_nb.pack(fill="x", pady=(2, 0))
+        fmin = tk.Frame(self._ai_data_nb, bg=LOG_BG)
+        self._ai_mini_cv = tk.Canvas(fmin, height=80, bg=LOG_BG,
+                                     highlightthickness=0)
+        self._ai_mini_cv.pack(fill="both", expand=True)
+        self._ai_mini_cv.bind("<Configure>",
+                              lambda e: self._ai_draw_mini())
+        self._ai_data_nb.add(fmin, text=" 分时 ")
+
+        fetf = tk.Frame(self._ai_data_nb, bg=LOG_BG)
+        self._ai_etf_info_var = tk.StringVar(value="非ETF")
+        tk.Label(fetf, textvariable=self._ai_etf_info_var, bg=LOG_BG,
+                 fg=AXIS_TXT, anchor="w",
+                 font=("Microsoft YaHei", 8)).pack(fill="x", padx=3)
+        cols = ("代码", "名称", "权重", "当日")
+        self._ai_etf_tv = ttk.Treeview(fetf, columns=cols, show="headings",
+                                       height=3)
+        for c, w in zip(cols, (72, 66, 46, 52)):
+            self._ai_etf_tv.heading(c, text=c)
+            self._ai_etf_tv.column(c, width=w, anchor="w", stretch=True)
+        sb_etf = ttk.Scrollbar(fetf, orient="vertical",
+                               command=self._ai_etf_tv.yview)
+        self._ai_etf_tv.configure(yscrollcommand=sb_etf.set)
+        sb_etf.pack(side="right", fill="y")
+        self._ai_etf_tv.pack(side="left", fill="both", expand=True)
+        self._ai_data_nb.add(fetf, text=" ETF成分 ")
+        self._ai_data_nb.tab(1, state="disabled")
+        self._ai_data_res = None
+        self._ai_data_gen = 0
+        self._ai_minute_data = None
+        self._ai_minute_busy = False
+
         cf = tk.Frame(parent, bg=bg)
-        cf.pack(fill="both", expand=True, padx=6, pady=4)
         self._ai_chat = tk.Text(
-            cf, wrap="word", state="disabled", bg=LOG_BG, fg=FG_MAIN,
-            insertbackground=FG_MAIN, selectbackground=SEL_BG,
-            relief="flat", padx=4, pady=4,
+            cf, height=8, width=20, wrap="word", state="disabled",
+            bg=LOG_BG, fg=FG_MAIN, insertbackground=FG_MAIN,
+            selectbackground=SEL_BG, relief="flat", padx=4, pady=4,
             font=("Microsoft YaHei", 9), spacing1=2, spacing3=2)
         sb = ttk.Scrollbar(cf, command=self._ai_chat.yview)
         self._ai_chat.configure(yscrollcommand=sb.set)
@@ -17561,7 +18418,6 @@ class App:
         self._ai_chat.tag_configure("table", font=("Consolas", 8))
 
         opt = tk.Frame(parent, bg=bg)
-        opt.pack(fill="x", padx=6, pady=(2, 0))
         self._ai_think_var = tk.BooleanVar(value=_ai_thinking_enabled())
         self._ai_effort_var = tk.StringVar(value=_ai_reasoning_effort())
         self._ai_tools_var = tk.BooleanVar(value=_ai_tools_enabled())
@@ -17588,13 +18444,11 @@ class App:
                  font=("Microsoft YaHei", 7)).pack(side="right")
 
         inp = tk.Frame(parent, bg=bg)
-        inp.pack(fill="x", padx=6, pady=(2, 2))
         self._ai_input = tk.Text(
-            inp, height=3, wrap="word", bg=LOG_BG, fg=FG_MAIN,
-            insertbackground=FG_MAIN, selectbackground=SEL_BG,
-            relief="flat", padx=6, pady=4,
+            inp, height=3, width=12, wrap="word", bg=LOG_BG,
+            fg=FG_MAIN, insertbackground=FG_MAIN,
+            selectbackground=SEL_BG, relief="flat", padx=6, pady=4,
             font=("Microsoft YaHei", 9))
-        self._ai_input.pack(side="left", fill="both", expand=True)
         self._ai_input.bind("<Return>", self._ai_on_enter)
         self._ai_send_btn = tk.Button(
             inp, text="发送", command=self._ai_send,
@@ -17602,12 +18456,17 @@ class App:
             activeforeground=BTN_FG, relief="flat", cursor="hand2",
             font=("Microsoft YaHei", 9, "bold"))
         self._ai_send_btn.pack(side="right", fill="y", padx=(4, 0))
+        self._ai_input.pack(side="left", fill="both", expand=True)
 
         self._ai_usage_var = tk.StringVar(value="")
-        tk.Label(parent, textvariable=self._ai_usage_var, bg=bg,
-                 fg=AXIS_TXT, anchor="w", justify="left",
-                 wraplength=max(200, self._rt_width - 26),
-                 font=("Consolas", 8)).pack(fill="x", padx=6, pady=(0, 4))
+        usage_lbl = tk.Label(parent, textvariable=self._ai_usage_var, bg=bg,
+                             fg=AXIS_TXT, anchor="w", justify="left",
+                             wraplength=max(200, self._rt_width - 26),
+                             font=("Consolas", 8))
+        usage_lbl.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        inp.pack(side="bottom", fill="x", padx=6, pady=(2, 2))
+        opt.pack(side="bottom", fill="x", padx=6, pady=(2, 0))
+        cf.pack(fill="both", expand=True, padx=6, pady=4)
         self._ai_chat_welcome(self.res)
         self.root.after(300, self._ai_poll)
 
@@ -17702,6 +18561,7 @@ class App:
             return
         code = res.get("full_code") or ""
         self._ai_code_var.set(code)
+        self._ai_data_autoload(res)
         if self._ai_agent is not None and self._ai_agent_code == code:
             try:
                 brief = self._ai_prompt_brief()
@@ -17733,6 +18593,205 @@ class App:
         self._ai_status_var.set(f"正在分析 {full} ...")
         self.progress_var.set(f"AI 侧栏切换：{full} ...")
         self.run()
+
+    def _ai_quick(self, text):
+        if self._ai_agent is None and not getattr(self, "res", None):
+            self._ai_status_var.set("先分析或切换一只股票")
+            return
+        self._ai_input.delete("1.0", "end")
+        if text:
+            self._ai_input.insert("1.0", text)
+        self._ai_send()
+
+    def _ai_etf_quick(self):
+        full = (getattr(self, "res", None) or {}).get("full_code") or ""
+        if not full or not _is_etf(full):
+            self._ai_status_var.set("当前不是ETF；先切换ETF代码")
+            return
+        self._ai_quick("分析当前ETF的成分股，生成统计表并给出结论。")
+
+    def _ai_minute_quick(self):
+        self._ai_quick("调用当日分时线，分析盘中走势与量价配合。")
+
+    def _ai_external_quick(self):
+        self._ai_quick("调用 get_external_env 查看当前外部环境（全球市场、黄金原油、"
+                       "美股港股、地缘政治/特朗普最新），并分析对A股和当前标的的影响。")
+
+    def _ai_data_bg(self, fn, done):
+        """数据区专用后台线程（不占 _BG_EX，避免被消融/分析任务排队）。"""
+        def work():
+            try:
+                r, e = fn(), None
+            except Exception as ex:
+                r, e = None, ex
+            self._safe_after(0, lambda: done(r, e))
+
+        threading.Thread(target=work, daemon=True,
+                         name="ai-data").start()
+
+    def _toggle_ai_data(self):
+        """完全收起/展开侧栏数据区（分时/ETF成分），把空间让给聊天。"""
+        self._ai_data_fold = not getattr(self, "_ai_data_fold", False)
+        if self._ai_data_fold:
+            self._ai_data_box.pack_forget()
+            self._ai_data_btn.config(text="数据▸")
+        else:
+            self._ai_data_box.pack(fill="x", padx=6, pady=(2, 2),
+                                   before=self._ai_chat.master)
+            self._ai_data_btn.config(text="数据▾")
+
+    def _ai_data_refresh(self):
+        res = self._ai_data_res or getattr(self, "res", None)
+        if res:
+            self._ai_data_autoload(res, force=True)
+
+    def _ai_data_autoload(self, res, force=False):
+        if not getattr(self, "_ai_data_nb", None):
+            return
+        try:
+            if not self._ai_panel.winfo_exists():
+                return
+        except Exception:
+            return
+        self._ai_data_res = res
+        self._ai_data_gen = getattr(self, "_ai_data_gen", 0) + 1
+        gen = self._ai_data_gen
+        code = res.get("full_code") or ""
+        etf = _is_etf(code)
+        try:
+            self._ai_data_nb.tab(1, state="normal" if etf else "disabled")
+            self._ai_data_nb.select(1 if etf else 0)
+        except Exception:
+            pass
+        self._ai_data_info_var.set("刷新中..." if force else "分时加载中...")
+        self._ai_data_load_minute(res, gen, force)
+        if etf:
+            self._ai_etf_info_var.set("ETF成分加载中...")
+            self._ai_data_load_etf(res, gen, force)
+        else:
+            for iid in self._ai_etf_tv.get_children():
+                self._ai_etf_tv.delete(iid)
+            self._ai_etf_info_var.set("非ETF")
+
+    def _ai_data_load_minute(self, res, gen, force=False):
+        code = res.get("full_code") or ""
+        if force:
+            try:
+                _MINUTE_MEM.pop(code, None)
+            except Exception:
+                pass
+
+        def done(data, err):
+            if gen != getattr(self, "_ai_data_gen", -1):
+                return
+            if (self._ai_data_res is not res
+                    or getattr(self, "res", None) is not res):
+                return
+            try:
+                if not self._ai_panel.winfo_exists():
+                    return
+            except Exception:
+                return
+            if err or not data:
+                self._ai_mini_cv.delete("all")
+                self._ai_mini_cv.create_text(
+                    8, 8, anchor="nw",
+                    text=f"分时加载失败: {err}"[:48],
+                    fill=UP, font=("Microsoft YaHei", 8))
+                return
+            self._ai_minute_data = data
+            self._ai_draw_mini()
+            self._ai_data_info_var.set(
+                f"分时 {data.get('day') or ''} 已加载")
+
+        self._ai_data_bg(lambda: fetch_minute_lines(code), done)
+
+    def _ai_data_load_etf(self, res, gen, force=False):
+        code = res.get("full_code") or ""
+
+        def done(out, err):
+            if gen != getattr(self, "_ai_data_gen", -1):
+                return
+            if (self._ai_data_res is not res
+                    or getattr(self, "res", None) is not res):
+                return
+            try:
+                if not self._ai_panel.winfo_exists():
+                    return
+            except Exception:
+                return
+            if err or not out:
+                self._ai_etf_info_var.set(f"ETF成分加载失败: {err}")
+                return
+            meta, rows = out
+            self._ai_etf_info_var.set(
+                f"{meta.get('name') or ''} · {meta.get('period') or ''} "
+                f"{meta.get('date') or ''} · 前{meta.get('shown')}/"
+                f"{meta.get('total')} · 加权"
+                f"{(meta.get('weighted_chg') or 0):+.2f}%")
+            tv = self._ai_etf_tv
+            for iid in tv.get_children():
+                tv.delete(iid)
+            for r in rows:
+                tv.insert("", "end", values=(
+                    r.get("code") or "", r.get("name") or "",
+                    f"{(r.get('weight') or 0):.2f}",
+                    (f"{(r.get('chg')):+.2f}%"
+                     if r.get("chg") is not None else "-")))
+            self._ai_data_info_var.set("ETF成分已加载")
+
+        self._ai_data_bg(
+            lambda: etf_constituent_perf(code, 20, refresh=force), done)
+
+    def _ai_draw_mini(self):
+        cv = getattr(self, "_ai_mini_cv", None)
+        if cv is None:
+            return
+        cv.delete("all")
+        d = self._ai_minute_data
+        if not d:
+            cv.create_text(8, 8, anchor="nw", text="暂无分时",
+                           fill=AXIS_TXT, font=("Microsoft YaHei", 8))
+            return
+        rows = d.get("rows") or []
+        n = len(rows)
+        if n < 2:
+            return
+        prices = [r[1] for r in rows]
+        avgs = d.get("avg") or []
+        prev = d.get("prev_close") or prices[0]
+        w = max(cv.winfo_width(), 80)
+        h = max(cv.winfo_height(), 50)
+        L, R, T, B = 6, 6, 15, 4
+        mx = max(max(prices), max(avgs) if avgs else prices[0], prev)
+        mn = min(min(prices), min(avgs) if avgs else prices[0], prev)
+        half = max(mx - prev, prev - mn, prev * 0.004)
+        hi, lo = prev + half * 1.08, prev - half * 1.08
+
+        def x(i):
+            return L + i / max(1, n - 1) * (w - L - R)
+
+        def y(p):
+            return T + (hi - p) / max(1e-9, hi - lo) * (h - T - B)
+
+        cv.create_line(L, y(prev), w - R, y(prev),
+                       fill=GUIDE_C, dash=(3, 3))
+        pts = []
+        for i, p in enumerate(prices):
+            pts.extend((x(i), y(p)))
+        if len(pts) >= 4:
+            cv.create_line(*pts, fill=ACCENT, width=1)
+        if avgs:
+            pts = []
+            for i, p in enumerate(avgs):
+                pts.extend((x(i), y(p)))
+            cv.create_line(*pts, fill="#ffd54a", width=1, dash=(2, 2))
+        chg = (prices[-1] / prev - 1) * 100 if prev else 0
+        cv.create_text(
+            L, 2, anchor="nw",
+            text=(f"分时 {d.get('day') or ''}  {prices[-1]:.2f} "
+                  f"({chg:+.2f}%)"),
+            fill=TITLE_TXT, font=("Microsoft YaHei", 8, "bold"))
 
     def _ai_refresh_models(self):
         key = get_ai_key()
@@ -18664,6 +19723,7 @@ class App:
             self.progress_var.set(
                 "无网络：已显示缓存K线与最近快照（联网后自动恢复实时）")
         if self.minute_mode.get():
+            self._refresh_order_book()   # 切股票：盘口跟随刷新（v7.0.2）
             self._load_minute()      # 切股票：分时跟随重拉（v6.6.5）
         self._maybe_finish_signals(res)
         if res.get("quick"):
@@ -20107,6 +21167,10 @@ class App:
             self._minute_data = None
             self._rerender()
             return
+        # 分时视图自动切右侧栏到「盘口」：集合竞价 + 五档挂单随手可见
+        if "盘口" in getattr(self, "_rt_panels", {}):
+            self._switch_rt("盘口")
+        self._refresh_order_book()
         self._load_minute()
 
     def _load_minute(self):
@@ -20139,7 +21203,7 @@ class App:
 
     def _draw_minute_view(self):
         """主图分时：价格线+均价线(VWAP)+昨收基准，右侧涨跌幅轴；
-        副图画分钟量（相对昨收红/绿）。纯展示，不参与预测/信号。"""
+        副图分钟量 + 分时MACD/量比（自动切换），并带同步十字光标。"""
         cv = self.cv_main
         cv.delete("all")
         d = self._minute_data
@@ -20159,12 +21223,14 @@ class App:
         w = max(cv.winfo_width(), 420)
         h = max(cv.winfo_height(), 300)
         L, R, T, B = 62, 52, 26, 28
+        ph = h - T - B
+        times = [str(r[0]) for r in rows]
 
         def xm(i):
             return L + i / max(1, n - 1) * (w - L - R)
 
         def ym(p):
-            return T + (hi - p) / max(1e-9, hi - lo) * (h - T - B)
+            return T + (hi - p) / max(1e-9, hi - lo) * ph
 
         for k in range(5):
             p = lo + (hi - lo) * k / 4
@@ -20177,48 +21243,290 @@ class App:
             cv.create_text(w - R + 4, yy, anchor="w",
                            text=f"{pct:+.2f}%", fill=color,
                            font=("Consolas", 8))
-        # 昨收基准
         cv.create_line(L, ym(prev), w - R, ym(prev),
                        fill=GUIDE_C, dash=(4, 3))
-        # 价格线
         pts = []
         for i, p in enumerate(prices):
             pts.extend((xm(i), ym(p)))
         if len(pts) >= 4:
             cv.create_line(*pts, fill=ACCENT, width=1,
                            joinstyle="round")
-        # 均价线（VWAP，黄色，同花顺惯例）
         if avgs:
             pts = []
             for i, p in enumerate(avgs):
                 pts.extend((xm(i), ym(p)))
             cv.create_line(*pts, fill="#ffd54a", width=1, dash=(3, 2))
-        # 标题
+        ob = getattr(self, "_ob_data", None) or {}
+        ob_txt = ""
+        if ob.get("auction") and ob.get("price"):
+            ob_txt = f"  集合竞价 {ob['price']:.2f}"
+        elif ob.get("open"):
+            ob_txt = f"  开盘竞价 {ob['open']:.2f}"
         cv.create_text(L, T - 10, anchor="w",
-                       text=f"分时 {d['day']}  昨收 {prev:.2f}"
-                            f"  现价 {prices[-1]:.2f} "
-                            f"({(prices[-1] / prev - 1) * 100:+.2f}%)"
-                            f"  均价 {avgs[-1]:.2f}" if avgs else
-                       f"分时 {d['day']}  昨收 {prev:.2f}",
+                       text=(f"分时 {d['day']}  昨收 {prev:.2f}  "
+                             f"现价 {prices[-1]:.2f} "
+                             f"({(prices[-1] / prev - 1) * 100:+.2f}%)"
+                             + (f"  均价 {avgs[-1]:.2f}" if avgs else "")
+                             + ob_txt),
                        fill=TITLE_TXT, font=("Microsoft YaHei", 9, "bold"))
-        # 副图：分钟量（相对昨收红/绿）
+        for i, lab in self._minute_marks(times):
+            cv.create_text(xm(i), h - B + 12, text=lab,
+                           fill=AXIS_TXT, font=("Consolas", 7))
+        g = {"w": w, "h": h, "L": L, "R": R, "T": T, "B": B,
+             "n": n, "ph": ph, "bw": (w - L - R) / max(1, n - 1),
+             "minute": True}
+        self._finish_panel(cv, g, "main", lo, hi, times,
+                           fmt=lambda v: f"{v:.2f}")
+
+        # 副图1：分钟量
         vols = d.get("vols") or []
         cv2 = self.cv_vol
-        if cv2 is None or not vols:
-            return
-        cv2.delete("all")
-        w2 = max(cv2.winfo_width(), 420)
-        h2 = max(cv2.winfo_height(), 60)
-        vmax = max(vols) or 1.0
-        bw = max(1.0, (w2 - L - R) / n - 0.5)
-        for i, v in enumerate(vols):
-            if v <= 0:
+        if cv2 is not None and vols:
+            cv2.delete("all")
+            w2 = max(cv2.winfo_width(), 420)
+            h2 = max(cv2.winfo_height(), 60)
+            L2, R2, T2, B2 = L, R, 8, 16
+            ph2 = h2 - T2 - B2
+            vmax = (max(vols) or 1.0) * 1.08
+
+            def xm2(i):
+                return L + i / max(1, n - 1) * (w2 - L - R)
+
+            def yv(v):
+                return T2 + (vmax - v) / max(1e-9, vmax) * ph2
+
+            bw = max(1.0, (w2 - L - R) / n - 0.5)
+            for i, v in enumerate(vols):
+                if v <= 0:
+                    continue
+                color = UP if prices[i] >= prev else DOWN
+                cv2.create_rectangle(xm2(i) - bw / 2, yv(v),
+                                     xm2(i) + bw / 2, yv(0),
+                                     fill=color, outline="")
+            cv2.create_text(L2 + 2, T2 - 3, text="分时量（手）", anchor="w",
+                            font=("Microsoft YaHei", 8), fill=TITLE_TXT)
+            for i, lab in self._minute_marks(times):
+                cv2.create_text(xm2(i), h2 - B2 + 10, text=lab,
+                                fill=AXIS_TXT, font=("Consolas", 7))
+            g2 = {"w": w2, "h": h2, "L": L2, "R": R2, "T": T2, "B": B2,
+                  "n": n, "ph": ph2, "bw": (w2 - L - R) / max(1, n - 1),
+                  "minute": True}
+            self._finish_panel(cv2, g2, "vol", 0.0, vmax, times,
+                               fmt=lambda v: fmt_vol_cn(v) + "手")
+        elif cv2 is not None:
+            cv2.delete("all")
+
+        # 副图2：分时 MACD + 量比（自动，不跟随日线指标下拉）
+        cv3 = self.cv_ind
+        dif = dea = mhist = []
+        vr_series = []
+        if cv3 is not None:
+            cv3.delete("all")
+            w3 = max(cv3.winfo_width(), 420)
+            h3 = max(cv3.winfo_height(), 80)
+            L3, R3, T3, B3 = L, R, 6, 16
+            ph3 = h3 - T3 - B3
+            macd_h = int(ph3 * 0.64)
+            vr_top = T3 + macd_h + 6
+            vr_h = max(18, ph3 - macd_h - 6)
+            dif, dea, mhist = calc_macd(prices)
+            vals = [x for x in dif + dea + mhist if x is not None]
+            mlo = min(vals + [0.0])
+            mhi = max(vals + [0.0])
+            pad = (mhi - mlo) * 0.08 or 0.01
+            mlo -= pad
+            mhi += pad
+
+            def xm3(i):
+                return L3 + i / max(1, n - 1) * (w3 - L3 - R3)
+
+            def ymacd(v):
+                return T3 + (mhi - v) / max(1e-9, mhi - mlo) * macd_h
+
+            zero = ymacd(0)
+            cv3.create_line(L3, zero, w3 - R3, zero, fill=GRID_C)
+            mbw = max(1.2, (w3 - L3 - R3) / n * 0.3)
+            for i, hv in enumerate(mhist):
+                if hv is None:
+                    continue
+                c = UP if hv >= 0 else DOWN
+                y = ymacd(hv)
+                cv3.create_rectangle(xm3(i) - mbw, min(y, zero),
+                                     xm3(i) + mbw, max(y, zero),
+                                     fill=c, outline=c)
+            self._line(cv3, xm3, dif, ymacd, C_ORANGE)
+            self._line(cv3, xm3, dea, ymacd, C_BLUE)
+            cv3.create_text(L3 - 4, zero, text="0", anchor="e",
+                            font=("Consolas", 7), fill=AXIS_TXT)
+
+            avg5 = self._minute_avg5(d)
+            vr_series = self._minute_vr(times, rows, avg5)
+            vr_vals = [x for x in vr_series if x is not None]
+            vmax = max([2.0] + vr_vals) * 1.1
+
+            def yvr(v):
+                return vr_top + (vmax - v) / max(1e-9, vmax) * vr_h
+
+            for gv, sty in ((0.8, (4, 4)), (1.0, (2, 4)), (1.2, (4, 4))):
+                if gv > vmax:
+                    continue
+                cv3.create_line(L3, yvr(gv), w3 - R3, yvr(gv),
+                                fill=GUIDE_C, dash=sty)
+                cv3.create_text(L3 - 4, yvr(gv), text=f"{gv:.1f}",
+                                anchor="e", font=("Consolas", 7),
+                                fill=AXIS_TXT)
+            self._line(cv3, xm3, vr_series, yvr, C_PURPLE)
+            ld = [x for x in dif if x is not None]
+            la = [x for x in dea if x is not None]
+            lv = [x for x in vr_series if x is not None]
+            info = (f"DIF:{ld[-1]:.3f} DEA:{la[-1]:.3f}"
+                    if ld and la else "MACD")
+            if lv:
+                info += f"  量比:{lv[-1]:.2f}"
+            cv3.create_text(L3 + 2, T3 - 4,
+                            text=f"分时MACD / 量比（自动）  {info}",
+                            anchor="w", font=("Microsoft YaHei", 8),
+                            fill=TITLE_TXT)
+            g3 = {"w": w3, "h": h3, "L": L3, "R": R3, "T": T3, "B": B3,
+                  "n": n, "ph": ph3, "bw": (w3 - L3 - R3) / max(1, n - 1),
+                  "minute": True,
+                  "macd_top": T3, "macd_bottom": T3 + macd_h,
+                  "macd_lo": mlo, "macd_hi": mhi,
+                  "vr_top": vr_top, "vr_bottom": vr_top + vr_h,
+                  "vr_max": vmax}
+            self._finish_panel(cv3, g3, "ind", 0.0, 1.0, times,
+                               fmt=lambda v: f"{v:.2f}")
+        self._minute_series = {
+            "prices": prices, "avgs": avgs, "vols": vols, "times": times,
+            "prev": prev, "dif": dif, "dea": dea, "mhist": mhist,
+            "vr": vr_series,
+        }
+
+    def _minute_marks(self, times):
+        want = {"0930": "09:30", "1030": "10:30", "1300": "13:00",
+                "1400": "14:00", "1500": "15:00"}
+        return [(i, want[t]) for i, t in enumerate(times) if t in want]
+
+    def _minute_elapsed(self, t):
+        try:
+            hh, mm = int(t[:2]), int(t[2:4])
+        except (ValueError, TypeError):
+            return 1
+        mins = hh * 60 + mm
+        if mins <= 11 * 60 + 30:
+            return max(1, mins - (9 * 60 + 30) + 1)
+        if mins >= 13 * 60:
+            return min(240, 120 + mins - 13 * 60 + 1)
+        return 120
+
+    def _minute_avg5(self, d):
+        day = d.get("day") or ""
+        bars = (self.res or {}).get("disp_rows") or []
+        vols = [float(b["vol"]) for b in bars
+                if b.get("vol") and (b.get("date") or "") < day]
+        if len(vols) < 5:
+            vols = [float(b["vol"]) for b in bars if b.get("vol")]
+        vols = vols[-5:]
+        return sum(vols) / len(vols) if vols else None
+
+    def _minute_vr(self, times, rows, avg5):
+        out = []
+        for r, t in zip(rows, times):
+            try:
+                cum = float(r[2])
+            except (TypeError, ValueError, IndexError):
+                out.append(None)
                 continue
-            hh = v / vmax * (h2 - 8)
-            color = UP if prices[i] >= prev else DOWN
-            cv2.create_rectangle(xm(i) - bw / 2, h2 - hh,
-                                 xm(i) + bw / 2, h2 - 1,
-                                 fill=color, outline="")
+            if not avg5:
+                out.append(None)
+                continue
+            el = max(5, self._minute_elapsed(t))
+            exp = avg5 * el / 240.0
+            out.append(cum / exp if exp > 0 else None)
+        return out
+
+    def _minute_motion(self, event, key):
+        sg = self.scales.get(key)
+        if not sg or not sg.get("minute"):
+            return
+        s = self._minute_series
+        n = sg["n"]
+        xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
+        for k2 in ("main", "vol", "ind"):
+            g2 = self.scales.get(k2)
+            if not g2:
+                continue
+            c2 = {"main": self.cv_main, "vol": self.cv_vol,
+                  "ind": self.cv_ind}[k2]
+            c2.coords(g2["vid"], xv, g2["T"] + 2, xv, g2["h"] - g2["B"])
+            c2.itemconfigure(g2["vid"], state="normal")
+        y = max(min(event.y, sg["h"] - sg["B"]), sg["T"])
+        cv = {"main": self.cv_main, "vol": self.cv_vol,
+              "ind": self.cv_ind}[key]
+        cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
+        for it in ("hid", "pid", "pbg", "did", "dbgd"):
+            cv.itemconfigure(sg[it], state="normal")
+        cv.tag_raise(sg["pbg"])
+        cv.tag_raise(sg["pid"])
+
+        idx = int(round((xv - sg["L"]) / max(1e-9, sg["w"] - sg["L"] - sg["R"])
+                        * (n - 1)))
+        idx = max(0, min(n - 1, idx))
+        t = sg["dates"][idx] if idx < len(sg["dates"]) else ""
+        dl = f"{t[:2]}:{t[2:4]}" if len(t) >= 4 else t
+        cv.coords(sg["did"], xv, sg["h"] - sg["B"] // 2 + 2)
+        cv.itemconfigure(sg["did"], text=dl)
+        wbg = len(dl) * 7 + 10
+        cv.coords(sg["dbgd"], xv - wbg / 2, sg["h"] - sg["B"] // 2 - 5,
+                  xv + wbg / 2, sg["h"] - sg["B"] // 2 + 11)
+
+        if key == "main":
+            val = sg["hi_v"] - (y - sg["T"]) / max(1e-9, sg["ph"]) * (
+                sg["hi_v"] - sg["lo_v"])
+            txt = sg["fmt"](val)
+        elif key == "vol":
+            val = sg["hi_v"] - (y - sg["T"]) / max(1e-9, sg["ph"]) * (
+                sg["hi_v"] - sg["lo_v"])
+            txt = sg["fmt"](val)
+        else:
+            if y <= sg.get("macd_bottom", sg["T"]):
+                v = sg["macd_hi"] - (y - sg["macd_top"]) / max(
+                    1e-9, sg["macd_bottom"] - sg["macd_top"]) * (
+                    sg["macd_hi"] - sg["macd_lo"])
+                txt = f"{v:.3f}"
+            else:
+                v = sg["vr_max"] - (y - sg["vr_top"]) / max(
+                    1e-9, sg["vr_bottom"] - sg["vr_top"]) * sg["vr_max"]
+                txt = f"{v:.2f}"
+        px = max(sg["L"] + 30, sg["w"] - 33)
+        tw = max(34, len(txt) * 7 + 8)
+        cv.coords(sg["pid"], px, y)
+        cv.itemconfigure(sg["pid"], text=txt)
+        cv.coords(sg["pbg"], px - tw / 2, y - 9, px + tw / 2, y + 9)
+
+        price = s["prices"][idx] if idx < len(s["prices"]) else None
+        avg = s["avgs"][idx] if idx < len(s["avgs"]) else None
+        vol = s["vols"][idx] if idx < len(s["vols"]) else None
+        vr = s["vr"][idx] if idx < len(s["vr"]) else None
+        dif = s["dif"][idx] if idx < len(s["dif"]) else None
+        dea = s["dea"][idx] if idx < len(s["dea"]) else None
+        mh = s["mhist"][idx] if idx < len(s["mhist"]) else None
+        chg = ((price / s["prev"] - 1) * 100
+               if price is not None and s.get("prev") else None)
+        bits = [dl]
+        if price is not None:
+            bits.append(f"价{price:.2f}")
+        if chg is not None:
+            bits.append(f"({chg:+.2f}%)")
+        if avg is not None:
+            bits.append(f"均价{avg:.2f}")
+        if vol is not None:
+            bits.append(f"量{fmt_vol_cn(vol)}手")
+        if vr is not None:
+            bits.append(f"量比{vr:.2f}（{vol_regime(vr)}）")
+        if dif is not None and dea is not None and mh is not None:
+            bits.append(f"DIF:{dif:.3f} DEA:{dea:.3f} MACD:{mh:.3f}")
+        self.hover_var.set("  ".join(bits))
 
     def _rerender(self):
         self._drag_job = None
@@ -21058,7 +22366,8 @@ class App:
         if getattr(self, "_drag_x", None) is not None:
             return          # 拖拽平移中，不画十字光标（避免拖拽卡顿）
         if self.minute_mode.get():
-            return          # 分时视图：无 scales 映射，跳过K线十字光标
+            self._minute_motion(event, key)
+            return
         """十字光标：线/标签连续跟随鼠标，数据读数吸附最近K线。"""
         if key not in self.scales or not self.view:
             return
@@ -21716,10 +23025,17 @@ class App:
                 lp, lc = self.idx_labels[code]
                 info = (data or {}).get(code)
                 if info:
-                    lp.config(text=f"{info['price']:.2f}")
-                    chg = info["chg"]
-                    lc.config(text=f"{chg:+.2f}%",
-                              fg=UP if chg >= 0 else DOWN)
+                    px = info.get("price")
+                    prev = info.get("prev_close")
+                    chg = info.get("chg")
+                    if chg is None and px is not None and prev:
+                        chg = (px / prev - 1) * 100
+                    lp.config(text=(f"{px:.2f}" if px is not None else "-"))
+                    if chg is not None:
+                        lc.config(text=f"{chg:+.2f}%",
+                                  fg=UP if chg >= 0 else DOWN)
+                    else:
+                        lc.config(text="-", fg=AXIS_TXT)
                 else:
                     lp.config(text="-")
                     lc.config(text="-", fg=AXIS_TXT)
@@ -21990,12 +23306,20 @@ class App:
             f"当前策略：{strat.get('label') or '多维评分'}"
             f"（{strat.get('algo') or res.get('sel_algo') or 'composite'}）；"
             f"风控：{risk_txt}\n\n"
-            "可用工具：get_kline（更多日K）、get_indicators（指标序列）、"
-            "get_prediction（预测分位/多日）、get_similar_samples（相似样本）、"
-            "get_market（大盘/闸门）、get_chips_action（筹码/评分/信号/回测）、"
-            "get_fundamentals（财报）、get_intraday（分时）、get_strategy"
-            "（策略参数）、search_news（联网资讯）。至少获取日K、指标、预测与"
-            "资讯后再给最终结论；画线前确认日期在最近60个交易日内、价位在近60日区间±30%内。\n"
+            "可用工具：get_kline（日K，可传 code 看成分股）、get_indicators"
+            "（指标序列，可传 code）、get_prediction（预测分位/多日）、"
+            "get_similar_samples（相似样本）、get_market（大盘/闸门）、"
+            "get_chips_action（筹码/评分/信号/回测）、get_fundamentals（财报）、"
+            "get_intraday（当日/最近交易日分时，可传 code）、get_strategy"
+            "（策略参数）、search_news（个股资讯）、get_etf_constituents"
+            "（ETF成分股+权重/涨跌/量比，分析ETF优先调用）、get_external_env"
+            "（外部宏观/地缘/黄金原油/美股港股/特朗普/关税等，DeepSeek 官方"
+            "搜索）。至少获取日K、指标、预测与资讯后再给最终结论；分析ETF时先取"
+            "成分股；涉及外部环境（全球市场/黄金原油/美股港股/地缘政治/特朗普/"
+            "关税/美联储）时先调用 get_external_env，不要臆测；看成分股盘中走势"
+            "用 get_intraday(code=...)。侧边栏已自动加载当前标的分时（ETF 还自动"
+            "加载成分股表），可直接引用；需要更细数据再调用工具。画线前确认日期"
+            "在最近60个交易日内、价位在近60日区间±30%内。\n"
             + AI_DRAW_SCHEMA
         )
         return txt
@@ -23743,6 +25067,41 @@ class App:
                   font=("Microsoft YaHei", 8)).grid(
                       row=11, column=1, columnspan=2, sticky="w")
 
+        # ---- 备选 AI 供应商（本地 Ollama / 其他 OpenAI 兼容）----
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=12, column=0, columnspan=3, sticky="we", pady=(10, 4))
+        ttk.Label(frm, text="备选 AI 供应商（主供应商失败时使用）").grid(
+            row=13, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text="备选接口地址").grid(row=14, column=0, sticky="w",
+                                                pady=4)
+        fallback_base_var = tk.StringVar(
+            value=_ai_ini_get("ollama", "base_url",
+                              "http://localhost:11434/v1"))
+        ttk.Entry(frm, textvariable=fallback_base_var, width=42).grid(
+            row=14, column=1, columnspan=2, sticky="we", pady=4)
+        ttk.Label(frm, text="备选模型").grid(row=15, column=0, sticky="w",
+                                            pady=4)
+        fallback_model_var = tk.StringVar(
+            value=_ai_ini_get("ollama", "model", "qwen3:4b"))
+        ttk.Entry(frm, textvariable=fallback_model_var, width=42).grid(
+            row=15, column=1, columnspan=2, sticky="we", pady=4)
+        ttk.Label(frm, text="备选 Key(可空)").grid(row=16, column=0, sticky="w",
+                                                 pady=4)
+        fallback_key_var = tk.StringVar(
+            value=_ai_ini_get("ollama", "api_key", ""))
+        ttk.Entry(frm, textvariable=fallback_key_var, width=42, show="*").grid(
+            row=16, column=1, columnspan=2, sticky="we", pady=4)
+        fallback_on_var = tk.BooleanVar(
+            value=_ai_ini_get("ollama", "enabled", "1") != "0")
+        ttk.Checkbutton(frm, text="主供应商失败时自动切换到备选",
+                        variable=fallback_on_var).grid(
+                            row=17, column=1, columnspan=2, sticky="w", pady=2)
+        ttk.Label(frm, text="本地 Ollama 默认 http://localhost:11434/v1 · qwen3:4b；"
+                            "留空 Key 即可（Ollama 不鉴权）",
+                   foreground=AXIS_TXT,
+                   font=("Microsoft YaHei", 8)).grid(
+                       row=18, column=1, columnspan=2, sticky="w")
+
         # ---- 预测参数（存 ini [predict]，下次启动生效）----
         frm = sec_pred
         ttk.Separator(frm, orient="horizontal").grid(
@@ -24403,6 +25762,24 @@ class App:
                 set_ai_web_search(bool(search_var.get()))
                 set_ai_thinking(bool(think_var.get()), effort_var.get())
                 set_ai_tools(bool(tools_var.get()))
+                # 备选 AI 供应商（Ollama）持久化
+                try:
+                    cp2 = configparser.ConfigParser()
+                    cp2.read(INI_PATH, encoding="utf-8")
+                    if not cp2.has_section("ollama"):
+                        cp2.add_section("ollama")
+                    cp2.set("ollama", "base_url",
+                            fallback_base_var.get().strip())
+                    cp2.set("ollama", "model",
+                            fallback_model_var.get().strip())
+                    cp2.set("ollama", "api_key",
+                            fallback_key_var.get().strip())
+                    cp2.set("ollama", "enabled",
+                            "1" if fallback_on_var.get() else "0")
+                    with open(INI_PATH, "w", encoding="utf-8") as f:
+                        cp2.write(f)
+                except Exception:
+                    log.exception("保存备选 AI 供应商失败")
                 self._save_ini()
             apply_theme(self.settings["theme"], self.settings["updown"],
                        ma_colors=ma_store, boll_colors=boll_store)
@@ -24624,7 +26001,7 @@ class App:
                         bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
                         wrap="word", highlightthickness=0)
         about.grid(row=30, column=0, columnspan=3, sticky="we")
-        about.insert("end", f"版本：v{APP_VERSION}（2026-10）\n")
+        about.insert("end", f"版本：v{APP_VERSION}（2026-11）\n")
         about.insert("end", "\n【免责声明】\n")
         about.insert(
             "end",

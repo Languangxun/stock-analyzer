@@ -54,6 +54,12 @@ api_key =
 model = deepseek-chat
 base_url = https://api.deepseek.com
 
+[ollama]
+enabled = 1
+base_url = http://localhost:11434/v1
+model = qwen3:4b
+api_key =
+
 [picks]
 ai_auto_tier = 0
 risk_pref = 均衡

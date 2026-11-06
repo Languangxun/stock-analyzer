@@ -125,8 +125,8 @@ def setup_logging():
 
 setup_logging()
 
-# 应用版本号（回测产物目录/关于/UA 共用；2026-10-25 升 7.0.1 多市场）
-APP_VERSION = "7.0.1"
+# 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
+APP_VERSION = "7.0.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -3558,6 +3558,236 @@ def backfill_etf_history(codes=None, progress=None, workers=6,
     return stat
 
 
+# ---- ETF/LOF 成分股（2026-11-05）：东财 F10 基金持仓 ----
+# 数据源：fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc
+# 返回最新报告期前 N 大股票持仓（代码/名称/权重/持股数/市值）。
+# 内存 6h + SQLite meta 24h 缓存；网络失败降级旧缓存。
+_ETF_HOLD_CACHE = {}
+_ETF_HOLD_LOCK = threading.Lock()
+_ETF_HOLD_TTL = 6 * 3600
+_ETF_HOLD_DB_TTL = 24 * 3600
+
+
+def _etf_hold_db_get(code6):
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "select value from meta where key=?",
+                (f"etf_hold2:{code6}",)).fetchone()
+        if row:
+            d = json.loads(row[0])
+            if isinstance(d, dict) and isinstance(d.get("rows"), list):
+                return d
+    except Exception:
+        log.debug("ETF成分股缓存读取失败", exc_info=True)
+    return None
+
+
+def _etf_hold_db_set(code6, data):
+    try:
+        with db_conn(commit=True) as conn:
+            conn.execute(
+                "insert or replace into meta(key,value) values(?,?)",
+                (f"etf_hold2:{code6}",
+                 json.dumps(data, ensure_ascii=False)))
+    except Exception:
+        log.debug("ETF成分股缓存写入失败", exc_info=True)
+
+
+def _strip_html_cell(s):
+    s = re.sub(r"<[^>]+>", "", s or "")
+    return (s.replace("&nbsp;", " ").replace("&amp;", "&")
+             .replace("&lt;", "<").replace("&gt;", ">").strip())
+
+
+def _parse_etf_holdings(txt):
+    """解析东财 F10 持仓 JS/HTML：返回各报告期 [{period,date,rows}]。"""
+    out = []
+    parts = re.split(r"<div class=['\"]boxitem", txt or "")
+    for part in parts[1:]:
+        pm = re.search(r"(\d{4}年\d季度)股票投资明细", part)
+        dm = re.search(r"截止至：<font[^>]*>([0-9-]+)</font>", part)
+        tm = re.search(r"<table[^>]*>(.*?)</table>", part, re.S)
+        if not tm:
+            continue
+        rows = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tm.group(1), re.S):
+            cells = [_strip_html_cell(c) for c in
+                     re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+            if len(cells) < 5:
+                continue
+            code6 = cells[1].strip()
+            name = cells[2].strip()
+            if not re.fullmatch(r"\d{5,6}", code6):
+                continue
+            weight = None
+            for c in cells[3:]:
+                if c.endswith("%"):
+                    try:
+                        weight = float(c.rstrip("%"))
+                    except ValueError:
+                        pass
+                    break
+            if weight is None:
+                continue
+            try:
+                shares = float(cells[-2].replace(",", ""))
+            except (ValueError, IndexError):
+                shares = None
+            try:
+                value = float(cells[-1].replace(",", ""))
+            except (ValueError, IndexError):
+                value = None
+            try:
+                full = (normalize_code(code6) if len(code6) == 6
+                        else "hk" + code6.zfill(5))
+            except ValueError:
+                continue
+            rows.append({"code": full, "code6": code6, "name": name,
+                         "weight": weight, "shares_wan": shares,
+                         "value_wan": value})
+        if rows:
+            out.append({"period": pm.group(1) if pm else "",
+                        "date": dm.group(1) if dm else "", "rows": rows})
+    return out
+
+
+def fetch_etf_holdings(full, refresh=False):
+    """ETF/LOF 成分股（最新季报前10 + 最近年报/中报完整持仓）。
+
+    数据源：东财 F10 基金持仓。优先取行数最多的报告期作为完整成分股，
+    同时保留最新季报前10；内存 6h + SQLite meta 24h 缓存。
+    返回 {period,date,rows,latest_period,latest_date,latest_rows,...}。
+    """
+    full = normalize_code(full)
+    if _market_of(full) != "cn" or not _is_etf(full):
+        raise ValueError("仅支持 A 股 ETF/LOF")
+    code6 = full[2:]
+    now = time.time()
+    with _ETF_HOLD_LOCK:
+        hit = _ETF_HOLD_CACHE.get(code6)
+    if hit and not refresh and now - hit.get("ts", 0) < _ETF_HOLD_TTL:
+        return hit
+    db = None if refresh else _etf_hold_db_get(code6)
+    if db and now - db.get("ts", 0) < _ETF_HOLD_DB_TTL:
+        with _ETF_HOLD_LOCK:
+            _ETF_HOLD_CACHE[code6] = db
+        return db
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Referer": f"https://fundf10.eastmoney.com/ccmx_{code6}.html",
+    }
+    tables = {}
+    last = None
+    this_year = datetime.date.today().year
+    for year in (this_year, this_year - 1, this_year - 2):
+        url = ("https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+               f"?type=jjcc&code={code6}&topline=200&year={year}&month=12"
+               f"&rt={random.random():.6f}")
+        try:
+            txt = _http_get(url, retries=2, timeout=20, headers=headers,
+                            src_name="em_etf_hold")
+            for t in _parse_etf_holdings(txt):
+                key = (t.get("period") or "", t.get("date") or "")
+                if key not in tables:
+                    tables[key] = t
+            # 找到完整持仓（年报/中报通常 >20 行）即可停止补年份
+            if tables and max(len(t["rows"]) for t in tables.values()) >= 20:
+                break
+        except Exception as e:
+            last = e
+    if not tables:
+        if db:
+            log.warning("ETF成分股网络失败，降级旧缓存 %s: %s", full, last)
+            return db
+        raise RuntimeError(f"ETF成分股获取失败 {full}: {last}")
+    latest = max(tables.values(), key=lambda t: (t.get("date") or "",
+                                                 len(t["rows"])))
+    full_t = max(tables.values(), key=lambda t: (len(t["rows"]),
+                                                 t.get("date") or ""))
+    data = {"ts": now, "period": full_t.get("period") or "",
+            "date": full_t.get("date") or "", "rows": full_t["rows"],
+            "latest_period": latest.get("period") or "",
+            "latest_date": latest.get("date") or "",
+            "latest_rows": latest["rows"]}
+    with _ETF_HOLD_LOCK:
+        _ETF_HOLD_CACHE[code6] = data
+    _etf_hold_db_set(code6, data)
+    log.info("ETF成分股 %s: 完整 %s %s %d只 / 最新 %s 前%d",
+             full, data["period"], data["date"], len(data["rows"]),
+             data["latest_period"], len(data["latest_rows"]))
+    return data
+
+
+def etf_constituent_perf(full, limit=20, refresh=False):
+    """ETF前N大成分股 + 现价/当日/5日/20日涨跌/量比 + 加权汇总。
+
+    返回 (meta, rows)；meta 含 period/date/name/code。
+    """
+    full = normalize_code(full)
+    data = fetch_etf_holdings(full, refresh=refresh)
+    all_rows = sorted(data.get("rows") or [],
+                      key=lambda r: r.get("weight") or 0, reverse=True)
+    rows = all_rows[:max(1, int(limit))]
+    codes = [r["code"] for r in rows]
+    quotes = {}
+    if codes:
+        try:
+            quotes = fetch_batch_quotes(codes) or {}
+        except Exception:
+            log.warning("ETF成分股批量行情失败(忽略)", exc_info=True)
+    out = []
+    for r in rows:
+        code = r["code"]
+        q = quotes.get(code) or {}
+        bars = []
+        try:
+            bars = get_daily(code, min_bars=30) or []
+        except Exception:
+            pass
+        closes = [b.get("close") for b in bars if b.get("close")]
+        chg = None
+        px = q.get("price")
+        pc = q.get("prev_close")
+        if px and pc:
+            chg = (px / pc - 1.0) * 100
+        elif len(closes) >= 2 and closes[-2]:
+            chg = (closes[-1] / closes[-2] - 1.0) * 100
+        ret5 = ((closes[-1] / closes[-6] - 1.0) * 100
+                if len(closes) >= 6 and closes[-6] else None)
+        ret20 = ((closes[-1] / closes[-21] - 1.0) * 100
+                 if len(closes) >= 21 and closes[-21] else None)
+        vr = None
+        if bars:
+            vols = [b.get("vol") or 0 for b in bars]
+            if len(vols) >= 20:
+                vr = vol_ratio_at(vols, len(vols) - 1)
+        out.append({"code": code, "name": r.get("name") or "",
+                    "weight": r.get("weight"),
+                    "price": px if px is not None else
+                    (closes[-1] if closes else None),
+                    "chg": chg, "ret5": ret5, "ret20": ret20, "vr": vr})
+    wsum = sum((r.get("weight") or 0) for r in out
+               if r.get("chg") is not None)
+    wchg = (sum((r.get("weight") or 0) * r["chg"] for r in out
+                if r.get("chg") is not None) / wsum) if wsum else None
+    up = sum(1 for r in out if (r.get("chg") or 0) > 0)
+    down = sum(1 for r in out if (r.get("chg") or 0) < 0)
+    info = get_stock_info(full) or {}
+    meta = {"code": full, "name": info.get("name") or full,
+            "period": data.get("period") or "",
+            "date": data.get("date") or "",
+            "latest_period": data.get("latest_period") or "",
+            "latest_date": data.get("latest_date") or "",
+            "latest_count": len(data.get("latest_rows") or []),
+            "total": len(all_rows), "shown": len(out),
+            "weight_sum": sum((r.get("weight") or 0) for r in out),
+            "weighted_chg": wchg, "up": up, "down": down}
+    return meta, out
+
+
 def get_stock_info(full: str):
     """股票基础信息（含 v6.2.4 起的换手率/动态PE/PB 快照；缺失为 None）。"""
     with db_conn() as conn:
@@ -4518,6 +4748,131 @@ def fetch_quote(full):
             last = e
             log.debug("%s失败 %s: %s", name, full, e)
     raise RuntimeError(f"所有行情源均失败: {last}")
+
+
+# ---- 盘口 / 集合竞价（v7.0.2）：腾讯五档 + 新浪兜底 ----
+_ORDER_BOOK_CACHE = {}
+_ORDER_BOOK_LOCK = threading.Lock()
+_ORDER_BOOK_TTL = 3.0
+
+
+def _parse_cn_phase(txt, open_px):
+    """根据行情时间判定交易阶段；返回 (phase, auction)。"""
+    s = (txt or "").strip()
+    hhmm = s[8:12] if len(s) >= 12 else ""
+    if not hhmm:
+        hhmm = time.strftime("%H%M")
+    if "0915" <= hhmm < "0925":
+        return "集合竞价", True
+    if "0925" <= hhmm < "0930":
+        return "竞价撮合", True
+    if "1457" <= hhmm <= "1500":
+        return "收盘竞价", True
+    if "0930" <= hhmm < "1130" or "1300" <= hhmm < "1457":
+        return "连续竞价", False
+    if "1130" <= hhmm < "1300":
+        return "午间休市", False
+    return ("开盘前" if (open_px or 0) <= 0 else "已收盘"), False
+
+
+def _order_book_tencent(full):
+    txt = http_get(QT_URL + full, retries=1)
+    body = txt.split('"')[1] if '"' in txt else ""
+    f = body.split("~")
+    if len(f) < 30 or not f[3]:
+        raise ValueError("腾讯盘口为空")
+
+    def fv(i):
+        try:
+            v = f[i].strip()
+            return float(v) if v and v != "-" else 0.0
+        except (ValueError, IndexError):
+            return 0.0
+
+    bids = [(fv(9 + i * 2), fv(10 + i * 2)) for i in range(5)]
+    asks = [(fv(19 + i * 2), fv(20 + i * 2)) for i in range(5)]
+    bids = [x for x in bids if x[0] > 0]
+    asks = [x for x in asks if x[0] > 0]
+    price, prev = fv(3), fv(4)
+    open_px = fv(5)
+    phase, auction = _parse_cn_phase(f[30] if len(f) > 30 else "", open_px)
+    bv = sum(v for _p, v in bids)
+    av = sum(v for _p, v in asks)
+    wei = (bv - av) / (bv + av) * 100 if (bv + av) else 0.0
+    return {
+        "code": full, "name": f[1], "price": price, "prev_close": prev,
+        "open": open_px, "high": fv(33), "low": fv(34),
+        "time": f[30] if len(f) > 30 else "", "phase": phase,
+        "auction": auction, "bids": bids, "asks": asks,
+        "bid_vol": bv, "ask_vol": av, "wei_bi": wei,
+        "vol": fv(6), "amount": fv(37),
+        "limit_up": fv(47), "limit_down": fv(48),
+    }
+
+
+def _order_book_sina(full):
+    txt = _http_get("https://hq.sinajs.cn/list=" + full, retries=1, timeout=6,
+                    decode="gbk",
+                    headers={"Referer": "https://finance.sina.com.cn/"},
+                    src_name="新浪盘口")
+    body = txt.split('"')[1] if '"' in txt else ""
+    f = body.split(",")
+    if len(f) < 30 or not f[3] or float(f[3] or 0) <= 0:
+        raise ValueError("新浪盘口为空")
+
+    def fv(i):
+        try:
+            return float(f[i] or 0)
+        except (ValueError, IndexError):
+            return 0.0
+
+    bids = [(fv(11 + i * 2), fv(10 + i * 2)) for i in range(5)]
+    asks = [(fv(21 + i * 2), fv(20 + i * 2)) for i in range(5)]
+    bids = [x for x in bids if x[0] > 0]
+    asks = [x for x in asks if x[0] > 0]
+    price, prev = fv(3), fv(2)
+    open_px = fv(1)
+    phase, auction = _parse_cn_phase(f[31] if len(f) > 31 else "", open_px)
+    bv = sum(v for _p, v in bids)
+    av = sum(v for _p, v in asks)
+    return {
+        "code": full, "name": f[0], "price": price, "prev_close": prev,
+        "open": open_px, "high": fv(4), "low": fv(5),
+        "time": f[31] if len(f) > 31 else "", "phase": phase,
+        "auction": auction, "bids": bids, "asks": asks,
+        "bid_vol": bv, "ask_vol": av,
+        "wei_bi": (bv - av) / (bv + av) * 100 if (bv + av) else 0.0,
+        "vol": fv(8), "amount": fv(9),
+        "limit_up": 0.0, "limit_down": 0.0,
+    }
+
+
+def fetch_order_book(full, ttl=_ORDER_BOOK_TTL):
+    """A 股五档盘口 + 集合竞价状态（腾讯优先、新浪兜底，3s 缓存）。
+
+    auction=True 时 price 为竞价参考价、open 可能仍为 0；盘中 open 即
+    当日开盘集合竞价成交价，vol 为集合竞价成交量（手）。"""
+    full = normalize_code(full)
+    if _market_of(full) != "cn":
+        raise ValueError("盘口仅支持 A 股")
+    now = time.time()
+    with _ORDER_BOOK_LOCK:
+        hit = _ORDER_BOOK_CACHE.get(full)
+        if hit and now - hit.get("ts", 0) < ttl:
+            return hit
+    last = None
+    for fn in (_order_book_tencent, _order_book_sina):
+        try:
+            d = fn(full)
+            d["ts"] = now
+            with _ORDER_BOOK_LOCK:
+                _ORDER_BOOK_CACHE[full] = d
+            return d
+        except Exception as e:
+            last = e
+    if hit:
+        return hit
+    raise RuntimeError(f"盘口获取失败: {last}")
 
 
 def _batch_tencent(codes):
@@ -15357,6 +15712,42 @@ def _ai_http_json(url, payload=None, api_key="", timeout=60, session=""):
     raise last or RuntimeError("AI 请求失败")
 
 
+def ai_fallback_config():
+    """备选 AI 供应商（默认本地 Ollama）：(enabled, base_url, model, key)。"""
+    enabled = _ai_ini_get("ollama", "enabled", "1") != "0"
+    base = (_ai_ini_get("ollama", "base_url",
+                        "http://localhost:11434/v1") or "").strip()
+    model = (_ai_ini_get("ollama", "model", "qwen3:4b") or "").strip()
+    key = (_ai_ini_get("ollama", "api_key", "") or "").strip()
+    return enabled, base, model, key
+
+
+def _ai_chat_json(payload, api_key, timeout=90, session="", allow_fallback=True):
+    """主 AI 接口调用；失败自动切备选供应商（Ollama 等 OpenAI 兼容）。
+
+    备选请求会去掉 DeepSeek 专属 thinking/reasoning_effort 字段，避免本地
+    模型拒绝未知参数；主接口 401/格式异常同样会尝试备选（本地兜底）。"""
+    try:
+        return _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
+                             session=session)
+    except Exception as exc:
+        enabled, base, model, key = ai_fallback_config()
+        if not allow_fallback or not enabled or not base or not model:
+            raise
+        p2 = dict(payload)
+        p2["model"] = model
+        for k in ("thinking", "reasoning_effort"):
+            p2.pop(k, None)
+        log.warning("主 AI 接口失败，切换备选供应商 %s (%s): %s",
+                    base, model, exc)
+        try:
+            return _ai_http_json(_ai_chat_url(base), p2, key,
+                                 max(120, int(timeout or 0)))
+        except Exception as exc2:
+            raise RuntimeError(
+                f"主接口失败（{exc}）；备选 {model} 也失败（{exc2}）") from exc2
+
+
 def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list:
     """获取 OpenAI 兼容接口模型列表（GET {base}/models）。"""
     d = _ai_http_json(_ai_models_url(base_url), None, api_key, timeout)
@@ -15539,8 +15930,7 @@ def _deepseek_chat(api_key, messages, model=None, timeout=90, session="",
         "temperature": 0.3,
     }
     payload.update(_ai_thinking_params(thinking, effort))
-    d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
-                      session=session)
+    d = _ai_chat_json(payload, api_key, timeout, session=session)
     _ai_usage_add(usage_sink, d.get("usage"))
     try:
         msg = d["choices"][0]["message"]
@@ -15989,13 +16379,36 @@ def _ai_tool_rows(res, days, end=None):
     return rows[-days:]
 
 
+def _ai_tool_rows_code(code, days, end=None):
+    try:
+        rows = get_daily(code, min_bars=max(100, days)) or []
+    except Exception:
+        rows = []
+    _end = str(end or "").strip()[:10]
+    if _end:
+        rows = [r for r in rows if (r.get("date") or "") <= _end]
+    return rows[-days:]
+
+
 def _ai_tool_kline(ctx, args):
     days = _ai_tool_int(args.get("days"), 60, 1, 240)
-    rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+    code = str(args.get("code") or "").strip()
+    cur = (ctx.get("res") or {}).get("full_code") or ""
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+        rows = (_ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
+                if code == cur
+                else _ai_tool_rows_code(code, days, args.get("end")))
+    else:
+        code = cur
+        rows = _ai_tool_rows(ctx.get("res") or {}, days, args.get("end"))
     if not rows:
-        return "无日K数据"
-    out = [f"日K {rows[0]['date']}~{rows[-1]['date']} 共{len(rows)}根"
-           "（列：日期,开,高,低,收,量）"]
+        return f"无日K数据 {code}"
+    out = [f"{code} 日K {rows[0]['date']}~{rows[-1]['date']} "
+           f"共{len(rows)}根（列：日期,开,高,低,收,量）"]
     out.extend(
         f"{r['date']},{_ai_tool_f(r.get('open'))},"
         f"{_ai_tool_f(r.get('high'))},{_ai_tool_f(r.get('low'))},"
@@ -16021,11 +16434,42 @@ _AI_IND_COLS = {
 }
 
 
+def _ai_build_ind(rows):
+    """任意代码的指标序列（与 get_daily 行对齐）。"""
+    closes = [r.get("close") for r in rows if r.get("close") is not None]
+    ma = {n: sma_period(closes, n) for n in MA_COLORS}
+    dif, dea, mhist = calc_macd(closes)
+    k, d, j = calc_kdj(rows)
+    rsi6 = calc_rsi(closes, INDP("RSI_SHORT"))
+    rsi12 = calc_rsi(closes, INDP("RSI_LONG"))
+    bmid, bup, blow = calc_boll(closes)
+    pdi, mdi, adx = calc_adx(rows)
+    return {"ma": ma, "dif": dif, "dea": dea, "mhist": mhist,
+            "k": k, "d": d, "j": j, "rsi6": rsi6, "rsi12": rsi12,
+            "boll_up": bup, "boll_mid": bmid, "boll_low": blow,
+            "pdi": pdi, "mdi": mdi, "adx": adx}
+
+
 def _ai_tool_indicators(ctx, args):
     res = ctx.get("res") or {}
-    ind = res.get("ind") or {}
-    rows = res.get("disp_rows") or []
+    cur = res.get("full_code") or ""
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        code = cur
     days = _ai_tool_int(args.get("days"), 30, 1, 240)
+    if code != cur:
+        rows = _ai_tool_rows_code(code, max(days, 120))
+        ind = _ai_build_ind(rows) if rows else {}
+    else:
+        rows = res.get("disp_rows") or []
+        ind = res.get("ind") or {}
+    if not rows or not ind:
+        return f"无指标数据 {code}"
     names = [x.strip().lower() for x in
              str(args.get("names") or "ma,macd,kdj,rsi,boll,adx").split(",")
              if x.strip()]
@@ -16035,10 +16479,10 @@ def _ai_tool_indicators(ctx, args):
             cols.append(("VOL", [r.get("vol") for r in rows]))
         elif nm in _AI_IND_COLS:
             cols.extend((h, arr) for h, arr in _AI_IND_COLS[nm](ind) if arr)
-    if not cols or not rows:
+    if not cols:
         return "无可返回指标"
     n = min([len(rows)] + [len(a) for _, a in cols if a])
-    out = ["日期," + ",".join(h for h, _ in cols)]
+    out = [f"指标 {code}", "日期," + ",".join(h for h, _ in cols)]
     for i in range(max(0, n - days), n):
         vals = [_ai_tool_f((a[i] if a and i < len(a) else None), 3)
                 for _, a in cols]
@@ -16177,14 +16621,25 @@ def _ai_tool_fundamentals(ctx, args):
 
 
 def _ai_tool_intraday(ctx, args):
-    res = ctx.get("res") or {}
-    data = fetch_minute_lines(res.get("full_code") or "")
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            code = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        code = (ctx.get("res") or {}).get("full_code") or ""
+    try:
+        data = fetch_minute_lines(code)
+    except Exception as e:
+        return f"分时获取失败 {code}: {e}"
     rows = data.get("rows") or []
     vols = data.get("vols") or []
     avg = data.get("avg") or []
     points = _ai_tool_int(args.get("points"), 60, 10, 240)
-    out = [f"分时 {data.get('day') or '-'} 昨收 "
-           f"{_ai_tool_f(data.get('prev_close'))}（时间,价格,均价,分钟量）"]
+    out = [f"分时 {code} {data.get('day') or '-'} 昨收 "
+           f"{_ai_tool_f(data.get('prev_close'))}"
+           "（时间,价格,均价,分钟量）"]
     for i in range(max(0, len(rows) - points), len(rows)):
         row = rows[i]
         if isinstance(row, (list, tuple)) and len(row) >= 2:
@@ -16196,7 +16651,7 @@ def _ai_tool_intraday(ctx, args):
         out.append(f"{t},{_ai_tool_f(px)},"
                    f"{_ai_tool_f(avg[i] if i < len(avg) else None)},"
                    f"{_ai_tool_f(vols[i] if i < len(vols) else None, 0)}")
-    return "\n".join(out) if len(out) > 1 else "无分时数据"
+    return "\n".join(out) if len(out) > 1 else f"无分时数据 {code}"
 
 
 def _ai_tool_strategy(ctx, args):
@@ -16264,6 +16719,138 @@ def _ai_tool_show_table(ctx, args):
     return "已生成统计表并在界面单独展示。\n" + md
 
 
+_AI_EXT_CACHE = {}
+_AI_EXT_LOCK = threading.Lock()
+_AI_EXT_TTL = 900
+
+
+def _ai_ext_query(q, days):
+    q = (q or "").strip()[:100]
+    if "after:" in q or "before:" in q:
+        return q
+    since = (datetime.date.today()
+             - datetime.timedelta(days=max(1, days))).isoformat()
+    return f"{q} after:{since}"
+
+
+def _ai_tool_external(ctx, args):
+    """外部宏观/地缘环境：仅用 DeepSeek 官方 Search API。"""
+    search_on = ctx.get("search")
+    if search_on is None:
+        search_on = _ai_web_search_enabled()
+    if not search_on:
+        return "联网检索已在本次会话关闭。"
+    key = get_ai_key()
+    if not key or not _ai_search_url():
+        return "当前接口不支持 DeepSeek 官方联网搜索。"
+    q = str(args.get("query") or "").strip()[:128]
+    days = _ai_tool_int(args.get("days"), 7, 1, 30)
+    count = _ai_tool_int(args.get("count"), 10, 5, 15)
+    ck = (q or "__default__", days, count)
+    now = time.time()
+    with _AI_EXT_LOCK:
+        hit = _AI_EXT_CACHE.get(ck)
+        if hit and now - hit.get("ts", 0) < _AI_EXT_TTL:
+            return hit.get("txt", "")
+    if q:
+        queries = [(f"聚焦：{q[:24]}", _ai_ext_query(q, days))]
+    else:
+        queries = [
+            ("全球市场/商品",
+             _ai_ext_query("黄金 原油 美股 港股 A股 美元 美债 最新 走势 宏观",
+                           days)),
+            ("地缘政治/特朗普",
+             _ai_ext_query("特朗普 最新 政策 关税 地缘政治 市场影响", days)),
+        ]
+    sections = []
+    seen = set()
+    n_ok = 0
+    for title, query in queries:
+        try:
+            rs = deepseek_search(key, query, count=count)
+        except Exception as e:
+            sections.append(f"【{title}】检索失败: {e}")
+            continue
+        uniq = []
+        for r in rs or []:
+            k = ((r.get("title") or "") + "|" + (r.get("url") or ""))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(r)
+        if not uniq:
+            sections.append(f"【{title}】近{days}天未检索到结果")
+            continue
+        n_ok += 1
+        txt = _fmt_search_results(uniq, limit=count)
+        if txt:
+            sections.append(f"【{title}】\n{txt}")
+    if n_ok and isinstance(ctx.get("usage"), dict):
+        ctx["usage"]["search_calls"] = int(
+            ctx["usage"].get("search_calls", 0)) + n_ok
+    out = f"DeepSeek 官方联网搜索（近{days}天）\n" + "\n\n".join(sections)
+    with _AI_EXT_LOCK:
+        _AI_EXT_CACHE[ck] = {"ts": now, "txt": out}
+        if len(_AI_EXT_CACHE) > 100:
+            for k in [k for k, v in _AI_EXT_CACHE.items()
+                      if now - v.get("ts", 0) > _AI_EXT_TTL]:
+                _AI_EXT_CACHE.pop(k, None)
+    return out
+
+
+def _ai_tool_etf(ctx, args):
+    code = str(args.get("code") or "").strip()
+    if code:
+        try:
+            full = normalize_code(code)
+        except ValueError:
+            return f"代码格式不对: {code}"
+    else:
+        full = (ctx.get("res") or {}).get("full_code") or ""
+    if not full or _market_of(full) != "cn" or not _is_etf(full):
+        return "当前不是 ETF/LOF；可传 code 指定，如 510300。"
+    limit = _ai_tool_int(args.get("limit"), 20, 5, 50)
+    try:
+        meta, rows = etf_constituent_perf(full, limit)
+    except Exception as e:
+        return f"ETF成分股获取失败 {full}: {e}"
+    cols = ["代码", "名称", "权重%", "现价", "当日%", "5日%", "20日%",
+            "量比"]
+    trows = []
+    for r in rows:
+        trows.append([
+            r.get("code") or "", r.get("name") or "",
+            _ai_tool_f(r.get("weight")), _ai_tool_f(r.get("price")),
+            _ai_tool_spct(r.get("chg")), _ai_tool_spct(r.get("ret5")),
+            _ai_tool_spct(r.get("ret20")), _ai_tool_f(r.get("vr")),
+        ])
+    title = (f"{meta['name']} 成分股 · {meta['period']} {meta['date']} "
+             f"（前{meta['shown']}大权重）")
+    cb = ctx.get("on_table")
+    if callable(cb):
+        try:
+            cb({"title": title, "columns": cols, "rows": trows})
+        except Exception:
+            log.exception("ETF成分股表格回传失败(忽略)")
+    latest = ""
+    if (meta.get("latest_period")
+            and meta.get("latest_period") != meta.get("period")):
+        latest = (f"；最新季报 {meta['latest_period']} "
+                  f"{meta.get('latest_date') or ''} 仅前"
+                  f"{meta.get('latest_count', 0)}")
+    header = (f"ETF {meta['name']} ({meta['code']}) 成分股：完整持仓 "
+              f"{meta['period']} {meta['date']} 共{meta['total']}只{latest}。"
+              f"展示前{meta['shown']}大权重"
+              f"（合计{meta['weight_sum']:.2f}%）。")
+    summary = (f"前{meta['shown']}大加权当日 "
+               f"{_ai_tool_spct(meta.get('weighted_chg'))}"
+               f" · 上涨{meta['up']}/下跌{meta['down']}")
+    lines = [header, summary, "序号," + ",".join(cols)]
+    for i, r in enumerate(trows, 1):
+        lines.append(str(i) + "," + ",".join(r))
+    return "\n".join(lines)
+
+
 _AI_TOOL_FUNCS = {
     "get_kline": _ai_tool_kline,
     "get_indicators": _ai_tool_indicators,
@@ -16275,6 +16862,8 @@ _AI_TOOL_FUNCS = {
     "get_intraday": _ai_tool_intraday,
     "get_strategy": _ai_tool_strategy,
     "search_news": _ai_tool_news,
+    "get_external_env": _ai_tool_external,
+    "get_etf_constituents": _ai_tool_etf,
     "show_table": _ai_tool_show_table,
 }
 
@@ -16284,22 +16873,27 @@ def ai_tool_specs():
     return [
         {"type": "function", "function": {
             "name": "get_kline",
-            "description": "获取该股更多日K线（OHLCV）。判断形态、趋势、"
-                           "支撑压力、量价关系时调用；可用 end 指定截止日期。",
+            "description": "获取任意股票/ETF日K线（默认当前标的，可用 code "
+                           "指定成分股等其它代码）。判断形态、趋势、支撑压力、"
+                           "量价关系时调用；可用 end 指定截止日期。",
             "parameters": {"type": "object", "properties": {
                 "days": {"type": "integer", "description": "最近多少根，1-240",
                          "default": 60},
                 "end": {"type": "string",
-                        "description": "可选截止日期 YYYY-MM-DD"}}}}},
+                        "description": "可选截止日期 YYYY-MM-DD"},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_indicators",
             "description": "获取技术指标序列（与日K对齐）：ma/macd/kdj/rsi/"
-                           "boll/adx/vol。",
+                           "boll/adx/vol；可用 code 指定其它代码（如成分股）。",
             "parameters": {"type": "object", "properties": {
                 "names": {"type": "string",
                           "description": "逗号分隔，默认 ma,macd,kdj,rsi,boll,adx"},
                 "days": {"type": "integer", "description": "最近多少天，1-240",
-                         "default": 30}}}}},
+                         "default": 30},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_prediction",
             "description": "获取形态预测：当日收盘分位/上行概率、T+1 预测、"
@@ -16327,10 +16921,13 @@ def ai_tool_specs():
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {
             "name": "get_intraday",
-            "description": "获取最近交易日分时（价格/均价/分钟量），用于盘中判断。",
+            "description": "获取当日/最近交易日分时（价格/均价/分钟量），"
+                           "可用 code 指定成分股等其它代码；用于盘中判断。",
             "parameters": {"type": "object", "properties": {
                 "points": {"type": "integer", "description": "最近多少分钟，10-240",
-                           "default": 60}}}}},
+                           "default": 60},
+                "code": {"type": "string",
+                         "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
             "name": "get_strategy",
             "description": "获取当前选中策略（算法/档位/风险参数/训练验证指标）。",
@@ -16343,6 +16940,30 @@ def ai_tool_specs():
                           "description": "检索词，≤128字；留空=默认近30天个股资讯"},
                 "count": {"type": "integer", "description": "结果数，1-10",
                           "default": 5}}}}},
+        {"type": "function", "function": {
+            "name": "get_external_env",
+            "description": "查询外部宏观/地缘环境（黄金/原油/美股/港股/A股/美元/"
+                           "美债/特朗普/关税/美联储等），仅使用 DeepSeek 官方"
+                           "联网搜索，返回近N天新闻摘要。可传 query 聚焦事件，"
+                           "如“特朗普 关税”。",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string",
+                          "description": "可选聚焦检索词，≤128字"},
+                "days": {"type": "integer", "description": "近N天，1-30",
+                         "default": 7},
+                "count": {"type": "integer", "description": "每类结果数，5-15",
+                          "default": 10}}}}},
+        {"type": "function", "function": {
+            "name": "get_etf_constituents",
+            "description": "获取ETF/LOF成分股（最近年报/中报完整持仓 + 最新"
+                           "季报前10）及权重、现价、当日/5日/20日涨跌、量比，"
+                           "并自动在界面生成统计表。分析ETF时优先调用；可用 "
+                           "code 指定其他ETF，如 510300。",
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "前N大权重，5-50",
+                          "default": 20},
+                "code": {"type": "string",
+                         "description": "可选ETF代码，如 510300"}}}}},
         {"type": "function", "function": {
             "name": "show_table",
             "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"
@@ -16394,8 +17015,7 @@ def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
             "temperature": 0.3,
         }
         payload.update(_ai_thinking_params(thinking, effort))
-        d = _ai_http_json(_ai_chat_url(), payload, api_key, timeout,
-                          session=session)
+        d = _ai_chat_json(payload, api_key, timeout, session=session)
         _ai_usage_add(usage_sink, d.get("usage"))
         try:
             msg = d["choices"][0]["message"]

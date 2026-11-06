@@ -138,24 +138,26 @@ def load_stocks(min_bars=200, with_etf=True):
     v6.1.2：不再排除 ETF；min_bars 默认 200（低于此值无法做训练/验证切分）。
     返回 [(code, rows, industry)]，industry 对 ETF 为 "ETF"（stocks 表内标注）。"""
     with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT code, date, open, high, low, close, vol "
-            "FROM daily_bars ORDER BY code, date"
-        ).fetchall()
+        codes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT code FROM daily_bars").fetchall()]
         ind_of = {c: (i or "") for c, i in
-                  conn.execute("SELECT code, industry FROM stocks")}
-    by = {}
-    for c, d, o, h, l, cl, v in rows:
-        by.setdefault(c, []).append(
-            {"date": d, "open": o, "high": h, "low": l, "close": cl, "vol": v or 0.0}
-        )
+                  conn.execute("SELECT code, industry FROM stocks").fetchall()}
     out = []
-    for c, r in by.items():
-        if len(r) < min_bars:
-            continue
+    MAXB = 1000
+    for c in codes:
         if not with_etf and _is_etf(c):
             continue
-        out.append((c, r, ind_of.get(c, "ETF" if _is_etf(c) else "")))
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close, vol "
+                "FROM daily_bars WHERE code=? ORDER BY date DESC LIMIT ?",
+                (c, MAXB)).fetchall()
+        if len(rows) < min_bars:
+            continue
+        rows = [ {"date": d, "open": o, "high": h, "low": l,
+                  "close": cl, "vol": v or 0.0}
+                 for (d, o, h, l, cl, v) in reversed(rows) ]
+        out.append((c, rows, ind_of.get(c, "ETF" if _is_etf(c) else "")))
     return out
 
 
