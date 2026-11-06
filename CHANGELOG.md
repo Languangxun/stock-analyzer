@@ -5,6 +5,17 @@
 
 ## 版本历史
 
+> **v7.1.0：美股可接 Twelve Data（替代 Yahoo 的免费源，2026-11-06）**：长桥 OpenAPI
+> 需开户实名，改用**免费层只需邮箱注册**的 Twelve Data（Basic：800 次/天、8 次/分钟，
+> 含美股实时行情与日K）。`fetch_market_quote` / `fetch_market_daily` 在美股时先试
+> `_td_quote`（`/quote`，`previous_close`/`percent_change` 齐全）与 `_td_daily`
+> （`/time_series?interval=1day&adjust=splits`，一次最多 5000 根，与 Yahoo 同口径
+> 拆股复权），**未配 key / 限频 / 日额度用尽 / 报错一律静默回落 Yahoo**，不改变原有
+> 行为。key：环境变量 `TWELVE_DATA_API_KEY` 优先，其次 `stock_gui.ini [data]`
+> `twelvedata_key`（`demo` 视为未配置）；`_td_acquire()` 令牌桶守免费层限额
+> （最小间隔 7.6s、日上限 700 次），不阻塞 UI；sm701 副本库仍优先于 TD。
+> `APP_VERSION=7.1.0`，`stock_predict.py` 重新生成。
+
 > **v7.0.9：今日行业面板按市场切换 + 全市场涨跌家数（2026-11-06）**：左侧
 > 「今日行业」在 A股 显示行业涨跌前三，并在底部新增**全市场涨/跌家数**
 > （左绿跌、右红涨 + 比例条，同花顺口径）：新增 `fetch_market_breadth()`

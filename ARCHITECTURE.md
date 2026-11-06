@@ -87,6 +87,7 @@
 - **数据源**：hk/us/fut 优先直读 sm701 副本库行情表（hk_daily/us_daily/fut_daily
   ——训练数据源，特征口径一致；`_sm701_market_bars`），Yahoo chart v8 兜底
   （`_yf_chart`，urllib 走 `_http_get` 继承节流/熔断/离线/代理路由）；crypto 仅 Yahoo；
+  **美股另可选 Twelve Data（v7.1.0）**：配 key 后快照与日K优先走 TD，Yahoo 退为兜底；
 - **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
   > **sm701 直出**（`sm701_paths(market)` 生产集 `prod_{hk|us|fut}_h{1,5,10}_tech.txt`
   + 各市场样本外预测文件；`_sm701_live_one` 副本库同源实时复算）> 多维评分
@@ -194,6 +195,16 @@ AI 找源（AI 只提议 URL，`_probe_kline_url` 实测有数据才采用）。
   仍按今日(T)预测并锚定「今日之前最后一根已收盘日K」，不误标 T+1。盘中若已有
   真实 T 日 bar，`slice_view` 把 T 日预测以同 x 虚线空心叠加在真实 K 上，不再
   额外追加一根（避免视觉上像 T+1）；盘前无真实 bar 才单独画 T 日幽灵。
+
+**美股可选源 Twelve Data（v7.1.0）**：长桥 OpenAPI 需开户实名，故改用免费层只需邮箱注册的
+Twelve Data（`https://api.twelvedata.com`，Basic：800 次/天、8 次/分钟，含美股实时行情与日K）。
+`fetch_market_quote` / `fetch_market_daily` 在 `_market_of(full)=="us"` 时先试 `_td_quote` /
+`_td_daily`（`/quote`、`/time_series?interval=1day&adjust=splits`，一次最多 5000 根，与 Yahoo
+同口径拆股复权），未配 key / 限频 / 日额度用尽 / 报错一律**静默回落 Yahoo**，行为与旧版一致。
+key 读取顺序：环境变量 `TWELVE_DATA_API_KEY` → `stock_gui.ini [data] twelvedata_key`（`demo` 视为
+未配置）。免费层限频/额度由 `_td_acquire()` 令牌桶守卫（最小间隔 7.6s、日上限 700 次），
+不阻塞 UI；实际来源记入 `stock_fetch.log`（`多市场入库 … 源=twelvedata|yahoo`）。
+注意：sm701 副本库仍优先于 TD（同源训练口径不变），TD 替换的是原来的 Yahoo 兜底位置。
 
 ### 2.2 SQLite 缓存（`stock_cache.db`）
 
@@ -1157,6 +1168,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.1.0**<br>（2026-11-06） | **美股可选源 Twelve Data**：长桥需实名，改接免费层只需邮箱注册的 Twelve Data（Basic 800 次/天、8 次/分，含美股实时行情+日K）；`fetch_market_quote`/`fetch_market_daily` 美股先试 `_td_quote`/`_td_daily`（`/quote`、`/time_series adjust=splits`，≤5000 根），未配 key/限频/超额/报错静默回落 Yahoo；key 取环境变量 `TWELVE_DATA_API_KEY` 或 `[data] twelvedata_key`；`_td_acquire()` 令牌桶守频（7.6s/次、700 次/天）不阻塞 UI；sm701 副本库仍优先；`APP_VERSION=7.1.0`，2.0/2.1 节与 CHANGELOG 同步 |
 | **v7.0.9**<br>（2026-11-06） | **今日行业面板按市场切换 + 全市场涨跌家数**：A股 底部新增全市场涨/跌/平家数（`fetch_market_breadth()` 汇总东财 ulist.np 上证指数/深证综指/北证50 的 f104/f105/f106，60s 缓存+四域轮换+熔断回退），渲染左绿跌/右红涨+比例条；hk/us/futures/crypto 改显该市场指数（`market_index_rows()`：美股 QQQ/SPY/DIA/IWM 等），标题切「今日指数」、切换即时刷新；修正多市场昨收口径（`chartPreviousClose`→上一交易日收盘，QQQ 曾 -9.5%）并补港股指数 Yahoo 符号映射；`APP_VERSION=7.0.9`，2.1 节与 README/CHANGELOG 同步 |
 | **v7.0.7**<br>（2026-11-06） | **左侧自选池按最长行自动加宽**：`tkfont.measure()` 量最长「代码 名称 涨幅」，列宽=文字+24、栏宽=列宽+18，随内容增减（下限184/上限屏宽18%）；159516 半导体设备ETF国泰 不再截断；`APP_VERSION=7.0.7`，2.1 节与 README/CHANGELOG 同步 |
 | **v7.0.6**<br>（2026-11-06） | **左侧自选池实时涨幅/红绿**：`tk.Listbox`→`Watch.Treeview`（字号 8/行高 19），行「代码 名称 涨跌幅」，涨红跌绿；`_refresh_names()` 批量取快照名称/现价/涨幅并接入 30s `_index_loop`；重绘保留选中/滚动；池宽下限 184px；`APP_VERSION=7.0.6`，2.1 节与 README/CHANGELOG 同步 |

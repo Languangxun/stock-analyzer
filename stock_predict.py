@@ -126,7 +126,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.9"
+APP_VERSION = "7.1.0"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -5623,17 +5623,155 @@ def _yf_rows(j, interval):
     return out
 
 
+# ---------------- Twelve Data：美股可选源（免费层邮箱注册即可，无需实名） -------------
+# 免费层 Basic：800 次/天、8 次/分钟，含美股实时行情与日K；未配置 key 时
+# 一切照旧走 Yahoo（零影响）。key 来源：环境变量 TWELVE_DATA_API_KEY 优先，
+# 其次 stock_gui.ini [data] twelvedata_key。
+_TD_BASE = "https://api.twelvedata.com"
+_TD_MIN_INTERVAL = 7.6        # 免费层 8 次/分钟，留一点余量
+_TD_DAY_CAP = 700             # 免费层 800 次/天，余下的留给手动调试
+_TD_STATE = {"day": "", "used": 0, "last": 0.0}
+_TD_LOCK = threading.Lock()
+_TD_KEY_CACHE = {"ts": 0.0, "key": ""}
+_MKT_DAILY_SRC = {"src": "yahoo"}     # 最近一次多市场日K实际来源（日志用）
+
+
+def _td_key():
+    """Twelve Data API key（60 秒缓存）；空串＝未配置，美股走 Yahoo。"""
+    now = time.time()
+    if _TD_KEY_CACHE["key"] and now - _TD_KEY_CACHE["ts"] < 60:
+        return _TD_KEY_CACHE["key"]
+    key = (os.environ.get("TWELVE_DATA_API_KEY") or "").strip()
+    if not key:
+        try:
+            cp = configparser.ConfigParser()
+            cp.read(INI_PATH, encoding="utf-8")
+            key = (cp.get("data", "twelvedata_key", fallback="") or "").strip()
+        except Exception:
+            key = ""
+    if key.lower() in ("", "none", "your_key", "demo"):
+        key = ""             # demo 只覆盖 AAPL/MSFT 等，当未配置处理
+    _TD_KEY_CACHE.update(ts=now, key=key)
+    return key
+
+
+def _td_acquire():
+    """免费层限频/日额度闸门：不满足返回 False，调用方回落 Yahoo（不阻塞）。"""
+    day = time.strftime("%Y-%m-%d")
+    with _TD_LOCK:
+        if _TD_STATE["day"] != day:
+            _TD_STATE.update(day=day, used=0, last=0.0)
+        if _TD_STATE["used"] >= _TD_DAY_CAP:
+            return False
+        now = time.time()
+        if now - _TD_STATE["last"] < _TD_MIN_INTERVAL:
+            return False
+        _TD_STATE.update(last=now, used=_TD_STATE["used"] + 1)
+        return True
+
+
+def _td_get(path, params):
+    """Twelve Data REST（走 _http_get：节流/熔断/代理路由）；异常由上层回落。"""
+    key = _td_key()
+    if not key:
+        raise RuntimeError("twelvedata 未配置 key")
+    if not _td_acquire():
+        raise RuntimeError("twelvedata 限频或日额度已用尽")
+    q = dict(params)
+    q["apikey"] = key
+    url = _TD_BASE + path + "?" + urllib.parse.urlencode(q)
+    j = json.loads(_http_get(url, retries=1, timeout=15,
+                            headers={"Accept": "application/json"},
+                            src_name="twelvedata"))
+    if isinstance(j, dict) and (j.get("status") == "error" or j.get("code")):
+        raise RuntimeError(f"twelvedata: {j.get('message') or j}")
+    return j
+
+
+def _td_daily(sym, n):
+    """Twelve Data 日K → [{date,open,high,low,close,vol}]（升序）。
+
+    adjust=splits 与 Yahoo chart 收盘同口径（拆股复权、不含分红），
+    免费层单次最多 5000 根。"""
+    size = max(500, min(5000, int(n or 5000)))
+    j = _td_get("/time_series", {"symbol": sym, "interval": "1day",
+                                 "outputsize": size, "adjust": "splits"})
+    out = []
+    for v in j.get("values") or []:
+        try:
+            c = float(v.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if c <= 0 or not v.get("datetime"):
+            continue
+        out.append({"date": v["datetime"][:10],
+                    "open": float(v.get("open") or c),
+                    "high": float(v.get("high") or c),
+                    "low": float(v.get("low") or c),
+                    "close": c,
+                    "vol": float(v.get("volume") or 0)})
+    out.sort(key=lambda r: r["date"])
+    return out
+
+
+def _td_quote(sym):
+    """Twelve Data 快照 → 与 fetch_market_quote 同构 dict（无数据返回 {}）。"""
+    q = _td_get("/quote", {"symbol": sym})
+    try:
+        price = float(q.get("close") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0:
+        return {}
+    try:
+        prev = float(q.get("previous_close") or 0)
+    except (TypeError, ValueError):
+        prev = 0.0
+    ts = int(q.get("timestamp") or 0)
+    return {
+        "name": q.get("name") or "",
+        "price": price,
+        "prev_close": prev,
+        "open": float(q.get("open") or price),
+        "high": float(q.get("high") or price),
+        "low": float(q.get("low") or price),
+        "time": (time.strftime("%Y%m%d%H%M%S", time.gmtime(ts)) if ts
+                 else (q.get("datetime") or "").replace("-", "")),
+        "currency": q.get("currency"),
+        "market": "us",
+    }
+
+
 def fetch_market_daily(full, count=None):
-    """多市场日K：Yahoo 1d period=10y（一次拉足，差量入库）。"""
+    """多市场日K：美股配了 Twelve Data key 时优先 TD，其余/失败回落 Yahoo。
+
+    Yahoo 1d period=10y 一次拉足；TD 一次 5000 根，同为拆股复权口径，
+    上层照旧差量入库、整只替换。"""
+    n = int(count or CFG.MAX_FETCH_BARS * 2)
+    if _market_of(full) == "us":
+        try:
+            rows = _td_daily(_market_yf_symbol(full), n)
+            if rows:
+                _MKT_DAILY_SRC["src"] = "twelvedata"
+                return rows[-n:] if n and len(rows) > n else rows
+        except Exception as e:
+            flog.info("twelvedata 日K回落 yahoo %s: %s", full, e)
     yf = _market_yf_symbol(full)
     j = _yf_chart(yf, interval="1d", period="10y")
     rows = _yf_rows(j, "1d")
-    n = int(count or CFG.MAX_FETCH_BARS * 2)
+    _MKT_DAILY_SRC["src"] = "yahoo"
     return rows[-n:] if n and len(rows) > n else rows
 
 
 def fetch_market_quote(full):
-    """多市场快照：Yahoo 5d 日K meta（last/prev_close/OHLC/名称/币种）。"""
+    """多市场快照：美股配了 Twelve Data key 时优先 TD，否则 Yahoo 5d 日K meta。"""
+    if _market_of(full) == "us":
+        try:
+            q = _td_quote(_market_yf_symbol(full))
+            if q:
+                return q
+        except Exception as e:
+            flog.info("twelvedata 快照回落 yahoo %s: %s", full, e)
     yf = _market_yf_symbol(full)
     j = _yf_chart(yf, interval="1d", period="5d")
     rows = _yf_rows(j, "1d")
@@ -5696,8 +5834,8 @@ def _get_daily_market(full, tail=None):
                       if r["date"] < today or _allow_today_bar()
                       and r["date"] == today]
             if not remote:
-                raise RuntimeError("yahoo 空K线")
-            info["src"] = "yahoo"
+                raise RuntimeError("多市场空K线")
+            info["src"] = _MKT_DAILY_SRC["src"]
     except Exception as e:
         _fstat_inc("pull_fail")
         flog.info("多市场拉取失败 %s: %s", full, e)
@@ -5716,8 +5854,9 @@ def _get_daily_market(full, tail=None):
               r["close"], r["vol"]) for r in remote])
         rows = _db_rows(conn, full)
     _fstat_inc("pull_ok")
-    flog.info("多市场入库 %s 源=yahoo %d根 合并后=%d根(末日%s) 耗时=%.0fms",
-              full, len(remote), len(rows), rows[-1]["date"] if rows else "-",
+    flog.info("多市场入库 %s 源=%s %d根 合并后=%d根(末日%s) 耗时=%.0fms",
+              full, info.get("src") or "?", len(remote), len(rows),
+              rows[-1]["date"] if rows else "-",
               (time.time() - t_pull) * 1000)
     return _display_rows(full, rows, tail)
 
