@@ -11028,7 +11028,10 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
 
     # 市场阶段（按行情快照时间）
     phase = market_phase_text(q.get("time"))
-    next_label = ("今日(T)" if (pre_open and not post_close)
+    # 标签必须跟 pred 的实际目标一致：盘前/盘中共用「今日(T)」，
+    # 收盘后/非今日快照才是下一交易日，避免把 T 日预测写成 T+1。
+    next_label = ("今日(T)" if ((pre_open or live is not None)
+                                and not post_close)
                   else ("下一交易日(T+1)" if stale_snap else "次日(T+1)"))
     t_pred_label = ("下一交易日收盘预测"
                     if (stale_snap and not pre_open)
