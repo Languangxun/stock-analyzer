@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.3"
+APP_VERSION = "7.0.4"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -17160,12 +17160,14 @@ class App:
         # 任意位置按下可打印字符 → 自动聚焦搜索框（输入类控件除外）
         root.bind_all("<KeyPress>", self._global_key)
         # 文本区比例：右侧参考面板宽度 / 自选池宽度 / 底部日志行数随屏幕缩放
-        self._rt_chars = 38 if self.compact else max(32, min(56, sw // 45))
-        self._rt_width = max(360, min(540, int(sw * 0.29)))
+        self._rt_chars = 38 if self.compact else max(30, min(44, sw // 50))
+        # 初始值仅作构建期上限；实际宽度由 _rt_fit_width() 按当前面板
+        # 内容自适应（预测参考/AI/盘口/插件各自不同），不再固定占 29% 屏宽。
+        self._rt_width = max(330, min(480, int(sw * 0.24)))
         self._rt_collapsed = False
         self._rt_col = None
         self._rt_handle_btn = None
-        self._wf_width = max(160, min(230, sw // 10))
+        self._wf_width = max(150, min(200, sw // 11))
         self._bottom_lines = (5 if self.compact
                               else max(6, min(12, sh // 130)))
         self.settings = {"theme": "dark", "updown": "red_up",
@@ -17661,6 +17663,17 @@ class App:
             self._build_ai_sidebar(ai)
 
             self._mount_plugins()
+            # 每个面板的"刚好显示完整"宽度（构建后测量一次，切页时直接套用）
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            self._rt_req = {}
+            for _n, _p in self._rt_panels.items():
+                try:
+                    self._rt_req[_n] = max(1, _p.winfo_reqwidth())
+                except Exception:
+                    self._rt_req[_n] = self._rt_width
             if len(self._rt_names) > 1:
                 self._rt_select.config(values=self._rt_names)
                 self._rt_select.pack(side="left", fill="x", expand=True,
@@ -18131,6 +18144,30 @@ class App:
                 self._rt_panels[name] = panel
                 self._rt_names.append(name)
 
+    def _rt_fit_width(self, name=None):
+        """右侧栏按当前面板内容取"刚好显示完整"的宽度，避免固定占屏。"""
+        col = getattr(self, "_rt_col", None)
+        if col is None:
+            return
+        name = name or getattr(self, "_rt_choice", "预测参考")
+        req = (getattr(self, "_rt_req", {}) or {}).get(name)
+        if not req:
+            p = (getattr(self, "_rt_panels", {}) or {}).get(name)
+            try:
+                req = p.winfo_reqwidth() if p is not None else self._rt_width
+            except Exception:
+                req = self._rt_width
+        req = max(1, int(req))
+        sw = self.root.winfo_screenwidth()
+        cap = max(300, min(560, int(sw * 0.34)))
+        # +22：面板内边距 + 滚动条；盘口/预测参考另有内容最小宽度
+        target = max(220, min(cap, req + 22))
+        try:
+            col.config(width=target)
+        except Exception:
+            return
+        self._rt_width = target
+
     def _switch_rt(self, name=None):
         """切换右侧栏显示：预测参考 / 某插件面板。"""
         panels = getattr(self, "_rt_panels", None)
@@ -18157,6 +18194,7 @@ class App:
                 self._w_right.config(text=f" {name} ")
             except Exception:
                 pass
+        self._rt_fit_width(name)
 
     # ---------- 盘口 / 集合竞价侧栏（v7.0.2） ----------
 
@@ -18390,7 +18428,7 @@ class App:
         self._ai_data_nb = ttk.Notebook(self._ai_data_box)
         self._ai_data_nb.pack(fill="x", pady=(2, 0))
         fmin = tk.Frame(self._ai_data_nb, bg=LOG_BG)
-        self._ai_mini_cv = tk.Canvas(fmin, height=80, bg=LOG_BG,
+        self._ai_mini_cv = tk.Canvas(fmin, height=80, width=220, bg=LOG_BG,
                                      highlightthickness=0)
         self._ai_mini_cv.pack(fill="both", expand=True)
         self._ai_mini_cv.bind("<Configure>",
@@ -18405,7 +18443,7 @@ class App:
         cols = ("代码", "名称", "权重", "当日")
         self._ai_etf_tv = ttk.Treeview(fetf, columns=cols, show="headings",
                                        height=3)
-        for c, w in zip(cols, (72, 66, 46, 52)):
+        for c, w in zip(cols, (64, 58, 42, 48)):
             self._ai_etf_tv.heading(c, text=c)
             self._ai_etf_tv.column(c, width=w, anchor="w", stretch=True)
         sb_etf = ttk.Scrollbar(fetf, orient="vertical",
