@@ -126,7 +126,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.2"
+APP_VERSION = "7.0.3"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -7726,7 +7726,11 @@ def market_phase_text(time_str):
         return hm + " 盘前"
     if hhmm < 925:
         return hm + " 集合竞价"
-    if hhmm < 1130 or 1300 <= hhmm < 1500:
+    if hhmm < 930:
+        return hm + " 集合竞价撮合（待开盘）"
+    if 1457 <= hhmm < 1500:
+        return hm + " 收盘集合竞价"
+    if hhmm < 1130 or 1300 <= hhmm < 1457:
         return hm + " 盘中交易"
     if hhmm < 1300:
         return hm + " 午间休市"
@@ -10874,8 +10878,9 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         hhmm = int(snap_full[8:12])
     except ValueError:
         hhmm = 0
-    # 盘中 live 仅限交易时段（9:25~15:00）；盘后不再伪装盘中
-    if (snap_d == today_compact and q["price"] > 0 and 925 <= hhmm < 1500):
+    # 盘中 live 仅限连续竞价（9:30~15:00）；9:15~9:30 集合竞价/撮合阶段
+    # 没有真实日K，不能再合成 T 日 bar（否则 T 日 K 提前上色，预测错位一天）
+    if (snap_d == today_compact and q["price"] > 0 and 930 <= hhmm < 1500):
         pc0 = q["prev_close"] or (rows[-1]["close"] if rows else 0)
         lo0 = q["low"] if q["low"] > 0 else min(q["price"], q["open"] or q["price"])
         live = {"date": today_str, "open": q["open"] or pc0,
@@ -10981,13 +10986,26 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         sims.append((score, i))
     top = heapq.nsmallest(CFG.CANDIDATE_TOPK, sims, key=lambda x: x[0])
 
-    prev_close = q["prev_close"] or closes_m[-1]
+    # 昨收必须取"今日之前最后一根已收盘日K"：个股快照偶尔滞后到上一交易日，
+    # 此时 q["prev_close"] 是再前一日收盘，直接锚定会把预测整体错一天。
+    if rows and rows[-1]["date"] < today_str:
+        prev_close = rows[-1]["close"]
+    else:
+        prev_close = (q["prev_close"]
+                      or (rows[-2]["close"] if len(rows) > 1
+                          else closes_m[-1]))
     # 盘前检测：快照日期已切到今日，但日K还没有今日bar → 尚未开盘，
-    # 无今开可锚，改锚昨收（否则会把上一交易日的开价误当"今开"）
+    # 无今开可锚，改锚昨收（否则会把上一交易日的开价误当"今开"）。
+    # 个股快照可能仍停在上一交易日：若指数快照表明今日为交易日且未收盘，
+    # 仍按"今日 T 日"处理，避免把 T 日预测标成 T+1。
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
+    now_hm = time.strftime("%H%M")
+    stale_today = (bool(snap_d) and snap_d < today_compact
+                   and now_hm < "1500"
+                   and _today_is_session() is not False)
     pre_open = (not had_today_bar and not post_close
-                and snap_d >= today_compact)
+                and (snap_d >= today_compact or stale_today))
     stale_snap = bool(snap_d) and snap_d < today_compact
     if post_close:
         o_today = q["price"] or prev_close
@@ -11012,7 +11030,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     phase = market_phase_text(q.get("time"))
     next_label = ("今日(T)" if (pre_open and not post_close)
                   else ("下一交易日(T+1)" if stale_snap else "次日(T+1)"))
-    t_pred_label = ("下一交易日收盘预测" if stale_snap
+    t_pred_label = ("下一交易日收盘预测"
+                    if (stale_snap and not pre_open)
                     else "今日(T)收盘预测")
 
     samples = []

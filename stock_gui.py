@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.2"
+APP_VERSION = "7.0.3"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -7712,7 +7712,11 @@ def market_phase_text(time_str):
         return hm + " 盘前"
     if hhmm < 925:
         return hm + " 集合竞价"
-    if hhmm < 1130 or 1300 <= hhmm < 1500:
+    if hhmm < 930:
+        return hm + " 集合竞价撮合（待开盘）"
+    if 1457 <= hhmm < 1500:
+        return hm + " 收盘集合竞价"
+    if hhmm < 1130 or 1300 <= hhmm < 1457:
         return hm + " 盘中交易"
     if hhmm < 1300:
         return hm + " 午间休市"
@@ -10860,8 +10864,9 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         hhmm = int(snap_full[8:12])
     except ValueError:
         hhmm = 0
-    # 盘中 live 仅限交易时段（9:25~15:00）；盘后不再伪装盘中
-    if (snap_d == today_compact and q["price"] > 0 and 925 <= hhmm < 1500):
+    # 盘中 live 仅限连续竞价（9:30~15:00）；9:15~9:30 集合竞价/撮合阶段
+    # 没有真实日K，不能再合成 T 日 bar（否则 T 日 K 提前上色，预测错位一天）
+    if (snap_d == today_compact and q["price"] > 0 and 930 <= hhmm < 1500):
         pc0 = q["prev_close"] or (rows[-1]["close"] if rows else 0)
         lo0 = q["low"] if q["low"] > 0 else min(q["price"], q["open"] or q["price"])
         live = {"date": today_str, "open": q["open"] or pc0,
@@ -10967,13 +10972,26 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         sims.append((score, i))
     top = heapq.nsmallest(CFG.CANDIDATE_TOPK, sims, key=lambda x: x[0])
 
-    prev_close = q["prev_close"] or closes_m[-1]
+    # 昨收必须取"今日之前最后一根已收盘日K"：个股快照偶尔滞后到上一交易日，
+    # 此时 q["prev_close"] 是再前一日收盘，直接锚定会把预测整体错一天。
+    if rows and rows[-1]["date"] < today_str:
+        prev_close = rows[-1]["close"]
+    else:
+        prev_close = (q["prev_close"]
+                      or (rows[-2]["close"] if len(rows) > 1
+                          else closes_m[-1]))
     # 盘前检测：快照日期已切到今日，但日K还没有今日bar → 尚未开盘，
-    # 无今开可锚，改锚昨收（否则会把上一交易日的开价误当"今开"）
+    # 无今开可锚，改锚昨收（否则会把上一交易日的开价误当"今开"）。
+    # 个股快照可能仍停在上一交易日：若指数快照表明今日为交易日且未收盘，
+    # 仍按"今日 T 日"处理，避免把 T 日预测标成 T+1。
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
+    now_hm = time.strftime("%H%M")
+    stale_today = (bool(snap_d) and snap_d < today_compact
+                   and now_hm < "1500"
+                   and _today_is_session() is not False)
     pre_open = (not had_today_bar and not post_close
-                and snap_d >= today_compact)
+                and (snap_d >= today_compact or stale_today))
     stale_snap = bool(snap_d) and snap_d < today_compact
     if post_close:
         o_today = q["price"] or prev_close
@@ -10998,7 +11016,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     phase = market_phase_text(q.get("time"))
     next_label = ("今日(T)" if (pre_open and not post_close)
                   else ("下一交易日(T+1)" if stale_snap else "次日(T+1)"))
-    t_pred_label = ("下一交易日收盘预测" if stale_snap
+    t_pred_label = ("下一交易日收盘预测"
+                    if (stale_snap and not pre_open)
                     else "今日(T)收盘预测")
 
     samples = []
@@ -15570,14 +15589,24 @@ def slice_view(res, show_n, pan=0):
     # 翻看历史（pan>0）时整体隐藏，避免预测悬浮在历史区间中间。
     at_latest = end >= n_total
     ghosts = [g for g in (res.get("ghosts") or []) if g] if at_latest else []
-    extras = ([res["pred"]] + ghosts) if at_latest else []
-    extra_dates = (["T+1" if pd.startswith("T+") else "T日"]
-                   + [g["date"] for g in ghosts]) if at_latest else []
+    # 盘中已有真实 T 日 bar 时，T 日预测不再另起一根（否则视觉上像 T+1），
+    # 改为叠加在最后一根真实 K 上；盘前没有 T 日 bar 才单独画 T 日幽灵。
+    overlay_t = bool(at_latest and res.get("has_live")
+                     and pd == "T日预测")
+    extras = (([res["pred"]] if not overlay_t else []) + ghosts) \
+        if at_latest else []
+    extra_dates = []
+    if at_latest:
+        if not overlay_t:
+            extra_dates.append("T+1" if pd.startswith("T+") else "T日")
+        extra_dates += [g["date"] for g in ghosts]
     view = {
         "bars": vis + extras,
         "dates": [r["date"] for r in vis] + extra_dates,
         "off": off,
         "at_latest": at_latest,
+        "tday_pred": (res.get("tpred_bar") or res.get("pred"))
+        if overlay_t else None,
         "tpred": res.get("tpred_bar") if at_latest else None,
         "chips": res.get("chips"),
         "phase": (res.get("phase", "")
@@ -21916,6 +21945,28 @@ class App:
                 by2 = ty + 1
             cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
                                 fill=color, outline=color)
+
+        # 盘中 T 日预测：叠加在最后一根真实 T 日 K 上（同 x，虚线空心），
+        # 不再单独占下一格，避免被误读成 T+1。
+        td = v.get("tday_pred")
+        if td:
+            i_live = len(bars) - 1 - int(v.get("ghost_n", 0))
+            if 0 <= i_live < len(bars):
+                x = xs(i_live)
+                yo, yc = ymap(td["open"]), ymap(td["close"])
+                bw2 = max(g["bw"] * 0.78, 2)
+                ty, by2 = min(yo, yc), max(yo, yc)
+                if by2 - ty < 1.5:
+                    by2 = ty + 1.5
+                cv.create_line(x, ymap(td["high"]), x, ty,
+                               fill=TPRED_C, dash=(3, 2))
+                cv.create_line(x, by2, x, ymap(td["low"]),
+                               fill=TPRED_C, dash=(3, 2))
+                cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
+                                    fill="", outline=TPRED_C, dash=(4, 3))
+                cv.create_text(x, max(ty - 9, g["T"] + 6), text="T日",
+                               fill=TPRED_C,
+                               font=("Consolas", 7, "bold"))
 
         # 预测区分隔线：只在视野到达最新K线时出现（翻看历史时随幽灵K线隐藏）
         if v.get("at_latest", True) and 0 < n_real < len(bars):
