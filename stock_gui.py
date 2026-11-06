@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.5"
+APP_VERSION = "7.0.6"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -17167,13 +17167,16 @@ class App:
         self._rt_collapsed = False
         self._rt_col = None
         self._rt_handle_btn = None
-        self._wf_width = max(150, min(200, sw // 11))
+        # 自选池要显示「代码 + 名称 + 涨幅」，下限略抬到 184px
+        self._wf_width = max(184, min(210, sw // 10))
         self._bottom_lines = (5 if self.compact
                               else max(6, min(12, sh // 130)))
         self.settings = {"theme": "dark", "updown": "red_up",
                        "ma_colors": {}, "boll_colors": {}, "ind_w": 1}
         self.api_key = ""
         self._watchlists = {}       # v6.6.5：自选池按市场分开 {market: [codes]}
+        self._wl_quotes = {}         # 自选池实时快照（名称/现价/涨幅）
+        self._wl_busy = False
         self.ai_text = ""
         self.idx_data = {}
         self._prog_running = False
@@ -17372,6 +17375,17 @@ class App:
                   foreground=[("selected", FG_MAIN)])
         style.map("Treeview.Heading",
                   background=[("active", BTN_HOVER)])
+        # 左侧自选池：紧凑单列，行高/字号压小以塞下代码+名称+涨幅
+        style.configure("Watch.Treeview", background=PANEL_BG,
+                        foreground=FG_MAIN, fieldbackground=PANEL_BG,
+                        bordercolor=PANEL_BG, lightcolor=PANEL_BG,
+                        darkcolor=PANEL_BG, borderwidth=0, rowheight=19,
+                        font=("Consolas", 8))
+        style.layout("Watch.Treeview",
+                     [("Treeview.treearea", {"sticky": "nswe"})])
+        style.map("Watch.Treeview",
+                  background=[("selected", SEL_BG)],
+                  foreground=[("selected", FG_MAIN)])
         # 单选/复选：clam 主题悬停时背景默认近白(#eeebe7)，导致整块按钮变白、
         # 白字不可见。这里显式映射 active/selected/disabled，随主题换色。
         for _sub in ("TRadiobutton", "TCheckbutton"):
@@ -17698,13 +17712,11 @@ class App:
             self._wf_content = tk.Frame(wf, bg=DARK_BG)
             self._wf_content.pack(fill="both", expand=True)
 
-            self.watch_list = tk.Listbox(self._wf_content, width=12,
-                                         font=("Consolas", 9),
-                                         exportselection=False, bg=PANEL_BG,
-                                         fg=FG_MAIN, selectbackground=SEL_BG,
-                                         selectforeground=FG_MAIN,
-                                         activestyle="none", relief="flat",
-                                         highlightthickness=0, borderwidth=0)
+            self.watch_list = ttk.Treeview(
+                self._wf_content, show="tree", selectmode="browse",
+                style="Watch.Treeview")
+            self.watch_list.column("#0", width=max(120, self._wf_width - 18),
+                                   stretch=True)
             self.watch_list.pack(fill="both", expand=True)
             self.watch_list.bind("<Double-Button-1>", self._on_pick)
             bf = ttk.Frame(self._wf_content)
@@ -23042,10 +23054,50 @@ class App:
     def _render_watchlist(self):
         if getattr(self, "compact", False) or not hasattr(self, "watch_list"):
             return                  # 小屏无自选池面板
-        self.watch_list.delete(0, "end")
+        try:
+            sel = self.watch_list.selection()
+        except Exception:
+            sel = ()
+        try:
+            yf = self.watch_list.yview()[0]
+        except Exception:
+            yf = 0.0
+        try:
+            self.watch_list.delete(*self.watch_list.get_children())
+        except TypeError:           # 兼容旧 tk.Listbox（理论上不会走到）
+            self.watch_list.delete(0, "end")
+        self.watch_list.tag_configure("up", foreground=UP)
+        self.watch_list.tag_configure("down", foreground=DOWN)
+        self.watch_list.tag_configure("flat", foreground=AXIS_TXT)
+        quotes = getattr(self, "_wl_quotes", {}) or {}
         for c in self.watchlist:
-            name = getattr(self, "_names", {}).get(c, "")
-            self.watch_list.insert("end", f"{c} {name}")
+            q = quotes.get(c) or {}
+            name = q.get("name") or getattr(self, "_names", {}).get(c, "")
+            chg = q.get("chg")
+            if chg is None:
+                px, prev = q.get("price"), q.get("prev_close")
+                if px and prev:
+                    chg = (px / prev - 1) * 100
+            if chg is None:
+                txt = f"{c} {name} -".rstrip()
+                tag = "flat"
+            else:
+                txt = f"{c} {name} {chg:+.2f}%".rstrip()
+                tag = "up" if chg >= 0 else "down"
+            try:
+                self.watch_list.insert("", "end", iid=c, text=txt,
+                                       tags=(tag,))
+            except Exception:
+                # iid 冲突（历史脏数据重复代码）时退回自动 iid
+                self.watch_list.insert("", "end", text=txt, tags=(tag,))
+        try:
+            for c in sel:
+                if self.watch_list.exists(c):
+                    self.watch_list.selection_set(c)
+                    break
+            self.watch_list.yview_moveto(yf)
+        except Exception:
+            pass
 
     def add_watch(self):
         raw = self.code_var.get()
@@ -23068,36 +23120,44 @@ class App:
         self._refresh_names()
 
     def del_watch(self):
-        sel = self.watch_list.curselection()
+        sel = self.watch_list.selection()
         if not sel:
             messagebox.showinfo("提示", "请先在列表中选中一项")
             return
-        real = self.watch_list.get(sel[0]).split()[0]
+        real = sel[0]
         if real in self.watchlist:
             self.watchlist.remove(real)
             self._save_ini()
             self._render_watchlist()
 
-    def _on_pick(self, _event):
-        sel = self.watch_list.curselection()
+    def _on_pick(self, event=None):
+        row = self.watch_list.identify_row(event.y) if event is not None else ""
+        sel = (row,) if row else self.watch_list.selection()
         if not sel:
             return
-        code = self.watchlist[sel[0]].split()[0]
+        code = sel[0]
         self.code_var.set(code)
         self.run()
 
     def _refresh_names(self):
-        """批量拉自选池名称后刷新列表。"""
+        """批量拉自选池名称/现价/涨幅后刷新列表（红涨绿跌）。"""
         if not self.watchlist:
             self._render_watchlist()
             return
+        if getattr(self, "_wl_busy", False):
+            return
+        self._wl_busy = True
 
         def fn():
-            return {c: v["name"] for c, v in
-                    fetch_batch_quotes(self.watchlist).items()}
+            return fetch_batch_quotes(self.watchlist)
 
-        def done(names, err):
-            if err is None:
+        def done(data, err):
+            self._wl_busy = False
+            if err is None and data:
+                self._wl_quotes.update(data)
+                names = dict(getattr(self, "_names", {}))
+                for c, q in data.items():
+                    names[c] = ((q or {}).get("name") or names.get(c, ""))
                 self._names = names
             self._render_watchlist()
         self._run_bg(fn, done)
@@ -23138,6 +23198,8 @@ class App:
         self._update_indices()
         if not getattr(self, "compact", False):
             self._update_sectors()      # 小屏无行业面板
+            if self.watchlist:
+                self._refresh_names()   # 自选池实时涨幅（30s 同指数刷新）
         self._safe_after(30000, self._index_loop)
 
     def _update_sectors(self):
