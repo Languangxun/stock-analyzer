@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.4"
+APP_VERSION = "7.0.5"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -18850,7 +18850,7 @@ class App:
         for i, p in enumerate(prices):
             pts.extend((x(i), y(p)))
         if len(pts) >= 4:
-            cv.create_line(*pts, fill=ACCENT, width=1)
+            cv.create_line(*pts, fill=TPRED_C, width=1)
         if avgs:
             pts = []
             for i, p in enumerate(avgs):
@@ -21319,7 +21319,8 @@ class App:
         for i, p in enumerate(prices):
             pts.extend((xm(i), ym(p)))
         if len(pts) >= 4:
-            cv.create_line(*pts, fill=ACCENT, width=1,
+            # 分时价格线用白色（亮色主题自动转黑），与黄色虚线均价线区分
+            cv.create_line(*pts, fill=TPRED_C, width=1,
                            joinstyle="round")
         if avgs:
             pts = []
