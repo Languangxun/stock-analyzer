@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.8"
+APP_VERSION = "7.0.9"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -4531,6 +4531,96 @@ def fetch_top_sectors():
     return _TOP_SECTORS_LAST
 
 
+# ---------------- 全市场涨跌家数 + 分市场指数（今日行业面板用） ----------------
+
+_MARKET_BREADTH_CACHE = None    # (ts, (up, down, flat))
+_MARKET_BREADTH_TTL = 60.0
+_MARKET_BREADTH_LOCK = threading.Lock()
+
+# 各市场「今日行业」位置展示的指数（项目前缀口径；美股含 QQQ/SPY/DIA/IWM）
+_MARKET_INDEX_PANELS = {
+    "us": [("usQQQ", "纳指100"), ("usSPY", "标普500"),
+           ("usDIA", "道琼斯"), ("usIWM", "罗素2000")],
+    "hk": [("hkHSI", "恒生指数"), ("hkHSCEI", "国企指数")],
+    "futures": [("fuES", "标普500期货"), ("fuNQ", "纳指100期货"),
+                ("fuYM", "道指期货"), ("fuGC", "黄金"), ("fuCL", "原油")],
+    "crypto": [("cryptoBTCUSDT", "比特币"), ("cryptoETHUSDT", "以太坊"),
+               ("cryptoSOLUSDT", "Solana")],
+}
+
+
+def fetch_market_breadth():
+    """A股全市场涨/跌/平家数（沪+深+北合计），供涨跌家数条使用。
+
+    东财 ulist.np 的 f104/f105/f106 即指数覆盖个股的涨/跌/平家数：
+    上证指数覆盖沪市全部、深证综指覆盖深市全部、北证50 覆盖北交所，
+    三者相加＝全市场口径（同花顺/东财首页「涨跌家数」口径）。
+    60 秒缓存；东财熔断期或请求失败返回上次结果，无结果返回 None。
+    """
+    global _MARKET_BREADTH_CACHE
+    now = time.time()
+    with _MARKET_BREADTH_LOCK:
+        hit = _MARKET_BREADTH_CACHE
+    if hit and now - hit[0] < _MARKET_BREADTH_TTL:
+        return hit[1]
+    if not _cb_ok("东财板块"):
+        return hit[1] if hit else None
+    UT = "fa5fd1943c7b386f172d6893dbfba10b"
+    hdr = {"User-Agent": "Mozilla/5.0",
+           "Referer": "https://quote.eastmoney.com/"}
+    u = ("/api/qt/ulist.np/get?fltt=2&invt=2"
+         "&fields=f12,f104,f105,f106&secids=1.000001,0.399106,0.899050"
+         f"&ut={UT}")
+    for host in ("https://push2delay.eastmoney.com",
+                 "https://push2.eastmoney.com",
+                 "http://push2delay.eastmoney.com",
+                 "http://push2.eastmoney.com"):
+        try:
+            data = json.loads(_http_get(host + u, retries=2, timeout=8,
+                                        headers=dict(hdr),
+                                        src_name="东财板块"))
+            diff = (data.get("data") or {}).get("diff") or []
+            if isinstance(diff, dict):
+                diff = list(diff.values())
+            up = sum(int(v.get("f104") or 0) for v in diff)
+            down = sum(int(v.get("f105") or 0) for v in diff)
+            flat = sum(int(v.get("f106") or 0) for v in diff)
+            if up or down:
+                res = (up, down, flat)
+                with _MARKET_BREADTH_LOCK:
+                    _MARKET_BREADTH_CACHE = (now, res)
+                return res
+        except Exception as e:
+            log.debug("涨跌家数 %s 失败: %s", host, e)
+            continue
+    return hit[1] if hit else None
+
+
+def market_index_rows(market):
+    """某市场主要指数快照 → [(名称, 现价, 涨跌%)]，缺失项为 None。
+
+    us 含 QQQ（纳指100）/SPY（标普500）/DIA（道指）/IWM（罗素2000）；
+    统一走 fetch_batch_quotes → Yahoo 多市场链路（带缓存与降级）。
+    """
+    items = _MARKET_INDEX_PANELS.get(market) or []
+    if not items:
+        return []
+    data = fetch_batch_quotes([c for c, _ in items], ttl=60) or {}
+    rows = []
+    for code, name in items:
+        q = data.get(code) or {}
+        px = q.get("price")
+        prev = q.get("prev_close")
+        chg = None
+        try:
+            if px is not None and prev:
+                chg = (float(px) / float(prev) - 1) * 100
+        except (TypeError, ValueError):
+            chg = None
+        rows.append((name, float(px) if px is not None else None, chg))
+    return rows
+
+
 def fetch_sector_context(full):
     """个股所属行业板块指数上下文。
 
@@ -5313,6 +5403,9 @@ def _market_yf_symbol(full):
     mk = _market_of(s)
     body = s[2:] if mk != "crypto" else s[6:]
     if mk == "hk":
+        if body in ("hsi", "hscei", "hstech"):
+            return {"hsi": "^HSI", "hscei": "^HSCE",
+                    "hstech": "^HSTECH"}[body]
         digits = body.lstrip("0") or "0"
         return digits.zfill(4) + ".HK"
     if mk == "us":
@@ -5535,12 +5628,15 @@ def fetch_market_quote(full):
     meta = ((j.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
     last_row = rows[-1]
     prev = 0.0
-    try:
-        prev = float(meta.get("chartPreviousClose") or 0)
-    except (TypeError, ValueError):
-        prev = 0.0
-    if not prev and len(rows) > 1:
+    # 上一交易日收盘优先（meta.chartPreviousClose 是 5 日窗口起点前的收盘，
+    # 直接当昨收会把日涨跌算成多日累计）
+    if len(rows) > 1:
         prev = rows[-2]["close"]
+    if not prev:
+        try:
+            prev = float(meta.get("chartPreviousClose") or 0)
+        except (TypeError, ValueError):
+            prev = 0.0
     if not prev:
         prev = last_row["open"] or last_row["close"]
     ts = int(meta.get("regularMarketTime") or 0)
@@ -17729,6 +17825,7 @@ class App:
 
             sf = ttk.LabelFrame(self._wf_content, text=" 今日行业 ", padding=2)
             sf.pack(fill="both", expand=True, pady=(6, 0))
+            self.sector_frame = sf
             self.sector_txt = tk.Text(sf, height=8, wrap="word",
                                       font=("Consolas", 9),
                                       bg=PANEL_BG, fg=FG_MAIN, relief="flat",
@@ -21135,6 +21232,8 @@ class App:
                 pass
         self._render_watchlist()
         self._refresh_names()
+        if not getattr(self, "compact", False):
+            self._update_sectors()   # 切换市场立即换面板内容
 
     def _auto_switch_market(self, full):
         """run() 时检测代码所属市场 ≠ 当前模式 → 自动切换（v7.0.1）。"""
@@ -23240,33 +23339,104 @@ class App:
         self._safe_after(30000, self._index_loop)
 
     def _update_sectors(self):
-        def fn():
-            return fetch_top_sectors()
+        market = _CUR_MARKET[0] if _CUR_MARKET[0] in _MARKET_LABELS else "cn"
 
-        def done(result, err):
+        def fn():
+            # A股：行业板块涨跌前三 + 全市场涨/跌家数（面板底部）
+            # 其他市场：该市场主要指数（美股含 QQQ/SPY/DIA/IWM）
+            if market == "cn":
+                try:
+                    sectors = fetch_top_sectors()
+                except Exception:
+                    sectors = ([], [])
+                try:
+                    breadth = fetch_market_breadth()
+                except Exception:
+                    breadth = None
+                return {"market": "cn", "sectors": sectors, "breadth": breadth}
+            return {"market": market, "rows": market_index_rows(market)}
+
+        def done(payload, err):
             if getattr(self, "compact", False):
                 return              # 小屏无行业面板
-            top3, bot3 = result or ([], [])
             st = self.sector_txt
+            st.tag_config("up", foreground=UP)      # 涨：红
+            st.tag_config("dn", foreground=DOWN)    # 跌：绿
             st.config(state="normal")
             st.delete("1.0", "end")
-            if not top3 and not bot3:
+            mk = (payload or {}).get("market") or "cn"
+            frame = getattr(self, "sector_frame", None)
+            if frame is not None:
+                frame.config(text=" 今日指数 " if mk != "cn" else " 今日行业 ")
+            if err or not payload:
                 st.insert("end", "  暂无数据")
+                st.config(state="disabled")
+                return
+            if mk == "cn":
+                top3, bot3 = payload.get("sectors") or ([], [])
+                if top3:
+                    st.insert("end", "  涨幅前三\n")
+                    for name, pct in top3:
+                        tag = "up" if pct >= 0 else "dn"
+                        st.insert("end", f"    {name:<8}", (tag,))
+                        st.insert("end", f" {pct:+.2f}%\n", (tag,))
+                if bot3:
+                    st.insert("end", "  跌幅前三\n")
+                    for name, pct in bot3:
+                        tag = "up" if pct >= 0 else "dn"
+                        st.insert("end", f"    {name:<8}", (tag,))
+                        st.insert("end", f" {pct:+.2f}%\n", (tag,))
+                if not top3 and not bot3:
+                    st.insert("end", "  暂无数据\n")
+                self._render_breadth(st, payload.get("breadth"))
             else:
-                st.insert("end", "  涨幅前三\n")
-                for name, pct in top3:
-                    tag = "g" if pct >= 0 else "r"
-                    st.insert("end", f"    {name:<8}", (tag,))
-                    st.insert("end", f" {pct:+.2f}%\n", (tag,))
-                st.insert("end", "\n  跌幅前三\n")
-                for name, pct in bot3:
-                    tag = "g" if pct >= 0 else "r"
-                    st.insert("end", f"    {name:<8}", (tag,))
-                    st.insert("end", f" {pct:+.2f}%\n", (tag,))
-            st.tag_config("g", foreground=UP)
-            st.tag_config("r", foreground=DOWN)
+                rows = payload.get("rows") or []
+                if not rows:
+                    st.insert("end", "  暂无数据")
+                for name, px, chg in rows:
+                    st.insert("end", f"    {name:<9}")
+                    if px is None:              # 该指数本轮取不到（无缓存/断网）
+                        st.insert("end", "        -\n")
+                        continue
+                    tag = "up" if (chg or 0) >= 0 else "dn"
+                    st.insert("end", f"{px:>9.2f}", (tag,))
+                    st.insert("end",
+                              (f" {chg:+.2f}%\n" if chg is not None
+                               else "     -\n"), (tag,))
             st.config(state="disabled")
         self._run_bg(fn, done)
+
+    def _render_breadth(self, st, breadth):
+        """面板底部：全市场涨跌家数 + 比例条（左跌绿 / 右涨红，同花顺口径）。"""
+        if not breadth:
+            return
+        up, down, _flat = breadth
+        st.insert("end", "\n")
+        left, right = f"跌{down}", f"涨{up}"
+        pad = max(2, 22 - len(left) - len(right))
+        st.insert("end", left, ("dn",))
+        st.insert("end", " " * pad + right, ("up",))
+        st.insert("end", "\n")
+        total = up + down
+        if total <= 0:
+            return
+        # 条宽跟着面板实际宽度走（Consolas 9 ≈ 7px/字），避免换行折断
+        try:
+            avail = int(st.winfo_width() / 7) - 2
+        except Exception:
+            avail = 26
+        width = max(12, min(30, avail))
+        if down <= 0:
+            n_down = 0
+        elif up <= 0:
+            n_down = width
+        else:
+            n_down = max(1, min(width - 1,
+                                int(round(width * down / float(total)))))
+        if n_down:
+            st.insert("end", "█" * n_down, ("dn",))
+        if width - n_down:
+            st.insert("end", "█" * (width - n_down), ("up",))
 
     def copy_report(self):
         if not self.res:

@@ -118,6 +118,20 @@
 `_render_watchlist()` 用 `tkfont.measure()` 量最长行，列宽=文字宽+24、栏宽=列宽+18，
 随自选池内容增减（下限 184、上限屏宽 18%），长 ETF 名称不再截断。
 
+**左侧「今日行业」面板（v7.0.9）**：随市场模式换内容——A股 显示行业涨跌前三
+（`fetch_top_sectors`，东财 clist 板块 `fs=m:90+t:2` 三页 + 腾讯/akshare 兜底、10 分钟缓存）
+并在底部追加 **全市场涨/跌/平家数**：`fetch_market_breadth()` 汇总东财
+`ulist.np` 的 `f104/f105/f106`（上证指数=沪市全部、深证综指=深市全部、北证50=北交所，
+三者相加即全市场口径），60s 缓存、四域轮换、东财熔断期回退上次结果；渲染为
+「左绿跌 / 右红涨 + 比例条」（`_render_breadth`，标签 `dn`/`up` 用 DOWN/UP 色）。
+非 A股（hk/us/futures/crypto）改为 `market_index_rows()`：走 `fetch_batch_quotes`
+取该市场指数（美股 **QQQ/SPY/DIA/IWM**、港股 恒生/国企、期货 ES/NQ/YM/GC/CL、
+加密 BTC/ETH/SOL），面板标题自动切「今日指数」，`_apply_market_mode()` 切换市场后
+立即刷新。**多市场日涨跌口径修正（v7.0.9）**：`fetch_market_quote` 昨收改取上一交易日
+收盘（`rows[-2]`），原用 `meta.chartPreviousClose`（5 日窗口起点前收盘）会把日涨跌
+算成多日累计（QQQ 曾显示 -9.5%）；港股指数补 Yahoo 符号映射（hkHSI→`^HSI`、
+hkHSCEI→`^HSCE`、hkHSTECH→`^HSTECH`）。
+
 **基本面财报（v6.2.1 `fetch_f10_metrics`，v6.6.2 加持久缓存）**：东财 datacenter F10
 主要指标 `RPT_F10_FINANCE_MAINFINADATA`（报告期倒序最多 12 期），双 host 容灾
 （`datacenter.eastmoney.com` → `datacenter-web.eastmoney.com`），走 `_http_get`
@@ -1143,6 +1157,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.0.9**<br>（2026-11-06） | **今日行业面板按市场切换 + 全市场涨跌家数**：A股 底部新增全市场涨/跌/平家数（`fetch_market_breadth()` 汇总东财 ulist.np 上证指数/深证综指/北证50 的 f104/f105/f106，60s 缓存+四域轮换+熔断回退），渲染左绿跌/右红涨+比例条；hk/us/futures/crypto 改显该市场指数（`market_index_rows()`：美股 QQQ/SPY/DIA/IWM 等），标题切「今日指数」、切换即时刷新；修正多市场昨收口径（`chartPreviousClose`→上一交易日收盘，QQQ 曾 -9.5%）并补港股指数 Yahoo 符号映射；`APP_VERSION=7.0.9`，2.1 节与 README/CHANGELOG 同步 |
 | **v7.0.7**<br>（2026-11-06） | **左侧自选池按最长行自动加宽**：`tkfont.measure()` 量最长「代码 名称 涨幅」，列宽=文字+24、栏宽=列宽+18，随内容增减（下限184/上限屏宽18%）；159516 半导体设备ETF国泰 不再截断；`APP_VERSION=7.0.7`，2.1 节与 README/CHANGELOG 同步 |
 | **v7.0.6**<br>（2026-11-06） | **左侧自选池实时涨幅/红绿**：`tk.Listbox`→`Watch.Treeview`（字号 8/行高 19），行「代码 名称 涨跌幅」，涨红跌绿；`_refresh_names()` 批量取快照名称/现价/涨幅并接入 30s `_index_loop`；重绘保留选中/滚动；池宽下限 184px；`APP_VERSION=7.0.6`，2.1 节与 README/CHANGELOG 同步 |
 | **v7.0.5**<br>（2026-11-06） | **分时价格线改白色**：主图分时价格线 `ACCENT`→`TPRED_C`（暗色纯白/亮色黑），与黄色虚线均价线区分；AI 侧栏分时 Mini 图同步；`APP_VERSION=7.0.5`，3.13 节与 CHANGELOG 同步 |
