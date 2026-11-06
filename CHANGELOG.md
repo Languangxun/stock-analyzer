@@ -5,6 +5,13 @@
 
 ## 版本历史
 
+> **v7.0.7：左侧自选池按最长行自动加宽（2026-11-06）**：修复 `sz159516
+> 半导体设备ETF国泰` 等长名称/ETF 被截断——`_render_watchlist()` 用
+> `tkfont.Font("Consolas",8).measure()` 量当前最长行，列宽=文字宽+24px，
+> 自选池栏宽=列宽+18px，并随自选池内容自动增减（下限 184、上限屏宽 18%，
+> 1920 下最大 280px）；实测 159516 行宽 191px → 栏宽 233px 完整显示。
+> `APP_VERSION=7.0.7`，`stock_predict.py` 重新生成，README/ARCHITECTURE 同步。
+
 > **v7.0.6：左侧自选池显示实时涨幅 + 红绿（2026-11-06）**：自选池由
 > `tk.Listbox` 改为紧凑 `ttk.Treeview`（Watch.Treeview，字号 8/行高 19），
 > 每行显示「代码 名称 涨跌幅」，涨幅≥0 红色、<0 绿色（沿用 UP/DOWN）；

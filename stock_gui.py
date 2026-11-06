@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.6"
+APP_VERSION = "7.0.7"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -17708,6 +17708,7 @@ class App:
             wf.pack(side="left", fill="y", padx=(8, 2), pady=2)
             wf.pack_propagate(False)
             wf.config(width=self._wf_width)
+            self._wf_frame = wf
 
             self._wf_content = tk.Frame(wf, bg=DARK_BG)
             self._wf_content.pack(fill="both", expand=True)
@@ -23070,6 +23071,11 @@ class App:
         self.watch_list.tag_configure("down", foreground=DOWN)
         self.watch_list.tag_configure("flat", foreground=AXIS_TXT)
         quotes = getattr(self, "_wl_quotes", {}) or {}
+        try:
+            wl_font = tkfont.Font(family="Consolas", size=8)
+        except Exception:
+            wl_font = None
+        max_px = 0
         for c in self.watchlist:
             q = quotes.get(c) or {}
             name = q.get("name") or getattr(self, "_names", {}).get(c, "")
@@ -23084,12 +23090,31 @@ class App:
             else:
                 txt = f"{c} {name} {chg:+.2f}%".rstrip()
                 tag = "up" if chg >= 0 else "down"
+            if wl_font is not None:
+                try:
+                    max_px = max(max_px, wl_font.measure(txt))
+                except Exception:
+                    pass
             try:
                 self.watch_list.insert("", "end", iid=c, text=txt,
                                        tags=(tag,))
             except Exception:
                 # iid 冲突（历史脏数据重复代码）时退回自动 iid
                 self.watch_list.insert("", "end", text=txt, tags=(tag,))
+        # 宽度按最长一行自动加宽（含 Treeview 缩进/内边距），上限屏宽 18%
+        if max_px > 0:
+            sw = self.root.winfo_screenwidth()
+            cap = max(184, min(280, int(sw * 0.18)))
+            col_w = max(120, min(cap - 18, max_px + 24))
+            frame_w = col_w + 18
+            self._wf_width = frame_w
+            try:
+                self.watch_list.column("#0", width=col_w)
+                wf = getattr(self, "_wf_frame", None)
+                if wf is not None:
+                    wf.config(width=frame_w)
+            except Exception:
+                pass
         try:
             for c in sel:
                 if self.watch_list.exists(c):
