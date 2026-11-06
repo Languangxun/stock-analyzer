@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.0.7"
+APP_VERSION = "7.0.8"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -21369,7 +21369,8 @@ class App:
             cv2.delete("all")
             w2 = max(cv2.winfo_width(), 420)
             h2 = max(cv2.winfo_height(), 60)
-            L2, R2, T2, B2 = L, R, 8, 16
+            # 顶部预留标题行，标题按 nw 锚点画，避免上半截被画布顶边裁掉
+            L2, R2, T2, B2 = L, R, 16, 16
             ph2 = h2 - T2 - B2
             vmax = (max(vols) or 1.0) * 1.08
 
@@ -21387,7 +21388,7 @@ class App:
                 cv2.create_rectangle(xm2(i) - bw / 2, yv(v),
                                      xm2(i) + bw / 2, yv(0),
                                      fill=color, outline="")
-            cv2.create_text(L2 + 2, T2 - 3, text="分时量（手）", anchor="w",
+            cv2.create_text(L2 + 2, 2, text="分时量（手）", anchor="nw",
                             font=("Microsoft YaHei", 8), fill=TITLE_TXT)
             for i, lab in self._minute_marks(times):
                 cv2.create_text(xm2(i), h2 - B2 + 10, text=lab,
@@ -21408,7 +21409,8 @@ class App:
             cv3.delete("all")
             w3 = max(cv3.winfo_width(), 420)
             h3 = max(cv3.winfo_height(), 80)
-            L3, R3, T3, B3 = L, R, 6, 16
+            # 顶部预留标题行，标题按 nw 锚点画，避免上半截被画布顶边裁掉
+            L3, R3, T3, B3 = L, R, 18, 16
             ph3 = h3 - T3 - B3
             macd_h = int(ph3 * 0.64)
             vr_top = T3 + macd_h + 6
@@ -21467,9 +21469,19 @@ class App:
                     if ld and la else "MACD")
             if lv:
                 info += f"  量比:{lv[-1]:.2f}"
-            cv3.create_text(L3 + 2, T3 - 4,
-                            text=f"分时MACD / 量比（自动）  {info}",
-                            anchor="w", font=("Microsoft YaHei", 8),
+            # 标题按可用宽度逐级降级，窄窗口下也不会横向截断
+            avail = max(80, w3 - (L3 + 2) - R3 - 6)
+            title = "MACD / 量比"
+            for cand in (f"分时MACD / 量比（自动）  {info}",
+                         f"分时MACD / 量比  {info}",
+                         f"MACD / 量比  {info}",
+                         "分时MACD / 量比（自动）"):
+                if self._text_px(cv3, cand, size=8,
+                                 family="Microsoft YaHei") <= avail:
+                    title = cand
+                    break
+            cv3.create_text(L3 + 2, 2, text=title, anchor="nw",
+                            font=("Microsoft YaHei", 8),
                             fill=TITLE_TXT)
             g3 = {"w": w3, "h": h3, "L": L3, "R": R3, "T": T3, "B": B3,
                   "n": n, "ph": ph3, "bw": (w3 - L3 - R3) / max(1, n - 1),
