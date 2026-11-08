@@ -74,8 +74,12 @@ def index_boll_pos(window=20, nbdev=2.0):
 
 def zone_of(pos, mode="fixed_0"):
     """pos → 风险区 0/1/2（fixed_* 供固定档基线：恒定在某个风险档）。"""
-    if isinstance(mode, str) and mode.startswith("fixed_"):
+    if mode.startswith("fixed"):
         return int(mode[6:])
+    return zone_from_pos(pos)
+
+
+def zone_from_pos(pos):
     if pos is None:
         return 1
     return 0 if pos < 1.0 / 3 else (1 if pos < 2.0 / 3 else 2)
@@ -84,7 +88,11 @@ def zone_of(pos, mode="fixed_0"):
 def sim_composite(mode, i0, i1, ctx):
     """auto/固定档组合模拟（档位动态切换版 tier_sim_phase，费率/约束不变）。
 
-    mode: "auto"（每日按 BOLL 位置解析）或 "fixed_0/1/2"（固定风险档基线）。"""
+    mode: "auto"（每日按 BOLL 位置解析；切换日立即换仓，追势口径）、
+    "auto_lazy"（auto 同款切档，但**只在各档自然调仓日生效**——切换日不换仓，
+    下个调仓日按新档选股，大幅降低切换摩擦）或
+    "fixed_0/1/2"（固定风险档基线）。"""
+    lazy = "auto_lazy" in mode
     codes, cal, C, V = ctx["codes"], ctx["cal"], ctx["C"], ctx["V"]
     feat = ctx["feat"]
     tier_cfg = ctx["tier_cfg"]
@@ -120,6 +128,8 @@ def sim_composite(mode, i0, i1, ctx):
     eq, eq_cal, zone_seq, switch_cnt = [], [], [], 0
     prev_zone = None
     fee_total = 0.0
+    slip_total = 0.0
+    fee_by_reason = {}
     n_buy = n_sell = 0
 
     def sell_fee(amount):
@@ -135,6 +145,7 @@ def sim_composite(mode, i0, i1, ctx):
         amount = shares[k] * px
         fee = sell_fee(amount)
         fee_total += fee
+        fee_by_reason[reason] = fee_by_reason.get(reason, 0.0) + fee
         cash += amount - fee
         holding[k] = False
         shares[k] = 0.0
@@ -149,16 +160,16 @@ def sim_composite(mode, i0, i1, ctx):
         for k in np.nonzero(holding & (miss >= sg._TIER_STALE_DAYS))[0]:
             close_pos(k, t, last[k] if last[k] > 0 else entry[k], "delist")
 
-        zone = zone_of(index_pos.get(cal[t]) if mode == "auto" else None,
-                       mode)
+        zone = zone_of(index_pos.get(cal[t])
+                       if not mode.startswith("fixed") else None, mode)
         tier = TIERS[zone]
         cfg = tier_cfg[tier]
         gate = gates[tier]
         on = bool(gate[t]) if gate is not None else True
         if prev_zone is not None and zone != prev_zone:
-            switch_cnt += 1          # 档位切换日立即换仓
+            switch_cnt += 1          # 档位切换（计数口径两模式一致）
         reb_now = ((t - i0) % max(1, cfg["reb"]) == 0) \
-            or (prev_zone is not None and zone != prev_zone)
+            or ((not lazy) and prev_zone is not None and zone != prev_zone)
         prev_zone = zone
 
         if reb_now:
@@ -186,8 +197,12 @@ def sim_composite(mode, i0, i1, ctx):
         for k in np.nonzero(holding)[0]:
             if int(k) in target or not fin[k] or limit_dn[k, t]:
                 continue
-            close_pos(k, t, col[k] * (1 - sg._TIER_SLIP),
-                      "switch" if (prev_zone and reb_now and not on) else "target")
+            px_close = col[k]
+            px = px_close * (1 - sg._TIER_SLIP)
+            slip_total += float(shares[k] * px_close * sg._TIER_SLIP)
+            close_pos(k, t, px,
+                      "switch" if ((not lazy) and reb_now and not on)
+                      else "target")
 
         if reb_now and on:
             eqv = equity()
@@ -209,6 +224,8 @@ def sim_composite(mode, i0, i1, ctx):
                     continue
                 cash -= amount + fee
                 fee_total += fee
+                fee_by_reason["buy"] = fee_by_reason.get("buy", 0.0) + fee
+                slip_total += float(amount / (1 + sg._TIER_SLIP) * sg._TIER_SLIP)
                 shares[k] = n_lot * sg._TIER_LOT
                 entry[k] = (amount + fee) / shares[k]
                 t_in[k] = t
@@ -244,7 +261,8 @@ def sim_composite(mode, i0, i1, ctx):
         "ann": res_total ** (1 / years) - 1.0 if res_total > 0 else -1.0,
         "mdd": _curve_mdd(eq),
         "years": years, "sells": n_sell, "buys": n_buy,
-        "fee_total": fee_total,
+        "fee_total": fee_total, "slip_total": slip_total,
+        "fee_by_reason": fee_by_reason,
         "switches": switch_cnt,
         "fraction_zones": [round(sum(1 for z in zone_seq if z == i) / len(zone_seq), 4)
                            for i in range(3)],
@@ -271,7 +289,7 @@ def main():
     ap.add_argument("--universe", default="all",
                     choices=["all", "main", "etf", "all_etf"])
     ap.add_argument("--ic", action="store_true", help="启用 IC 确认层")
-    ap.add_argument("--zones", default="auto,fixed_0,fixed_1,fixed_2")
+    ap.add_argument("--zones", default="auto,auto_lazy,fixed_0,fixed_1,fixed_2")
     ap.add_argument("--window", type=int, default=20)
     ap.add_argument("--nbdev", type=float, default=2.0)
     args = ap.parse_args()
@@ -317,12 +335,15 @@ def main():
           f"段={args.seg}({d0}~{d1}，{i1 - i0}根) · 池={args.universe} · "
           f"BOLL({args.window},{args.nbdev:g}) 三等分：下1/3→稳健(保守)、"
           f"中1/3→均衡、上1/3→激进；档位切换日立即换仓。",
-          "费用：滑点0.1%/边、佣金万2.5（**最低5元**）、印花卖出1‰、"
-          "过户费沪十万1；整手/涨跌停/停牌/闸门/缓冲带/mdd_guard=8%（稳健档）"
+          "费用：滑点0.1%/边、佣金万2.5（**最低5元**）、印花卖出1‰、过户费沪十万1；"
+          "费用列=佣金+印花+过户（**切换摩擦主因**见明细行），滑点列单列；"
+          "整手/涨跌停/停牌/闸门/缓冲带/mdd_guard=8%（稳健档）"
           f" full 口径；IC确认层={'开' if args.ic else '关'}。",
+          "auto：档位切换日立即换仓（追势，摩擦大）；auto_lazy：切档只在各档"
+          "自然调仓日生效（切档不立即换仓，摩擦小）。",
           "单相位口径（不相位平均），跨 mode 基线可比。", "",
-          "| 风险档切换 | 总收益 | 年化 | 最大回撤 | 买入笔 | 卖出笔 | 手续费(元) | 档位切换次数 | 区间占用 稳/均/激 |",
-          "|---|---|---|---|---|---|---|---|---|"]
+          "| 风险档切换 | 总收益 | 年化 | 最大回撤 | 买入笔 | 卖出笔 | 手续费(元)¹ | 滑点(元) | 档位切换次数 | 区间占用 稳/均/激 |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
     for mode in [m.strip() for m in args.zones.split(",") if m.strip()]:
         res = sim_composite(mode, i0, i1, ctx)
         if not res:
@@ -334,7 +355,12 @@ def main():
             f"| {label} | {res['total'] * 100:+.1f}% | "
             f"{res['ann'] * 100:+.1f}% | {res['mdd'] * 100:.1f}% | "
             f"{res['buys']} | {res['sells']} | {res['fee_total']:,.0f} | "
-            f"{res['switches']} | {fq[0]:.0%}/{fq[1]:.0%}/{fq[2]:.0%} |")
+            f"{res['slip_total']:,.0f} | {res['switches']} | "
+            f"{fq[0]:.0%}/{fq[1]:.0%}/{fq[2]:.0%} |")
+        fb = res["fee_by_reason"]
+        md.append(f"  ¹费用明细 {mode}: "
+                  + "、".join(f"{k}={v:,.0f}" for k, v in
+                              sorted(fb.items(), key=lambda x: -x[1])))
         print(label, {k: float(res[k]) for k in ("total", "ann", "mdd")},
               flush=True)
 
@@ -351,7 +377,8 @@ def main():
 
 index_pos = {}
 _labels = {
-    "auto": "**auto**（BOLL三等分动态切换）",
+    "auto": "**auto**（切换日立即换仓）",
+    "auto_lazy": "**auto_lazy**（切档仅在调仓日生效）",
     "fixed_0": "恒 保守(稳健档·reb20)",
     "fixed_1": "恒 稳健(均衡档·reb10)",
     "fixed_2": "恒 激进(板块轮动·Top5)",
