@@ -514,6 +514,16 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 才移动止盈、买点门槛 1/冷却 2；**不设最大回撤止损**，v6.1.8 的 500 日 MDD 机制已删除）
 （顺序：atr_mult / trail_trigger / trail_ratio / buy_th / cooldown）。
 
+**auto 风险偏好（v7.3.1）**：`ini [predict] risk_mode=auto` 时交易层动态解析——
+上证（sh000001）收盘对 BOLL(`AUTO_RISK_WINDOW`=20, `NBDEV`=2) 的带内位置
+`pos=(收盘−下轨)/带宽` 三等分：下1/3→保守（弱市贴下轨）、中1/3→稳健
+（中轨附近）、上1/3→激进（贴上轨；`auto_boll_zone()` 只读最新一根及以前
+日K，无前视，60s 进程内缓存；数据不足抛错由调用方回退设置档）。
+解析结果只替换交易层参数与信号兜底/异动覆盖档（`_bt_events`/多维兜底/
+复合打分都用解析档参数），消融选出的算法/缓存不变；AI 行为约束经
+`ai_risk_mode()` 同样解析（`RISK_AI_GUIDE["auto"]`）。组合口径的同套切换
+回测见 4.x `backtests/backtest_tiers_auto.py`。
+
 **GUI 单股回测面板（工具→信号胜率，2026-09-26 升级；v6.1.6 与消融统一）**：
 `backtest_signals` 内部为 `_bt_simulate`（单段）+ 组合全期/分段，用于 IC/信号后收益等
 信号质量统计；面板的**全期/训练/验证指标自 v6.1.6 起改用消融同引擎 `_bt_events`
@@ -1220,6 +1230,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.3.1**<br>（2026-11-08） | **风险偏好新增 auto（大盘 BOLL 三等分）**：①`[predict] risk_mode=auto`——`auto_boll_zone()` 用上证收盘 BOLL(20,2) 带内位置三等分解析风险档（下1/3→保守/中1/3→稳健/上1/3→激进；无前视、60s 缓存），覆盖交易层参数与信号兜底/异动覆盖档；消融算法不变；`RISK_AI_GUIDE["auto"]` + `ai_risk_mode()` 解析 auto；②`backtests/backtest_tiers_auto.py` 组合切换回测（同套三等分逐日映射三档、切换日换仓，费用/整手/闸门/熔断全复用 tier_sim_phase，含**最低 5 元佣金**；固定三档同引擎基线），产物 `research/tiers_auto.*`；3.2/4.x 节更新 |
 | **v7.3.0**<br>（2026-11-08） | **sm701 隔离为外接算法 + test 实验档删除**：①算法本体（模型定位/副本库只读/概率复算/买卖点信号，~620 行）从 `stock_gui.py` 迁出到 `external/sm701_ext.py`（唯一入口；`init_host(globals())` 惰性注入宿主 np/db_conn/_market_of/tier_load_panel，模块不反向 import 主程序；适配层入库，sm701 数据+模型目录 `.gitignore` 排除、git 不分发）；②`test`（sm701 实验组合档 + 风险偏好）删除——TIER_CFG×4/TIER_BENCH/RISK_PARAMS/荐股窗/工具菜单/CLI --tier test 全部退役，旧 ini `risk_mode=test` 自动迁移回稳健；A股消融子的「排除 test」漏斗删除；③**外接算法开关（可选参加 A股消融或指定市场）**：`[predict] sm701_ext`（默认 1；0=hk/us/futures 只看行情、A股消融剔除候选）+ `[predict] sm701_ablation`（默认 1；0=不参加 A股单股消融）；多市场直出风控改 `external/sm701_ext.EXT_RISK`（=原 test 宽松参数）；④港股外接算法**全库回测**（`backtest_sm701_markets.py --market hk --top 0`：主库 ≥300 根 2596 只，落盘样本外概率直出滞回信号）产物 `research/sm701_markets_full.*`；⑤`backtests/compare_tier_sm701.py` test 行退出；2.0/3.4/3.7/1.1 节更新 |
 | **v7.2.2**<br>（2026-11-07） | **非 DeepSeek 模型工具取数**：`AIAgent.use_tools` 去掉 `_ai_is_deepseek()` 限制，`[deepseek] tools` 开启时 Claude Haiku/GLM/Kimi 等 OpenAI 兼容模型同走「首轮核心快照 + tools 按需取数」；工具轮仅 DeepSeek 回传 `reasoning_content`，其他网关省略以避免 400；不支持 tools 时自动回退全文上下文；实测 `claude-haiku-5-5` 调用 `get_prediction` 并基于结果作答；3.9 节与 README/CHANGELOG 同步 |
 | **v7.2.1**<br>（2026-11-07） | **AI 分析报错修复**：①`KeyError: 'open'` 根因——`_batch_tencent`/`_batch_sina` 只缓存现价/涨幅，tick 覆盖 `res["quote"]` 后 AI prompt/报告取 `q["open"]` 崩溃、首轮上下文变空；批量源补齐 OHLC、`quote_cache` 只写完整快照、残缺缓存视为未命中、`_quote_ensure()` 分析/tick 兜底、prompt/报告安全格式化；上下文异常回退最小股票快照；②`get_ai_key()` 按 ini `api_key_source` 选 Key，环境变量不再覆盖显式 ini Key（修 opencode 网关 401）；③修复设置保存 `_ind_mk` 自我赋值 `UnboundLocalError`；3.9 节更新 |

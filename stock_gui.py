@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.3.0"
+APP_VERSION = "7.3.1"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -345,6 +345,14 @@ class CFG:
     #                  其他算法消融，sm701 仅多市场直出/独立调用）。
     SM701_EXT_ON = True
     SM701_JOIN_ABLATION = True
+    # ---- auto 风险偏好（v7.3.1，ini [predict] risk_mode=auto）----
+    # 大盘（上证）BOLL(AUTO_RISK_WINDOW, AUTO_RISK_NBDEV) 带内位置三等分
+    # 动态解析风险档：下 1/3→保守、中 1/3→稳健、上 1/3→激进；恒只用最新
+    # 一根及以前的日K（无前视）。单股分析的交易层参数与信号兜底档随解析
+    # 结果切换；消融选出的算法不变。auto 也作为组合档位切换口径参与回测
+    # （backtests/backtest_tiers_auto.py，组合引擎按档位映射 稳健/均衡/激进）。
+    AUTO_RISK_WINDOW = 20
+    AUTO_RISK_NBDEV = 2.0
 
     # ---- 外部策略（股票策略工坊，v6.6.0）----
     # 选择后：单股买卖点直接用导入的工坊规则，不再消融、不使用风险偏好；
@@ -354,8 +362,15 @@ class CFG:
     STUDIO_TAKE_PROFIT = 0.0
     STUDIO_MAX_HOLD = 0
 
-    def risk_params():
-        return CFG.RISK_PARAMS.get(CFG.RISK_MODE, CFG.RISK_PARAMS["稳健"])
+    def risk_params(mode=None):
+        m = mode or CFG.RISK_MODE
+        if m == "auto":
+            # v7.3.1 auto：解析成保守/稳健/激进后取对应参数；解析失败回退稳健
+            try:
+                m = auto_boll_zone()["mode"]
+            except Exception:
+                m = "稳健"
+        return CFG.RISK_PARAMS.get(m, CFG.RISK_PARAMS["稳健"])
     
     # 各技术维度在信号打分中的权重（1.0=标准；<1 降权、>1 升权）
     IND_W = {
@@ -378,6 +393,49 @@ class CFG:
 # v6.4.1：消融/选型只跑稳定三档；v7.3.0：test（sm701 实验档）已删除——
 # sm701 改为外接算法，作为候选参加 A 股单股消融（[predict] sm701_ablation 可关）。
 ABLATION_MODES = ("保守", "稳健", "激进")
+
+# ---- auto 风险偏好（v7.3.1）：大盘 BOLL 带内位置三等分动态解析 ----
+_AUTO_RISK_CACHE = {}
+
+
+def auto_boll_zone(refresh=False):
+    """大盘收盘的 BOLL 带内位置 → 风险档（v7.3.1 auto 风险偏好）。
+
+    上证指数（sh000001）日K BOLL(CFG.AUTO_RISK_WINDOW, CFG.AUTO_RISK_NBDEV)：
+      pos = (收盘 − 下轨) / 带宽（0~1），三等分：
+        下 1/3 → 保守（弱市/贴下轨）、中 1/3 → 稳健、上 1/3 → 激进（贴上轨）；
+    恒只用**最新一根及以前**的收盘序列（无前视），60s 进程内缓存。
+    返回 {mode,pos,close,boll_mid,boll_lower,boll_upper,date}；
+    指数数据不足时抛异常，由调用方回退默认档。"""
+    hit = _AUTO_RISK_CACHE.get("zone")
+    now = time.time()
+    if not refresh and hit and now - hit[0] < 60:
+        return dict(hit[1])
+    with db_conn() as conn:
+        rows = conn.execute(
+            "select date, close from daily_bars where code='sh000001' "
+            "order by date desc limit ?", (int(CFG.AUTO_RISK_WINDOW) * 3 + 10,)).fetchall()
+    rows = [(d, float(c)) for d, c in reversed(rows) if c]
+    w = max(10, int(CFG.AUTO_RISK_WINDOW))
+    k = float(CFG.AUTO_RISK_NBDEV)
+    if len(rows) < w:
+        raise RuntimeError("上证指数日K不足 BOLL 窗口")
+    closes = [c for _, c in rows[-(w + 1):]]      # 预热 1 根用于差分安定
+    win = closes[-w:]
+    ma = sum(win) / w
+    var = sum((c - ma) ** 2 for c in win) / w
+    sd = var ** 0.5
+    lower, upper = ma - k * sd, ma + k * sd
+    span = upper - lower
+    c = closes[-1]
+    pos = 0.5 if span <= 1e-12 else \
+        max(0.0, min(1.0, (c - lower) / span))
+    mode = "保守" if pos < 1.0 / 3 else ("稳健" if pos < 2.0 / 3 else "激进")
+    out = {"mode": mode, "pos": pos, "close": c,
+           "boll_mid": ma, "boll_lower": lower, "boll_upper": upper,
+           "date": rows[-1][0] if rows else ""}
+    _AUTO_RISK_CACHE["zone"] = (now, dict(out))
+    return dict(out)
 
 # ---- 外部策略（股票策略工坊）目录与严格 ID 规则（v6.6.0）----
 # 默认工坊目录：环境变量 STOCK_STUDIO_DIR 可覆盖；导入后复制到本目录
@@ -449,7 +507,8 @@ def _load_predict_cfg():
             # v7.3.0 迁移：test（sm701 实验档）已删除；sm701 直出不占用
             # 风险偏好档位。旧 ini 值自动改回稳健（外接算法看下方开关）。
             rm = "稳健"
-        if rm in CFG.RISK_PARAMS:
+        # v7.3.1：接受 auto（大盘 BOLL 带内位置三等分动态切换，见 auto_boll_zone）
+        if rm in CFG.RISK_PARAMS or rm == "auto":
             CFG.RISK_MODE = rm
         # sm701 外接算法开关（v7.3.0；默认开，行为与 v7.2.x一致）
         CFG.SM701_EXT_ON = bool(gi("sm701_ext",
@@ -11969,6 +12028,19 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     if sel_algo not in ALGO_LABEL:
         sel_algo = "composite"
     sel_mode = (strat or {}).get("mode") or CFG.RISK_MODE
+    # ---- auto 风险偏好（v7.3.1）：大盘 BOLL 带内位置三等分动态解析 ----
+    # 覆盖交易层参数与 sel_mode（信号兜底/异动覆盖跟随解析档）；算法仍来自
+    # 消融缓存（缓存档=选股参考）。选用 hd auto 时消融选型环节不变，
+    # 解析结果在「信号口径/波段提示」标注（无前视：只用最新一根日K）。
+    _auto_risk = None
+    if sel_mode == "auto" or CFG.RISK_MODE == "auto":
+        try:
+            _auto_risk = auto_boll_zone()
+        except Exception:
+            log.exception("auto 风险偏好解析失败(回退设置档)")
+        if _auto_risk:
+            sel_mode = _auto_risk["mode"]
+            rp = dict(CFG.risk_params(mode=sel_mode))
 
     signals = []
     # ---- 懒加载（v6.6.5）：重信号算法（sm701/lgbm，需全市场模型复算/
@@ -12064,6 +12136,9 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
                     else "近250日无信号")
             band_algo += f"（{_why} → 兜底改用多维评分·{sel_mode}）"
     band_note = f"波段适合度 {band_score:.0f}/100 → {band_algo}"
+    if _auto_risk:
+        band_note += (f"｜auto 风险偏好：BOLL位置 {_auto_risk['pos']:.0%} → "
+                      f"{_auto_risk['mode']}（{_auto_risk['date']}）")
     if sel_algo == "studio":
         _bits = []
         if rp.get("stop_loss_pct"):
@@ -15825,6 +15900,9 @@ RISK_AI_GUIDE = {
     "sm701": "风险偏好=sm701 外接算法直出档（多市场）：买卖点不做策略消融，直接来自"
              " sm701 模型概率（≥0.55 买入 / <0.50 卖出，滞回）。请围绕模型概率"
              "与趋势给结论，仍须给出可执行价位/仓位，不要用『观望』搪塞。",
+    "auto": "风险偏好=auto（v7.3.1）：按大盘 BOLL 带内位置三等分动态解析为"
+            " 保守/稳健/激进（下1/3→保守、中1/3→稳健、上1/3→激进）。请依据解析后的"
+            "档位行为约束给结论，并在结论中注明当前档位与解析依据。",
     "外部策略": "外部策略模式（股票策略工坊）：买卖点来自用户导入的策略规则，"
                 "不适用风险偏好；退出按设置→外部策略中的止损/止盈/最长持有执行。"
                 "请围绕该策略规则与显式风控参数给结论，不要套用内置三档偏好。",
@@ -15845,6 +15923,12 @@ def ai_risk_mode(res=None):
     if rm in ("外部策略", "sm701"):
         return rm
     prefer = CFG.RISK_MODE
+    if prefer == "auto":
+        # v7.3.1 auto：解析成保守/稳健/激进取对应行为约束
+        try:
+            prefer = auto_boll_zone()["mode"]
+        except Exception:
+            prefer = "稳健"
     return prefer if prefer in RISK_AI_GUIDE else "稳健"
 
 
