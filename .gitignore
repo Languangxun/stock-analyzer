@@ -45,6 +45,14 @@ research/perstock_backtest_v*/
 # 每只股回测导出（数据工具生成，可重跑；规范产物在 research/perstock_backtest_v*/）
 reports/每只股回测_*
 
+# sm701 外接算法（v7.3.0）：数据+模型目录在桌面（~/桌面/sm701），本地只读
+# 接入，绝不入仓库；若误拷进仓库按目录/库文件一并忽略。适配层
+# external/sm701_ext.py 本身入库（无 sm701 数据）。
+/sm701/
+/sm701 (副本)/
+sm701*.db
+sm701*.db-*
+
 # --- 标准 Python 忽略项 ---
 .env
 .venv/

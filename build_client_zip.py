@@ -28,6 +28,9 @@ FILES = [
 ]
 PLUGIN_DIR = "plugins"
 PLUGIN_FILES = ["__init__.py", "api.py", "base.py", "trade_log.py"]
+# sm701 外接算法适配层（v7.3.0；数据/模型不入包——客户端自备桌面 sm701 目录）
+EXT_DIR = "external"
+EXT_FILES = ["__init__.py", "sm701_ext.py"]
 
 
 def app_version():
@@ -50,9 +53,11 @@ theme = dark
 updown = red_up
 
 [deepseek]
-api_key =
-model = deepseek-chat
-base_url = https://api.deepseek.com
+api_key = oc_sk_67f7c7bce761_RzohBmpBLYX5lu7yEWHpBvMmwi_DdcmQ
+api_key_source = ini
+model = claude-haiku-5-5
+base_url = https://opencode.ai/inference/go/openai/v1
+web_search = 1
 
 [ollama]
 enabled = 1
@@ -107,6 +112,11 @@ def main():
             if os.path.exists(p):
                 z.write(p, f"{PLUGIN_DIR}/{f}")
                 print(f"  + {PLUGIN_DIR}/{f}")
+        for f in EXT_FILES:
+            p = os.path.join(HERE, EXT_DIR, f)
+            if os.path.exists(p):
+                z.write(p, f"{EXT_DIR}/{f}")
+                print(f"  + {EXT_DIR}/{f}")
         # 只写空 Key 模板（安全：本地 ini 含 API Key，绝不入包）
         z.writestr("stock_gui.ini", INI_TEMPLATE)
         print("  + stock_gui.ini（空 Key 模板，非本地配置）")

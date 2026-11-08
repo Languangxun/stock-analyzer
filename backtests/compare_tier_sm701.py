@@ -72,16 +72,13 @@ def _run(universe, segment, progress):
                       overrides={"score": "sm701",
                                  "score_start_from_data": True},
                       progress=progress)
-    raw = sg.tier_eval(segment=segment, universe=universe, tiers=["test"],
-                       progress=progress)
+    raw = {}   # v7.3.0：test 组合档已删除（sm701 经外接算法接入，见 backtest_sm701_markets.py）
     rows = []
     for t in TIERS:
         if t in base:
             rows.append(_row(f"{t}·当前", base[t]))
         if t in sm:
             rows.append(_row(f"{t}·sm701", sm[t]))
-    if "test" in raw:
-        rows.append(_row("test·sm701原生", raw["test"]))
     return {"baseline": base, "sm701": sm, "raw_test": raw, "rows": rows}
 
 

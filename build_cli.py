@@ -41,17 +41,19 @@ K线源自动切换：腾讯(多域名容灾) -> 新浪 -> 同花顺 -> 东财�
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
   --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
   --tiers          组合档位：输出最新目标持仓/闸门状态（默认稳定三档）
-  --tier test       sm701 LightGBM 实验档（需桌面 sm701 副本；显式指定）
-  --ai-tier        荐股前由AI在稳定三档内选一档（test 仅手动）
+  --tier 名称       显式指定档位（稳健|均衡|激进；v7.3.0 起 test 档已删除）
+  --ai-tier        荐股前由AI在稳定三档内选一档
   --universe       标的池：all(全A不含ETF，默认)/main(沪深主板)/etf(仅ETF)/all_etf(全A含ETF)
-  --tiers-backtest 组合回测摘要（默认稳定三档；--tier 可显式加 test）
+  --tiers-backtest 组合回测摘要（默认稳定三档）
   --picks-backtest v6.1.5 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 
-sm701 路径：默认自动查找 ~/桌面/sm701 (副本) 与原目录；
-             也可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖。
-风险偏好 test（stock_gui.ini [predict] risk_mode=test，v6.4.1）：
-             单股买卖点不消融，直接用 sm701 模型概率（≥0.55 买入/<0.50 卖出）。
+sm701 外接算法（v7.3.0）：适配层在 external/sm701_ext.py；sm701 目录
+             （数据+模型）保存在仓库外，git 不分发。默认自动查找
+             ~/桌面/sm701 (副本) 与原目录；也可用 SM701_DIR / SM701_DB /
+             SM701_MODEL / SM701_PRED 覆盖。A 股作为候选参加单股消融
+             （ini [predict] sm701_ablation=0 可关）；hk/us/futures 由
+             市场策略链直出买卖点（sm701_ext=0 则只看行情）。
 """
 
 '''

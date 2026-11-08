@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.3.0"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -332,13 +332,19 @@ class CFG:
         "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
                  "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3,
                  "sell_cooldown": 3},
-        # v6.4.1 test：sm701 模型直出档——买卖点不做策略消融，直接用
-        # sm701 LightGBM 概率（≥0.55 BUY / <0.50 SELL 滞回，见 _sig_sm701）；
-        # 本档参数只作用于 ATR 止损/移动止盈（沿用激进档的宽松风控）。
-        "test": {"atr_mult": 2.5, "trail_trigger": 1.05,
-                 "trail_ratio": 0.90, "buy_th": 1, "cooldown": 1,
-                 "sell_cooldown": 1},
+        # v7.3.0：test（sm701 模型直出实验档，v6.4.1）已删除——sm701 按
+        # **外接算法**接入（external/sm701_ext.py）：A 股作为候选参加单股
+        # 消融（[predict] sm701_ablation 可关），多市场（hk/us/futures）由
+        # 市场策略链直出（[predict] sm701_ext=0 时只看行情）；外接风控参数
+        # 见 external/sm701_ext.EXT_RISK，不再占用风险偏好档位。
     }
+    # ---- sm701 外接算法开关（v7.3.0，ini [predict] 可改）----
+    # sm701_ext=1      外接算法接入：hk/us/futures 直出买卖点；0=断开，
+    #                  其他市场只看行情不出买卖点（A股消融也剔除候选）。
+    # sm701_ablation=1 sm701 参加 A股单股策略消融候选；0=不参加（A股用
+    #                  其他算法消融，sm701 仅多市场直出/独立调用）。
+    SM701_EXT_ON = True
+    SM701_JOIN_ABLATION = True
 
     # ---- 外部策略（股票策略工坊，v6.6.0）----
     # 选择后：单股买卖点直接用导入的工坊规则，不再消融、不使用风险偏好；
@@ -358,10 +364,10 @@ class CFG:
         "RSI": 0.9,         # 同上
         "量价": 1.0,
         "MA20": 1.0,
-        "MA趋势": 1.2,      # MA20/60趋势状态（v3.3全A实证 IC 0.228，最强规则信号）
+        "MA趋势": 1.4,      # MA20/60趋势状态（IC 0.228 最强规则信号；v7.0 升权并并入买卖点）
         "形态": 1.2,        # L1形态上行概率（IC 0.265，全A实证最强）
-        "爆发力": 1.0,      # 20日动量（10%~35%强势区加分，>35%过热减分：bias20 极端延伸 IC 为负）
-        "量能": 0.9,        # 量能扩张（5日均量/20日均量，突破期特征）
+        "爆发力": 1.2,      # 20日动量（10%~35%强势区加分，>35%过热减分；v7.0 升权）
+        "量能": 1.0,        # 量能扩张（v7.0 并入买卖点并升权）
         "板块": 1.0,        # 板块轮动（行业5日收益强势/前20%领先，v4.0.2 全A实证 Rot 变体显著增益）
         "筹码": 0.8,
         "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
@@ -369,7 +375,8 @@ class CFG:
     }
 
 
-# v6.4.1：消融/选型只跑稳定三档；test=sm701 模型直出信号，不参与消融。
+# v6.4.1：消融/选型只跑稳定三档；v7.3.0：test（sm701 实验档）已删除——
+# sm701 改为外接算法，作为候选参加 A 股单股消融（[predict] sm701_ablation 可关）。
 ABLATION_MODES = ("保守", "稳健", "激进")
 
 # ---- 外部策略（股票策略工坊）目录与严格 ID 规则（v6.6.0）----
@@ -392,7 +399,7 @@ STUDIO_MAX_CONDITIONS = 20
 
 
 def ablation_risk_params():
-    """消融/选型用的风险参数（排除 test）。"""
+    """消融/选型用的风险参数（v7.3.0：稳定三档）。"""
     return {m: rp for m, rp in CFG.RISK_PARAMS.items()
             if m in ABLATION_MODES}
 
@@ -438,8 +445,18 @@ def _load_predict_cfg():
         CFG.VOLCHG_W = gf("volchg_w", CFG.VOLCHG_W, 0.0, 3.0)
         CFG.WEEKLY_W = gf("weekly_w", CFG.WEEKLY_W, 0.0, 3.0)
         rm = cp.get("predict", "risk_mode", fallback=CFG.RISK_MODE)
+        if rm in ("test", "sm701"):
+            # v7.3.0 迁移：test（sm701 实验档）已删除；sm701 直出不占用
+            # 风险偏好档位。旧 ini 值自动改回稳健（外接算法看下方开关）。
+            rm = "稳健"
         if rm in CFG.RISK_PARAMS:
             CFG.RISK_MODE = rm
+        # sm701 外接算法开关（v7.3.0；默认开，行为与 v7.2.x一致）
+        CFG.SM701_EXT_ON = bool(gi("sm701_ext",
+                                   1 if CFG.SM701_EXT_ON else 0, 0, 1))
+        CFG.SM701_JOIN_ABLATION = bool(gi("sm701_ablation",
+                                          1 if CFG.SM701_JOIN_ABLATION
+                                          else 0, 0, 1))
         CFG.ENABLE_L3 = bool(gi("enable_l3", 0 if not CFG.ENABLE_L3 else 1,
                                 0, 1))
         CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
@@ -883,15 +900,27 @@ def set_ai_base(base: str) -> None:
     _save_ai_conf(base=base)
 
 
+def _ai_key_source() -> str:
+    """ini [deepseek] api_key_source：env/ini（空=兼容旧版，环境变量优先）。"""
+    return _ai_ini_get("deepseek", "api_key_source", "").lower()
+
+
 def get_ai_key() -> str:
-    """当前可用 Key：环境变量 > ini > 主目录 opencode-go 授权。"""
-    return (ENV_API_KEY or _ai_ini_get("deepseek", "api_key", "")
-            or _opencode_go_key()).strip()
+    """当前可用 Key：按 ini 记录的来源 env/ini 选择；旧配置仍 env > ini
+    > 主目录 opencode-go 授权。这样环境变量里的其他平台 Key 不会覆盖
+    用户显式保存的 ini Key（否则换 base_url 后常见 401）。"""
+    ini_key = _ai_ini_get("deepseek", "api_key", "")
+    src = _ai_key_source()
+    if src == "ini" and ini_key:
+        return ini_key
+    if src == "env" and ENV_API_KEY:
+        return ENV_API_KEY
+    return (ENV_API_KEY or ini_key or _opencode_go_key()).strip()
 
 
 def _ai_web_search_enabled() -> bool:
     """ini [deepseek] web_search：AI 分析前自动联网检索个股资讯。
-    默认开（仅 DeepSeek 官方 Search API 生效，其他 OpenAI 兼容网关自动跳过）。"""
+    默认开（DeepSeek 官方走 Search API；其他 OpenAI 兼容网关走 RSS 兜底）。"""
     return _ai_ini_get("deepseek", "web_search", "1") != "0"
 
 
@@ -947,7 +976,7 @@ _load_pick_perms()
 
 def picks_conf() -> dict:
     """荐股设置：AI自动选档 / 风险偏好 / 股票池口径。"""
-    _tiers = ("稳健", "均衡", "激进", "test")
+    _tiers = ("稳健", "均衡", "激进")
     return {
         "ai_auto_tier": _ai_ini_get("picks", "ai_auto_tier", "0") == "1",
         "risk_pref": (_ai_ini_get("picks", "risk_pref", "稳健") or "稳健")
@@ -1328,14 +1357,32 @@ def _note_index_snap(t):
 
 
 def _today_is_session():
-    """今日是否交易日：有今日指数快照→是；快照落后且已过开盘→否；未知→None。"""
+    """今日是否交易日：有今日指数快照→是；快照落后且已过开盘→否；
+    快照缺失或时间戳非法时，周六/周日按非交易日处理（v7.1.1）。
+
+    修复「周六早间打开程序（指数快照尚未加载/未更新到今日）时，
+    T 日预测被错标为『今日(T)』、锚定又按未开盘处理」的 K 线异常：
+    旧逻辑两分支都不命中 → 返回 None → analyze 误判今日开盘中。
+    周末调休开市的极端场景仍由指数快照 d>=today 分支覆盖（快照优先）。"""
     d = _LAST_INDEX_SNAP_DATE[0]
     today = time.strftime("%Y%m%d")
-    if not d:
-        return None
-    if d >= today:
+    if d and d >= today:
         return True
-    if time.strftime("%H%M") >= "0915":
+    try:
+        import datetime
+        wd = datetime.date.today().weekday()
+    except Exception:
+        wd = 0
+    if d:
+        if 0 <= wd < 5:
+            pass
+        else:
+            return False     # 快照落后 + 周末 → 必非交易日
+        if time.strftime("%H%M") >= "0915":
+            return False
+        return None
+    # 快照未知：周六日直接按非交易日（周一~周五维持 None 等快照）
+    if wd >= 5:
         return False
     return None
 
@@ -1986,6 +2033,395 @@ def _fetch_ths(full, count=600, base=None):
     return _fetch_ths_raw(full, count=count, base=base)
 
 
+# ================= 通达信（TDX）7709 直连源（v7.2.0） =================
+# 2026-07 起通达信服务端对 pytdx 系旧帧（0c 02 系）停供行情：TCP 可连、
+# 目录/财务照常应答，但 K线/快照/分时静默返回空 2 字节载荷。官方终端改用
+# 新帧，本段内联实现（纯标准库、无第三方依赖、无需安装 pytdx/mootdx）：
+#   - 登录帧 80B 静态字节串，可跨连接重放；响应帧 16B 头（zlib 标志）
+#     `<IIIHH` = 魔数/方法/保留/压缩长/原始长；
+#   - 日K记录 36B：[u32 日期][u32 时间][f32 开][f32 高][f32 低][f32 收]
+#     [f32 成交额][f32 成交量(股)][f32 流通股本]，载荷尾部 120B 为 GBK 名称；
+#     单次上限 700 根，start 偏移向前翻页 → 2003 年起全历史（600000 实测
+#     5600 根、首根 2003-05-19）；日K为**不复权**原始价，成交量需 /100 对齐
+#     库内「手」口径；
+#   - 除权除息：旧帧 0x0f 在各主站仍可用（category 1 分红送配 / 11 扩缩股），
+#     据此自算乘法后复权因子。实测与新浪 hfq.js 的 f 逐值互逆等价
+#     （600000/000001/600519/300750 四点全吻合），且能还原 ETF 的份额折算
+#     （suogu）——新浪对 ETF 只给 f=1，这正是此前 ETF 只能退回「腾讯前复权」
+#     并随新分红整体漂移、进而在回填里撞「口径冲突」的根因。
+# 源名「通达信」同时是熔断器键。
+
+_TDX_HOSTS = [
+    "121.36.248.138",     # 主站（实测 2026-11 可用）
+    "180.153.18.170",
+    "115.238.56.198",
+    "115.238.90.165",
+    "218.75.126.9",
+    "60.191.117.167",
+    "60.12.136.250",
+    "59.36.5.11",
+    "117.34.114.13",
+]                         # 2026-11 实测能答新帧的 9 台；轮换用
+_TDX_MAX_PAGE = 700       # 服务端单次上限（载荷 u16 长度字段约束）
+
+# 登录帧（80B，官方客户端建连后原样重放即可）
+_TDX_LOGIN = bytes.fromhex(
+    "000300010001460046000f1204002d3100000000000000000027100e00000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000")
+# 日K请求帧（58B）：市场@12 代码@14（哨兵 C0DE00）周期u16@36（4=日线）
+# 起始偏移u32@40 条数u16@44
+_TDX_BARS = bytes.fromhex(
+    "000a00681301300030002e120000433044453030000000000000000000000000"
+    "000000000400010000000000bc02000001010001000000000000")
+# 除权除息请求帧（旧协议 0x0f，尾部追加 <B6s 市场+6位代码>）
+_TDX_XDXR = bytes.fromhex("0c1f187600010b000b000f000100")
+
+_TDX_ROT = [0]                 # 主站轮换下标
+_TDX_TLS = threading.local()   # 每线程一条长连接（翻页复用）
+_TDX_DOWN_UNTIL = [0.0]        # 全主站失败后的冷却截止（避免逐股空烧）
+_TDX_XDXR_CACHE = {}           # {code: [事件]}，进程内缓存
+
+
+def _tdx_market(full):
+    """腾讯代码 → 通达信市场字节（1=沪 0=深）；其它市场返回 None。"""
+    if full.startswith("sh"):
+        return 1
+    if full.startswith("sz"):
+        return 0
+    return None
+
+
+class _TdxSock:
+    """通达信 7709 裸 TCP 客户端（一连接一用，非线程安全）。"""
+
+    def __init__(self, host, timeout=6.0):
+        self.host = host
+        self.timeout = timeout
+        self.sock = None
+
+    def connect(self):
+        import socket
+        self.sock = socket.create_connection((self.host, 7709),
+                                            timeout=self.timeout)
+        self.sock.settimeout(self.timeout)
+        self._send(_TDX_LOGIN)
+        self._recv()                       # 登录应答（约 203B 载荷）
+
+    def close(self):
+        s, self.sock = self.sock, None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _send(self, data):
+        if self.sock is None:
+            raise RuntimeError("通达信连接未建立")
+        self.sock.sendall(data)
+
+    def _recv(self):
+        import struct
+        import zlib
+        head = b""
+        while len(head) < 16:
+            chunk = self.sock.recv(16 - len(head))
+            if not chunk:
+                raise RuntimeError("通达信连接被服务端关闭")
+            head += chunk
+        _, _, _, zsize, usize = struct.unpack("<IIIHH", head)
+        body = b""
+        while len(body) < zsize:
+            chunk = self.sock.recv(zsize - len(body))
+            if not chunk:
+                raise RuntimeError("通达信载荷不完整")
+            body += chunk
+        if body and zsize != usize:
+            body = zlib.decompress(body)
+        return body
+
+    def bars(self, market, code, start, count):
+        import struct
+        f = bytearray(_TDX_BARS)
+        f[12] = market
+        f[14:20] = code.encode()
+        f[36:38] = struct.pack("<H", 4)               # 4=日线
+        f[40:44] = struct.pack("<I", int(start))
+        f[44:46] = struct.pack("<H", int(count))
+        self._send(bytes(f))
+        return _tdx_parse_bars(self._recv(), code)
+
+    def xdxr(self, market, code):
+        import struct
+        f = bytearray(_TDX_XDXR)
+        f.extend(struct.pack("<B6s", market, code.encode()))
+        self._send(bytes(f))
+        return _tdx_parse_xdxr(self._recv())
+
+
+def _tdx_parse_bars(payload, code):
+    """日K载荷 → [{date,open,high,low,close,vol(手)}]（升序）。"""
+    import struct
+    if not payload or len(payload) < 40:
+        return []
+    if payload[2:8] != code.encode():
+        raise RuntimeError("通达信日K代码回显不匹配")
+    end = len(payload) - 120          # 载荷尾部 120B 为 GBK 名称区
+    if end < 33:
+        end = len(payload)
+    out = []
+    pos = 33
+    while pos + 36 <= end:
+        rec = payload[pos:pos + 36]
+        pos += 36
+        (zipday,) = struct.unpack("<I", rec[:4])
+        o, h, l, c, _amount, vol = struct.unpack("<6f", rec[8:32])
+        if zipday < 19900101 or c <= 0 or l <= 0:
+            continue
+        out.append({"date": "%04d-%02d-%02d" % (zipday // 10000,
+                                                zipday // 100 % 100,
+                                                zipday % 100),
+                    "open": o, "close": c, "high": h, "low": l,
+                    "vol": vol / 100.0})
+    return out
+
+
+def _tdx_parse_xdxr(payload):
+    """除权除息载荷 → [{date,cat,fenhong,songzhuangu,peigu,peigujia,suogu}]。
+
+    帧体：9B 头 + u16 条数 + 每条[7B 市场代码回显][1B 保留][u32 日期]
+    [u8 类别][16B 类别载荷]。只保留 1（除权除息）与 11/12（扩缩股）。"""
+    import struct
+    if not payload or len(payload) < 11:
+        return []
+    pos = 9
+    (num,) = struct.unpack("<H", payload[pos:pos + 2])
+    pos += 2
+    out = []
+    for _ in range(num):
+        pos += 8
+        if pos + 21 > len(payload):
+            break
+        (zipday,) = struct.unpack("<I", payload[pos:pos + 4])
+        pos += 4
+        cat = payload[pos]
+        pos += 1
+        raw = payload[pos:pos + 16]
+        pos += 16
+        if zipday < 19900101:
+            continue
+        ev = {"date": "%04d-%02d-%02d" % (zipday // 10000,
+                                         zipday // 100 % 100, zipday % 100),
+              "cat": cat}
+        if cat == 1:
+            fh, pgp, szg, pg = struct.unpack("<ffff", raw)
+            ev.update(fenhong=fh, peigujia=pgp, songzhuangu=szg, peigu=pg)
+        elif cat in (11, 12):
+            (_a, _b, suogu, _c) = struct.unpack("<IIfI", raw)
+            ev["suogu"] = suogu
+        else:
+            continue
+        out.append(ev)
+    return out
+
+
+def _tdx_reset(rotate=True):
+    """丢弃本线程连接；rotate=True 时换下一台主站。"""
+    conn = getattr(_TDX_TLS, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _TDX_TLS.conn = None
+    if rotate:
+        _TDX_ROT[0] = (_TDX_ROT[0] + 1) % len(_TDX_HOSTS)
+
+
+def _tdx_conn():
+    """本线程的连接（不存在则按轮换序建连）。"""
+    conn = getattr(_TDX_TLS, "conn", None)
+    if conn is not None:
+        return conn
+    conn = _TdxSock(_TDX_HOSTS[_TDX_ROT[0] % len(_TDX_HOSTS)])
+    conn.connect()
+    _TDX_TLS.conn = conn
+    return conn
+
+
+def _tdx_call(fn, tries=None):
+    """在当前线程连接上执行 fn(conn)；失败换主站，全灭进入 120s 冷却。"""
+    if time.time() < _TDX_DOWN_UNTIL[0]:
+        raise RuntimeError("通达信源冷却中")
+    tries = tries or min(len(_TDX_HOSTS), 4)
+    last = None
+    for _ in range(tries):
+        try:
+            return fn(_tdx_conn())
+        except Exception as e:
+            last = e
+            _tdx_reset()
+    _TDX_DOWN_UNTIL[0] = time.time() + 120
+    raise RuntimeError(f"通达信主站全部失败: {str(last)[:60]}")
+
+
+def _tdx_bars_raw(full, count=600, max_pages=10):
+    """通达信**不复权**日K（升序）。返回 (rows, exhausted)。
+
+    exhausted=True 表示已取到该标的上市首根（末页不足 700 根）——回填据此
+    判断「短历史是天生短，不是拉取失败」，新 ETF/次新股不再每次重拉。"""
+    m = _tdx_market(full)
+    if m is None:
+        return [], True
+    need = max(1, int(count or 600))
+    code = full[2:]
+    rows, start, exhausted = [], 0, False
+    for _ in range(max_pages):
+        seg = _tdx_call(lambda c: c.bars(m, code, start, _TDX_MAX_PAGE))
+        if not seg:
+            exhausted = True
+            break
+        rows = seg + rows
+        if len(seg) < _TDX_MAX_PAGE:
+            exhausted = True
+            break
+        if len(rows) >= need:
+            break
+        start += _TDX_MAX_PAGE
+    seen, uniq = set(), []
+    for r in rows:                    # 翻页重叠/服务端补记去重
+        if r["date"] in seen:
+            continue
+        seen.add(r["date"])
+        uniq.append(r)
+    uniq.sort(key=lambda r: r["date"])
+    return (uniq[-need:] if need < len(uniq) else uniq), exhausted
+
+
+def _tdx_xdxr_events(full):
+    """该标的除权除息事件（进程内缓存；取不到返回 []）。"""
+    if full in _TDX_XDXR_CACHE:
+        return _TDX_XDXR_CACHE[full]
+    m = _tdx_market(full)
+    if m is None:
+        return []
+    try:
+        ev = _tdx_call(lambda c: c.xdxr(m, full[2:]))
+    except Exception:
+        ev = []
+    if len(_TDX_XDXR_CACHE) > 4000:       # 防无限增长（全市场约 7400 只）
+        for k in list(_TDX_XDXR_CACHE)[:800]:
+            _TDX_XDXR_CACHE.pop(k, None)
+    _TDX_XDXR_CACHE[full] = ev
+    return ev
+
+
+def _tdx_event_factor(ev, prev_close):
+    """单个除权事件的乘法因子 f：事件前价格 × f = 后复权价。
+
+    - 除权除息：f = P×(1+送转+配股) / (P - 现金分红 + 配股×配股价)（每10股口径）；
+    - 扩缩股：f = suogu（512220 实测 suogu=3 → 折算日价格 /3，前段 ×3 后才连续）。
+    因子越界（<=0.2 或 >=50）判为脏事件丢弃，交由调用方保留原值。"""
+    if ev["cat"] in (11, 12):
+        s = float(ev.get("suogu") or 0)
+        return s if 0.01 < s < 100 else None
+    p = prev_close
+    if not p or p <= 0:
+        return None
+    fh = float(ev.get("fenhong") or 0) / 10.0
+    szg = float(ev.get("songzhuangu") or 0) / 10.0
+    pg = float(ev.get("peigu") or 0) / 10.0
+    pgp = float(ev.get("peigujia") or 0)
+    den = p - fh + pg * pgp
+    if den <= 0 or (1 + szg + pg) <= 0:
+        return None
+    f = p * (1 + szg + pg) / den
+    return f if 0.2 < f < 50 else None
+
+
+def _tdx_factor_series(full, rows):
+    """[(事件日, 归一化累计因子)]：自算乘法复权因子（升序）。
+
+    事件日 <= K线日 即计入（除权日当天开盘已是除权价，故当天起乘因子）。
+    早于本地首根的事件没有昨收、无法定因子 —— 直接跳过：这类事件对段内
+    收益无影响，只差一个常数因子。
+
+    归一口径：全部因子除以**最后一根K线当天**的累计值，即前复权式定基
+    （末根 = 真实价、k≈1）。这样得到的因子与取多深的历史无关（早于窗口
+    的事件在分子分母里同时消失），不会因子窗口长度不同而把序列按不同
+    基期写入；新分红引起的基期漂移由回填/读库的重叠比对与整只重定基吃掉。
+    返回首项为哨兵 ("0000-00-00", 1/norm)，供早于首个事件的日子取值。"""
+    import bisect
+    ev = _tdx_xdxr_events(full)
+    if not ev or not rows:
+        return []
+    ds = [r["date"] for r in rows]
+    out, cum = [], 1.0
+    for e in sorted(ev, key=lambda x: x["date"]):
+        i = bisect.bisect_left(ds, e["date"]) - 1
+        if i < 0:
+            continue
+        f = _tdx_event_factor(e, rows[i]["close"])
+        if not f:
+            continue
+        cum *= f
+        out.append((e["date"], cum))
+    if not out:
+        return []
+    norm = 1.0
+    for d, c in out:                 # 末根当天已生效的累计值
+        if d <= ds[-1]:
+            norm = c
+    if norm <= 0:
+        return []
+    return [("0000-00-00", 1.0 / norm)] + [(d, c / norm) for d, c in out]
+
+
+def _apply_factor_series(rows, series):
+    """按 [(日期, 累计因子)] 缩放 rows（价×f，量不变）。"""
+    if not series:
+        return rows
+    import bisect
+    ds = [d for d, _ in series]
+    fs = [f for _, f in series]
+    out = []
+    for r in rows:
+        i = bisect.bisect_right(ds, r["date"]) - 1
+        f = fs[i] if i >= 0 else 1.0
+        if abs(f - 1.0) < 1e-12:
+            out.append(r)
+        else:
+            out.append({"date": r["date"], "open": r["open"] * f,
+                        "close": r["close"] * f, "high": r["high"] * f,
+                        "low": r["low"] * f, "vol": r["vol"]})
+    return out
+
+
+def _tdx_adjust(full, raw):
+    """通达信不复权 rows → 库内口径（真乘法后复权）。
+
+    个股优先新浪 hfq 因子（与既有全库同口径、绝对基期一致）；ETF/指数/无
+    分红个股的新浪因子恒等，改用通达信除权事件自算（含份额折算）——
+    这是修掉「ETF 只能退回腾讯前复权、新分红后整段漂移」的关键：折算与
+    分红都按乘法因子还原，日收益不失真，且因子不随取数深度变化。"""
+    if not raw:
+        return []
+    try:
+        factors = _sina_hfq_factors(full)
+    except Exception:
+        factors = []
+    if any(abs(f - 1.0) > 1e-9 for _, f in factors):
+        return _apply_hfq_factors(raw, factors)
+    return _apply_factor_series(raw, _tdx_factor_series(full, raw))
+
+
+def _fetch_tdx(full, count=600):
+    """通达信日K（后复权口径，与库内一致）。单次最多 max_pages×700 根。"""
+    raw, _ = _tdx_bars_raw(full, count=count)
+    return _tdx_adjust(full, raw)
+
+
 # ================= K线源链配置（v6.6.5：设置→数据源，ini [data]） =================
 # 内置源顺序/启用 + 自定义源（腾讯/同花顺/东财/新浪/网易格式），运行时
 # 组装为 [(源名, fetcher工厂)] 供 _fetch_remote_rows 遍历；源名同时是
@@ -2020,6 +2456,8 @@ def _kline_builtin_defs():
         ("腾讯webHTTP", "web.ifzq.gtimg.cn (HTTP)",
          lambda f, c: _fetch_tencent_mul(
              f, c, "http://web.ifzq.gtimg.cn/" + tx)),
+        ("通达信", "7709 直连新帧（700根/请求，2003起全历史，不惧腾讯限流）",
+         _fetch_tdx),
         ("新浪", "money.finance.sina.com.cn CN_MarketData",
          _fetch_sina_kline),
         ("同花顺", "d.10jqka.com.cn（前复权口径，新浪后东财前的第三源）",
@@ -2792,8 +3230,12 @@ def _bf_tx_fetch(full, end, count, fq="hfq"):
     raise last
 
 
-def _bf_tx_pages(full, page=800, target=None, fq="hfq", max_pages=6):
-    """腾讯深历史按需翻页（fq='' 不复权 / 'hfq' / 'qfq'）。"""
+def _bf_tx_pages(full, page=800, target=None, fq="hfq", max_pages=7):
+    """腾讯深历史按需翻页（fq='' 不复权 / 'hfq' / 'qfq'）。
+
+    v7.1.1：max_pages 6→7（目标≥2005 年起回填：2005-01~今约 5300 个
+    交易日，6 页=4800 根只到 2006 年底；7 页=5600 根覆盖 2005 年并
+    略有富余，翻页在源侧无更早数据时自动停）。"""
     import datetime
     target = target or max(CFG.MAX_FETCH_BARS, page * 2)
     rows = _bf_tx_fetch(full, "", page, fq)
@@ -2845,16 +3287,28 @@ def _bf_hint_set(full, raw):
 
 
 def _bf_fetch_one(full, page=800, target=None):
-    """单只深历史回填：腾讯不复权翻页 → 同花顺全历史兜底 → 东财兜底。
+    """单只深历史回填：通达信直连 → 腾讯不复权翻页 → 同花顺 → 东财。
 
     target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）。
     口径（v6.1.5 热修⑪）：主源一律取**不复权** × 新浪因子=真乘法后复权，
-    绝不回写腾讯 hfq 仿射口径；东财兜底为 fqt=2 后复权直存。
+    绝不回写腾讯 hfq 仿射口径。
     v6.6.5：腾讯整域 501/断连或浅返回(<300根)时，改走同花顺深历史
     （完整前复权口径原样使用，与库内口径不同时由上层重叠偏差检测
-    **整只**替换，绝不逐条混写），回填不再随腾讯单点故障中断。"""
+    **整只**替换，绝不逐条混写），回填不再随腾讯单点故障中断。
+    v7.2.0：通达信 7709 新帧提到首位——单只 8 个请求就拿回 2003 年起
+    全历史（腾讯需 7 页且常被限流），且是唯一能给出 ETF 折算因子的源。"""
     target = target or max(CFG.MAX_FETCH_BARS, page * 2)
     raw_last = None
+    # 主源0：通达信（不复权全历史 × 复权因子）
+    try:
+        raw, _exhausted = _tdx_bars_raw(full, count=target)
+        if raw:
+            raw_last = _bf_hint_set(full, raw)
+            rows0 = _tdx_adjust(full, raw)
+            if len(rows0) >= 20:
+                return rows0, raw_last
+    except Exception:
+        pass          # 通达信整体不可用：退回腾讯/同花顺/东财
     try:
         raw = _bf_tx_pages(full, page=page, target=target, fq="")
     except Exception:
@@ -2876,9 +3330,14 @@ def _bf_fetch_one(full, page=800, target=None):
             return rows2, rows2[-1].get("close")
     except Exception:
         pass
-    # 兜底B：东财（fqt=2 后复权直存）
+    # 兜底B：东财（v7.1.4：不用 fqt=2——实测分段仿射、日收益被逐股
+    # 缩放；ETF 用 fqt=1 前复权直存，个股用不复权 × 新浪因子真后复权）
     try:
-        rows = _fetch_eastmoney(full, count=1100)
+        if _is_etf(full):
+            rows = _fetch_eastmoney(full, count=max(target, 800), fqt=1)
+        else:
+            _raw = _fetch_eastmoney(full, count=max(target, 800), fqt=0)
+            rows = _to_hfq_mul(full, _raw, page=page, target=target)
         if len(rows) >= 300:
             return rows, raw_last
     except Exception:
@@ -2968,7 +3427,9 @@ def backfill_full_market(progress=None, force=False, limit=0,
                 if mismatch:
                     full = []
                     try:
-                        full = _fetch_eastmoney(c, count=8000)
+                        # v7.2.0：改用同口径多源整只重拉（原为东财 fqt=2，
+                        # 属加法仿射口径，会把整只写成失真收益）
+                        full, _rl = _bf_fetch_one(c, target=8000)
                     except Exception:
                         full = []
                     if len(full) >= 200 and len(full) >= min(len(old), 400):
@@ -4969,10 +5430,12 @@ def _batch_tencent(codes):
             continue
         code = seg.split("=")[0].strip().replace("v_", "", 1).lower()
         f = seg.split("~")
-        if len(f) < 34 or not f[3]:
+        if len(f) < 35 or not f[3]:
             continue
         try:
             out[code] = {"name": f[1], "price": float(f[3]),
+                         "prev_close": float(f[4]), "open": float(f[5]),
+                         "high": float(f[33]), "low": float(f[34]),
                          "chg": float(f[32]), "time": f[30],
                          "turnover": _fv(f, 38), "pe": _fv(f, 39),
                          "pb": _fv(f, 46)}
@@ -4998,6 +5461,9 @@ def _batch_sina(codes):
         try:
             price = float(f[3])
             prev = float(f[2] or 0)
+            op = float(f[1] or 0)
+            high = float(f[4] or 0)
+            low = float(f[5] or 0)
         except ValueError:
             continue
         if price <= 0:
@@ -5006,6 +5472,8 @@ def _batch_sina(codes):
         if len(f) > 31 and f[30]:
             tstr = f[30].replace("-", "") + f[31].replace(":", "")
         out[code] = {"name": f[0], "price": price,
+                     "prev_close": prev, "open": op,
+                     "high": high, "low": low,
                      "chg": (price / prev * 100 - 100) if prev else 0.0,
                      "time": tstr}
     return out
@@ -5046,6 +5514,38 @@ def refresh_valuation_tx(progress=None, batch=60, only_missing=False):
     return n_ok
 
 
+def _quote_complete(q):
+    """快照是否含完整 OHLC 字段（批量行情曾只写现价/涨幅，
+    污染共享 quote_cache 后会让 AI 上下文/报告取值 KeyError）。"""
+    return (isinstance(q, dict)
+            and all(q.get(k) is not None
+                    for k in ("price", "prev_close", "open", "high", "low")))
+
+
+def _quote_ensure(q, fallback_px=0.0):
+    """补齐快照缺失/非法的 OHLC 字段，避免下游格式化与提示词崩溃。"""
+    q = dict(q or {})
+    px = q.get("price")
+    try:
+        px = float(px) if px is not None else float(fallback_px or 0)
+    except (TypeError, ValueError):
+        px = float(fallback_px or 0)
+    if px <= 0:
+        px = float(fallback_px or 0)
+    q["price"] = px
+    for k in ("prev_close", "open", "high", "low"):
+        try:
+            v = float(q.get(k))
+        except (TypeError, ValueError):
+            v = 0.0
+        if v <= 0:
+            v = px
+        q[k] = v
+    q.setdefault("name", "")
+    q.setdefault("time", "")
+    return q
+
+
 def fetch_batch_quotes(codes, ttl=_IDX_QUOTE_TTL):
     """批量行情快照（自选池名称/指数栏用）：缓存优先，网络兜底，无网则降级。
 
@@ -5062,7 +5562,7 @@ def fetch_batch_quotes(codes, ttl=_IDX_QUOTE_TTL):
     with _STATE_LOCK:
         for c in codes:
             hit = _IDX_QUOTE_CACHE.get(c)
-            if hit and now - hit[0] < ttl:
+            if hit and now - hit[0] < ttl and _quote_complete(hit[1]):
                 out[c] = hit[1]
             else:
                 need_fetch.append(c)
@@ -5072,7 +5572,8 @@ def fetch_batch_quotes(codes, ttl=_IDX_QUOTE_TTL):
         ts, cached = _quote_cache_get(c)
         if ts and now - ts < ttl * 4:
             out[c] = cached
-            if now - ts < ttl:
+            # 旧版批量源只缓存现价/涨幅（无 OHLC），视为未命中以便补齐
+            if now - ts < ttl and _quote_complete(cached):
                 continue
         still_need.append(c)
     if not still_need:
@@ -5132,7 +5633,11 @@ def _quote_cache_get(full):
 
 
 def _quote_cache_set(full, data):
-    """持久化行情快照缓存。"""
+    """持久化行情快照缓存（只写完整快照，避免污染共享缓存）。"""
+    if not _quote_complete(data):
+        log.debug("跳过不完整行情快照缓存 %s: %s", full,
+                  sorted((data or {}).keys()) if isinstance(data, dict) else data)
+        return
     try:
         with db_conn(commit=True) as conn:
             conn.execute(
@@ -5148,13 +5653,14 @@ def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
     所有行情快照调用应优先走本函数，避免盘中每次刷新都联网。
     """
     now = time.time()
+    hit = None
     with _STATE_LOCK:
         hit = _IDX_QUOTE_CACHE.get(full)
-        if hit and now - hit[0] < ttl:
+        if hit and now - hit[0] < ttl and _quote_complete(hit[1]):
             return hit[1]
     # 数据库持久化缓存（跨启动仍可用）
     ts, cached = _quote_cache_get(full)
-    if ts and now - ts < ttl * 4:          # 内存未命中时先用库内（允许稍旧）
+    if ts and now - ts < ttl * 4 and _quote_complete(cached):
         with _STATE_LOCK:
             _IDX_QUOTE_CACHE[full] = (ts, cached)
         if now - ts < ttl:
@@ -5162,10 +5668,12 @@ def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
     try:
         q = fetch_quote(full)
     except Exception as e:
-        # 网络失败：返回库内旧缓存，避免界面空白
-        if cached is not None:
+        # 网络失败：返回库内/内存旧缓存，避免界面空白（残缺快照由
+        # 调用方 _quote_ensure 补齐 OHLC 后再展示）
+        fallback = cached if cached is not None else (hit[1] if hit else None)
+        if fallback is not None:
             log.debug("行情快照网络失败，降级缓存 %s: %s", full, e)
-            return cached
+            return fallback
         raise
     with _STATE_LOCK:
         _IDX_QUOTE_CACHE[full] = (now, q)
@@ -8354,6 +8862,7 @@ def _composite_precompute(rows, chip_tail=400, use_chips=True):
     _, b_up, b_low = calc_boll(closes)
     pdi_a, mdi_a, adx_a = calc_adx(rows)
     ma20 = sma_period(closes, 20)
+    ma60 = sma_period(closes, 60)          # MA趋势维度（IC 0.228，最强规则信号）
     vols_d = [r.get("vol") or 0.0 for r in rows]
     try:
         chip_snaps = chip_snapshots(rows, tail=chip_tail) if use_chips \
@@ -8361,7 +8870,7 @@ def _composite_precompute(rows, chip_tail=400, use_chips=True):
     except Exception:
         chip_snaps = {}
     return (dif, dea, k_, d_, r6, b_up, b_low, pdi_a, mdi_a, adx_a,
-            ma20, vols_d, chip_snaps)
+            ma20, ma60, vols_d, chip_snaps)
 
 
 def _sell_cd(rp):
@@ -8392,7 +8901,7 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
     if pre is None:
         pre = _composite_precompute(rows, chip_tail, use_chips)
     (dif, dea, k_, d_, r6, b_up, b_low, pdi_a, mdi_a, adx_a,
-     ma20, vols_d, chip_snaps) = pre
+     ma20, ma60, vols_d, chip_snaps) = pre
     weak = idx_chg_by_date or {}
     buy_th = rp["buy_th"]
 
@@ -8434,6 +8943,37 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
         a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
         if None not in (a_i, p_i, m_i) and a_i >= INDP("ADX_TH") and p_i != m_i:
             s["ADX"] = 1 if p_i > m_i else -1
+        # v7.0 analyzer 升权：MA20/60 趋势状态（v3.3 全A实证 IC 0.228，
+        # 与 daily_pick_score 同口径并入买卖点评分）
+        m60 = ma60[i] if i < len(ma60) else None
+        if m20 and m20p and m60 and c > 0 and m60 > 0:
+            if c > m20 > m60 and m20 > m20p:
+                s["MA趋势"] = 2
+            elif c < m20 < m60 and m20 < m20p:
+                s["MA趋势"] = -2
+        # 爆发力：20日动量（10%~35% 强势区加分；≥35% 过热反向减分）
+        if i >= 20:
+            c20 = rows[i - 20]["close"]
+            if c20 and c20 > 0:
+                bias20 = c / c20 - 1.0
+                if 0.10 <= bias20 < 0.35:
+                    s["爆发力"] = 2
+                elif 0.05 <= bias20 < 0.10:
+                    s["爆发力"] = 1
+                elif bias20 >= 0.35:
+                    s["爆发力"] = -2
+                elif bias20 <= -0.15:
+                    s["爆发力"] = -1
+        # 量能扩张：5日均量/20日均量 显著放大且收涨
+        v20 = sum(vols_d[max(0, i - 20):i]) / max(1, min(20, i))
+        if v20 > 0:
+            ve = (vols_d[max(0, i - 5):i])
+            ve_avg = sum(ve) / max(1, len(ve))
+            expansion = ve_avg / v20
+            if expansion >= 1.5 and c > cp:
+                s["量能"] = 1
+            elif expansion >= 1.5 and c < cp:
+                s["量能"] = -1
         return s
 
     start = max(1, n - 1000)
@@ -9509,17 +10049,6 @@ def studio_bind_market(market, slug):
         log.exception("工坊策略绑定保存失败 %s", market)
 
 
-def sm701_has_model(market, _cache={}):
-    """该市场是否有 sm701 生产模型集（结果缓存；crypto 恒 False）。"""
-    if market not in _SM701_MK:
-        return False
-    if market not in _cache:
-        try:
-            sm701_paths(market=market)
-            _cache[market] = True
-        except Exception:
-            _cache[market] = False
-    return _cache[market]
 
 
 def _px_distances(rets, cur, W):
@@ -10162,9 +10691,6 @@ def _pick_one_from_pool(pool, key):
     （防“1~2 笔 100% 胜率”假策略；不足自动回退到 ≥3 笔，再不足全量，
     见 _ablation_pool），激进保持 0（允许低频高赔率）。
     返回 (picked, note)。"""
-    # v6.4.2 防泄漏：稳定档选型一律排除 test（sm701 模型直出，不参与消融；
-    # 研究脚本若仍用 CFG.RISK_PARAMS 全量跑出 test 候选，此处兜底过滤）。
-    p = [c for c in pool if c.get("mode") != "test"] or pool
     if key == "保守":
         p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
         if p2:
@@ -10576,8 +11102,11 @@ def _run_ablation_body(full, rows, idx_rows=None, progress=None):
     # v6.6.5：逐个报进度——sm701/lgbm/analog 单个就可能要几十秒到几分钟，
     # 此前 13 个信号 + 42 候选评估全程静默（GUI 手动消融像卡死）。
     sig_cache = {}
-    gens = {
-        "macd": lambda: _sig_macd(rows),
+    # v7.3.0：sm701（外接算法）候选可选参加 A 股消融（[predict] sm701_ablation；
+    # 接入总开关 sm701_ext=0 时同样剔除）。其余候选不受影响。
+    _include_701 = CFG.SM701_JOIN_ABLATION and CFG.SM701_EXT_ON
+    gens = {k: v for k, v in (
+        {"macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
         "rsi": lambda: _sig_rsi(rows),
         "boll": lambda: _sig_boll(rows),
@@ -10590,7 +11119,7 @@ def _run_ablation_body(full, rows, idx_rows=None, progress=None):
         "lgbm": lambda: _sig_lgbm(rows),
         "sm701": lambda: _sig_sm701(rows, full),
         "analog": lambda: _sig_analog(rows, full),
-    }
+        }.items()) if (k != "sm701" or _include_701)}
     for i, (algo, gen) in enumerate(gens.items(), 1):
         if progress:
             progress(f"消融进度: 生成信号 {i}/{len(gens)} "
@@ -11088,6 +11617,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
             offline = True
             log.info("无网络且无 %s 快照缓存，用最近收盘合成快照", full)
     rows = f_rows.result()
+    # 缓存/降级快照可能缺少 OHLC（旧版批量行情只存现价），统一补齐
+    q = _quote_ensure(q, rows[-1]["close"] if rows else 0.0)
 
     # 识别今日盘中bar（缓存库只存已收盘日K，实时bar由快照合成）
     today_str = time.strftime("%Y-%m-%d")
@@ -11405,8 +11936,9 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     # ---- 所选策略（meta缓存，5日过期；无缓存用默认多维·稳健）----
     # v6.6.0：启用外部策略（股票策略工坊）→ 直接用导入规则，不读消融缓存、
     # 不参与消融；风险偏好不生效，交易层改用止损/止盈/最长持有参数。
-    # v6.4.1：预测参数风险偏好=test → 不读消融缓存、不消融，直接用
-    # sm701 模型概率出买卖点（见 _sig_sm701）。
+    # v7.3.0：test（sm701 实验档）已删除——A 股走消融/缓存；多市场
+    # （hk/us/futures）由外接算法直出（[predict] sm701_ext 开关；
+    # 接入才出买卖点，断开只看行情）。crypto 暂无生产模型 → 多维评分。
     strat = None
     mk = _market_of(full)
     if mk != "cn":
@@ -11415,22 +11947,18 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         bound = studio_bound_strategy(mk)
         if bound:
             strat = bound
-        elif mk in _SM701_MK and sm701_has_model(mk):
+        elif (CFG.SM701_EXT_ON and mk in _SM701_MK
+              and sm701_has_model(mk)):
             strat = {"algo": "sm701", "mode": "sm701",
-                     "params": dict(CFG.RISK_PARAMS["test"]),
-                     "label": f"sm701模型·{_MARKET_LABELS[mk]}（直出，不消融）"}
-        # crypto/无模型：strat 保持 None → 走默认多维评分
+                     "params": dict(_SM701_EXT_RISK),
+                     "label": f"sm701外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
+        # 未接入外接算法 / crypto：strat 保持 None → 只看行情不出买卖点
     if not strat:
         strat = studio_active_strategy()
     if not strat:
-        if CFG.RISK_MODE == "test":
-            strat = {"algo": "sm701", "mode": "test",
-                     "params": dict(CFG.RISK_PARAMS["test"]),
-                     "label": "sm701 模型·test（不消融）"}
-        else:
-            # v6.6.5：缓存过期不再丢弃旧策略——沿用出买卖点（_stale 标记），
-            # 同时 _ensure_strategy 后台跑新一轮消融，完成后自动替换。
-            strat = load_strategy(full, allow_stale=True)
+        # v6.6.5：缓存过期不再丢弃旧策略——沿用出买卖点（_stale 标记），
+        # 同时 _ensure_strategy 后台跑新一轮消融，完成后自动替换。
+        strat = load_strategy(full, allow_stale=True)
     if strat and strat.get("_stale"):
         strat = dict(strat)
         strat["label"] = ((strat.get("label") or "旧策略")
@@ -11519,10 +12047,10 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     _win = max(1, len(disp_rows) - 250)
     _recent_n = len([s for s in signals if s[0] >= _win])
     _min_need = 8 if sel_mode == "激进" else 2
-    # test 档严格模型直出 / 外部策略显式规则：信号少也不混入多维评分；
+    # 外接算法（sm701）/外部策略显式规则：信号少也不混入多维评分；
     # 懒加载延后时同样跳过（后台补算后再按同规则兜底，避免先画兜底信号
-    # 又被 sm701 信号替换造成误导）。
-    if sel_mode not in ("test", "外部策略") and not _defer_heavy \
+    # 又被外接算法信号替换造成误导）。
+    if sel_mode not in ("sm701", "外部策略") and not _defer_heavy \
             and _recent_n < _min_need:
         try:
             _fb = [s for s in _composite_signals(disp_rows, rp)
@@ -11552,7 +12080,7 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     # ②最新一日方向明确时覆盖近端相反信号；分歧维持原策略。
     analog = None
     if (not quick and CFG.ANALOG_OVERRIDE
-            and sel_mode not in ("保守", "test", "外部策略")):
+            and sel_mode not in ("保守", "sm701", "外部策略")):
         _asigs = []
         if sel_algo != "analog":      # 策略本身就是 analog 时避免重复生成
             try:
@@ -11855,7 +12383,7 @@ def analyze_finish_signals(res, progress=None):
     _recent_n = len([s for s in signals if s[0] >= _win])
     _min_need = 8 if sel_mode == "激进" else 2
     _fb_applied = False
-    if sel_mode not in ("test", "外部策略") and _recent_n < _min_need:
+    if sel_mode not in ("sm701", "外部策略") and _recent_n < _min_need:
         try:
             _fb = [s for s in _composite_signals(disp_rows, rp)
                    if s[0] >= max(1, len(disp_rows) - 120)]
@@ -13517,8 +14045,10 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
 # v6.3.1 稳健档收紧：IC 确认层 + Top10 + 换仓缓冲带10（原 Top20、无确认），
 # 交易数约 -57%、样本外（val/bull）显著增强；候选须过 tier_ic_confirm
 # 「历史信号 IC 显著为正 + MA20/60 趋势在场」，确认不足宁缺毋滥。
-# v6.4.0 新增 test：独立 sm701 LightGBM 实验档，Top10/每日重排、不设闸门；
-# 只手动选择，不进入 AI 自动选档和默认三档回测。
+# v6.4.0 曾新增 test：sm701 实验档（Top10/每日重排、无闸门）；
+# v7.3.0 删除 test——sm701 改为外接算法（external/sm701_ext.py）：A 股
+# 作为「sm701上涨概率」候选参加单股消融（可选关），多市场由市场策略链
+# 直出；不再以组合档位形式占用 TIER_CFG。
 # v6.4.2 稳健档再收紧（只做高胜率、严控回撤）：四口径稳健统一加
 # mdd_guard=0.08——本相位净值从峰值回撤超 8% 即清仓熔断（reason="mdd_guard"，
 # 峰值重置、下个调仓日才可重建；跌停/停牌顺延），把最大回撤机械地压在
@@ -13527,9 +14057,6 @@ _ROT = dict(score="rotate", sec_w=0.5, mom_w=0.7, top=5, reb=10,
 # 均衡接管 v6.4.2 老稳健口径（blend-Top10/reb10/buffer10/IC/熔断8%），
 # 新稳健在老稳健基础上拉长持有（reb10→20、buffer10→20，换手更低）；
 # 熔断改为稳健/均衡两档配置，激进不设，保持进攻弹性。
-_SM701_TEST = dict(score="sm701", top=10, reb=1, gate=None, ma=None,
-                   source="sm701", experimental=True,
-                   score_start_from_data=True, stop_k=2.0)
 TIER_CFG = {
     "稳健": dict(universe="all", score="blend", top=10, reb=20,
                  gate="sh000001", ma=20, hold_buffer=20, ic_filter=True,
@@ -13538,7 +14065,6 @@ TIER_CFG = {
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
     "激进": dict(_ROT, universe="all"),
-    "test": dict(_SM701_TEST, universe="all"),
 }
 # 主板口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
 # （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）。
@@ -13552,7 +14078,6 @@ TIER_CFG_MAIN = {
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
     "激进": dict(_ROT, universe="main"),
-    "test": dict(_SM701_TEST, universe="main"),
 }
 # ETF 口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
 # （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）；
@@ -13566,7 +14091,6 @@ TIER_CFG_ETF = {
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
     "激进": dict(_ROT, universe="etf"),
-    "test": dict(_SM701_TEST, universe="etf"),
 }
 # 全A含ETF 口径：稳健长期持有（reb20/buffer20），均衡为老稳健中期口径
 # （blend 等权 Top10/reb10/buffer10/IC/熔断8%/上证MA20）。
@@ -13578,7 +14102,6 @@ TIER_CFG_ALLETF = {
                  gate="sh000001", ma=20, hold_buffer=10, ic_filter=True,
                  mdd_guard=0.08),
     "激进": dict(_ROT, universe="all_etf"),
-    "test": dict(_SM701_TEST, universe="all_etf"),
 }
 TIER_UNIVERSES = {"all": TIER_CFG, "main": TIER_CFG_MAIN,
                   "etf": TIER_CFG_ETF, "all_etf": TIER_CFG_ALLETF}
@@ -13590,13 +14113,13 @@ UNIVERSE_NAME = {"all": "全A", "main": "沪深主板", "etf": "ETF",
 # 池内实测用上证 MA20）。
 TIER_BENCH = {
     ("all", "稳健"): "sh000001", ("all", "均衡"): "sh000001",
-    ("all", "激进"): "sh000688", ("all", "test"): "sh000001",
+    ("all", "激进"): "sh000688",
     ("main", "稳健"): "sh000001", ("main", "均衡"): "sh000001",
-    ("main", "激进"): "sh000688", ("main", "test"): "sh000001",
+    ("main", "激进"): "sh000688",
     ("etf", "稳健"): "sh000001", ("etf", "均衡"): "sh000001",
-    ("etf", "激进"): "sh000688", ("etf", "test"): "sh000001",
+    ("etf", "激进"): "sh000688",
     ("all_etf", "稳健"): "sh000001", ("all_etf", "均衡"): "sh000001",
-    ("all_etf", "激进"): "sh000688", ("all_etf", "test"): "sh000001",
+    ("all_etf", "激进"): "sh000688",
 }
 # 基准指数中文名（报告/对照用）
 BENCH_NAME = {"sh000001": "上证指数", "sz399006": "创业板指",
@@ -13610,14 +14133,14 @@ def tier_cfg(tier, universe="all"):
 
 
 def tier_default_names(universe="all"):
-    """默认研究/回测档位：稳定三档；test 仅显式传入时运行。"""
+    """默认研究/回测档位：稳定三档。"""
     base = TIER_UNIVERSES.get(universe, TIER_CFG)
     return [t for t in base
             if not (base.get(t) or {}).get("experimental")]
 
 
 def tier_gate_label(cfg):
-    """档位闸门短标签；test 无闸门时返回固定文案。"""
+    """档位闸门短标签。"""
     if not cfg.get("gate"):
         return "无闸门"
     return f"闸门 {cfg['gate']} MA{cfg.get('ma')}"
@@ -13661,627 +14184,24 @@ _TIER_TRANSFER = 0.00001
 _TIER_LOT = 100
 _TIER_CACHE = {}
 
-# ---- sm701 实验档桥接（test）----
-# 独立只读接入桌面 sm701 副本（默认优先 `sm701 (副本)`），不复制 7GB 扩展库：
-#   stock_cache.db          日K/股票/行业等数据（只读连接）
-#   lgbm_train_backtest.py  特征工程 _compute_feats（模型/历史预测同口径）
-# v6.5.2：优先接入生产定稿三周期模型（`production/` 目录）——
-#   production/features_tech.json        tech 40 特征名/列序
-#   production/prod_h1|h5|h10_tech.txt    T+1/T+5/T+10 三模型（实时复算等权平均）
-#   production/valid_predictions.csv.gz   2024-01 起历史样本外分数（三模型）
-# 回退旧单模型：lgbm_output/lgbm_model.txt + valid_predictions.csv.gz。
-# 路径可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖
-# （设置 SM701_MODEL 时强制单模型口径，跳过 production/）。
-_SM701_CACHE = {}
-_SM701_LOCK = threading.RLock()
-_SM701_WARMUP_BARS = 180
+# ---- sm701 外接算法桥接（v7.3.0：算法本体已隔离至 external/sm701_ext.py）----
+# 本文件不再内嵌 sm701 模型/特征/副本库代码；sm701 目录（数据+模型）仍是
+# 仓库外资产，git 不分发（详见 external/sm701_ext.py 与 .gitignore）。
+# 接入开关：ini [predict] sm701_ext=0 → 其他市场只看行情、A 股消融剔除
+# sm701 候选；消融开关：[predict] sm701_ablation=0 → 不参加 A 股消融。
+# 路径可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖。
+import external.sm701_ext as _sm701_ext
 
-
-_SM701_MK = {
-    # 市场 -> (模型前缀, 历史预测文件, 副本库行情表)；cn 表=daily_bars
-    "cn":      {"mpre": "",     "pred": "valid_predictions.csv.gz",
-                "table": "daily_bars"},
-    "hk":      {"mpre": "hk_",  "pred": "valid_predictions_hk.csv.gz",
-                "table": "hk_daily"},
-    "us":      {"mpre": "us_",  "pred": "valid_predictions_us.csv.gz",
-                "table": "us_daily"},
-    "futures": {"mpre": "fut_", "pred": "valid_predictions_fut.csv.gz",
-                "table": "fut_daily"},
-}
-# crypto 无生产模型：信号回退多维评分并标注（见 analyze 市场分支）
-
-
-def _sm701_code(full):
-    """本项目前缀代码 → sm701 预测文件/副本库 code 形态：
-    hk00700→'00700'、usaapl→'AAPL'、fua0→'A0'；cn 原样。"""
-    mk = _market_of(full)
-    if mk == "hk":
-        return full[2:].zfill(5)
-    if mk == "us":
-        return full[2:].upper()
-    if mk == "futures":
-        return full[2:].upper()
-    return full
-
-
-def _sm701_production_set(base, mpre=""):
-    """桌面 sm701 `production/` 三周期 tech 模型集（mpre=市场前缀）；缺失
-    任一文件返回 None。v6.6.5 多市场：prod_{hk|us|fut}_h{1,5,10}_tech.txt。"""
-    pdir = os.path.join(base, "production")
-    man = os.path.join(pdir, "features_tech.json")
-    models = {h: os.path.join(pdir, f"prod_{mpre}h{h}_tech.txt")
-              for h in ("1", "5", "10")}
-    if not (os.path.isfile(man)
-            and all(os.path.isfile(v) for v in models.values())):
-        return None
-    try:
-        import json
-        with open(man, encoding="utf-8") as f:
-            feats = json.load(f).get("features") or []
-    except Exception:
-        log.exception("读取 sm701 生产特征清单失败")
-        return None
-    if not feats:
-        return None
-    pred = os.path.join(pdir, "valid_predictions" +
-                        ("" if not mpre else "_" + mpre[:-1]) + ".csv.gz")
-    return {"dir": pdir, "features": feats, "models": models, "pred": pred}
-
-
-def _sm701_model_mtimes(paths):
-    """模型文件 mtime 元组（生产三模型逐个；否则单模型），供缓存失效。"""
-    paths = paths or {}
-    prod = paths.get("prod")
-    files = (list(prod["models"].values()) if prod else [paths.get("model")])
-    out = []
-    for p in files:
-        try:
-            out.append(os.path.getmtime(p))
-        except (OSError, TypeError):
-            out.append(0.0)
-    return tuple(out)
-
-
-def sm701_paths(refresh=False, market="cn"):
-    """定位 sm701 副本及模型/预测产物；优先副本，其次原目录。
-    v6.6.5 多市场：models/pred 按市场（prod_{hk|us|fut}_*），按市场缓存。"""
-    mk = market if market in _SM701_MK else "cn"
-    cache_key = "paths_" + mk
-    if not refresh and _SM701_CACHE.get(cache_key):
-        return dict(_SM701_CACHE[cache_key])
-    env_dir = (os.environ.get("SM701_DIR") or "").strip()
-    env_model = (os.environ.get("SM701_MODEL") or "").strip()
-    env_pred = (os.environ.get("SM701_PRED") or "").strip()
-    home = os.path.expanduser("~")
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    if env_dir:
-        candidates.append(env_dir)
-    for base in (
-        os.path.join(home, "桌面", "sm701 (副本)"),
-        os.path.join(home, "Desktop", "sm701 (副本)"),
-        os.path.join(here, "sm701 (副本)"),
-        os.path.join(os.path.dirname(here), "sm701 (副本)"),
-        os.path.join(home, "桌面", "sm701"),
-        os.path.join(home, "Desktop", "sm701"),
-        os.path.join(here, "sm701"),
-        os.path.join(os.path.dirname(here), "sm701"),
-    ):
-        if base and base not in candidates:
-            candidates.append(base)
-    mpre = _SM701_MK[mk]["mpre"]
-    pred_file = _SM701_MK[mk]["pred"]
-    for base in candidates:
-        base = os.path.abspath(os.path.expanduser(base))
-        db = (os.environ.get("SM701_DB") or
-              os.path.join(base, "stock_cache.db"))
-        script = os.path.join(base, "lgbm_train_backtest.py")
-        if not (os.path.isfile(db) and os.path.isfile(script)):
-            continue
-        # SM701_MODEL 显式指定时强制单模型口径（仅 cn；多市场跳过 production 探测）
-        prod = None if (env_model or mk != "cn") \
-            else _sm701_production_set(base)
-        if mk != "cn":
-            prod = _sm701_production_set(base, mpre)
-            if not prod:
-                continue        # 该市场无生产模型集
-        if prod:
-            model = prod["models"]["1"]
-            pred = env_pred if (env_pred and mk == "cn") else \
-                (prod["pred"] if os.path.isfile(prod["pred"])
-                 else os.path.join(base, "lgbm_output", pred_file))
-        else:
-            model = (env_model or
-                     os.path.join(base, "lgbm_output", "lgbm_model.txt"))
-            pred = env_pred or os.path.join(base, "lgbm_output",
-                                            "valid_predictions.csv.gz")
-        if not os.path.isfile(model) or not os.path.isfile(pred):
-            continue
-        out = {"dir": base, "db": db, "model": model, "pred": pred,
-               "script": script, "prod": prod, "market": mk,
-               "table": _SM701_MK[mk]["table"]}
-        _SM701_CACHE[cache_key] = out
-        return dict(out)
-    raise RuntimeError(
-        f"未找到 sm701 {mk} 市场模型集（需 production/prod_{mpre}h*_tech.txt "
-        f"+ {pred_file}）；可用 SM701_DIR 指定目录")
-
-
-def _sm701_conn(path=None):
-    """只读打开 sm701 扩展库，避免与副本训练进程争用写锁。"""
-    import urllib.request as _ur
-    path = path or sm701_paths()["db"]
-    uri = "file:" + _ur.pathname2url(os.path.abspath(path)) + "?mode=ro"
-    return sqlite3.connect(uri, uri=True, timeout=30)
-
-
-def _sm701_module(paths=None):
-    """加载 sm701 的特征工程模块，实时预测与离线训练保持同一口径。"""
-    import importlib.util
-    paths = paths or sm701_paths()
-    cached = _SM701_CACHE.get("module")
-    if cached and cached[0] == paths["script"]:
-        return cached[1]
-    spec = importlib.util.spec_from_file_location(
-        "_stock_predict_sm701_lgbm", paths["script"])
-    if spec is None or spec.loader is None:
-        raise RuntimeError("无法加载 sm701 特征工程: " + paths["script"])
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _SM701_CACHE["module"] = (paths["script"], mod)
-    return mod
-
-
-def _sm701_stock_info():
-    """sm701 股票表（补足主库缺失的代码名/行业/PE/换手率）。"""
-    cached = _SM701_CACHE.get("info")
-    if cached is not None:
-        return cached
-    with _sm701_conn() as conn:
-        rows = conn.execute(
-            "select code,name,industry,pe,turnover from stocks").fetchall()
-        try:
-            extra_ind = dict(conn.execute(
-                "select code,industry_name from stock_industry "
-                "where industry_name is not null and industry_name<>''"))
-        except sqlite3.Error:
-            extra_ind = {}
-    rows = [(c, n, ind or extra_ind.get(c, ""), pe, tu)
-            for c, n, ind, pe, tu in rows]
-    out = {c: (n or c, ind or "", pe, tu)
-           for c, n, ind, pe, tu in rows}
-    _SM701_CACHE["info"] = out
-    return out
-
-
-def _sm701_fill_history(F, codes, cal, path):
-    """把历史样本外概率写入面板矩阵；标准库流式读取，避免整包 pandas。"""
-    import csv
-    import gzip
-    code_pos = {c: i for i, c in enumerate(codes)}
-    date_pos = {d: j for j, d in enumerate(cal)}
-    loaded = 0
-    with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        fields = set(reader.fieldnames or ())
-        pcol = "prob" if "prob" in fields else (
-            "prob_lgbm" if "prob_lgbm" in fields else
-            "prob_fuse" if "prob_fuse" in fields else "")
-        if not pcol:
-            raise RuntimeError("sm701 预测文件缺少 prob/prob_lgbm/prob_fuse 列")
-        for row in reader:
-            i = code_pos.get(row.get("code"))
-            j = date_pos.get(row.get("date"))
-            if i is None or j is None:
-                continue
-            try:
-                F[i, j] = float(row[pcol])
-            except (TypeError, ValueError):
-                continue
-            loaded += 1
-    return loaded
-
-
-def _sm701_predict_feats(feats, paths):
-    """按 sm701 模型对特征矩阵打分。
-
-    生产档（`paths["prod"]`）为 h1/h5/h10 三模型概率等权平均；否则单模型
-    `paths["model"]`（用模型自带 feature_name 选列，兼容任意特征组）。"""
-    import pandas as pd
-    import lightgbm as lgb
-    prod = (paths or {}).get("prod")
-    if prod:
-        names = prod["features"]
-        X = pd.DataFrame({k: np.asarray(feats[k], dtype=np.float32)
-                          for k in names}, dtype=np.float32)
-        acc = None
-        for h in sorted(prod["models"], key=int):
-            pv = lgb.Booster(model_file=prod["models"][h]).predict(X)
-            acc = pv if acc is None else acc + pv
-        return acc / float(len(prod["models"]))
-    booster = lgb.Booster(model_file=paths["model"])
-    names = booster.feature_name()
-    X = pd.DataFrame({k: np.asarray(feats[k], dtype=np.float32)
-                      for k in names}, dtype=np.float32)
-    return booster.predict(X)
-
-
-_DB_LATEST_CACHE = {}           # path -> (ts, date)；MAX(date) 无 date 索引，
-                                # 主库/副本全表扫 0.6~2s，60s 缓存供
-                                # sm701 缓存 key 等高频调用方复用（v6.6.5）
-
-
-def _db_latest_date(path=None):
-    """行情库最新交易日；path 为空时读主库。失败返回空串。
-    v6.6.5：加 60s 进程内缓存——本函数被 sm701 缓存 key 高频调用，
-    全表 MAX(date) 在主库/副本上每次 0.6~2s；数据推进频率为日级，
-    60s 缓存安全。"""
-    try:
-        key = os.path.abspath(path) if path else "main"
-        hit = _DB_LATEST_CACHE.get(key)
-        now = time.time()
-        if hit and now - hit[0] < 60:
-            return hit[1]
-        if path:
-            import urllib.request as _ur
-            uri = ("file:" + _ur.pathname2url(os.path.abspath(path))
-                   + "?mode=ro")
-            conn = sqlite3.connect(uri, uri=True, timeout=30)
-            try:
-                d = conn.execute(
-                    "select max(date) from daily_bars").fetchone()[0] or ""
-            finally:
-                conn.close()
-        else:
-            with db_conn() as conn:
-                d = conn.execute(
-                    "select max(date) from daily_bars").fetchone()[0] or ""
-        _DB_LATEST_CACHE[key] = (now, d)
-        return d
-    except sqlite3.Error:
-        return ""
-
-
-def _sm701_cache_epoch(src_max):
-    """当日数据的缓存桶：src_max 为今天时按 30 分钟分桶（盘中数据会变），
-    历史日期恒为 0（收盘定型，稳定缓存）。配合 key 用数据指纹替代
-    库文件 mtime——预取/回填写库改变 mtime 但数据未推进，不应触发
-    sm701 全市场重算（v6.6.5 修复：曾致 sm701 股票每次分析卡 100s+）。"""
-    if src_max and src_max >= time.strftime("%Y-%m-%d"):
-        return int(time.time() // 1800)
-    return 0
-
-
-def _sm701_live_predict(target_dates, cal, progress=None):
-    """用副本 LightGBM 模型实时复算目标日期全市场概率。
-
-    返回 {(code, date): prob}；cal 为交易日日历（用于取 180 根预热起点）。
-    结果按（预热起点 + 目标日期集合 + 取数库最新日K日期/当日30分钟桶/模型
-    mtime）缓存，组合矩阵与单股 test 信号两条链共用同一次复算。
-    v6.6.4：sm701 副本日K落后主库时改用主库最新行情复算——两库日K同源
-    （重叠段逐值一致），否则目标日停在副本末日会让 test 荐股整页为空。
-    v6.6.5：缓存 key 由「取数库 mtime」改为「取数库最新日K日期 +
-    当日 30 分钟桶」——mtime 在每次预取/回填写库后必变，而数据未推进
-    时复算结果不变，曾导致 sm701 股票每次分析都触发 100s+ 全市场复算
-    （主图长时间空白）。"""
-    import pandas as pd
-    if np is None:
-        raise RuntimeError("test 档实时评分需要 numpy")
-    paths = sm701_paths()
-    date_pos = {d: j for j, d in enumerate(cal)}
-    wanted = sorted({d for d in target_dates if d in date_pos})
-    if not wanted:
-        return {}
-    first = min(date_pos[d] for d in wanted)
-    start_i = max(0, first - (_SM701_WARMUP_BARS - 1))
-    start = cal[start_i]
-    sm_max = _db_latest_date(paths["db"])
-    src_db, src_max = paths["db"], sm_max
-    main_max = _db_latest_date()
-    if main_max > sm_max:
-        src_db, src_max = DB_PATH, main_max
-    use_main = os.path.abspath(src_db) == os.path.abspath(DB_PATH)
-    key = (start, tuple(wanted), os.path.abspath(src_db), src_max,
-           _sm701_cache_epoch(src_max), _sm701_model_mtimes(paths))
-    cached = _SM701_CACHE.get("live")
-    if cached and cached[0] == key:
-        return cached[1]
-
-    def _qual(col):
-        return (f"({col} GLOB 'sh60[0135]*' OR {col} GLOB 'sh68[89]*' "
-                f"OR {col} GLOB 'sz00[0123]*' OR {col} GLOB 'sz30[01]*' "
-                f"OR {col} GLOB 'bj[489]*')")
-
-    if progress:
-        progress(f"test(sm701)：复算 {wanted[0]} ~ {wanted[-1]} 概率"
-                 f"（数据至 {src_max or '-'}）...")
-    if use_main:
-        sql = (f"SELECT code,date,open,high,low,close,vol FROM daily_bars "
-               f"WHERE date>=? AND {_qual('code')} ORDER BY code,date")
-        with db_conn() as conn:
-            df = pd.read_sql_query(sql, conn, params=[start])
-    else:
-        sql = (f"SELECT b.code,b.date,b.open,b.high,b.low,b.close,b.vol "
-               f"FROM daily_bars b JOIN stocks s ON s.code=b.code "
-               f"WHERE b.date>=? AND {_qual('s.code')} ORDER BY b.code,b.date")
-        with _sm701_conn(src_db) as conn:
-            df = pd.read_sql_query(sql, conn, params=[start])
-    if df.empty:
-        raise RuntimeError("sm701/主库均无可用日K")
-    df["code"] = df["code"].astype("category")
-    feats = _sm701_module(paths)._compute_feats(df)
-    prob = _sm701_predict_feats(feats, paths)
-    code_arr = df["code"].astype(str).to_numpy()
-    date_arr = df["date"].to_numpy()
-    wanted_set = set(wanted)
-    out = {}
-    for code, date, pv in zip(code_arr, date_arr, prob):
-        if date not in wanted_set:
-            continue
-        out[(str(code), str(date))] = float(pv)
-    _SM701_CACHE["live"] = (key, out)
-    return out
-
-
-def _sm701_live_fill(F, codes, cal, target_dates, progress=None):
-    """实时概率写入面板矩阵（sm701_score_matrix 用）。"""
-    preds = _sm701_live_predict(target_dates, cal, progress=progress)
-    code_pos = {c: i for i, c in enumerate(codes)}
-    date_pos = {d: j for j, d in enumerate(cal)}
-    loaded = 0
-    for (code, date), pv in preds.items():
-        i = code_pos.get(code)
-        j = date_pos.get(date)
-        if i is None or j is None:
-            continue
-        F[i, j] = pv
-        loaded += 1
-    return loaded
-
-
-def sm701_score_matrix(progress=None):
-    """返回与 tier_load_panel 对齐的 sm701 概率矩阵（代码 × 交易日）。"""
-    if np is None:
-        raise RuntimeError("test 档需要 numpy")
-    codes, cal, _, _ = tier_load_panel()
-    paths = sm701_paths()
-    try:
-        pred_mt = os.path.getmtime(paths["pred"])
-    except OSError:
-        pred_mt = 0.0
-    main_max = _db_latest_date()
-    key = (tuple(codes[:3]), len(codes), cal[0], cal[-1],
-           os.path.getmtime(paths["db"]), _sm701_model_mtimes(paths),
-           pred_mt, main_max, _sm701_cache_epoch(main_max))
-    cached = _SM701_CACHE.get("scores")
-    if cached and cached[0] == key:
-        return cached[1]
-    with _SM701_LOCK:
-        cached = _SM701_CACHE.get("scores")
-        if cached and cached[0] == key:
-            return cached[1]
-        F = np.full((len(codes), len(cal)), np.nan, np.float32)
-        hist_max = ""
-        if os.path.isfile(paths["pred"]):
-            n = _sm701_fill_history(F, codes, cal, paths["pred"])
-            if n:
-                hist_max = max(cal[j] for j in range(len(cal))
-                               if np.isfinite(F[:, j]).any())
-        missing = ([d for d in cal if d > hist_max] if hist_max else
-                   list(cal[-_SM701_WARMUP_BARS:]))
-        if missing:
-            try:
-                _sm701_live_fill(F, codes, cal, missing, progress=progress)
-            except Exception:
-                log.exception("sm701 实时概率复算失败")
-                if not np.isfinite(F).any():
-                    raise
-        _SM701_CACHE["scores"] = (key, F)
-    return F
-
-
-def sm701_status():
-    """test 档数据/模型状态，供报告和排障展示。"""
-    try:
-        p = sm701_paths()
-        with _sm701_conn(p["db"]) as conn:
-            db_date = conn.execute("select max(date) from daily_bars").fetchone()[0]
-        out = {"ok": True, "dir": p["dir"], "db_date": db_date or "",
-               "live_db_date": max(db_date or "", _db_latest_date()),
-               "model": p["model"], "pred": p["pred"]}
-        prod = p.get("prod")
-        if prod:
-            out["prod_dir"] = prod["dir"]
-            out["prod_models"] = {h: os.path.basename(v)
-                                  for h, v in prod["models"].items()}
-            out["prod_n_feat"] = len(prod["features"])
-        return out
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-# test 档（预测参数·风险偏好）信号阈值：模型概率滞回映射
-# （v6.4.1：不消融，直接用 sm701 概率；≥0.55 买入、<0.50 卖出）
-_SM701_SIG_BUY = 0.55
-_SM701_SIG_SELL = 0.50
-
-
-def _sm701_live_one(full, dates, progress=None):
-    """多市场单股实时复算：读**副本库同源行情表**（hk_daily/us_daily/fut_daily
-    ——特征与训练同源同口径），取 ≥180 根预热 + 目标日段，三周期模型等权。
-
-    返回 {date: prob}。副本库缺最新日时用主库同前缀代码补（重叠段副本优先，
-    接缝仅影响最后一日特征尾部）。缓存按（full, dates, 主库最新日/模型mtime）。"""
-    import pandas as pd
-    mk = _market_of(full)
-    paths = sm701_paths(market=mk)
-    sm_code = _sm701_code(full)
-    dates_u = list(dict.fromkeys(d for d in dates if d))
-    if not dates_u:
-        return {}
-    src_max = _db_latest_date()
-    key = (full, tuple(dates_u), src_max, _sm701_cache_epoch(src_max),
-           _sm701_model_mtimes(paths))
-    cache = _SM701_CACHE.setdefault("live_one", {})
-    hit = cache.get(key)
-    if hit is not None:
-        return dict(hit)
-    table = _SM701_MK[mk]["table"]
-    con = _sm701_conn(paths["db"])
-    try:
-        df = pd.read_sql_query(
-            f"SELECT code,date,open,high,low,close,vol FROM {table} "
-            f"WHERE code=? AND date>=? ORDER BY date",
-            con, params=[sm_code, "2010-01-01"])
-    finally:
-        con.close()
-    if df.empty:
-        raise RuntimeError(f"副本库 {table} 无 {sm_code} 行情")
-    # 主库补最新日（副本滞后时；重叠日以副本为准）
-    try:
-        with db_conn() as conn:
-            extra = pd.read_sql_query(
-                "SELECT code,date,open,high,low,close,vol FROM daily_bars "
-                "WHERE code=? ORDER BY date", conn, params=[full])
-        if not extra.empty:
-            have = set(df["date"])
-            add = extra[~extra["date"].isin(have)]
-            if not add.empty:
-                df = pd.concat([df, add], ignore_index=True)
-                df = df.sort_values("date").reset_index(drop=True)
-    except Exception:
-        log.debug("主库补最新分时数据失败(忽略)", exc_info=True)
-    for c in ("open", "high", "low", "close", "vol"):
-        df[c] = df[c].astype("float64")
-    df["code"] = df["code"].astype("category")
-    mod = _sm701_module(paths)
-    feats = mod._compute_feats(df)
-    date_arr = [str(d) for d in df["date"]]
-    pos = {d: i for i, d in enumerate(date_arr)}
-    want_idx = [i for d in dates_u if (i := pos.get(d)) is not None]
-    if not want_idx:
-        return {}
-    need_from = min(want_idx) - (_SM701_WARMUP_BARS - 1)
-    if need_from < 0:
-        need_from = 0
-    sub = df.iloc[need_from:].reset_index(drop=True)
-    sub_feats = {k: v[need_from:] for k, v in feats.items()}
-    probs = _sm701_predict_feats(sub_feats, paths)
-    sub_dates = [str(d) for d in sub["date"]]
-    pmap = {d: float(p) for d, p in zip(sub_dates, probs) if p == p}
-    out = {d: pmap[d] for d in dates_u if d in pmap}
-    cache[key] = dict(out)
-    return out
-
-
-def sm701_prob_map(full, dates=None):
-    """单股 sm701 概率序列 {date: prob}：历史落盘 + 新交易日实时复算。
-
-    历史段流式读对应市场 valid_predictions[_市场].csv.gz（只留该股，按文件
-    mtime 缓存）；dates 中晚于历史末日的交易日走实时复算——cn 全市场口径
-    （_sm701_live_predict），hk/us/fut 单股口径（_sm701_live_one，
-    v6.6.5 多市场）。crypto 无模型返回 {}。"""
-    if np is None:
-        return {}
-    mk = _market_of(full)
-    if mk not in _SM701_MK:
-        return {}
-    try:
-        paths = sm701_paths(market=mk)
-    except Exception:
-        return {}
-    sm_code = _sm701_code(full)
-    try:
-        pred_mt = os.path.getmtime(paths["pred"])
-    except OSError:
-        pred_mt = 0.0
-    key = (pred_mt, _sm701_model_mtimes(paths),
-           _db_latest_date(paths["db"]))
-    cache = _SM701_CACHE.setdefault("probmap", {})
-    hit = cache.get(full)
-    if hit and hit[0] == key:
-        out = dict(hit[1])
-    else:
-        import csv
-        import gzip
-        out = {}
-        if os.path.isfile(paths["pred"]):
-            with gzip.open(paths["pred"], "rt", encoding="utf-8",
-                           newline="") as f:
-                rd = csv.reader(f)
-                head = next(rd, [])
-                try:
-                    ci, di = head.index("code"), head.index("date")
-                    pi = next(head.index(c) for c in
-                              ("prob", "prob_lgbm", "prob_fuse")
-                              if c in head)
-                except (StopIteration, ValueError):
-                    ci = di = pi = -1
-                if pi >= 0:
-                    need = max(ci, di, pi)
-                    for row in rd:
-                        if len(row) <= need or row[ci] != sm_code:
-                            continue
-                        try:
-                            out[row[di]] = float(row[pi])
-                        except ValueError:
-                            continue
-        cache[full] = (key, dict(out))
-    if dates:
-        hist_max = max(out) if out else ""
-        missing = ([d for d in dict.fromkeys(dates) if d > hist_max]
-                   if hist_max else list(dict.fromkeys(dates)))
-        if missing:
-            try:
-                if mk == "cn":
-                    preds = _sm701_live_predict(
-                        missing, list(dict.fromkeys(dates)))
-                    out.update({d: pv for (code, d), pv in preds.items()
-                                if code == full and pv is not None})
-                else:
-                    out.update(_sm701_live_one(full, missing))
-            except Exception:
-                log.exception("sm701 单股实时概率复算失败")
-    return out
-
-
-def _sig_sm701_from_probs(rows, probs):
-    """sm701 概率序列 → 买卖点（probs 可为 {date: prob} 或按行对齐的序列）。
-
-    与 `_sig_sm701` 同一滞回口径，供研究消融在父进程一次性预载概率后
-    直接生成信号，避免每个 worker 重复扫描 70MB+ 预测文件。"""
-    if not rows or probs is None:
-        return []
-    seq = isinstance(probs, dict)
-    out = []
-    state = 0
-    for i, r in enumerate(rows):
-        p = probs.get(r.get("date")) if seq else (
-            probs[i] if i < len(probs) else None)
-        if p is None:
-            continue
-        if state <= 0 and p >= _SM701_SIG_BUY:
-            out.append((i, r["date"], "BUY",
-                        f"sm701概率{p:.2f}≥{_SM701_SIG_BUY:.2f}"))
-            state = 1
-        elif state >= 1 and p < _SM701_SIG_SELL:
-            out.append((i, r["date"], "SELL",
-                        f"sm701概率{p:.2f}<{_SM701_SIG_SELL:.2f}"))
-            state = 0
-    return out
-
-
-def _sig_sm701(rows, full, **_kw):
-    """sm701 概率信号（test 档专用，模型直出、不消融）：
-    概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。"""
-    if not rows or not full:
-        return []
-    try:
-        probs = sm701_prob_map(full, [r.get("date") for r in rows])
-    except Exception:
-        log.exception("sm701 单股概率读取失败")
-        return []
-    return _sig_sm701_from_probs(rows, probs)
+_sm701_ext.init_host(globals())
+from external.sm701_ext import (  # noqa: E402,F401
+    _SM701_MK, _SM701_SIG_BUY, _SM701_SIG_SELL,
+    _db_latest_date, _sig_sm701, _sig_sm701_from_probs,
+    _sm701_cache_epoch, _sm701_code, _sm701_conn, _sm701_module,
+    _sm701_predict_feats, _sm701_live_one, _sm701_live_predict,
+    _sm701_stock_info, sm701_has_model, sm701_paths, sm701_prob_map,
+    sm701_score_matrix, sm701_status)
+from external.sm701_ext import (  # noqa: E402,F401
+    EXT_RISK as _SM701_EXT_RISK)
 
 
 def tier_segments(cal):
@@ -15073,8 +14993,8 @@ def tier_make_score(feat, kind, mom_w=None, base=None, sec_w=None):
       beta       = 60日β（对创业板指）
       beta_sh    = 60日β（对上证，主板口径）
       beta_star  = 60日β（对科创50，历史研究对照）
-      sm701      = sm701 副本 LightGBM 概率（test 实验档；历史落盘预测 +
-                   缺失最新日实时复算）
+      sm701      = sm701 外接算法 LightGBM 概率（历史落盘预测 +
+                   缺失最新日实时复算；v7.3.0 起为待选分数 kind）
     base：横截面排名基数掩码（None=全面板）；见 tier_rank_base。
     注：beta 两口径在主板池已证伪（全期年化为负、回撤 40%+），仅保留作研究对照。"""
     NST, NDT = feat["vol20"].shape
@@ -15363,15 +15283,14 @@ def _tier_metrics(eq, dates, trades=None):
 
 def tier_eval(segment="full", tiers=None, phases=None, progress=None,
               overrides=None, universe="all", ic_filter=False, capital=None):
-    """组合档回测（相位平均主口径；稳定三档默认，test 显式运行）。
+    """组合档回测（相位平均主口径；稳定三档）。
     overrides 可覆盖 cfg（研究用）。
     universe: all=全A / main=沪深主板。返回 {tier: metrics}。
     v6.2.0：ic_filter=True 启用荐股确认层（tier_ic_confirm：历史信号 IC 显著
     为正 + 指标在场，候选不足时宁缺毋滥）；capital 覆盖本金（10 万组合荐股
     回测用，整手约束随本金变化），None=默认 100 万口径不变。
     v6.3.1：确认层可由档位 cfg 的 ic_filter 开启（稳健档默认开启），
-    全局 ic_filter=True 仍对全部档生效。v6.4.0：test 使用 sm701 概率，
-    历史有预测的首日起算。"""
+    全局 ic_filter=True 仍对全部档生效；v7.3.0 起 test 档已删除（sm701 概率分数 kind 保留供显式 overrides 研究）。"""
     codes, cal, C, V = tier_load_panel()
     if progress:
         progress("组合引擎：构建特征 ...")
@@ -15504,7 +15423,7 @@ def tier_picks_stats(segment="full", tiers=None, phases=None, progress=None,
     与 tier_eval 同引擎（相位平均），区别是输出逐笔荐股口径：
     推荐次数/平均收益/胜率/盈亏比/持有期/右尾占比/退出原因分布。
     v6.3.1：档位 cfg.ic_filter=True（稳健档）时同样过 IC 确认层。
-    v6.4.0：test 仍为显式实验档，默认只统计稳定三档。"""
+"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
@@ -15640,7 +15559,7 @@ def tier_latest_picks(capital=100000.0, min_active=300, tiers=None,
     设置 ini [picks] exclude_loss=0 可关）；picks 增加 pe/turnover 字段。
     v6.3.1：档位 cfg.ic_filter=True（稳健档）时即使调用方未开 ic_filter
     也强制过确认层（档位定义内的严格指标要求）。
-    v6.4.0：test 只在显式传入时运行；其名称/行业/PE 从 sm701 副本补全。"""
+    v7.3.0：source=sm701 的显式档位仍可从 sm701 副本补全名称/行业/PE。"""
     codes, cal, C, V = tier_load_panel()
     if _TIER_CACHE.get("feat") is None:
         _TIER_CACHE["feat"] = tier_build_features(cal, C, V)
@@ -15780,7 +15699,7 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
             lines.append(
                 "  注意：sm701 信号为「次日开盘买→收盘卖」的日频截面 alpha"
                 "（A股 T+1 无法当日卖出）；本工具 T 收盘集合口径回测显著为负"
-                "（2024-01~2026-09 年化约 -69%），test 仅供研究观察。")
+                "（2024-01~2026-09 年化约 -69%）；仅供研究观察。")
         if not d["gate_on"]:
             lines.append("")
             continue
@@ -15903,11 +15822,7 @@ RISK_AI_GUIDE = {
             "强势突破/加速/涨停附近可直接给出买入或打板（涨停价）建议；"
             "禁止用『等待趋势企稳/等待确认/观望』搪塞，必须给出明确的进攻性"
             "动作与具体价位。",
-    "test": "风险偏好=test（sm701 模型实验档）：买卖点不做策略消融，直接来自"
-            " sm701 LightGBM 概率（≥0.55 买入 / <0.50 卖出）。请围绕模型概率"
-            "给出结论，并提示这是研究口径的「次日开盘→收盘」日内 alpha，"
-            "A 股 T+1 不可当日卖出、样本外 AUC 仅约 0.53，风险自负。",
-    "sm701": "风险偏好=sm701 模型直出档（多市场）：买卖点不做策略消融，直接来自"
+    "sm701": "风险偏好=sm701 外接算法直出档（多市场）：买卖点不做策略消融，直接来自"
              " sm701 模型概率（≥0.55 买入 / <0.50 卖出，滞回）。请围绕模型概率"
              "与趋势给结论，仍须给出可执行价位/仓位，不要用『观望』搪塞。",
     "外部策略": "外部策略模式（股票策略工坊）：买卖点来自用户导入的策略规则，"
@@ -15927,7 +15842,7 @@ def ai_risk_mode(res=None):
     的风险偏好（`CFG.RISK_MODE`）。策略缓存档位（`res["risk_mode"]`）是
     该股消融时选中的回测档，可能和当前设置不同，不能覆盖用户设置。"""
     rm = ((res or {}).get("risk_mode") or "").strip()
-    if rm in ("外部策略", "test", "sm701"):
+    if rm in ("外部策略", "sm701"):
         return rm
     prefer = CFG.RISK_MODE
     return prefer if prefer in RISK_AI_GUIDE else "稳健"
@@ -15979,8 +15894,10 @@ def _ai_http_json(url, payload=None, api_key="", timeout=60, session=""):
         hdr = {"Content-Type": "application/json",
                "User-Agent": AI_UA,
                "Authorization": f"Bearer {api_key}"}
-        if session:
-            hdr["x-opencode-session"] = session
+        # OpenCode Go（go/zen 网关）要求每个请求都带 x-opencode-session；
+        # 其他 OpenAI 兼容平台会忽略该头，因此缺省时补一个全局稳定 ID。
+        hdr["x-opencode-session"] = (session or "").strip() \
+            or _ai_session_id("global")
         req = urllib.request.Request(url, data=data, headers=hdr)
         with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -16066,7 +15983,7 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
 
 # ================= DeepSeek Search（AI 分析自动联网资讯） =================
 # 文档：https://api-docs.deepseek.com/guides/search
-# 仅官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关无此能力时自动跳过。
+# 仅官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关走 Google News RSS 兜底。
 AI_SEARCH_COUNT = 5
 AI_SEARCH_TTL = 1800          # 同股资讯缓存 30 分钟（避免重复计费）
 AI_SEARCH_FAIL_TTL = 300      # 失败/空结果缓存 5 分钟，网络恢复后尽快重试
@@ -16075,7 +15992,8 @@ _AI_SEARCH_LOCK = threading.Lock()
 
 
 def _ai_is_deepseek(base_url="") -> bool:
-    """当前接口是否 DeepSeek 官方（Search/思考/工具调用仅官方支持）。"""
+    """当前接口是否 DeepSeek 官方（Search/思考参数仅官方协议；工具调用
+    为 OpenAI 兼容标准，其它网关也可用）。"""
     import urllib.parse
     p = urllib.parse.urlsplit(_normalize_ai_base(base_url or AI_BASE_URL))
     return (p.hostname or "").lower() == "api.deepseek.com"
@@ -16106,15 +16024,100 @@ def _ai_thinking_params(thinking=None, effort=None) -> dict:
     return {"thinking": {"type": "enabled"}, "reasoning_effort": eff}
 
 
+def _gnrss_search(query, count=AI_SEARCH_COUNT, timeout=12):
+    """免 Key 兜底联网检索：Google News RSS（同 DeepSeek Search 结果结构）。
+    DeepSeek 官方缓存已带上代理优先，此处复用同一代理/直连策略。"""
+    import xml.etree.ElementTree as ET
+    import email.utils as _em
+
+    u = ("https://news.google.com/rss/search?q="
+         + urllib.parse.quote(query)
+         + "&hl=zh-CN&gl=CN&ceid=CN:zh")
+    openers = ([_PROXY_OPENER]
+               if _PROXY_OPENER is not None and not _proxy_dead() else []) \
+        + [urllib.request.build_opener()]
+    raw = None
+    last = None
+    for op in openers:
+        try:
+            req = urllib.request.Request(u, headers={
+                "User-Agent": AI_UA,
+                "Accept": "application/rss+xml,text/xml,*/*"})
+            with op.open(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+            break
+        except Exception as e:
+            last = e
+            continue
+    if not raw:
+        raise last or RuntimeError("联网检索失败")
+
+    def _parse(xml):
+        def _iso(dstr):
+            try:
+                return _em.parsedate_to_datetime(dstr).strftime("%Y-%m-%d")
+            except Exception:
+                return (dstr or "")[:10]
+
+        items = []
+        for it in ET.fromstring(xml).iter("item"):
+            title = re.sub(r"\s+", " ", (it.findtext("title") or "")).strip()
+            link = (it.findtext("link") or "").strip()
+            date = _iso((it.findtext("pubDate") or "").strip())
+            src_el = it.find("source")
+            site = (src_el.text or "").strip() if src_el is not None else ""
+            desc = re.sub(r"<[^>]+>", " ", (it.findtext("description") or ""))
+            snippet = re.sub(r"\s+", " ", desc).strip()
+            items.append({"title": title, "summary": snippet,
+                          "snippet": snippet, "date": date,
+                          "site_name": site, "link": link})
+            if len(items) >= max(1, count):
+                break
+        return items
+
+    items = _parse(raw)
+    if not items:
+        # 0 条时自动简化检索词重试一次（去掉 after: 与引号等强约束）
+        q2 = re.sub(r"after:\S+", "", query).replace('"', " ").strip()
+        if q2 and q2 != query:
+            u2 = ("https://news.google.com/rss/search?q="
+                  + urllib.parse.quote(q2)
+                  + "&hl=zh-CN&gl=CN&ceid=CN:zh")
+            for op in openers:
+                try:
+                    req = urllib.request.Request(u2, headers={
+                        "User-Agent": AI_UA,
+                        "Accept": "application/rss+xml,text/xml,*/*"})
+                    with op.open(req, timeout=timeout) as r:
+                        items = _parse(r.read().decode("utf-8", "replace"))
+                    break
+                except Exception as e:
+                    last = e
+                    continue
+            items = items or []
+    return items
+
+
 def deepseek_search(api_key, query, count=AI_SEARCH_COUNT, timeout=12,
                     base_url=""):
-    """DeepSeek Search API（纯标准库）。返回 results 列表；不支持时返回 []。"""
-    url = _ai_search_url(base_url)
-    if not url or not api_key or not (query or "").strip():
+    """联网检索（纯标准库）。DeepSeek 官方 → /v1/tools/search；
+    其他 OpenAI 兼容网关（opencode-go 等）→ Google News RSS 免 Key 兜底。
+    返回 results 列表；网络异常抛给调用方兜底，静默失败返回 []。"""
+    q = (query or "").strip()
+    if not q:
         return []
-    d = _ai_http_json(url, {"query": query.strip(), "count": count},
-                      api_key, timeout)
-    return d.get("results") if isinstance(d, dict) else []
+    url = _ai_search_url(base_url)
+    if url and api_key:
+        d = _ai_http_json(url, {"query": q, "count": count},
+                          api_key, timeout)
+        rs = d.get("results") if isinstance(d, dict) else []
+        if isinstance(rs, list) and rs:
+            return rs
+        return []          # DeepSeek 官方正常响应但无结果：不再兜底
+    if not url and not _ai_is_deepseek(base_url):
+        # 非 DeepSeek 官方（例如 opencode-go）→ RSS 兜底，不需要 Key
+        return _gnrss_search(q, count, timeout)
+    return []
 
 
 def _fmt_search_results(results, limit=None):
@@ -16151,8 +16154,7 @@ def ai_stock_news(code="", name="", timeout=12):
     if not ck or not _ai_web_search_enabled():
         return ""
     key = get_ai_key()
-    if not key or not _ai_search_url():
-        return ""
+    # 非官方网关（opencode-go 等）也走免 Key RSS 兜底，不再拒单
     now = time.time()
     with _AI_SEARCH_LOCK:
         ent = _AI_SEARCH_CACHE.get(ck)
@@ -16587,8 +16589,6 @@ def ai_market_brief():
 def ai_choose_tier(model="", pref="均衡", timeout=60):
     """AI 在各风险档内选一档（按市场环境+用户风险偏好），失败回退 pref。
     返回 (tier, reason)。"""
-    if pref == "test":
-        return "稳健", "test 为 sm701 实验档，不参与 AI 自动选档，回退 稳健"
     pref = pref if pref in TIER_CFG else "均衡"
     key = get_ai_key()
     if not key:
@@ -16985,8 +16985,7 @@ def _ai_tool_news(ctx, args):
             txt = ai_stock_news(ctx.get("code") or "", ctx.get("name") or "")
         return txt or "（近30天未检索到相关资讯）"
     key = get_ai_key()
-    if not key or not _ai_search_url():
-        return "当前接口不支持联网检索。"
+    # 非官方网关（opencode-go 等）走 RSS 兜底，不再一律拒绝
     try:
         rs = deepseek_search(key, q, count=count)
         if rs and isinstance(ctx.get("usage"), dict):
@@ -17043,8 +17042,7 @@ def _ai_tool_external(ctx, args):
     if not search_on:
         return "联网检索已在本次会话关闭。"
     key = get_ai_key()
-    if not key or not _ai_search_url():
-        return "当前接口不支持 DeepSeek 官方联网搜索。"
+    # 非官方网关（opencode-go 等）走 RSS 兜底，不再一律拒绝
     q = str(args.get("query") or "").strip()[:128]
     days = _ai_tool_int(args.get("days"), 7, 1, 30)
     count = _ai_tool_int(args.get("count"), 10, 5, 15)
@@ -17300,8 +17298,9 @@ def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
                          timeout=120, session="", system=None,
                          max_rounds=8, on_event=None, usage_sink=None,
                          thinking=None, effort=None):
-    """带工具调用的多轮 chat（DeepSeek 思考模式）。返回 (content,
-    reasoning_content)。工具轮内必须回传 reasoning_content（官方要求）。"""
+    """带工具调用的多轮 chat（OpenAI 兼容，DeepSeek/Claude/GLM 等均可用）。
+    返回 (content, reasoning_content)。DeepSeek 工具轮内必须回传
+    reasoning_content；其它网关无该字段时省略。"""
     msgs = [{"role": "system", "content": system or ai_system_prompt()}]
     msgs += [dict(m) for m in messages]
     tools = ai_tool_specs()
@@ -17332,7 +17331,11 @@ def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
         if not calls:
             return content, reasoning
         asst = {"role": "assistant", "content": content,
-                "reasoning_content": reasoning, "tool_calls": calls}
+                "tool_calls": calls}
+        if reasoning or _ai_is_deepseek():
+            # DeepSeek 工具轮要求回传该字段（即使为空）；其他网关无此字段
+            # 时省略，避免严格校验的 OpenAI 兼容服务报 400。
+            asst["reasoning_content"] = reasoning
         msgs.append(asst)
         for tc in calls:
             fn = tc.get("function") or {}
@@ -17409,6 +17412,7 @@ class App:
         self.settings = {"theme": "dark", "updown": "red_up",
                        "ma_colors": {}, "boll_colors": {}, "ind_w": 1}
         self.api_key = ""
+        self.api_key_source = ""
         self._watchlists = {}       # v6.6.5：自选池按市场分开 {market: [codes]}
         self._wl_quotes = {}         # 自选池实时快照（名称/现价/涨幅）
         self._wl_busy = False
@@ -18041,7 +18045,7 @@ class App:
     # ---------- 折叠 ----------
 
     def _open_picks(self):
-        """每日荐股：AI自动选档 / 风险档位（含 test）/ 18 策略共振。"""
+        """每日荐股：AI自动选档 / 风险档位 / 18 策略共振。"""
         pconf = picks_conf()
         uni_name = UNIVERSE_NAME.get(pconf["universe"], pconf["universe"])
         win = tk.Toplevel(self.root)
@@ -18062,7 +18066,7 @@ class App:
                  font=("Microsoft YaHei", 10)).pack(side="left")
         ai_mode = "AI自动(按偏好)"
         MODES = ((ai_mode,) if pconf["ai_auto_tier"] else ()) + \
-            ("稳健", "均衡", "激进", "test", "综合(18策略)")
+            ("稳健", "均衡", "激进", "综合(18策略)")
         default_mode = ai_mode if pconf["ai_auto_tier"] else \
             (pconf["risk_pref"] if pconf["risk_pref"] in MODES else "稳健")
         mode = tk.StringVar(value=default_mode)
@@ -18093,7 +18097,7 @@ class App:
                         win, lb, data))
                 threading.Thread(target=worker, daemon=True).start()
             else:
-                _src = "sm701 实验模型" if m == "test" else "v6.2.3 三档引擎"
+                _src = "v6.2.3 三档引擎"
                 lb.insert("end", f"{m}：加载 {_src}"
                                  f"（Top10，首次约 1~3 分钟）…")
 
@@ -18109,7 +18113,7 @@ class App:
                         data = tier_latest_picks(
                             capital=self._picks_capital(), tiers=[m2],
                             universe=pconf["universe"],
-                            ic_filter=(m2 != "test"), top_n=10)
+                            ic_filter=True, top_n=10)
                     except Exception as e:
                         self._safe_after(0, lambda: lb.delete(0, "end") or
                                          lb.insert("end", f"失败: {e}"))
@@ -18123,7 +18127,7 @@ class App:
                   fg=FG_MAIN, activebackground=BTN_HOVER,
                   font=("Microsoft YaHei", 10), highlightthickness=0)
         om.pack(side="left")
-        tk.Label(top, text=f"（{uni_name}股票池；test=sm701 实验档；"
+        tk.Label(top, text=f"（{uni_name}股票池；"
                            f"权限/自动选档在设置内配置；"
                            f"双击某行分析该股）",
                  bg=DARK_BG, fg="#8a97a5",
@@ -18191,15 +18195,6 @@ class App:
         if cfg.get("ic_filter"):
             lb.insert("end", "IC=该股历史信号IC（120日窗，IC>0且t≥2且指标在场"
                              "才入选；确认不足宁缺毋滥，可能少于10只）")
-        if cfg.get("source") == "sm701":
-            st = sm701_status()
-            lb.insert("end", "test 数据源：sm701 副本 + 主库最新行情"
-                             f"（sm701 日K至 {st.get('db_date', '-')}，"
-                             f"实时复算至 {st.get('live_db_date') or st.get('db_date', '-')}；"
-                             "历史分数读取落盘预测）")
-            lb.insert("end", "注意：sm701 为「次日开盘买→收盘卖」日频 alpha"
-                             "（A股 T+1 无法当日卖出）；本工具收盘口径回测为负"
-                             "（2024-01~2026-09 年化约 -69%），仅供研究观察。")
         if picks_exclude_loss():
             lb.insert("end", "生产端过滤：动态PE≤0（亏损）已剔除"
                              "（ini [picks] exclude_loss=0 可关；PE 缺失不过滤）")
@@ -18317,8 +18312,6 @@ class App:
             m.add_separator()
             m.add_command(label="v6.2.3 三档组合（当前目标持仓）",
                           command=self.run_tiers_bg)
-            m.add_command(label="test(sm701) 当前目标持仓",
-                          command=lambda: self.run_tiers_bg(["test"]))
             m.add_command(label="v6.2.3 三档回测（全A，相位平均）",
                           command=self.run_tiers_backtest_bg)
             m.add_command(label="v6.2.3 三档回测（主板）",
@@ -18669,6 +18662,18 @@ class App:
                  fg=AXIS_TXT, anchor="w",
                  font=("Microsoft YaHei", 8)).pack(
                      side="left", padx=4, fill="x", expand=True)
+        self._ai_nb_fold = False
+        # v7.1.2：数据区内部折叠——「分时 / ETF成分」页签栏可单独收起
+        self._ai_nb_btn = tk.Button(
+            dh, text="▸" if (getattr(self, "res", None)
+                             and not _is_etf(
+                                 (self.res or {}).get("full_code") or ""))
+            else "▾",
+            command=self._toggle_ai_data_nb,
+            bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
+            activeforeground=BTN_FG, relief="flat", cursor="hand2",
+            font=("Microsoft YaHei", 8), width=3)
+        self._ai_nb_btn.pack(side="right", padx=(0, 4))
         tk.Button(dh, text="刷新", command=self._ai_data_refresh,
                   bg=BTN_BG, fg=BTN_FG, activebackground=BTN_HOVER,
                   activeforeground=BTN_FG, relief="flat", cursor="hand2",
@@ -18677,6 +18682,7 @@ class App:
         self._ai_data_nb = ttk.Notebook(self._ai_data_box)
         self._ai_data_nb.pack(fill="x", pady=(2, 0))
         fmin = tk.Frame(self._ai_data_nb, bg=LOG_BG)
+        self._ai_minute_frame = fmin
         self._ai_mini_cv = tk.Canvas(fmin, height=80, width=220, bg=LOG_BG,
                                      highlightthickness=0)
         self._ai_mini_cv.pack(fill="both", expand=True)
@@ -18685,6 +18691,7 @@ class App:
         self._ai_data_nb.add(fmin, text=" 分时 ")
 
         fetf = tk.Frame(self._ai_data_nb, bg=LOG_BG)
+        self._ai_etf_frame = fetf
         self._ai_etf_info_var = tk.StringVar(value="非ETF")
         tk.Label(fetf, textvariable=self._ai_etf_info_var, bg=LOG_BG,
                  fg=AXIS_TXT, anchor="w",
@@ -18701,7 +18708,14 @@ class App:
         sb_etf.pack(side="right", fill="y")
         self._ai_etf_tv.pack(side="left", fill="both", expand=True)
         self._ai_data_nb.add(fetf, text=" ETF成分 ")
-        self._ai_data_nb.tab(1, state="disabled")
+        # v7.1.2：启动时当前代码是个股（非ETF）→ ETF成分页签直接隐藏，
+        # 不再显示灰色「非ETF」占位
+        try:
+            _c0 = (getattr(self, "res", None) or {}).get("full_code") or ""
+            if _c0 and not _is_etf(_c0):
+                self._ai_data_nb.hide(fetf)
+        except Exception:
+            pass
         self._ai_data_res = None
         self._ai_data_gen = 0
         self._ai_minute_data = None
@@ -18832,11 +18846,15 @@ class App:
             self._ai_agent = None
             self._ai_chat_welcome(None)
             return
+        fallback = (f"股票：{(res.get('quote') or {}).get('name') or ''}"
+                    f"({res.get('full_code') or ''})。上下文构建异常，"
+                    "请先调用工具获取行情、指标、预测与资讯，再按风险偏好"
+                    "给出明确结论；若工具不可用，请提示用户重新分析该股。")
         try:
             brief = self._ai_prompt_brief()
         except Exception:
             log.exception("构建AI简要上下文失败")
-            brief = ""
+            brief = fallback
         try:
             full = self._ai_prompt()
         except Exception:
@@ -18886,7 +18904,11 @@ class App:
                 brief = self._ai_prompt_brief()
                 full = self._ai_prompt()
             except Exception:
-                brief = full = ""
+                log.exception("刷新AI上下文失败，使用最小快照")
+                brief = full = (
+                    f"股票：{(res.get('quote') or {}).get('name') or ''}"
+                    f"({res.get('full_code') or ''})。上下文构建异常，"
+                    "请先用工具取数再给结论。")
             self._ai_agent.bind_res(res, brief, full)
             self._ai_status_var.set("数据已更新（对话保留）")
             return
@@ -18959,6 +18981,16 @@ class App:
                                    before=self._ai_chat.master)
             self._ai_data_btn.config(text="数据▾")
 
+    def _toggle_ai_data_nb(self, btn=None):
+        """收起/展开「分时 / ETF成分」页签栏（数据区内部折叠，v7.1.2）。"""
+        self._ai_nb_fold = not getattr(self, "_ai_nb_fold", False)
+        if self._ai_nb_fold:
+            self._ai_data_nb.pack_forget()
+            (btn or self._ai_nb_btn).config(text="▸")
+        else:
+            self._ai_data_nb.pack(fill="x", pady=(2, 0))
+            (btn or self._ai_nb_btn).config(text="▾")
+
     def _ai_data_refresh(self):
         res = self._ai_data_res or getattr(self, "res", None)
         if res:
@@ -18977,9 +19009,21 @@ class App:
         gen = self._ai_data_gen
         code = res.get("full_code") or ""
         etf = _is_etf(code)
+        # v7.1.2：ETF成分页签按标的是否 ETF 显隐——个股整栏消失（hide，
+        # 不再显示灰色「非ETF」占位），ETF 正常显示并可选中
+        nb = self._ai_data_nb
         try:
-            self._ai_data_nb.tab(1, state="normal" if etf else "disabled")
-            self._ai_data_nb.select(1 if etf else 0)
+            if etf:
+                if self._ai_etf_frame not in nb.tabs():
+                    nb.add(self._ai_etf_frame, text=" ETF成分 ")
+                nb.tab(self._ai_etf_frame, state="normal")
+                if self._ai_minute_frame not in nb.tabs():
+                    nb.add(self._ai_minute_frame, text=" 分时 ")
+                nb.select(self._ai_etf_frame)
+            else:
+                if self._ai_etf_frame in nb.tabs():
+                    nb.hide(self._ai_etf_frame)
+                nb.select(self._ai_minute_frame)
         except Exception:
             pass
         self._ai_data_info_var.set("刷新中..." if force else "分时加载中...")
@@ -19622,8 +19666,8 @@ class App:
         self._center_win(win, 980, 640)
 
     def run_tiers_bg(self, tiers=None):
-        """工具菜单：稳定三档或显式 test——最新目标持仓。"""
-        title = "test(sm701) 实验档" if tiers == ["test"] else "v6.2.3 三档"
+        """工具菜单：三档最新目标持仓（tiers 可显式指定，默认稳定三档）。"""
+        title = "v6.2.3 三档"
         if getattr(self, "_tiers_running", False):
             messagebox.showinfo(title, "已在后台运行中，请稍候")
             return
@@ -20144,11 +20188,6 @@ class App:
             self.progress_var.set(
                 "外部策略已启用：买卖点按导入规则，跳过策略消融")
             return
-        if CFG.RISK_MODE == "test":
-            # v6.4.1：test=sm701 模型直出，不消融、不弹策略选择窗
-            self.progress_var.set(
-                "风险偏好 test：sm701 模型直出买卖点（跳过策略消融）")
-            return
         if res.get("strategy"):
             st = res["strategy"]
             if st.get("_stale"):
@@ -20442,14 +20481,6 @@ class App:
                 "不参与消融选型。\n"
                 "如需恢复内置消融，请在 设置→外部策略 选择"
                 "「自动消融（内置策略）」并保存。")
-            return
-        if CFG.RISK_MODE == "test":
-            messagebox.showinfo(
-                "test 模型直出",
-                "当前风险偏好为 test：买卖点由 sm701 模型概率直出，"
-                "不参与策略消融。\n"
-                "如需消融选策略，请在 设置→预测参数 把风险偏好切回"
-                " 保守/稳健/激进 后重试。")
             return
         res = self.res
         full = res["full_code"]
@@ -20977,6 +21008,10 @@ class App:
             return
         old_snap = (res["quote"].get("time") or "")[:8]
         new_snap = (q.get("time") or "")[:8]
+        # 残缺快照（旧批量缓存/网络降级）先与旧快照合并并补齐 OHLC，
+        # 否则下游报告/AI 提示词取 q["open"] 会 KeyError。
+        q = _quote_ensure({**(res.get("quote") or {}), **(q or {})},
+                          (res.get("quote") or {}).get("price") or 0.0)
         res["quote"] = q
         if new_snap != old_snap and old_snap:
             # 跨快照日（如开盘后出现今日bar/新交易日）→ 触发完整重分析
@@ -21473,12 +21508,12 @@ class App:
         elif res.get("stale_snap"):
             self.info_var.set(
                 f"{head}  昨收{res['prev_close']:.2f} "
-                f"最近开{q['open']:.2f}  收盘{q['price']:.2f}({chg:+.2f}%)"
+                f"最近开{_ai_tool_f(q.get('open'))}  收盘{q['price']:.2f}({chg:+.2f}%)"
                 f"{_to_txt}  快照{q['time']}（非今日）" + tail)
         else:
             self.info_var.set(
                 f"{head}  昨收{res['prev_close']:.2f} "
-                f"今开{q['open']:.2f}(缺口{res['gap_today']:+.2f}%) "
+                f"今开{_ai_tool_f(q.get('open'))}(缺口{res['gap_today']:+.2f}%) "
                 f"现价{q['price']:.2f}({chg:+.2f}%){_to_txt}  快照{q['time']}"
                 + ("  [含盘中实时bar]" if res["has_live"] else "") + tail)
 
@@ -21875,6 +21910,12 @@ class App:
         except Exception:
             n = 60
         n = max(20, min(n, 250))
+        # 屏幕比例异常（过窄/筹码列过宽）时自动减小K线数量保证可读性：
+        # cap 不改写用户 show_n 设置，窗口变宽后自动放宽
+        cap = self._n_read_cap()
+        if n > cap:
+            n = max(20, cap)
+            self.progress_var.set(f"K线根数: {n}（屏幕过窄，已自动减小保证可读性）")
         self.view = slice_view(self.res, n, pan=self.view_pan)
         self._axis_lpad = 0          # 主图按实际字体重新计算轴标签让位
         self._draw_main()
@@ -21894,6 +21935,38 @@ class App:
         if getattr(self, "side_txt", None):
             self._write_side()
         self._write_report()
+
+    def _n_read_cap(self):
+        """按主图可用宽度估算「可读K线」根数上限。
+
+        屏幕比例异常（窗口过窄、右侧筹码列占比过大等）时，每根K线
+        会被压到不足几个像素、数字与蜡烛糊成一片：此函数按当前画布
+        宽度反算可读根数上限（每根至少 6px，紧凑模式 5px），_rerender
+        里用 min(用户根数, 上限) 自动减小。窗口变宽后上限自动放宽，
+        用户的 show_n 设置本身不被改写。"""
+        try:
+            w = self.cv_main.winfo_width()
+        except Exception:
+            return 250
+        if not w or w <= 1:
+            return 250
+        compact = bool(getattr(self, "compact", False))
+        chip_on = False
+        res = getattr(self, "res", None)
+        try:
+            if res and self.show_chips.get() \
+                    and (res.get("chips") or {}).get("bins"):
+                chip_on = True
+        except Exception:
+            chip_on = False
+        L = 34 if compact else 58
+        R = 44 if (chip_on and compact) else (
+            70 if chip_on else (28 if compact else 20))
+        if chip_on and not compact:
+            R = max(R, min(int(w * CFG.CHIP_W_RATIO), int(w * 0.30)))
+        pw = w - L - R
+        min_bw = 5 if compact else 6   # 每根K线最小占宽(px)：body≈4px 仍可辨
+        return int(pw // min_bw)
 
     def _on_wheel(self, event):
         """滚轮：上下缩放，Shift+滚轮左右平移。"""
@@ -22863,7 +22936,7 @@ class App:
                  f"快照 {q['time']}  昨收 {res['prev_close']:.2f}")
         _to = res.get("turnover")
         _to_txt = (f"  换手 {_to:.2f}%" if _to is not None else "")
-        L.append(f"今开 {q['open']:.2f} (缺口 {res['gap_today']:+.2f}%)  "
+        L.append(f"今开 {_ai_tool_f(q.get('open'))} (缺口 {res['gap_today']:+.2f}%)  "
                  f"现价 {q['price']:.2f}{_to_txt}")
         idx_txt = (f"{res['idx_chg_today']:+.2f}%"
                    if res["idx_chg_today"] is not None else "未知")
@@ -23239,9 +23312,15 @@ class App:
                         int(cp.get("ui", "ind_w", fallback="1"))))
                 except Exception:
                     pass
-                # 环境变量优先；若无再从 ini 读取（兼容旧版，建议迁移到环境变量）
-                self.api_key = ENV_API_KEY or cp.get(
-                    "deepseek", "api_key", fallback="")
+                # 按 ini 记录的来源选择 Key；旧配置仍环境变量优先
+                _ini_key = cp.get("deepseek", "api_key", fallback="").strip()
+                _src = cp.get("deepseek", "api_key_source",
+                              fallback="").strip().lower()
+                if _src not in ("env", "ini"):
+                    _src = "env" if ENV_API_KEY else "ini"
+                self.api_key_source = _src
+                self.api_key = ((_ini_key if _src == "ini" else "")
+                                or ENV_API_KEY or _ini_key)
                 self.proxy_url = cp.get("proxy", "url", fallback="")
             except Exception:
                 pass
@@ -23285,12 +23364,13 @@ class App:
             cp.set("ui", "ind_w", "1")
         if not cp.has_section("deepseek"):
             cp.add_section("deepseek")
-        if ENV_API_KEY:
-            # 环境变量已提供 Key，不再把 Key 写回 ini，避免明文落盘
+        _src = getattr(self, "api_key_source", "") or (
+            "env" if ENV_API_KEY else "ini")
+        if _src == "env" and ENV_API_KEY:
+            # 明确选择环境变量时不再把 Key 写回 ini，避免明文落盘
             cp.set("deepseek", "api_key", "")
             cp.set("deepseek", "api_key_source", "env")
         else:
-            # 仅在无环境变量时回写 ini；仍建议迁移到环境变量
             cp.set("deepseek", "api_key", self.api_key)
             cp.set("deepseek", "api_key_source", "ini")
         if not cp.has_section("proxy"):
@@ -23645,6 +23725,8 @@ class App:
         last = lambda a: next((v for v in reversed(a) if v is not None), None)
         f3 = lambda v: f"{v:.3f}" if isinstance(v, (int, float)) else "-"
         f1 = lambda v: f"{v:.1f}" if isinstance(v, (int, float)) else "-"
+        f2 = lambda v: f"{v:.2f}" if isinstance(v, (int, float)) else "-"
+        f2s = lambda v: f"{v:+.2f}" if isinstance(v, (int, float)) else "-"
         rows = res["disp_rows"]
         bars = rows[-15:]
         kline_txt = "\n".join(
@@ -23707,9 +23789,10 @@ class App:
             f"{strat_note}"
             f"（必须按该风险偏好给结论：低档可等确认，激进 禁止用"
             f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
-            f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
-            f"昨收{res['prev_close']:.2f} 今开{q['open']:.2f}"
-            f"(缺口{res['gap_today']:+.2f}%) 现价{cur_px:.2f}\n"
+            f"股票：{q.get('name') or ''}({res['full_code']}) "
+            f"快照{q.get('time') or '-'}\n"
+            f"昨收{f2(res.get('prev_close'))} 今开{f2(q.get('open'))}"
+            f"(缺口{f2s(res.get('gap_today'))}%) 现价{cur_px:.2f}\n"
             f"大盘：上证指数今日 {idx_txt}；本股量能：{vr_txt}；"
             f"板块：{sec_txt}\n"
             f"区间统计：近5日{_fmt(_ret(5))} 近20日{_fmt(_ret(20))} "
@@ -23795,10 +23878,14 @@ class App:
             f"{strat_note}"
             f"（必须按该风险偏好给结论：低档可等确认，激进禁止用"
             f"『等企稳/等回踩/观望』搪塞，直接给进攻性动作。）\n\n"
-            f"股票：{q['name']}({res['full_code']}) 快照{q['time']}\n"
-            f"昨收{res['prev_close']:.2f} 今开{q['open']:.2f} "
-            f"现价{q['price']:.2f} 缺口{res['gap_today']:+.2f}%"
-            f" 最高{q.get('high', 0):.2f} 最低{q.get('low', 0):.2f}\n"
+            f"股票：{q.get('name') or ''}({res['full_code']}) "
+            f"快照{q.get('time') or '-'}\n"
+            f"昨收{_ai_tool_f(res.get('prev_close'))} "
+            f"今开{_ai_tool_f(q.get('open'))} "
+            f"现价{_ai_tool_f(q.get('price'))} "
+            f"缺口{_ai_tool_spct(res.get('gap_today'), 2)}"
+            f" 最高{_ai_tool_f(q.get('high'))} "
+            f"最低{_ai_tool_f(q.get('low'))}\n"
             f"量比{_ai_tool_f(res.get('vr_now'))}"
             f"（{res.get('cur_regime') or '-'}）；"
             f"上证今日{_ai_tool_spct(res.get('idx_chg_today'))}；"
@@ -25468,11 +25555,20 @@ class App:
         frm = sec_ai
         ttk.Label(frm, text="AI Key").grid(row=2, column=0, sticky="w",
                                            pady=(8, 4))
-        key_var = tk.StringVar(value=("" if ENV_API_KEY else self.api_key))
+        # 来源以 ini 记录为准：显式保存的 ini Key 不被同名环境变量覆盖
+        _env_active = bool(ENV_API_KEY) and (
+            getattr(self, "api_key_source", "env") != "ini")
+        key_var = tk.StringVar(value=("" if _env_active else self.api_key))
         ent = ttk.Entry(frm, textvariable=key_var, width=42, show="*")
         ent.grid(row=2, column=1, columnspan=2, sticky="we", pady=(8, 4))
-        if ENV_API_KEY:
+        if _env_active:
             ttk.Label(frm, text="当前从环境变量 DEEPSEEK_API_KEY 读取",
+                      foreground=AXIS_TXT,
+                      font=("Microsoft YaHei", 8)).grid(
+                          row=2, column=1, columnspan=2, sticky="e")
+        elif ENV_API_KEY:
+            ttk.Label(frm, text="当前使用 ini Key（已忽略环境变量 "
+                                "DEEPSEEK_API_KEY）",
                       foreground=AXIS_TXT,
                       font=("Microsoft YaHei", 8)).grid(
                           row=2, column=1, columnspan=2, sticky="e")
@@ -25531,11 +25627,11 @@ class App:
                                             pady=4)
         search_var = tk.BooleanVar(value=_ai_web_search_enabled())
         ttk.Checkbutton(
-            frm, text="AI 分析前自动检索个股最新资讯（DeepSeek Search）",
+            frm, text="AI 分析前自动检索个股最新资讯（Search / RSS）",
             variable=search_var).grid(row=6, column=1, columnspan=2,
                                       sticky="w", pady=4)
-        ttk.Label(frm, text="仅官方 api.deepseek.com 生效；约 $0.75/千次，"
-                            "失败自动跳过，不影响分析",
+        ttk.Label(frm, text="官方 DeepSeek Search 约 $0.75/千次；其他网关走 "
+                            "Google News RSS 免 Key；失败自动跳过",
                   foreground=AXIS_TXT,
                   font=("Microsoft YaHei", 8)).grid(
                       row=7, column=1, columnspan=2, sticky="w")
@@ -25619,8 +25715,7 @@ class App:
                                 values=list(CFG.RISK_PARAMS.keys()))
         cmb_risk.grid(row=8, column=1, sticky="w", pady=2)
         risk_hint_var = tk.StringVar(
-            value="保守=严进紧出 稳健=严进缓出 激进=宽进宽出 "
-                  "test=sm701模型直出(不消融)")
+            value="保守=严进紧出 稳健=严进缓出 激进=宽进宽出 ")
         risk_hint = ttk.Label(frm, textvariable=risk_hint_var)
         risk_hint.grid(row=8, column=2, sticky="w")
 
@@ -25815,8 +25910,7 @@ class App:
                     or "自动消融：按风险偏好做多算法消融选策略（内置模式）。")
                 cmb_risk.config(state="readonly")
                 risk_hint_var.set(
-                    "保守=严进紧出 稳健=严进缓出 激进=宽进宽出 "
-                    "test=sm701模型直出(不消融)")
+                    "保守=严进紧出 稳健=严进缓出 激进=宽进宽出 ")
                 _state = "disabled"
             for _w in studio_trade_widgets:
                 try:
@@ -25923,7 +26017,7 @@ class App:
                                   textvariable=ind_mk_var)
         ind_mk_box.grid(row=0, column=4, sticky="w")
 
-        def _ind_mk():
+        def _cur_ind_mk():
             return {v: k for k, v in _MARKET_LABELS.items()}.get(
                 ind_mk_var.get(), "cn")
 
@@ -25937,7 +26031,7 @@ class App:
                         str(ov if ov is not None else getattr(CFG, _a)))
 
         ind_mk_box.bind("<<ComboboxSelected>>",
-                        lambda e: _load_ind_for_mk(_ind_mk()))
+                        lambda e: _load_ind_for_mk(_cur_ind_mk()))
         ind_defs = [
             ("MACD 快线", "MACD_FAST", "EMA 快线周期 (2-60)"),
             ("MACD 慢线", "MACD_SLOW", "EMA 慢线周期 (3-120，须>快线)"),
@@ -26031,17 +26125,15 @@ class App:
                                                pady=4)
         auto_var = tk.BooleanVar(value=pconf["ai_auto_tier"])
         ttk.Checkbutton(frm, text="荐股时由AI在稳健/均衡/激进 内选一档"
-                                  "（test 仅手动，按下方偏好锚定）",
+                                  "（按下方偏好锚定）",
                         variable=auto_var).grid(row=26, column=1, columnspan=2,
                                                 sticky="w", pady=4)
         ttk.Label(frm, text="荐股偏好").grid(row=27, column=0, sticky="w",
                                              pady=4)
         pref_var = tk.StringVar(value=pconf["risk_pref"])
         ttk.Combobox(frm, textvariable=pref_var, width=6, state="readonly",
-                     values=["稳健", "均衡", "激进", "test"]).grid(
+                     values=["稳健", "均衡", "激进"]).grid(
                          row=27, column=1, sticky="w", pady=4)
-        ttk.Label(frm, text="test=sm701 实验档（手动选择；AI 自动选档时回退稳健）",
-                  foreground=AXIS_TXT).grid(row=27, column=2, sticky="w")
         ttk.Label(frm, text="荐股股票池").grid(row=28, column=0, sticky="w",
                                                pady=4)
         uni_var = tk.StringVar(value=pconf["universe"])
@@ -26248,13 +26340,21 @@ class App:
                 self.settings["ind_w"] = 1
             globals()["IND_LINE_W"] = self.settings["ind_w"]
             new_key = key_var.get().strip()
-            if ENV_API_KEY:
-                # 环境变量优先级最高；设置页输入框仅作提示，不覆盖
-                key_changed = False
-                self.api_key = ENV_API_KEY
-            else:
+            if new_key:
+                # 输入框有值：以用户输入为准，保存到 ini
                 key_changed = new_key != self.api_key
                 self.api_key = new_key
+                self.api_key_source = "ini"
+            elif _env_active:
+                # 环境变量模式且未覆盖输入：继续用环境变量
+                key_changed = False
+                self.api_key = ENV_API_KEY
+                self.api_key_source = "env"
+            else:
+                # 用户清空 ini Key：有环境变量则回退 env
+                key_changed = new_key != self.api_key
+                self.api_key = new_key
+                self.api_key_source = "env" if ENV_API_KEY else "ini"
             self.proxy_url = proxy_var.get().strip()
             if CACHE_OK:
                 set_proxy(self.proxy_url)
@@ -26383,7 +26483,7 @@ class App:
                               + (_sd["name"] if _sd else "自动消融"))
                 # 指标参数（v7.0.1 分市场：A股→[inds]，其他→[inds_市场]；
                 # 非A股值与A股相同时不写覆盖=继承）
-                _ind_mk = _ind_mk()
+                _ind_mk = _cur_ind_mk()
                 _sec = "inds" if _ind_mk == "cn" else f"inds_{_ind_mk}"
                 if not cp.has_section(_sec):
                     cp.add_section(_sec)
@@ -26661,7 +26761,9 @@ class AIAgent:
             "search": _ai_web_search_enabled(),
         }
         self.model = ""
-        self.use_tools = bool(self.opts["tools"] and _ai_is_deepseek())
+        # v7.2.2：工具调用是 OpenAI 兼容标准能力，不再仅限 DeepSeek 官方；
+        # 网关不支持 tools 时 _run_turn 会自动回退全文上下文。
+        self.use_tools = bool(self.opts["tools"])
         self.fallback = False
         self._q = ""
         self.settings = {}
@@ -26729,7 +26831,7 @@ class AIAgent:
             self.opts["search"] = bool(search)
         if model is not None:
             self.model = str(model or "").strip()
-        self.use_tools = bool(self.opts["tools"] and _ai_is_deepseek())
+        self.use_tools = bool(self.opts["tools"])
         if not self.use_tools:
             self.fallback = True
         self.refresh_settings()
