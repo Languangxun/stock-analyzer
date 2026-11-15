@@ -11,9 +11,10 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
 
 - **多市场（v7.0.1，v7.3.0 外接算法化）——港股 / 美股 / 期货 / 加密 一键切换**：
   顶栏市场下拉，代码前缀 `hk00700 / usaapl / fugc / cryptobtcusdt`；
-  K线/分时/快照/预测与 A股同库同链路（Yahoo + sm701 副本库同源数据）；
-  **这些市场的买卖点由 sm701 外接算法直出**（hk/us/fut 各三周期；算法本体在
-  `external/sm701_ext.py`，ini `[predict] sm701_ext=0` 可断开——断开则只看行情）；
+  K线/分时/快照/预测与 A股同库同链路（Yahoo + sm701/global 库同源数据）；
+  **这些市场的买卖点由 sm70x 外接算法直出**（cn/hk/us/futures/crypto 各三周期；
+  算法本体在 `external/sm701_ext.py`，ini `[predict] sm701_ext=0` 可断开——
+  断开则只看行情）；
   策略工坊策略可按市场绑定应用（优先于 sm701）；
   自选池、交易记录账本、指标参数均按市场独立（期货/加密支持杠杆与 T+0）；
   网页面板含「多市场 sm701 信号概览」。
@@ -81,15 +82,29 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   按设置中的行业/板块权限过滤，**默认剔除动态 PE≤0（亏损）股**
   （v6.2.4，ini `[picks] exclude_loss=0` 可关；估值快照来自代码表刷新，
   不参与历史回测），给出建议手数/金额/参考止损；
-- **`sm701` 外接算法（v7.3.0 起，替代已删除的 `test` 实验档）**：客房-以「外接算法」
-  形态隔离接入桌面 `sm701` 库——代码在 `external/sm701_ext.py`（适配层本文件入库；
-  sm701 数据+模型目录在仓库外，git 不分发）。开关：
-  `ini [predict] sm701_ext`（默认 1 接入；0=断开，hk/us/futures 只看行情不出买卖点，
+- **`sm701` 外接算法（v7.3.0 起，替代已删除的 `test` 实验档；v7.4.0 兼容新克隆）**：
+  以「外接算法」形态隔离接入桌面 `sm70x` 库——代码在 `external/sm701_ext.py`
+  （适配层本文件入库；sm701 数据+模型目录在仓库外，git 不分发）。开关：
+  `ini [predict] sm701_ext`（默认 1 接入；0=断开，hk/us/futures/crypto 只看行情不出买卖点，
   A股消融剔除候选）与 `ini [predict] sm701_ablation`（默认 1；0=不参加 A 股单股
-  策略消融）。多市场：hk/us/futures 各有生产三周期模型（`prod_{hk|us|fut}_h{1,5,10}_tech.txt`
-  等权平均），样本外概率落盘 + 实时复算；策略工坊绑定优先。
+  策略消融）。多市场：cn/hk/us/futures/**crypto** 各有生产三周期模型
+  （`prod_{hk|us|fut|crypto}_h{1,5,10}_tech.txt` 等权平均），样本外概率落盘 + 实时复算；
+  策略工坊绑定优先。v7.4.0：行情库兼容 `~/桌面/global_daily.db`（统一
+  `daily_bars.market` 表）；模型 .txt 被 git 转成 CRLF 也能加载；`stock_cache.db` /
+  历史预测文件缺失时自动降级（主库行情 + 实时复算）；路径可用
+  `SM70_DIR/DB/MODEL/PRED`（兼容 `SM701_*`）。
   **注意**：sm701 是「次日开盘买→收盘卖」的日内口径，A 股 T+1 不可当日卖出，
- 与本仓库 T 收盘口径回测错位（详见「三档策略」末 sm701 对照节），仅作研究观察；- **auto 风险偏好（v7.3.1，`ini [predict] risk_mode=auto`）**：大盘 BOLL
+ 与本仓库 T 收盘口径回测错位（详见「三档策略」末 sm701 对照节），仅作研究观察；
+- **quant 每日消融数据接入（v7.4.2）**：工具→数据工具「quant 消融数据接入」→
+  「立即同步最新消融」，或启动时自动后台同步
+  `https://quant.tail6a6cc8.ts.net/downloads` 的
+  `public/ablation/latest.csv`（5460 只 × 保守/稳健/激进三档策略 + 验证指标）；
+  转换后写 `research/ablation_gui_cache.json`，三档窗/全部组合直接可用，
+  还可「应用推荐档到全部策略缓存」；`ini [predict] ablation_sync=0` 关自动同步、
+  `ablation_url` 换源；也可单独运行 `python ablation_quant.py`（`--offline`
+  用已下载文件、`--file` 指定本地 CSV）。原始数据存 `research/ablation_quant/`，
+  不入库。配合 `local_ablation=0` 即「quant 算消融、本地只消费」。
+- **auto 风险偏好（v7.3.1，`ini [predict] risk_mode=auto`）**：大盘 BOLL
   三等分自动切换——上证收盘在 BOLL(20,2) 带内位置下 1/3→保守（贴下轨）、
   中 1/3→稳健（中轨附近）、上 1/3→激进（贴上轨），单股交易层参数与信号
   兜底档随之切换，消融算法不变，无前视（复测时点样本 auto 年化 15.7%，
@@ -400,7 +415,7 @@ python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填�
 - **排名基数隔离**：`tier_rank_base()` 保证 `all`/`main` 仍在**个股池**内排名（历史数字不变），
   `etf` 在 ETF 池内排名，`all_etf` 在合并池内排名。
 
-### sm701 外接算法（v7.3.0；`test` 实验档已删除）
+### sm701 外接算法（v7.3.0；`test` 实验档已删除；v7.4.0 兼容新克隆）
 
 > **v7.3.0 变更**：v6.4.0 的 `test` 组合实验档删除（本引擎 T 收盘口径下实测显著为负，
 > 且与 sm701 标签口径天然错位）。sm701 改以**外接算法**接入：
@@ -408,10 +423,19 @@ python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填�
 >   `.gitignore` 已排除 `sm701/`，git 不分发），`stock_gui.py` 只留桥接；
 > - **A 股**：作为「sm701上涨概率」候选参加**单股策略消融**
 >   （`ini [predict] sm701_ablation=0` 可关；`sm701_ext=0` 则全面断开）；
-> - **多市场**：hk/us/futures 由市场策略链直出买卖点（工坊绑定 > sm701 直出）；
+> - **多市场**：cn/hk/us/futures/crypto 由市场策略链直出买卖点（工坊绑定 > sm701 直出）；
 >   `sm701_ext=0` 时这些市场只看行情不出买卖点；
-> - 模型/路径/实时复算机制与 v6.4.x 相同（生产三周期等权、落盘样本外分数 +
->   180 根预热实时复算、副本库只读 URI；`SM701_DIR/DB/MODEL/PRED` 覆盖）。
+> - **v7.4.0（sm 系列接入优化）**：①模型 .txt 统一按 LF 规范化加载——Windows
+>   `git clone` 把 `production/prod_*.txt` 转成 CRLF 时 LightGBM 会直接报
+>   `Model format error`，现在不再受影响，且 Booster 按 (mtime,size) 缓存
+>   （首次 ~2.4s/个，后续 0ms）；②数据/预测产物缺失自动降级：新克隆没有
+>   `stock_cache.db` / `valid_predictions*.csv.gz` 时，A 股用主库行情实时复算、
+>   历史段留空，非 cn 市场优先读 `~/桌面/global_daily.db`（统一
+>   `daily_bars(market,code,...)` + `stocks` 名称表），其次主库同前缀行情；
+>   ③新增 crypto 生产三模型（`prod_crypto_h{1,5,10}_tech.txt`）——h10 需要
+>   `crypto_hourly` 的 11 个分时特征，缺失时自动只用 h1/h5 等权；
+>   ④路径新增 `SM70_DIR/SM70_DB/SM70_MODEL/SM70_PRED` 别名，并探测桌面其它
+>   `sm70*` 目录（sm702 等后续系列模型可复用同一适配层）。
 
 ### sm701 全库对照（v6.6.4，是否替换三档生产策略）
 
@@ -422,18 +446,22 @@ python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填�
     （`features_tech.json` 的 tech 40 特征列序 + `prod_{适配市场}h1|h5|h10_tech.txt`），
     实时复算对三模型分别打分、**等权平均**；若 `production/` 缺失则回退旧
     单模型口径（仅 cn），显式设置 `SM701_MODEL` 时也强制单模型；
-  - **历史分数**：各市场 `production/valid_predictions[.csv.gz|_hk|_us|_fut].gz`
+  - **历史分数**：各市场 `production/valid_predictions[.csv.gz|_hk|_us|_fut|_crypto].gz`
     （`date,code,prob_h1,prob_h5,prob_h10,prob`，`prob`=三模型等权平均），
-    按 code × 交易日对齐本项目面板；
-  - **最新交易日**：历史文件结束之后的新交易日，用生产三模型加副本
+    按 code × 交易日对齐本项目面板；文件缺失时该市场仅实时复算（不阻塞分析，
+    报告会标注）。
+  - **最新交易日**：历史文件结束之后的新交易日，用生产三模型加 sm701
     `lgbm_train_backtest.py` 的原特征工程 `_compute_feats` **实时复算**；
-  - **路径**：默认优先 `~/桌面/sm701 (副本)`，其次 `~/桌面/sm701`；
-    可用 `SM701_DIR` / `SM701_DB` / `SM701_MODEL` / `SM701_PRED` 覆盖。
+    crypto h10 另需 `crypto_hourly` 的 11 个分时特征，缺数据时自动跳过 h10。
+  - **路径**：默认优先 `~/桌面/sm701 (副本)`，其次 `~/桌面/sm701`，再探测
+    桌面其它 `sm70*`；可用 `SM70_DIR` / `SM70_DB` / `SM70_MODEL` / `SM70_PRED`
+    覆盖（兼容旧 `SM701_*`）。行情库兼容 sm701 原生表与桌面
+    `global_daily.db`（`market=HK/US/FUT/CRYPTO` 统一表）。
 - **A股消融候选（可关）**：单股分析中「sm701上涨概率」候选由
   `_sig_sm701()` 直出——`prob ≥ 0.55` 触发 BUY、`prob < 0.50` 触发
   SELL（滞回、同向不重复）；`ini [predict] sm701_ablation=0`
   时消融候选剔除，`sm701_ext=0` 时全面断开；
-- **多市场直出（v6.6.5 起，v7.3.0 接入开关化）**：hk/us/futures 默认
+- **多市场直出（v6.6.5 起，v7.3.0 接入开关化）**：cn/hk/us/futures/crypto 默认
   直接以 sm701 概率作为市场策略出买卖点（策略工坊绑定优先）；外接
   风控参数 `_SM701_EXT_RISK`（原 test 档宽松风控）只作用于 ATR 止损/
   移动止盈。
@@ -701,6 +729,10 @@ python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填�
   **v6.3.3 起按钮直接打开「全部组合」窗口列出全部候选**，可切换排列方式后任选其一应用，
   优先流式读研究批量消融全量文件、秒开，无覆盖才本地重算）；
   **v6.5.1 起消融完成后弹三档窗还是全表可在设置→预测参数→消融策略选择**（默认三档推荐）；
+  **v7.4.1 起新增「允许本地消融」勾选**（ini `[predict] local_ablation`，默认 1）：
+  关闭后 GUI 不再本地跑 `run_ablation`——策略缓存过期只沿用旧策略，无缓存或
+  「全部组合」重算时提示从 quant 导入研究消融结果
+  （`research/ablation_gui_cache.json` / `strategy_ablation_per_stock.json`）；
   档位名是**选型目标**（保守档限定保守/稳健参数候选），候选后缀是它自身的风险参数；
   弹窗按**训练集** Calmar 给出推荐档；验证集仅展示且不参与指标 rank 打分
   （近端一致性门槛见上），高波动股（年化波动 >45%）推荐强制在 稳健/激进 中取较优。
@@ -852,9 +884,8 @@ python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sa
   未保存时才读环境变量 `DEEPSEEK_API_KEY`，避免不同平台的 Key 串用导致 401 /
   **备选 AI 供应商（Ollama）**：可填本地 `http://localhost:11434/v1` + `qwen3:4b`，
   主供应商不可用时使用（`[ollama]` 持久化）/ 代理 /
-  预测参数（含**风险偏好：保守/稳健/激进/test**——`test` 为 v6.4.1 新增的 sm701
-  模型直出档：单股买卖点不做策略消融，直接用模型概率（≥0.55 买入 / <0.50 卖出）；
-  **最大拉取样本量**：单只股票单次联网拉取根数，默认 1000；
+  预测参数（含**风险偏好：保守/稳健/激进**（v7.3.1 起另有 auto 自动切换；
+  v7.3.0 起 `test` 实验档已删除）；**最大拉取样本量**：单只股票单次联网拉取根数，默认 1000；
   **只限制拉取、不限制读库**，库内历史全量参与分析）/
   **外部策略（v6.6.0）**：导入股票策略工坊自定义策略，启用后风险偏好禁用、
   改用止损/止盈/最长持有参数 / **荐股权限（行业多选 + 主板/创业板/科创板/ETF 勾选）** /

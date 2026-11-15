@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.3.1"
+APP_VERSION = "7.4.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -345,6 +345,18 @@ class CFG:
     #                  其他算法消融，sm701 仅多市场直出/独立调用）。
     SM701_EXT_ON = True
     SM701_JOIN_ABLATION = True
+    # ---- 本地策略消融开关（v7.4.1，ini [predict] local_ablation）----
+    # 0 = GUI 不再在本地跑 run_ablation（缓存过期/无缓存/「全部组合」重算
+    #     都不跑）——只沿用旧策略或读取导入的研究消融结果
+    #     （research/ablation_gui_cache.json / strategy_ablation_per_stock.json）。
+    # 适合在 quant 侧跑完消融、再拉取结果回填的场景；默认 1 保持原行为。
+    LOCAL_ABLATION = True
+    # ---- quant 每日消融数据接入（v7.4.2，ini [predict] ablation_sync/url）----
+    # 启动后后台同步 https://quant.tail6a6cc8.ts.net/downloads 的
+    # public/ablation/latest.csv → research/ablation_gui_cache.json；
+    # 本地文件 12h 内新鲜则跳过，失败静默（工具菜单可手动同步）。
+    ABLATION_SYNC = True
+    ABLATION_URL = "https://quant.tail6a6cc8.ts.net"
     # ---- auto 风险偏好（v7.3.1，ini [predict] risk_mode=auto）----
     # 大盘（上证）BOLL(AUTO_RISK_WINDOW, AUTO_RISK_NBDEV) 带内位置三等分
     # 动态解析风险档：下 1/3→保守、中 1/3→稳健、上 1/3→激进；恒只用最新
@@ -516,6 +528,16 @@ def _load_predict_cfg():
         CFG.SM701_JOIN_ABLATION = bool(gi("sm701_ablation",
                                           1 if CFG.SM701_JOIN_ABLATION
                                           else 0, 0, 1))
+        # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
+        CFG.LOCAL_ABLATION = bool(gi("local_ablation",
+                                     1 if CFG.LOCAL_ABLATION else 0, 0, 1))
+        # v7.4.2：quant 消融数据自动同步（启动后台拉 latest.csv）
+        CFG.ABLATION_SYNC = bool(gi("ablation_sync",
+                                    1 if CFG.ABLATION_SYNC else 0, 0, 1))
+        _au = (cp.get("predict", "ablation_url",
+                      fallback=CFG.ABLATION_URL) or "").strip()
+        if _au:
+            CFG.ABLATION_URL = _au.rstrip("/")
         CFG.ENABLE_L3 = bool(gi("enable_l3", 0 if not CFG.ENABLE_L3 else 1,
                                 0, 1))
         CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
@@ -5146,7 +5168,11 @@ def fetch_sector_context(full):
 
     返回 (板块名, {date: 当日涨跌%}, 板块今日涨跌%)；失败返回 (None, {}, None)。
     带 30 分钟缓存：板块日内变化不大，命中缓存零耗时。
+    v7.4.0：仅 A 股适用（东财 secid 为沪深口径）——hk/us/fut/crypto 直接跳过，
+    避免每轮分析发出无效请求并在日志里报 NoneType 警告。
     """
+    if _market_of(full) != "cn":
+        return None, {}, None
     now = time.time()
     with _STATE_LOCK:
         hit = _SECTOR_CACHE.get(full)
@@ -5989,8 +6015,9 @@ def _market_yf_symbol(full):
 
 
 def _sm701_market_bars(full):
-    """多市场日K**同源数据**：直读 sm701 副本库行情表（hk_daily/us_daily/
-    fut_daily——sm701 训练数据源，特征口径完全一致）。无该股返回 []。"""
+    """多市场日K**同源数据**：直读 sm70x/global 库行情表（hk_daily/us_daily/
+    fut_daily/crypto_daily 或统一 daily_bars.market——sm701 训练数据源，
+    特征口径一致）。无该股/无库返回 []（调用方走 Yahoo 兜底）。"""
     mk = _market_of(full)
     if mk not in _SM701_MK or mk == "cn":
         return []
@@ -5998,21 +6025,17 @@ def _sm701_market_bars(full):
         paths = sm701_paths(market=mk)
     except Exception:
         return []
-    table = _SM701_MK[mk]["table"]
-    code = _sm701_code(full)
-    con = _sm701_conn(paths["db"])
-    try:
-        rows = con.execute(
-            f"SELECT date,open,high,low,close,vol FROM {table} "
-            f"WHERE code=? ORDER BY date", (code,)).fetchall()
-    except sqlite3.Error:
-        rows = []
-    finally:
-        con.close()
+    db = paths.get("db")
+    if not db:
+        return []
+    df = _sm701_read_bars(db, mk, _sm701_code(full))
     out = []
-    for d, o, h, l, c, v in rows:
+    if df is None or df.empty:
+        return out
+    cols = ["code", "date", "open", "high", "low", "close", "vol"]
+    for _, d, o, h, l, c, v in df[cols].itertuples(index=False, name=None):
         if c and c > 0:
-            out.append({"date": d, "open": float(o), "high": float(h),
+            out.append({"date": str(d), "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c),
                         "vol": float(v or 0)})
     return out
@@ -6073,34 +6096,25 @@ _FUT_NAMES = {
 
 
 def _sm701_market_pool(market):
-    """多市场池（从 sm701 副本库行情表取实际有数据的代码，名称借 sniper 库）。
-    futures=副本库 fut_daily 的 82 只国内期货品种（A0 等）。"""
+    """多市场池（sm70x/global 库内有 ≥200 根日K 的代码，名称取库内 stocks
+    或 sniper/期货名表）。futures=库 FUT 市场 82 只国内期货品种（A0 等）；
+    无库返回 None。"""
     mk = market
     if mk not in ("hk", "us", "futures"):
         return None
-    if mk == "futures":
-        table = "fut_daily"
-    else:
-        table = f"{mk}_daily"
     try:
-        paths = sm701_paths(market=mk)
+        rows = sm701_market_pool(mk)
     except Exception:
         return None
-    con = _sm701_conn(paths["db"])
-    try:
-        codes = [r[0] for r in con.execute(
-            f"SELECT code, COUNT(*) c FROM {table} GROUP BY code "
-            f"HAVING c>=200 ORDER BY code")]
-    except sqlite3.Error:
-        codes = []
-    finally:
-        con.close()
+    if not rows:
+        return None
     names = _sniper_names({"hk": "HK", "us": "US"}.get(mk, ""))
     out = []
-    for code in codes:
+    for code, db_name in rows:
         full = (mk[:2] if mk != "futures" else "fu") + code.lower()
-        name = names.get(code) or _FUT_NAMES.get(code, code) \
-            if mk == "futures" else names.get(code, code)
+        name = names.get(code) or db_name
+        if mk == "futures":
+            name = name if name and name != code else _FUT_NAMES.get(code, code)
         out.append((full, name))
     return out
 
@@ -10751,15 +10765,15 @@ def _pick_one_from_pool(pool, key):
     见 _ablation_pool），激进保持 0（允许低频高赔率）。
     返回 (picked, note)。"""
     if key == "保守":
-        p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
+        p2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
         if p2:
-            p = p2
+            pool = p2
     obj = {"激进": "激进"}.get(key, "稳健")
     mt = 8 if key in ("保守", "稳健") else 0
     picked, note = pick_ablation_consistent(
-        p, obj, min_trades=mt, recent_of=lambda c: c.get("recent"))
+        pool, obj, min_trades=mt, recent_of=lambda c: c.get("recent"))
     if not picked:
-        return dict(p[0]), "回退池内首个"
+        return dict(pool[0]), "回退池内首个"
     return picked, note
 
 
@@ -11996,13 +12010,13 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     # v6.6.0：启用外部策略（股票策略工坊）→ 直接用导入规则，不读消融缓存、
     # 不参与消融；风险偏好不生效，交易层改用止损/止盈/最长持有参数。
     # v7.3.0：test（sm701 实验档）已删除——A 股走消融/缓存；多市场
-    # （hk/us/futures）由外接算法直出（[predict] sm701_ext 开关；
-    # 接入才出买卖点，断开只看行情）。crypto 暂无生产模型 → 多维评分。
+    # （hk/us/futures/crypto）由外接算法直出（[predict] sm701_ext 开关；
+    # 接入才出买卖点，断开只看行情）。
     strat = None
     mk = _market_of(full)
     if mk != "cn":
-        # v6.6.5 多市场策略链：工坊绑定（显式）> sm701 直出（默认）。
-        # crypto 暂无生产模型 → 回退多维评分（label 标注）。
+        # v6.6.5 多市场策略链：工坊绑定（显式）> sm70x 直出（默认）。
+        # v7.4.0：crypto 生产三模型已接入（h10 分时特征缺失时自动 h1/h5）。
         bound = studio_bound_strategy(mk)
         if bound:
             strat = bound
@@ -12010,8 +12024,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
               and sm701_has_model(mk)):
             strat = {"algo": "sm701", "mode": "sm701",
                      "params": dict(_SM701_EXT_RISK),
-                     "label": f"sm701外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
-        # 未接入外接算法 / crypto：strat 保持 None → 只看行情不出买卖点
+                     "label": f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
+        # 未接入外接算法：strat 保持 None → 只看行情不出买卖点
     if not strat:
         strat = studio_active_strategy()
     if not strat:
@@ -14259,12 +14273,13 @@ _TIER_TRANSFER = 0.00001
 _TIER_LOT = 100
 _TIER_CACHE = {}
 
-# ---- sm701 外接算法桥接（v7.3.0：算法本体已隔离至 external/sm701_ext.py）----
+# ---- sm70x 外接算法桥接（v7.3.0 隔离；v7.4.0 兼容 sm701 新克隆）----
 # 本文件不再内嵌 sm701 模型/特征/副本库代码；sm701 目录（数据+模型）仍是
 # 仓库外资产，git 不分发（详见 external/sm701_ext.py 与 .gitignore）。
 # 接入开关：ini [predict] sm701_ext=0 → 其他市场只看行情、A 股消融剔除
 # sm701 候选；消融开关：[predict] sm701_ablation=0 → 不参加 A 股消融。
-# 路径可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖。
+# 路径可用 SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）覆盖；
+# 行情库兼容 sm701 原生表与桌面 global_daily.db（market 列统一表）。
 import external.sm701_ext as _sm701_ext
 
 _sm701_ext.init_host(globals())
@@ -14273,8 +14288,8 @@ from external.sm701_ext import (  # noqa: E402,F401
     _db_latest_date, _sig_sm701, _sig_sm701_from_probs,
     _sm701_cache_epoch, _sm701_code, _sm701_conn, _sm701_module,
     _sm701_predict_feats, _sm701_live_one, _sm701_live_predict,
-    _sm701_stock_info, sm701_has_model, sm701_paths, sm701_prob_map,
-    sm701_score_matrix, sm701_status)
+    _sm701_read_bars, _sm701_stock_info, sm701_has_model, sm701_market_pool,
+    sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status)
 from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
@@ -15767,10 +15782,14 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
                      + f" → {flag}")
         if d.get("source") == "sm701":
             status = sm701_status()
+            src = status.get("db") or "主库回退"
             lines.append(
-                f"  数据源：sm701 副本 {status.get('dir', '-')} "
-                f"（日K至 {status.get('db_date', '-')}；"
+                f"  数据源：{status.get('series', 'sm70x')} {status.get('dir', '-')}"
+                f"（库 {src}，日K至 {status.get('live_db_date') or status.get('db_date', '-')}；"
                 f"{'可用' if status.get('ok') else status.get('error', '不可用')}）")
+            if not status.get("pred_ok"):
+                lines.append("  提示：历史预测文件缺失，sm701 分数为实时全量复算"
+                             "（首次较慢，之后按数据指纹缓存）。")
             lines.append(
                 "  注意：sm701 信号为「次日开盘买→收盘卖」的日频截面 alpha"
                 "（A股 T+1 无法当日卖出）；本工具 T 收盘集合口径回测显著为负"
@@ -17507,6 +17526,11 @@ class App:
         self._ai_sessions = {}      # (code,model) -> {hash, msgs} 会话缓存
         self._last_ablation = None      # 最近一次消融结果（含全部候选）
         self._last_ablation_for = ""    # 上面对应的股票代码（防跨股串用）
+        # v7.4.2：启动 4s 后后台同步 quant 每日消融（缓存 12h 内则跳过）
+        try:
+            self.root.after(4000, self._quant_ablation_autosync)
+        except Exception:
+            pass
         self._load_config()
         apply_theme(self.settings["theme"], self.settings["updown"],
                   ma_colors=self.settings.get("ma_colors") or {},
@@ -18422,6 +18446,8 @@ class App:
                           command=self.run_etf_sync_bg)
         m.add_command(label="策略工坊（外部策略·按市场应用）",
                       command=lambda: self._open_studio_window())
+        m.add_command(label="同步 quant 消融数据（最新批次）",
+                      command=lambda: self._sync_quant_ablation_bg(manual=True))
         m.add_separator()
         m.add_command(label="⚙ 设置", command=self.open_settings)
         x = anchor_widget.winfo_rootx()
@@ -20272,6 +20298,7 @@ class App:
             self.progress_var.set(
                 "外部策略已启用：买卖点按导入规则，跳过策略消融")
             return
+        full0 = res["full_code"]
         if res.get("strategy"):
             st = res["strategy"]
             if st.get("_stale"):
@@ -20279,6 +20306,22 @@ class App:
                 # 用 allow_stale 载入），这里后台跑新一轮消融；完成后自动
                 # 保存推荐档、清理旧缓存并重分析（不再打断弹窗，手动
                 # 「重选策略」入口的弹窗保持不变）。
+                # v7.4.2：quant 消融批次比旧策略新时，直接换用推荐档
+                # （不跑本地消融）；否则 v7.4.1 的 local_ablation=0 只沿用旧策略。
+                abl = load_research_ablation(full0)
+                try:
+                    newer = bool(abl) and (
+                        float((abl or {}).get("ts") or 0)
+                        > float(st.get("ts") or 0))
+                except (TypeError, ValueError):
+                    newer = False
+                if newer and self._apply_imported_strategy(res, abl):
+                    return
+                if not getattr(CFG, "LOCAL_ABLATION", True):
+                    self.progress_var.set(
+                        f"策略缓存已过期，继续沿用旧策略 {st.get('label', '?')}"
+                        "（本地消融已关闭，等待导入研究消融结果）")
+                    return
                 self.progress_var.set(
                     f"策略缓存已过期，沿用旧策略 {st.get('label', '?')}；"
                     "后台重新消融中...")
@@ -20288,7 +20331,6 @@ class App:
                 f"当前策略: {st.get('label', '?')} "
                 f"(策略缓存{5 - (time.time() - st.get('ts', 0)) // 86400:.0f}日内有效)")
             return
-        full0 = res["full_code"]
         # v6.2.2：优先读研究消融批量结果（全市场一次跑完后免本地重算），
         # 读不到（未跑批量/已过期/该股不在覆盖内）才后台本地消融。
         abl = load_research_ablation(full0)
@@ -20297,6 +20339,11 @@ class App:
             self._last_ablation_for = full0
             self.progress_var.set("已载入研究消融结果（批量缓存，免本地重算）")
             self._show_strategy_result(res, abl)
+            return
+        if not getattr(CFG, "LOCAL_ABLATION", True):
+            self.progress_var.set(
+                "未找到策略且本地消融已关闭：请从 quant 导入研究消融结果"
+                "（research/ablation_gui_cache.json）后重新分析")
             return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
                               "MA/筹码峰/板块轮动/多维×4风险档, 近1000交易日)...")
@@ -20314,11 +20361,158 @@ class App:
 
         self._run_bg(work, lambda r, e: self._ablation_done(res, r, e))
 
+    def _apply_imported_strategy(self, res, abl):
+        """把 quant/研究消融的推荐档落库并重新分析（v7.4.2）。
+
+        只保存**一个**策略（analyze 的 strategy 缓存结构），不跑本地消融；
+        返回 True 表示已触发重分析。"""
+        full = res.get("full_code")
+        rec = (abl or {}).get("recommend") or "稳健"
+        _pref = getattr(CFG, "RISK_MODE", "")
+        if _pref in ABLATION_MODES and _pref in ((abl or {}).get(
+                "mode_candidates") or {}):
+            rec = _pref
+        picked = ((abl or {}).get("mode_candidates") or {}).get(rec)
+        if not (full and picked):
+            return False
+        save_strategy(full, picked)
+        self._last_ablation = abl
+        self._last_ablation_for = full
+        src = (abl or {}).get("source") or "研究"
+        self.progress_var.set(
+            f"已载入{src}消融结果（推荐 {rec}·{picked.get('label', '?')}），"
+            "重新分析中...")
+        self._run_bg(
+            lambda: analyze(full, self._progress, quick=True,
+                            defer_signals=True),
+            self._done_load)
+        return True
+
+    # ---------- quant 每日消融数据同步（v7.4.2） ----------
+
+    def _quant_ablation_fresh(self, max_age=12 * 3600):
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "research", "ablation_gui_cache.json")
+        try:
+            return time.time() - os.path.getmtime(p) < max_age
+        except OSError:
+            return False
+
+    def _sync_quant_ablation_bg(self, manual=False, silent=False):
+        """后台下载 quant latest.csv → research/ablation_gui_cache.json。"""
+        if getattr(self, "_ablation_sync_busy", False):
+            return
+        self._ablation_sync_busy = True
+        if manual:
+            self.progress_var.set("正在从 quant 下载最新消融数据 ...")
+
+        def work():
+            import ablation_quant
+            prefer = (CFG.RISK_MODE if CFG.RISK_MODE in ABLATION_MODES
+                      else None)
+            return ablation_quant.sync(
+                base=getattr(CFG, "ABLATION_URL", "") or
+                ablation_quant.DEFAULT_BASE,
+                params=ablation_risk_params(), prefer_mode=prefer)
+
+        def done(r, e):
+            self._ablation_sync_busy = False
+            if e or not r:
+                msg = f"quant 消融同步失败: {e}" if e else "quant 消融同步失败"
+                log.warning(msg)
+                if manual:
+                    messagebox.showwarning("消融数据同步", msg, parent=self.root)
+                elif not silent:
+                    self.progress_var.set(msg)
+                return
+            # 让 load_research_ablation 下一轮按 mtime 重新加载
+            _RESEARCH_ABL.update(mtime=0.0, ts=0.0, codes={})
+            txt = (f"quant 消融数据已更新：{r.get('codes', 0)} 只 / "
+                   f"批次 {time.strftime('%m-%d %H:%M', time.localtime(r.get('ts') or 0))}")
+            log.info(txt)
+            self.progress_var.set(txt)
+            if manual:
+                messagebox.showinfo(
+                    "消融数据同步",
+                    txt + "\n已写入 research/ablation_gui_cache.json。\n"
+                    "分析股票时自动使用 quant 三档结果；旧策略缓存过期后"
+                    "会自动换用推荐档（不跑本地消融）。",
+                    parent=self.root)
+
+        self._run_bg(work, done)
+
+    def _apply_quant_all_bg(self):
+        """把 quant 消融缓存里的推荐档批量写入策略缓存（显式操作）。
+
+        只写 `recommend` 对应的一档（默认=当前风险偏好），不会逐股弹三档窗；
+        用户仍可对单股「重选策略」覆盖。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "research", "ablation_gui_cache.json")
+        if not os.path.isfile(path):
+            messagebox.showwarning(
+                "应用 quant 消融", "还没有 quant 消融缓存，请先点「立即同步最新消融」",
+                parent=self.root)
+            return
+
+        def work():
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            n = 0
+            with db_conn(commit=True) as conn:
+                for code, c in (d.get("codes") or {}).items():
+                    rec = (c or {}).get("recommend") or "稳健"
+                    _pref = getattr(CFG, "RISK_MODE", "")
+                    if _pref in ABLATION_MODES and _pref in (
+                            (c or {}).get("mode_candidates") or {}):
+                        rec = _pref
+                    picked = ((c or {}).get("mode_candidates") or {}).get(rec)
+                    if not picked:
+                        continue
+                    picked = dict(picked)
+                    picked.pop("_stale", None)
+                    picked["ts"] = time.time()
+                    _set_meta(conn, _strat_key(code),
+                              json.dumps(picked, ensure_ascii=False))
+                    n += 1
+            return n
+
+        def done(n, e):
+            if e or not n:
+                messagebox.showwarning(
+                    "应用 quant 消融",
+                    f"应用失败：{e}" if e else "缓存里没有可用推荐档",
+                    parent=self.root)
+                return
+            self.progress_var.set(
+                f"已把 quant 推荐档写入 {n} 只股票的策略缓存（重新分析即生效）")
+            messagebox.showinfo(
+                "应用 quant 消融",
+                f"已写入 {n} 只股票的策略缓存。\n"
+                "下次分析/重选策略直接使用该档；单股仍可手动改选。",
+                parent=self.root)
+
+        self._run_bg(work, done)
+
+    def _quant_ablation_autosync(self):
+        """启动后台同步（缓存新鲜/开关关闭则跳过；失败静默）。"""
+        try:
+            if not getattr(CFG, "ABLATION_SYNC", True):
+                return
+            if self._quant_ablation_fresh():
+                return
+            self._sync_quant_ablation_bg(manual=False, silent=True)
+        except Exception:
+            log.debug("quant 消融自动同步失败(忽略)", exc_info=True)
+
     def _auto_reablation(self, res):
         """策略缓存过期后的自动续期（v6.6.5）：后台重跑该股消融，完成后
         自动保存推荐档（训练集 Calmar 最优，与弹窗「用推荐档」同口径）、
         清理旧策略缓存并重分析。消融期间图上始终用旧策略（analyze 的
         allow_stale），绝不下沉到默认多维评分。"""
+        if not getattr(CFG, "LOCAL_ABLATION", True):
+            self.progress_var.set(
+                "本地消融已关闭：沿用旧策略，等待从 quant 导入消融结果")
+            return
         if getattr(self, "_auto_abl_busy", False):
             return
         full = res["full_code"]
@@ -20381,7 +20575,12 @@ class App:
         三档推荐窗 / 全部组合大表。设成全表时走 _rerun_strategy 复用
         研究全量候选直读 + 本地重算兜底链路。"""
         if getattr(CFG, "ABLATION_VIEW", "three") == "all":
-            self._rerun_strategy()
+            # v7.4.2：quant/外部导入结果只有三档候选时直接展示；本地全量
+            # 消融/研究全量文件仍走 _rerun_strategy 的全量候选链路。
+            if (abl or {}).get("source") == "quant":
+                self._open_all_strategy_window(res, abl=abl)
+            else:
+                self._rerun_strategy()
         else:
             self._show_strategy_popup(res, abl)
 
@@ -20407,15 +20606,23 @@ class App:
         # 按钮栏先占底部，避免被上方可滚动区挤没
         btns = ttk.Frame(win)
         btns.pack(side="bottom", fill="x", pady=10)
-        ttk.Label(win, text=(
-            f"基于近{abl['bars']}个交易日回测选策略 "
-            f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
-            f"验证集未参与选择）\n"
-            f"每档按各自风险目标在候选中选优"
-            f"（13算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
-            f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
-            f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
-                  ).pack(anchor="w", padx=12, pady=(10, 4))
+        if (abl or {}).get("source") == "quant":
+            _head = (
+                "quant 每日消融批次（三档：保守/稳健/激进）\n"
+                "每档策略由 quant 侧全市场消融选型；CSV 只发布验证集指标，"
+                "训练期显示为 “-”\n"
+                "推荐档=当前风险偏好匹配档（无匹配取验证年化最高）；"
+                "以下胜率/年化/回撤均为【验证集】样本外数据。")
+        else:
+            _head = (
+                f"基于近{abl['bars']}个交易日回测选策略 "
+                f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
+                f"验证集未参与选择）\n"
+                f"每档按各自风险目标在候选中选优"
+                f"（13算法+多维评分 × 3风险参数；保守档限定保守/稳健参数）\n"
+                f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
+                f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
+        ttk.Label(win, text=_head).pack(anchor="w", padx=12, pady=(10, 4))
         rec = abl.get("recommend", "稳健")
         _vol = abl.get("vol_ann")
         if _vol is not None:
@@ -20604,7 +20811,23 @@ class App:
 
     def _start_local_ablation(self, res, on_done=None):
         """后台本地消融（近1000日，全部候选），完成后回调 on_done(abl|None)。
-        v6.3.3：「全部组合」窗口的本地重算与无研究缓存兜底共用。"""
+        v6.3.3：「全部组合」窗口的本地重算与无研究缓存兜底共用。
+        v7.4.1：ini [predict] local_ablation=0 时直接拒绝，只允许导入结果。"""
+        if not getattr(CFG, "LOCAL_ABLATION", True):
+            self.progress_var.set(
+                "本地消融已关闭：请从 quant 导入消融结果"
+                "（research/ablation_gui_cache.json / "
+                "strategy_ablation_per_stock.json）")
+            if on_done is not None:
+                on_done(None)
+            else:
+                messagebox.showinfo(
+                    "本地消融已关闭",
+                    "当前设置为「不跑本地消融」。\n"
+                    "请从 quant 拉取消融结果后放入 research/ 目录，"
+                    "或在 设置→预测参数 勾选「允许本地消融」。",
+                    parent=self.root)
+            return
         full = res["full_code"]
         bars = res["disp_rows"][:-1] if res.get("has_live") \
             else res["disp_rows"]
@@ -21190,8 +21413,7 @@ class App:
                 return
             mk = {"港股": "hk", "美股": "us", "期货": "futures",
                   "加密": "crypto"}[binds_box.get()]
-            if not sm701_has_model(mk) and mk == "crypto":
-                pass      # crypto 无模型：studio 绑定正是唯一信号源，放行
+            # v7.4.0：crypto 已有生产模型，但工坊绑定仍优先于 sm70x 直出
             studio_bind_market(mk, slug)
             refresh()
             self.progress_var.set(
@@ -24918,6 +25140,33 @@ class App:
                            "日志见下方", foreground=AXIS_TXT).pack(
                                side="left", padx=6)
 
+        # —— quant 每日消融数据接入（v7.4.2）——
+        qa = ttk.LabelFrame(
+            parent, padding=8,
+            text=" quant 消融数据接入（每日批次 → research/ablation_gui_cache.json） ")
+        qa.pack(fill="x", pady=(0, 6))
+        q1 = ttk.Frame(qa)
+        q1.pack(fill="x")
+        ttk.Button(q1, text="立即同步最新消融",
+                   command=lambda: self._sync_quant_ablation_bg(
+                       manual=True)).pack(side="left")
+        ttk.Button(q1, text="应用推荐档到全部策略缓存",
+                   command=self._apply_quant_all_bg).pack(
+                       side="left", padx=(6, 0))
+        ttk.Label(q1, text="  数据源: ",
+                  foreground=AXIS_TXT).pack(side="left")
+        ttk.Label(q1, text=f"{getattr(CFG, 'ABLATION_URL', '')}"
+                           "/downloads → public/ablation/latest.csv",
+                  foreground=AXIS_TXT).pack(side="left")
+        q2 = ttk.Frame(qa)
+        q2.pack(fill="x", pady=(4, 0))
+        _qa_fresh = self._quant_ablation_fresh()
+        ttk.Label(q2, text=(
+            "启动时自动同步（缓存超过 12h 才拉取；ini [predict] ablation_sync=0 可关）。"
+            "导入后三档窗/推荐档直接使用 quant 结果，不再本地跑消融；"
+            f"当前本地缓存：{'12h 内已更新' if _qa_fresh else '过期/缺失'}。"),
+            foreground=AXIS_TXT, wraplength=980).pack(side="left")
+
         # —— 全量策略消融（v6.5.5：全市场 12算×3档 + 可选刷新 GUI 策略缓存）——
         ab = ttk.LabelFrame(parent, padding=8,
                             text=" 全量策略消融（全市场逐只·13算法×3档，AI 不参与） ")
@@ -25814,7 +26063,10 @@ class App:
                                    width=8, state="readonly",
                                    values=("三档推荐", "全部组合"))
         cmb_ablview.grid(row=9, column=1, sticky="w", pady=2)
-        ttk.Label(frm, text="消融完成后弹哪种窗口").grid(
+        local_abl_var = tk.BooleanVar(
+            value=bool(getattr(CFG, "LOCAL_ABLATION", True)))
+        ttk.Checkbutton(frm, text="允许本地消融（关=只用导入结果）",
+                        variable=local_abl_var).grid(
             row=9, column=2, sticky="w")
 
         def _int_var(attr, lo, hi):
@@ -26534,6 +26786,12 @@ class App:
                 pnotes.append(
                     "消融策略选择="
                     f"{'全部组合' if _av == 'all' else '三档推荐'}")
+                CFG.LOCAL_ABLATION = bool(local_abl_var.get())
+                cp.set("predict", "local_ablation",
+                       "1" if CFG.LOCAL_ABLATION else "0")
+                pnotes.append(
+                    "本地消融="
+                    + ("开" if CFG.LOCAL_ABLATION else "关（仅用导入结果）"))
                 if risk_var.get() in CFG.RISK_PARAMS:
                     CFG.RISK_MODE = risk_var.get()
                     cp.set("predict", "risk_mode", CFG.RISK_MODE)

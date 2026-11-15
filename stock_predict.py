@@ -30,12 +30,14 @@ K线源自动切换：腾讯(多域名容灾) -> 新浪 -> 同花顺 -> 东财�
   --picks-backtest v6.1.5 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 
-sm701 外接算法（v7.3.0）：适配层在 external/sm701_ext.py；sm701 目录
-             （数据+模型）保存在仓库外，git 不分发。默认自动查找
-             ~/桌面/sm701 (副本) 与原目录；也可用 SM701_DIR / SM701_DB /
-             SM701_MODEL / SM701_PRED 覆盖。A 股作为候选参加单股消融
-             （ini [predict] sm701_ablation=0 可关）；hk/us/futures 由
-             市场策略链直出买卖点（sm701_ext=0 则只看行情）。
+sm701 外接算法（v7.3.0；v7.4.0 兼容新克隆）：适配层在
+             external/sm701_ext.py；sm701 目录（数据+模型）保存在仓库外，
+             git 不分发。默认自动查找 ~/桌面/sm701 (副本) 与原目录；也可用
+             SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）
+             覆盖。行情库兼容 sm701 原生表与桌面 global_daily.db；模型
+             CRLF/缺失预测文件均可自动降级。A 股作为候选参加单股消融
+             （ini [predict] sm701_ablation=0 可关）；hk/us/futures/crypto
+             由市场策略链直出买卖点（sm701_ext=0 则只看行情）。
 """
 
 
@@ -128,7 +130,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.3.1"
+APP_VERSION = "7.4.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -359,6 +361,18 @@ class CFG:
     #                  其他算法消融，sm701 仅多市场直出/独立调用）。
     SM701_EXT_ON = True
     SM701_JOIN_ABLATION = True
+    # ---- 本地策略消融开关（v7.4.1，ini [predict] local_ablation）----
+    # 0 = GUI 不再在本地跑 run_ablation（缓存过期/无缓存/「全部组合」重算
+    #     都不跑）——只沿用旧策略或读取导入的研究消融结果
+    #     （research/ablation_gui_cache.json / strategy_ablation_per_stock.json）。
+    # 适合在 quant 侧跑完消融、再拉取结果回填的场景；默认 1 保持原行为。
+    LOCAL_ABLATION = True
+    # ---- quant 每日消融数据接入（v7.4.2，ini [predict] ablation_sync/url）----
+    # 启动后后台同步 https://quant.tail6a6cc8.ts.net/downloads 的
+    # public/ablation/latest.csv → research/ablation_gui_cache.json；
+    # 本地文件 12h 内新鲜则跳过，失败静默（工具菜单可手动同步）。
+    ABLATION_SYNC = True
+    ABLATION_URL = "https://quant.tail6a6cc8.ts.net"
     # ---- auto 风险偏好（v7.3.1，ini [predict] risk_mode=auto）----
     # 大盘（上证）BOLL(AUTO_RISK_WINDOW, AUTO_RISK_NBDEV) 带内位置三等分
     # 动态解析风险档：下 1/3→保守、中 1/3→稳健、上 1/3→激进；恒只用最新
@@ -530,6 +544,16 @@ def _load_predict_cfg():
         CFG.SM701_JOIN_ABLATION = bool(gi("sm701_ablation",
                                           1 if CFG.SM701_JOIN_ABLATION
                                           else 0, 0, 1))
+        # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
+        CFG.LOCAL_ABLATION = bool(gi("local_ablation",
+                                     1 if CFG.LOCAL_ABLATION else 0, 0, 1))
+        # v7.4.2：quant 消融数据自动同步（启动后台拉 latest.csv）
+        CFG.ABLATION_SYNC = bool(gi("ablation_sync",
+                                    1 if CFG.ABLATION_SYNC else 0, 0, 1))
+        _au = (cp.get("predict", "ablation_url",
+                      fallback=CFG.ABLATION_URL) or "").strip()
+        if _au:
+            CFG.ABLATION_URL = _au.rstrip("/")
         CFG.ENABLE_L3 = bool(gi("enable_l3", 0 if not CFG.ENABLE_L3 else 1,
                                 0, 1))
         CFG.AUTO_PREFETCH = bool(gi("auto_prefetch",
@@ -5162,7 +5186,11 @@ def fetch_sector_context(full):
 
     返回 (板块名, {date: 当日涨跌%}, 板块今日涨跌%)；失败返回 (None, {}, None)。
     带 30 分钟缓存：板块日内变化不大，命中缓存零耗时。
+    v7.4.0：仅 A 股适用（东财 secid 为沪深口径）——hk/us/fut/crypto 直接跳过，
+    避免每轮分析发出无效请求并在日志里报 NoneType 警告。
     """
+    if _market_of(full) != "cn":
+        return None, {}, None
     now = time.time()
     with _STATE_LOCK:
         hit = _SECTOR_CACHE.get(full)
@@ -6005,8 +6033,9 @@ def _market_yf_symbol(full):
 
 
 def _sm701_market_bars(full):
-    """多市场日K**同源数据**：直读 sm701 副本库行情表（hk_daily/us_daily/
-    fut_daily——sm701 训练数据源，特征口径完全一致）。无该股返回 []。"""
+    """多市场日K**同源数据**：直读 sm70x/global 库行情表（hk_daily/us_daily/
+    fut_daily/crypto_daily 或统一 daily_bars.market——sm701 训练数据源，
+    特征口径一致）。无该股/无库返回 []（调用方走 Yahoo 兜底）。"""
     mk = _market_of(full)
     if mk not in _SM701_MK or mk == "cn":
         return []
@@ -6014,21 +6043,17 @@ def _sm701_market_bars(full):
         paths = sm701_paths(market=mk)
     except Exception:
         return []
-    table = _SM701_MK[mk]["table"]
-    code = _sm701_code(full)
-    con = _sm701_conn(paths["db"])
-    try:
-        rows = con.execute(
-            f"SELECT date,open,high,low,close,vol FROM {table} "
-            f"WHERE code=? ORDER BY date", (code,)).fetchall()
-    except sqlite3.Error:
-        rows = []
-    finally:
-        con.close()
+    db = paths.get("db")
+    if not db:
+        return []
+    df = _sm701_read_bars(db, mk, _sm701_code(full))
     out = []
-    for d, o, h, l, c, v in rows:
+    if df is None or df.empty:
+        return out
+    cols = ["code", "date", "open", "high", "low", "close", "vol"]
+    for _, d, o, h, l, c, v in df[cols].itertuples(index=False, name=None):
         if c and c > 0:
-            out.append({"date": d, "open": float(o), "high": float(h),
+            out.append({"date": str(d), "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c),
                         "vol": float(v or 0)})
     return out
@@ -6089,34 +6114,25 @@ _FUT_NAMES = {
 
 
 def _sm701_market_pool(market):
-    """多市场池（从 sm701 副本库行情表取实际有数据的代码，名称借 sniper 库）。
-    futures=副本库 fut_daily 的 82 只国内期货品种（A0 等）。"""
+    """多市场池（sm70x/global 库内有 ≥200 根日K 的代码，名称取库内 stocks
+    或 sniper/期货名表）。futures=库 FUT 市场 82 只国内期货品种（A0 等）；
+    无库返回 None。"""
     mk = market
     if mk not in ("hk", "us", "futures"):
         return None
-    if mk == "futures":
-        table = "fut_daily"
-    else:
-        table = f"{mk}_daily"
     try:
-        paths = sm701_paths(market=mk)
+        rows = sm701_market_pool(mk)
     except Exception:
         return None
-    con = _sm701_conn(paths["db"])
-    try:
-        codes = [r[0] for r in con.execute(
-            f"SELECT code, COUNT(*) c FROM {table} GROUP BY code "
-            f"HAVING c>=200 ORDER BY code")]
-    except sqlite3.Error:
-        codes = []
-    finally:
-        con.close()
+    if not rows:
+        return None
     names = _sniper_names({"hk": "HK", "us": "US"}.get(mk, ""))
     out = []
-    for code in codes:
+    for code, db_name in rows:
         full = (mk[:2] if mk != "futures" else "fu") + code.lower()
-        name = names.get(code) or _FUT_NAMES.get(code, code) \
-            if mk == "futures" else names.get(code, code)
+        name = names.get(code) or db_name
+        if mk == "futures":
+            name = name if name and name != code else _FUT_NAMES.get(code, code)
         out.append((full, name))
     return out
 
@@ -10767,15 +10783,15 @@ def _pick_one_from_pool(pool, key):
     见 _ablation_pool），激进保持 0（允许低频高赔率）。
     返回 (picked, note)。"""
     if key == "保守":
-        p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
+        p2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
         if p2:
-            p = p2
+            pool = p2
     obj = {"激进": "激进"}.get(key, "稳健")
     mt = 8 if key in ("保守", "稳健") else 0
     picked, note = pick_ablation_consistent(
-        p, obj, min_trades=mt, recent_of=lambda c: c.get("recent"))
+        pool, obj, min_trades=mt, recent_of=lambda c: c.get("recent"))
     if not picked:
-        return dict(p[0]), "回退池内首个"
+        return dict(pool[0]), "回退池内首个"
     return picked, note
 
 
@@ -12012,13 +12028,13 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     # v6.6.0：启用外部策略（股票策略工坊）→ 直接用导入规则，不读消融缓存、
     # 不参与消融；风险偏好不生效，交易层改用止损/止盈/最长持有参数。
     # v7.3.0：test（sm701 实验档）已删除——A 股走消融/缓存；多市场
-    # （hk/us/futures）由外接算法直出（[predict] sm701_ext 开关；
-    # 接入才出买卖点，断开只看行情）。crypto 暂无生产模型 → 多维评分。
+    # （hk/us/futures/crypto）由外接算法直出（[predict] sm701_ext 开关；
+    # 接入才出买卖点，断开只看行情）。
     strat = None
     mk = _market_of(full)
     if mk != "cn":
-        # v6.6.5 多市场策略链：工坊绑定（显式）> sm701 直出（默认）。
-        # crypto 暂无生产模型 → 回退多维评分（label 标注）。
+        # v6.6.5 多市场策略链：工坊绑定（显式）> sm70x 直出（默认）。
+        # v7.4.0：crypto 生产三模型已接入（h10 分时特征缺失时自动 h1/h5）。
         bound = studio_bound_strategy(mk)
         if bound:
             strat = bound
@@ -12026,8 +12042,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
               and sm701_has_model(mk)):
             strat = {"algo": "sm701", "mode": "sm701",
                      "params": dict(_SM701_EXT_RISK),
-                     "label": f"sm701外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
-        # 未接入外接算法 / crypto：strat 保持 None → 只看行情不出买卖点
+                     "label": f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
+        # 未接入外接算法：strat 保持 None → 只看行情不出买卖点
     if not strat:
         strat = studio_active_strategy()
     if not strat:
@@ -14275,12 +14291,13 @@ _TIER_TRANSFER = 0.00001
 _TIER_LOT = 100
 _TIER_CACHE = {}
 
-# ---- sm701 外接算法桥接（v7.3.0：算法本体已隔离至 external/sm701_ext.py）----
+# ---- sm70x 外接算法桥接（v7.3.0 隔离；v7.4.0 兼容 sm701 新克隆）----
 # 本文件不再内嵌 sm701 模型/特征/副本库代码；sm701 目录（数据+模型）仍是
 # 仓库外资产，git 不分发（详见 external/sm701_ext.py 与 .gitignore）。
 # 接入开关：ini [predict] sm701_ext=0 → 其他市场只看行情、A 股消融剔除
 # sm701 候选；消融开关：[predict] sm701_ablation=0 → 不参加 A 股消融。
-# 路径可用 SM701_DIR / SM701_DB / SM701_MODEL / SM701_PRED 覆盖。
+# 路径可用 SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）覆盖；
+# 行情库兼容 sm701 原生表与桌面 global_daily.db（market 列统一表）。
 import external.sm701_ext as _sm701_ext
 
 _sm701_ext.init_host(globals())
@@ -14289,8 +14306,8 @@ from external.sm701_ext import (  # noqa: E402,F401
     _db_latest_date, _sig_sm701, _sig_sm701_from_probs,
     _sm701_cache_epoch, _sm701_code, _sm701_conn, _sm701_module,
     _sm701_predict_feats, _sm701_live_one, _sm701_live_predict,
-    _sm701_stock_info, sm701_has_model, sm701_paths, sm701_prob_map,
-    sm701_score_matrix, sm701_status)
+    _sm701_read_bars, _sm701_stock_info, sm701_has_model, sm701_market_pool,
+    sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status)
 from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
@@ -15783,10 +15800,14 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
                      + f" → {flag}")
         if d.get("source") == "sm701":
             status = sm701_status()
+            src = status.get("db") or "主库回退"
             lines.append(
-                f"  数据源：sm701 副本 {status.get('dir', '-')} "
-                f"（日K至 {status.get('db_date', '-')}；"
+                f"  数据源：{status.get('series', 'sm70x')} {status.get('dir', '-')}"
+                f"（库 {src}，日K至 {status.get('live_db_date') or status.get('db_date', '-')}；"
                 f"{'可用' if status.get('ok') else status.get('error', '不可用')}）")
+            if not status.get("pred_ok"):
+                lines.append("  提示：历史预测文件缺失，sm701 分数为实时全量复算"
+                             "（首次较慢，之后按数据指纹缓存）。")
             lines.append(
                 "  注意：sm701 信号为「次日开盘买→收盘卖」的日频截面 alpha"
                 "（A股 T+1 无法当日卖出）；本工具 T 收盘集合口径回测显著为负"

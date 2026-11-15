@@ -5,6 +5,67 @@
 
 ## 版本历史
 
+> **v7.4.2：quant 每日消融数据接入（2026-11-15）**：
+> ①新增 **`ablation_quant.py`**：从 `https://quant.tail6a6cc8.ts.net/downloads`
+> 的「每日消融数据」下载 `public/ablation/latest.csv`（5460 只 × 保守/稳健/
+> 激进 三档策略 + 验证年化/胜率/回撤）+ `latest.json`（批次时间/汇总），
+> 按「策略名·风险档」反查 `algo`（KDJ/RSI/布林/MACD/LGBM/L1/L2/筹码峰/
+> 板块轮动/量比/异动/多维），生成与 `run_ablation()` 同构的
+> `research/ablation_gui_cache.json`；原始 CSV/JSON 留档
+> `research/ablation_quant/`（均 git 忽略）。也可 `python ablation_quant.py`
+> 单独跑（支持 `--offline/--file/--prefer/--base`）。
+> ②GUI 接入：工具→数据工具新增「quant 消融数据接入」——「立即同步最新消融」
+> 与「应用推荐档到全部策略缓存」；启动 4s 后自动后台同步（缓存 12h 内跳过，
+> `ini [predict] ablation_sync=0` 可关、`ablation_url` 可改），失败静默。
+> ③策略链：quant 批次比旧策略缓存新时，`_ensure_strategy()` 直接换用推荐档
+> （按 `risk_mode` 匹配档，无匹配取验证年化最高）并重分析，**不跑本地消融**；
+> 三档窗/全部组合窗标注数据源=quant（训练期指标显示 "-"，CSV 未发布）；
+> 与 v7.4.1 `local_ablation=0` 配套，实现“quant 算、本地只消费”。
+> `APP_VERSION=7.4.2`，`stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.4.1：修复消融选型崩溃 + 本地消融开关（quant 外部消融流程）（2026-11-15）**：
+> ①**修复 `_pick_one_from_pool()` 保守档崩溃**：分支里误用未定义局部变量 `p`
+> （应为参数 `pool`），导致全量消融选型必报
+> `cannot access local variable 'p' where it is not associated with a value`
+> ——GUI 后台重消融因此永远“未完成：…继续沿用旧策略”；修复后
+> sz000001 全量消融跑通（42 候选，推荐档正常产出）。
+> ②**新增本地消融开关**：ini `[predict] local_ablation`（默认 1），
+> 设置→预测参数新增「允许本地消融（关=只用导入结果）」勾选；关闭后
+> GUI **完全不跑** `run_ablation`——缓存过期只沿用旧策略并提示等待导入，
+> 无缓存/「全部组合」重算提示从 quant 拉取
+> `research/ablation_gui_cache.json` / `strategy_ablation_per_stock.json`；
+> 研究脚本/CLI 的 `run_ablation` 不受影响；本机 ini 已设 `local_ablation=0`
+> （消融结果稍后从 quant 导入）。`APP_VERSION=7.4.1`，
+> `stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.4.0：sm 系列模型接入优化（sm701 新克隆 + global_daily 库）（2026-11-14）**：
+> ①**模型加载**：Windows `git clone` 把 `production/prod_*.txt` 检出为 CRLF，
+> LightGBM 直接 `Model format error, expect a tree here`——适配层统一按 LF
+> 规范化后用 `model_str` 解析（失败才回落 `model_file`），并按 (mtime,size)
+> 缓存 Booster（首次 2.4s/个 → 0ms，原先每次复算重读 3 个 5~17MB 模型）；
+> ②**缺失降级**：`sm701_paths()` 不再强制 `stock_cache.db` + 历史预测文件
+> （新克隆默认都没有）——A 股用主库行情实时复算（单股优先复用
+> `sm701_score_matrix()` 的一次全市场矩阵；无历史预测时最多复算最近 250 日），
+> 非 cn 市场优先读 sm701 原生表或桌面 **`global_daily.db`**（统一
+> `daily_bars(market,code,...)` + `stocks` 名称，`market=HK/US/FUT/CRYPTO`；
+> crypto `BTCUSDT↔BTC/USDT` 自动映射），再回退主库同前缀行情；
+> ③**crypto 接入**：新增 `prod_crypto_h{1,5,10}_tech.txt` 三模型（E1 beta
+> 中性口径）——h10 依赖 `crypto_hourly` 的 11 个分时特征（`rv24/72/168`、
+> `mom4/8/24`、隔夜/日内、量集中度、区间位、VWAP 偏离），无分时数据时
+> 自动跳过 h10、h1/h5 等权；策略链 crypto 不再标注“无模型”；
+> ④**路径/系列**：新增 `SM70_DIR/SM70_DB/SM70_MODEL/SM70_PRED` 别名，
+> 兼容旧 `SM701_*`；自动探测桌面其它 `sm70*` 目录（sm702 等可复用）；
+> ⑤**多市场行情池**：`_sm701_market_bars/_sm701_market_pool` 支持 global
+> 统一表（实测 hk 2667 / us 3000（上限）/ fut 82 只，带库内名称）；
+> `sm701_status()` 增加 `series/db_fallback/pred_ok/markets`；报告在缺
+> 历史预测时提示“实时全量复算”；`backtest_sm701_markets.py --top 0`
+> 在无历史预测文件时跳过并说明；`.gitignore` 增加
+> `global_daily*.db` / `stock_cache*.db`（误拷入仓库也不入库）；
+> ⑥`fetch_sector_context()` 非 cn 直接跳过（东财 secid 仅沪深口径，
+> 原会每轮分析报 `NoneType` 警告并浪费请求）。
+> `APP_VERSION=7.4.0`，`stock_predict.py` 重新生成；README / ARCHITECTURE
+> （2.0/3.4/3.7/3.8 + 变更索引）同步。
+
 > **v7.3.1：风险偏好新增 auto（大盘 BOLL 三等分自动切换）+ 组合切换回测（2026-11-08）**：
 > ①**单股**：`ini [predict] risk_mode=auto` 新增——上证收盘在 BOLL(20,2)
 > 带内位置 `pos=(收盘−下轨)/带宽` 三等分动态解析风险档（下1/3→保守、

@@ -200,6 +200,11 @@ def main():
             out["markets"][market] = {"skipped": True}
             continue
         paths = sg.sm701_paths(market=market)
+        if full_db and not paths.get("pred"):
+            md.append(f"## {sg._MARKET_LABELS[market]}：无历史预测文件，"
+                      "全库回测跳过（可先运行 sm701 production/make_predictions.py）")
+            out["markets"][market] = {"skipped": True}
+            continue
         if full_db:
             codes = market_all_codes(market)
             print(f"[{market}] 全库 {len(codes)} 个代码（先一次性载入历史概率）",

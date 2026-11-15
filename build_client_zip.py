@@ -23,8 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
 DB = os.path.join(HERE, "stock_cache.db")
 FILES = [
-    "stock_gui.py", "stock_predict.py", "README.md", "LICENSE",
-    "PLUGIN_API.md", "requirements-client.txt",
+    "stock_gui.py", "stock_predict.py", "ablation_quant.py", "README.md",
+    "LICENSE", "PLUGIN_API.md", "requirements-client.txt",
 ]
 PLUGIN_DIR = "plugins"
 PLUGIN_FILES = ["__init__.py", "api.py", "base.py", "trade_log.py"]

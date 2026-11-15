@@ -37,6 +37,8 @@ research/perstock_tier_picks.json
 research/ablation_gui_cache.json
 # 全量消融进度快照（v6.5.6；运行时原子写，GUI/进度看板实时读取，可重跑）
 research/ablation_progress.json*
+# quant 每日消融数据（v7.4.2；ablation_quant.py 下载的原始 CSV/JSON + GUI 缓存）
+research/ablation_quant/
 
 # 回测统一规范运行目录（bt_common.py；消融/每只股导出等可重跑，
 # 根目录固定名「最新副本」按需入库，明细随研究包分发）
@@ -45,13 +47,18 @@ research/perstock_backtest_v*/
 # 每只股回测导出（数据工具生成，可重跑；规范产物在 research/perstock_backtest_v*/）
 reports/每只股回测_*
 
-# sm701 外接算法（v7.3.0）：数据+模型目录在桌面（~/桌面/sm701），本地只读
-# 接入，绝不入仓库；若误拷进仓库按目录/库文件一并忽略。适配层
-# external/sm701_ext.py 本身入库（无 sm701 数据）。
+# sm701 外接算法（v7.3.0；v7.4.0 兼容 global_daily）：数据+模型目录在桌面
+# （~/桌面/sm701），本地只读接入，绝不入仓库；若误拷进仓库按目录/库文件一并
+# 忽略。适配层 external/sm701_ext.py 本身入库（无 sm701 数据）。
 /sm701/
 /sm701 (副本)/
 sm701*.db
 sm701*.db-*
+# global 多市场行情库（v7.4.0；默认读 ~/桌面/global_daily.db，只读）
+global_daily*.db
+# 浏览器重复下载的 stock_cache (1).db 等
+stock_cache*.db
+stock_cache*.db-*
 
 # --- 标准 Python 忽略项 ---
 .env

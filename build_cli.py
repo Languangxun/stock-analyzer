@@ -48,12 +48,14 @@ K线源自动切换：腾讯(多域名容灾) -> 新浪 -> 同花顺 -> 东财�
   --picks-backtest v6.1.5 荐股收益回测（逐笔口径，按风险偏好；--tier 过滤）
   --picks-seg      荐股回测区间：full(默认)/val/bull/2024/2025...
 
-sm701 外接算法（v7.3.0）：适配层在 external/sm701_ext.py；sm701 目录
-             （数据+模型）保存在仓库外，git 不分发。默认自动查找
-             ~/桌面/sm701 (副本) 与原目录；也可用 SM701_DIR / SM701_DB /
-             SM701_MODEL / SM701_PRED 覆盖。A 股作为候选参加单股消融
-             （ini [predict] sm701_ablation=0 可关）；hk/us/futures 由
-             市场策略链直出买卖点（sm701_ext=0 则只看行情）。
+sm701 外接算法（v7.3.0；v7.4.0 兼容新克隆）：适配层在
+             external/sm701_ext.py；sm701 目录（数据+模型）保存在仓库外，
+             git 不分发。默认自动查找 ~/桌面/sm701 (副本) 与原目录；也可用
+             SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）
+             覆盖。行情库兼容 sm701 原生表与桌面 global_daily.db；模型
+             CRLF/缺失预测文件均可自动降级。A 股作为候选参加单股消融
+             （ini [predict] sm701_ablation=0 可关）；hk/us/futures/crypto
+             由市场策略链直出买卖点（sm701_ext=0 则只看行情）。
 """
 
 '''

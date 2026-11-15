@@ -40,7 +40,7 @@
 | `stock_gui.py` | **唯一算法源**：内嵌缓存层 + 数据获取 + 指标 + 分析 + **三档组合引擎** + **13 类消融信号** + AI 客户端 + Tkinter GUI |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 抽取拼装），**勿手改** |
 | `studio_strategies/` | 从「股票策略工坊」导入的自定义策略 JSON 副本（v6.6.0；规则引擎读取，设置→外部策略维护） |
-| `external/` | **外接算法适配层**（v7.3.0）：`sm701_ext.py` 为 sm701 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位/副本库只读/概率复算/买卖点信号；适配层代码入库，仅 sm701 目录不入库 |
+| `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号；缺库/缺预测文件自动降级；适配层代码入库，仅 sm701/global 数据目录不入库 |
 | `build_cli.py` | GUI → CLI 打包器；按锚点注释抽取「缓存块」「算法块」，并做 tkinter 残留 / 语法校验 |
 | `run_backtest.sh` | **一键全量回测**（GUI 工具菜单/数据工具页与桌面快捷方式共用入口）：全期/样本外/强势段 → 全市场逐股，`--yearly` 加逐年；日志 `research/oneclick_backtest_*.log`，结束自动打开仪表盘；GUI 侧由 `_ext_spawn` 子进程承载、日志回流 |
 | `stock_firstaid.py` | 数据源急救箱（独立于 GUI）：候选域体检 `--check` / 把实测可用K线源写回 ini / `--ai` 求救（AI 只提议 URL，实测验证后才采用） |
@@ -86,15 +86,18 @@
   同库同表（daily_bars/quote_cache/minute_cache/stocks），复用全部缓存/显示/
   分时/离线降级链路；`normalize_code` 前缀直通 + 模式感知归一（顶栏市场下拉，
   ini `[market] mode` 持久化）；
-- **数据源**：hk/us/fut 优先直读 sm701 副本库行情表（hk_daily/us_daily/fut_daily
-  ——训练数据源，特征口径一致；`_sm701_market_bars`，实现位于
-  `external/sm701_ext.py` 外接算法适配层），Yahoo chart v8 兜底
-  （`_yf_chart`，urllib 走 `_http_get` 继承节流/熔断/离线/代理路由）；crypto 仅 Yahoo；
+- **数据源**：hk/us/futures/crypto 优先直读 sm70x 行情库——sm701 原生表
+  （hk_daily/us_daily/fut_daily/crypto_daily）或桌面 `global_daily.db`
+  （统一 `daily_bars(market,code,date,open,high,low,close,volume)` +
+  `stocks(market,code,name)`，market=HK/US/FUT/CRYPTO）；训练数据源，
+  特征口径一致（`_sm701_market_bars`，实现位于 `external/sm701_ext.py`
+  外接算法适配层），无库时 Yahoo chart v8 兜底
+  （`_yf_chart`，urllib 走 `_http_get` 继承节流/熔断/离线/代理路由）；
   **美股另可选 Twelve Data（v7.1.0）**：配 key 后快照与日K优先走 TD，Yahoo 退为兜底；
 - **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
-  > **sm701 直出**（`sm701_paths(market)` 生产集 `prod_{hk|us|fut}_h{1,5,10}_tech.txt`
-  + 各市场样本外预测文件；`_sm701_live_one` 副本库同源实时复算）> 多维评分
-  （crypto 无模型回退并标注）；
+  > **sm70x 直出**（`sm701_paths(market)` 生产集
+  `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
+  `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；
 - **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
   （杠杆 `leverage_市场`，T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
   （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
@@ -469,7 +472,7 @@ MACD 1.1、**MA趋势 1.2**（MA20/60 多头状态，v3.3 全A实证 IC 0.228）
 **v7.3.0 外接算法（sm701，test 风险偏好已删除）**：风险偏好回归三档；
 sm701 改为**外接算法**接入（`external/sm701_ext.py`，`init_host(globals())`
 注入宿主）——
-- **多市场（hk/us/futures）**：市场策略链「工坊绑定 > sm701 直出 >
+- **多市场（cn/hk/us/futures/crypto）**：市场策略链「工坊绑定 > sm70x 直出 >
   无策略（只看行情）」——`sm701_ext=0`（ini [predict]）时该市场不再直出，
   只看行情不出买卖点；直出信号的买卖点由 `_sig_sm701()` 滞回产出
   （`≥0.55` BUY、`<0.50` SELL），风控走外接参数 `_SM701_EXT_RISK`
@@ -655,26 +658,36 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   组合档位 `TIER_CFG` 只剩稳定三档（旧 `_SM701_TEST` 删除，相关组合入口/CLI
   `--tier test` 退役）；`tier_default_names()` 返回稳定三档；
   - **路径解析 `sm701_paths(market)`**：优先 `~/桌面/sm701 (副本)`，其次
-    `~/桌面/sm701`，再查仓库同级目录；`SM701_DIR` / `SM701_DB` /
-    `SM701_MODEL` / `SM701_PRED` 可覆盖；要求副本内有 `stock_cache.db` +
-    `lgbm_train_backtest.py`（外加任一模型口径）。market=cn/hk/us/futures
-    按市场找 `prod_{mpre}h{1,5,10}_tech.txt`（**外部模块还要求该市场生产集
-    齐全**——hk/us/futures 无生产集时 `sm701_has_model()` 返回 False）；
-  - **模型口径（v6.6.3）**：生产定稿三周期 tech 模型等权平均为分数；cn 回退
-    旧单模型口径（`SM701_MODEL` 显式指定强制单模型）；
-  - **历史概率**：各市场 `production/valid_predictions[|_hk|_us|_fut].csv.gz`
+    `~/桌面/sm701`，再查仓库同级目录与桌面其它 `sm70*`（v7.4.0）；
+    `SM70_DIR` / `SM70_DB` / `SM70_MODEL` / `SM70_PRED`（兼容 `SM701_*`）
+    可覆盖；只要求目录内有 `lgbm_train_backtest.py` + 该市场生产模型集
+    （v7.4.0 起 `stock_cache.db` / 历史预测文件可缺失）；market=
+    cn/hk/us/futures/**crypto** 按市场找 `prod_{mpre}h{1,5,10}_tech.txt`
+    （无生产集时 `sm701_has_model()` 返回 False）；
+  - **模型口径（v6.6.3；v7.4.0 容错）**：生产定稿三周期 tech 模型等权平均为
+    分数；cn 回退旧单模型口径（`SM701_MODEL` 显式指定强制单模型）。模型文件
+    若被 git 以 CRLF 检出，加载时统一规范化 LF 再用 `model_str` 解析（否则
+    LightGBM 报 `Model format error`）；Booster 按 (mtime,size) 缓存，
+    每模型首次 ~2.4s、后续 0ms；每个模型按自身 `feature_name` 取列，
+    缺特征时跳过该模型（crypto h10 缺 `crypto_hourly` 分时特征 → 只用 h1/h5）；
+  - **历史概率**：各市场 `production/valid_predictions[|_hk|_us|_fut|_crypto].csv.gz`
     （`date,code,prob_h1,prob_h5,prob_h10,prob`；`prob`=三模型等权平均）；
-  - **数据读取**：`_sm701_conn()` 只读 URI 打开副本库，`_sm701_stock_info()`
-    补股票名/行业/PE/换手率；hk/us/fut 行情直读副本
-    `hk_daily/us_daily/fut_daily`（`_sm701_market_bars`，训练同源）；
+    文件缺失时历史段留空、只做实时复算（A 股单股复用 `sm701_score_matrix`
+    的一次全市场矩阵，避免逐股重算；非 cn 单股最多复算最近 250 个交易日）；
+  - **数据读取**：`_sm701_conn()` 只读 URI 打开行情库，`_sm701_stock_info()`
+    补股票名/行业/PE/换手率；多市场行情直读 sm701 原生
+    `hk_daily/us_daily/fut_daily/crypto_daily`，或 `global_daily.db` 的
+    统一 `daily_bars.market` 表（`_sm701_market_bars` / `_sm701_read_bars`，
+    训练同源；crypto `BTCUSDT` ↔ `BTC/USDT` 自动映射）；
   - **实时复算**：`_sm701_live_predict()`（cn 全市场）与 `_sm701_live_one()`
-    （多市场单股，v6.6.5）取数据较新的行情库（副本/主库之争见 v6.6.4），180 根
-    预热 → 副本 `lgbm_train_backtest._compute_feats` → 生产三模型打分等权平均；
+    （多市场单股，v6.6.5；v7.4.0 支持 global_daily 统一表与主库兜底）取数据
+    较新的行情库（副本/主库之争见 v6.6.4），180 根预热 → sm701
+    `lgbm_train_backtest._compute_feats` → 生产三模型打分等权平均；
     已对拍末交易日 2026-09-30 实时复算与落盘 prob 逐值一致（sh600000=0.42401537）；
     缓存 key 用「取数库最新日K日 + 当日 30 分钟桶 + 模型 mtime」（v6.6.5），
     `_SM701_CACHE`/`_SM701_LOCK` 移入 external 模块；
   - **开关（v7.3.0）**：`ini [predict] sm701_ext`（默认 1）外接接入——
-    0 时 hk/us/futures 策略链不直出（只看行情）、A股消融剔除候选；
+    0 时 hk/us/futures/crypto 策略链不直出（只看行情）、A股消融剔除候选；
     `[predict] sm701_ablation`（默认 1）控制「sm701上涨概率」是否参加
     A 股单股策略消融（关 = sm701 仅多市场直出/独立使用）；
   - **口径冲突（v6.4.0 备案，历史）**：sm701 标签为
@@ -699,11 +712,18 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
     以前」8 维特征（ret5/10/20 + rsi6 + boll_pct + macd_diff + kdj_diff + vr）
     重训一次预测次日收益；±0.5% 阈值 BUY/SELL，3 根冷却；`lightgbm` 包
     缺时静默返回 `[]`——回退到其他候选，**不让缺库打断消融**；
-  - **sm701（v6.6.4 新增）**：只读桌面 sm701 副本的生产 h1/h5/h10 三模型
-    等权概率，≥0.55 BUY / <0.50 SELL（滞回，同向不重复）；历史读
-    `production/valid_predictions.csv.gz`，副本日K落后时用主库最新行情实时
-    复算。研究批量消融由父进程一次性构建 `sm701_score_matrix` 并注入各
-    worker，worker 只按代码×日期取值，避免每只股重复扫描 70MB+ 预测文件；
+  - **sm701（v6.6.4 新增；v7.4.0 兼容新克隆）**：只读桌面 sm70x 的生产
+    h1/h5/h10 三模型等权概率，≥0.55 BUY / <0.50 SELL（滞回，同向不重复）；
+    历史读 `production/valid_predictions*.csv.gz`，缺失时由主库/sm701 行情
+    实时复算（CRLF 模型可加载、缺库自动降级）。研究批量消融由父进程一次性
+    构建 `sm701_score_matrix` 并注入各 worker，worker 只按代码×日期取值，
+    避免每只股重复扫描 70MB+ 预测文件；
+  - **quant 每日消融（v7.4.2）**：`ablation_quant.py` 下载 quant 下载中心的
+    `public/ablation/latest.csv`（三档策略 + 验证指标）→ 反查 algo →
+    `research/ablation_gui_cache.json`；GUI 启动自动同步（12h 新鲜度）+
+    数据工具手动同步/批量应用推荐档。`_ensure_strategy()` 在导入批次比旧策略
+    新时直接保存推荐档并重分析（`source=quant` 的 abl 训练指标为空，
+    三档窗显示 "-"），与 `[predict] local_ablation=0` 配套实现本地不跑消融；
 - **L2（v6.1.3 新增）**：每个行业构造「行业指数」——**优先同名行业ETF**收盘序列，无匹配则同行业个股等权收益累乘；
   行业指数 > MA20 且 5 日动量 > 0 → BUY，反向 SELL（时序行业趋势，与板块轮动的横截面强弱互补）；
 - **防过拟合**：前 ~75% 训练集选型，后 ~25% 验证集只报告；训练集上把 **Calmar/PF/胜率/年化**
@@ -1230,6 +1250,9 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.4.2**<br>（2026-11-15） | **quant 每日消融接入**：新增 `ablation_quant.py`——下载 `https://quant.tail6a6cc8.ts.net/downloads` 的 `public/ablation/latest.csv`（5460 只 × 三档策略 + 验证指标）与 `latest.json`，按「策略名·风险档」反查 `algo`，生成与 `run_ablation()` 同构的 `research/ablation_gui_cache.json`（原始数据留档 `research/ablation_quant/`，均忽略）；GUI 数据工具新增「立即同步最新消融 / 应用推荐档到全部策略缓存」，启动 4s 后自动同步（12h 新鲜度、`[predict] ablation_sync/ablation_url` 可配）；`_ensure_strategy()` 在 quant 批次比旧缓存新时直接换推荐档并重分析（不跑本地消融），三档/全组合窗标注数据源=quant；`APP_VERSION=7.4.2`，`stock_predict.py` 重新生成 |
+| **v7.4.1**<br>（2026-11-15） | **修复消融选型崩溃 + 本地消融开关**：①`_pick_one_from_pool()` 保守档误用未定义 `p`（应为 `pool`）→ 全量消融必崩 `cannot access local variable 'p'`，修复后 42 候选选型恢复；②ini `[predict] local_ablation`（默认 1）+ 设置→预测参数「允许本地消融」：0 时 GUI 不跑 `run_ablation`（过期缓存沿用旧策略、无缓存提示从 quant 导入 `research/ablation_gui_cache.json` / `strategy_ablation_per_stock.json`），CLI/研究脚本不受影响；`APP_VERSION=7.4.1`，`stock_predict.py` 重新生成 |
+| **v7.4.0**<br>（2026-11-14） | **sm 系列模型接入优化（sm701 新克隆）**：①`external/sm701_ext.py` 模型加载兼容 CRLF（Windows git 检出的 `production/prod_*.txt` 原会被 LightGBM 判为 Model format error）+ Booster 按 (mtime,size) 缓存（首次 ~2.4s/个→0ms）；②数据/预测缺失降级：`sm701_paths()` 不再强制要求 `stock_cache.db` / `valid_predictions*.csv.gz`——A股用主库行情实时复算（单股复用 `sm701_score_matrix` 一次全市场矩阵，无历史时最多 250 日）、非 cn 读取 sm701 原生表或桌面 `global_daily.db`（统一 `daily_bars.market` + `stocks` 名称，crypto `BTCUSDT↔BTC/USDT` 映射），最后回退主库同前缀行情；③新增 **crypto** 生产三模型（`prod_crypto_h{1,5,10}_tech.txt`；h10 需 `crypto_hourly` 的 11 个分时特征，缺失时跳过、h1/h5 等权）；④路径新增 `SM70_DIR/DB/MODEL/PRED` 别名并探测桌面其它 `sm70*`；⑤`_sm701_market_bars/_sm701_market_pool` 支持 global 统一表（hk 2667/us 3000（上限）/fut 82 只）；⑥`fetch_sector_context()` 非 cn 直接跳过（原东财 secid 仅沪深口径，会报 NoneType 警告）；`APP_VERSION=7.4.0`，`stock_predict.py` 重新生成；2.0/2.1/3.4/3.7/3.8 节与 README/CHANGELOG 同步 |
 | **v7.3.1**<br>（2026-11-08） | **风险偏好新增 auto（大盘 BOLL 三等分）**：①`[predict] risk_mode=auto`——`auto_boll_zone()` 用上证收盘 BOLL(20,2) 带内位置三等分解析风险档（下1/3→保守/中1/3→稳健/上1/3→激进；无前视、60s 缓存），覆盖交易层参数与信号兜底/异动覆盖档；消融算法不变；`RISK_AI_GUIDE["auto"]` + `ai_risk_mode()` 解析 auto；②`backtests/backtest_tiers_auto.py` 组合切换回测（同套三等分逐日映射三档、切换日换仓，费用/整手/闸门/熔断全复用 tier_sim_phase，含**最低 5 元佣金**；固定三档同引擎基线），产物 `research/tiers_auto.*`；3.2/4.x 节更新 |
 | **v7.3.0**<br>（2026-11-08） | **sm701 隔离为外接算法 + test 实验档删除**：①算法本体（模型定位/副本库只读/概率复算/买卖点信号，~620 行）从 `stock_gui.py` 迁出到 `external/sm701_ext.py`（唯一入口；`init_host(globals())` 惰性注入宿主 np/db_conn/_market_of/tier_load_panel，模块不反向 import 主程序；适配层入库，sm701 数据+模型目录 `.gitignore` 排除、git 不分发）；②`test`（sm701 实验组合档 + 风险偏好）删除——TIER_CFG×4/TIER_BENCH/RISK_PARAMS/荐股窗/工具菜单/CLI --tier test 全部退役，旧 ini `risk_mode=test` 自动迁移回稳健；A股消融子的「排除 test」漏斗删除；③**外接算法开关（可选参加 A股消融或指定市场）**：`[predict] sm701_ext`（默认 1；0=hk/us/futures 只看行情、A股消融剔除候选）+ `[predict] sm701_ablation`（默认 1；0=不参加 A股单股消融）；多市场直出风控改 `external/sm701_ext.EXT_RISK`（=原 test 宽松参数）；④港股外接算法**全库回测**（`backtest_sm701_markets.py --market hk --top 0`：主库 ≥300 根 2596 只，落盘样本外概率直出滞回信号）产物 `research/sm701_markets_full.*`；⑤`backtests/compare_tier_sm701.py` test 行退出；2.0/3.4/3.7/1.1 节更新 |
 | **v7.2.2**<br>（2026-11-07） | **非 DeepSeek 模型工具取数**：`AIAgent.use_tools` 去掉 `_ai_is_deepseek()` 限制，`[deepseek] tools` 开启时 Claude Haiku/GLM/Kimi 等 OpenAI 兼容模型同走「首轮核心快照 + tools 按需取数」；工具轮仅 DeepSeek 回传 `reasoning_content`，其他网关省略以避免 400；不支持 tools 时自动回退全文上下文；实测 `claude-haiku-5-5` 调用 `get_prediction` 并基于结果作答；3.9 节与 README/CHANGELOG 同步 |
