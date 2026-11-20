@@ -17,9 +17,13 @@ SM701_DIR 指定路径即可复用。
   模型，调用方恒回退多维评分。
 
 宿主注入：init_host(gui_globals) 由 stock_gui 调用，把 np / db_conn /
-DB_PATH / _market_of / tier_load_panel 以名称惰性解析传入；本模块**不
-import stock_gui**，避免双向依赖。build_cli 生成的 CLI 同样可用
+DB_PATH / _market_of / tier_load_panel / CFG 以名称惰性解析传入；本模块
+**不 import stock_gui**，避免双向依赖。build_cli 生成的 CLI 同样可用
 （需 external/ 与主文件同目录）。
+
+私有因子安全（v7.3.5）：本适配层只含“如何接入”，不包含特征清单/模型/
+预测数据；sm701 目录（含 lgbm_train_backtest.py 私有特征工程）始终在仓库外，
+.gitignore 与 build_client_zip.py 均有名称/内容自检，禁止入 git/客户端包。
 """
 import logging
 import os
@@ -60,6 +64,12 @@ def _DB_PATH():
 
 def tier_load_panel():
     return _HOST["tier_load_panel"]()
+
+
+def _sm701_enabled():
+    """宿主 ini [predict] sm701_ext 开关；未注入宿主时按开启处理。"""
+    cfg = (_HOST or {}).get("CFG")
+    return bool(getattr(cfg, "SM701_EXT_ON", True))
 
 
 # 独立只读接入桌面 sm701 副本（默认优先 `sm701 (副本)`），不复制 7GB 扩展库：
@@ -125,7 +135,12 @@ def _sm701_production_set(base, mpre=""):
         return None
     pred = os.path.join(pdir, "valid_predictions" +
                         ("" if not mpre else "_" + mpre[:-1]) + ".csv.gz")
-    return {"dir": pdir, "features": feats, "models": models, "pred": pred}
+    try:
+        man_mt = os.path.getmtime(man)
+    except OSError:
+        man_mt = 0.0
+    return {"dir": pdir, "manifest": man, "manifest_mtime": man_mt,
+            "features": feats, "models": models, "pred": pred}
 
 
 def _sm701_model_mtimes(paths):
@@ -133,6 +148,8 @@ def _sm701_model_mtimes(paths):
     paths = paths or {}
     prod = paths.get("prod")
     files = (list(prod["models"].values()) if prod else [paths.get("model")])
+    if prod and prod.get("manifest"):
+        files = files + [prod["manifest"]]
     out = []
     for p in files:
         try:
@@ -147,8 +164,18 @@ def sm701_paths(refresh=False, market="cn"):
     v6.6.5 多市场：models/pred 按市场（prod_{hk|us|fut}_*），按市场缓存。"""
     mk = market if market in _SM701_MK else "cn"
     cache_key = "paths_" + mk
-    if not refresh and _SM701_CACHE.get(cache_key):
-        return dict(_SM701_CACHE[cache_key])
+    cached = _SM701_CACHE.get(cache_key)
+    if cached and not refresh:
+        prod = cached.get("prod")
+        stale = False
+        if prod and prod.get("manifest"):
+            try:
+                stale = (os.path.getmtime(prod["manifest"])
+                         != prod.get("manifest_mtime", 0.0))
+            except OSError:
+                stale = True
+        if not stale:
+            return dict(cached)
     env_dir = (os.environ.get("SM701_DIR") or "").strip()
     env_model = (os.environ.get("SM701_MODEL") or "").strip()
     env_pred = (os.environ.get("SM701_PRED") or "").strip()
@@ -187,14 +214,13 @@ def sm701_paths(refresh=False, market="cn"):
                 continue        # 该市场无生产模型集
         if prod:
             model = prod["models"]["1"]
-            pred = env_pred if (env_pred and mk == "cn") else \
-                (prod["pred"] if os.path.isfile(prod["pred"])
-                 else os.path.join(base, "lgbm_output", pred_file))
+            pred = env_pred or (
+                prod["pred"] if os.path.isfile(prod["pred"])
+                else os.path.join(base, "lgbm_output", pred_file))
         else:
             model = (env_model or
                      os.path.join(base, "lgbm_output", "lgbm_model.txt"))
-            pred = env_pred or os.path.join(base, "lgbm_output",
-                                            "valid_predictions.csv.gz")
+            pred = env_pred or os.path.join(base, "lgbm_output", pred_file)
         if not os.path.isfile(model) or not os.path.isfile(pred):
             continue
         out = {"dir": base, "db": db, "model": model, "pred": pred,
@@ -216,19 +242,25 @@ def _sm701_conn(path=None):
 
 
 def _sm701_module(paths=None):
-    """加载 sm701 的特征工程模块，实时预测与离线训练保持同一口径。"""
+    """加载 sm701 的特征工程模块，实时预测与离线训练保持同一口径。
+
+    v7.3.5：缓存 key 增加脚本 mtime；私有特征工程更新后无需重启。"""
     import importlib.util
     paths = paths or sm701_paths()
+    try:
+        mt = os.path.getmtime(paths["script"])
+    except OSError:
+        mt = 0.0
     cached = _SM701_CACHE.get("module")
-    if cached and cached[0] == paths["script"]:
-        return cached[1]
+    if cached and cached[0] == paths["script"] and cached[1] == mt:
+        return cached[2]
     spec = importlib.util.spec_from_file_location(
         "_stock_predict_sm701_lgbm", paths["script"])
     if spec is None or spec.loader is None:
         raise RuntimeError("无法加载 sm701 特征工程: " + paths["script"])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    _SM701_CACHE["module"] = (paths["script"], mod)
+    _SM701_CACHE["module"] = (paths["script"], mt, mod)
     return mod
 
 
@@ -282,24 +314,54 @@ def _sm701_fill_history(F, codes, cal, path):
     return loaded
 
 
+_SM701_BOOSTER_CACHE = {}
+_SM701_BOOSTER_LOCK = threading.Lock()
+
+
+def _sm701_booster(path):
+    """按 (路径, mtime) 缓存 LightGBM Booster，避免每次预测重载 5~11MB 模型。"""
+    import lightgbm as lgb
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        mt = 0.0
+    key = (os.path.abspath(path), mt)
+    with _SM701_BOOSTER_LOCK:
+        hit = _SM701_BOOSTER_CACHE.get(key)
+        if hit is not None:
+            return hit
+        b = lgb.Booster(model_file=path)
+        # 同一路径旧 mtime 的 booster 不再需要，避免模型更新后常驻两份
+        for k in list(_SM701_BOOSTER_CACHE):
+            if k[0] == key[0] and k != key:
+                _SM701_BOOSTER_CACHE.pop(k, None)
+        _SM701_BOOSTER_CACHE[key] = b
+        return b
+
+
 def _sm701_predict_feats(feats, paths):
     """按 sm701 模型对特征矩阵打分。
 
     生产档（`paths["prod"]`）为 h1/h5/h10 三模型概率等权平均；否则单模型
-    `paths["model"]`（用模型自带 feature_name 选列，兼容任意特征组）。"""
+    `paths["model"]`（用模型自带 feature_name 选列，兼容任意特征组）。
+    v7.3.5：booster 按模型路径+mtime 缓存；生产档运行时校验特征列序，
+    防止 features_tech.json 与模型文件漂移导致静默错配。"""
     import pandas as pd
-    import lightgbm as lgb
     prod = (paths or {}).get("prod")
     if prod:
-        names = prod["features"]
+        names = list(prod["features"])
         X = pd.DataFrame({k: np.asarray(feats[k], dtype=np.float32)
                           for k in names}, dtype=np.float32)
         acc = None
         for h in sorted(prod["models"], key=int):
-            pv = lgb.Booster(model_file=prod["models"][h]).predict(X)
+            booster = _sm701_booster(prod["models"][h])
+            if list(booster.feature_name()) != names:
+                raise RuntimeError(
+                    f"sm701 模型特征列序与 features_tech.json 不一致: {h}")
+            pv = booster.predict(X)
             acc = pv if acc is None else acc + pv
         return acc / float(len(prod["models"]))
-    booster = lgb.Booster(model_file=paths["model"])
+    booster = _sm701_booster(paths["model"])
     names = booster.feature_name()
     X = pd.DataFrame({k: np.asarray(feats[k], dtype=np.float32)
                       for k in names}, dtype=np.float32)
@@ -352,6 +414,98 @@ def _sm701_cache_epoch(src_max):
     return 0
 
 
+_SM701_TABLE_LATEST = {}
+
+
+def _sm701_table_latest(path, table):
+    """副本库某市场行情表最新日期（60s 缓存；表名来自白名单）。"""
+    key = (os.path.abspath(path), table)
+    now = time.time()
+    hit = _SM701_TABLE_LATEST.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    with _sm701_conn(path) as conn:
+        d = conn.execute(f"select max(date) from {table}").fetchone()[0] or ""
+    _SM701_TABLE_LATEST[key] = (now, d)
+    return d
+
+
+def _sm701_market_start(conn, table, first_date):
+    """目标日往前取满 180 个交易日作为特征预热起点。"""
+    rows = conn.execute(
+        f"SELECT DISTINCT date FROM {table} WHERE date<=? "
+        f"ORDER BY date DESC LIMIT ?",
+        (first_date, _SM701_WARMUP_BARS)).fetchall()
+    dates = [r[0] for r in rows if r[0]]
+    return min(dates) if dates else first_date
+
+
+def _sm701_live_market(market, target_dates, progress=None):
+    """多市场**全市场**实时复算（v7.3.5）。
+
+    生产 tech 特征包含横截面排名特征。旧实现 `_sm701_live_one` 只装载
+    单只股票，排名恒为 1.0，实时概率与训练口径不一致。这里一次读取该
+    市场全部代码 + 180 根预热，按全市场截面算特征，再取目标 (code,date)，
+    从根上保证与 `make_predictions.py` 同口径。
+
+    只读副本库（训练同源）：主库 hk/us/fut 部分标的与副本库价格口径
+    不同、代码前缀也不同（hk00700 vs 00001），混用会污染特征；副本
+    落后时宁可不预测该日，由同步脚本补齐，不拿主库补洞。
+    """
+    import pandas as pd
+    if np is None:
+        raise RuntimeError("外接算法实时评分需要 numpy")
+    mk = market if market in _SM701_MK else "cn"
+    if mk == "cn":
+        raise RuntimeError("A股走 _sm701_live_predict 全市场路径")
+    paths = sm701_paths(market=mk)
+    dates_u = list(dict.fromkeys(str(d)[:10] for d in target_dates if d))
+    if not dates_u:
+        return {}
+    table = _SM701_MK[mk]["table"]
+    db = paths["db"]
+    latest = _sm701_table_latest(db, table)
+    wanted = [d for d in dates_u if d <= latest]
+    if not wanted:
+        log.warning("sm701 %s 副本表 %s 最新 %s，早于目标 %s；"
+                    "跳过实时复算，请先同步副本库",
+                    mk, table, latest or "-", max(dates_u))
+        return {}
+    first = min(wanted)
+    key = (mk, first, tuple(wanted), os.path.abspath(db), latest,
+           _sm701_cache_epoch(latest), _sm701_model_mtimes(paths))
+    cache = _SM701_CACHE.setdefault("live_market", {})
+    hit = cache.get(key)
+    if hit is not None:
+        return dict(hit)
+    with _sm701_conn(db) as conn:
+        start = _sm701_market_start(conn, table, first)
+        df = pd.read_sql_query(
+            f"SELECT code,date,open,high,low,close,vol FROM {table} "
+            f"WHERE date>=? AND date<=? ORDER BY code,date",
+            conn, params=[start, max(wanted)])
+    if df.empty:
+        raise RuntimeError(f"副本库 {table} 无 {start}~{max(wanted)} 行情")
+    df["code"] = df["code"].astype("category")
+    for c in ("open", "high", "low", "close", "vol"):
+        df[c] = df[c].astype("float64")
+    if progress:
+        progress(f"sm701({mk})：全市场复算 {first} ~ {max(wanted)}"
+                 f"（{df['code'].nunique()} 只，数据至 {latest}）...")
+    mod = _sm701_module(paths)
+    feats = mod._compute_feats(df)
+    prob = _sm701_predict_feats(feats, paths)
+    code_arr = df["code"].astype(str).to_numpy()
+    date_arr = df["date"].astype(str).str[:10].to_numpy()
+    wanted_set = set(wanted)
+    out = {}
+    for code, date, pv in zip(code_arr, date_arr, prob):
+        if date in wanted_set:
+            out[(str(code), str(date))] = float(pv)
+    cache[key] = out
+    return dict(out)
+
+
 def _sm701_live_predict(target_dates, cal, progress=None):
     """用副本 LightGBM 模型实时复算目标日期全市场概率。
 
@@ -393,7 +547,7 @@ def _sm701_live_predict(target_dates, cal, progress=None):
                 f"OR {col} GLOB 'bj[489]*')")
 
     if progress:
-        progress(f"test(sm701)：复算 {wanted[0]} ~ {wanted[-1]} 概率"
+        progress(f"sm701：复算 {wanted[0]} ~ {wanted[-1]} 概率"
                  f"（数据至 {src_max or '-'}）...")
     if use_main:
         sql = (f"SELECT code,date,open,high,low,close,vol FROM daily_bars "
@@ -450,8 +604,11 @@ def sm701_score_matrix(progress=None):
     except OSError:
         pred_mt = 0.0
     main_max = _db_latest_date()
+    copy_max = _db_latest_date(paths["db"])
+    # v7.3.5：用数据日期而不是 DB 文件 mtime；预取/回填改 mtime 但数据未推进
+    # 时不应触发全市场重算（v6.6.5 同类修复的遗漏点）。
     key = (tuple(codes[:3]), len(codes), cal[0], cal[-1],
-           os.path.getmtime(paths["db"]), _sm701_model_mtimes(paths),
+           copy_max, _sm701_model_mtimes(paths),
            pred_mt, main_max, _sm701_cache_epoch(main_max))
     cached = _SM701_CACHE.get("scores")
     if cached and cached[0] == key:
@@ -480,14 +637,27 @@ def sm701_score_matrix(progress=None):
     return F
 
 
-def sm701_status():
-    """sm701 外接算法数据/模型状态，供报告和排障展示。"""
+def sm701_status(market="cn"):
+    """sm701 外接算法数据/模型状态，供报告和排障展示。
+
+    v7.3.5：支持指定市场，并按该市场行情表显示副本库最新日；多市场
+    实时复算只读副本库，副本落后时状态可直接看出。"""
+    if market not in _SM701_MK:
+        return {"ok": False, "market": market,
+                "error": "该市场无 sm701 生产模型"}
+    mk = market
     try:
-        p = sm701_paths()
+        p = sm701_paths(market=mk)
+        table = _SM701_MK[mk]["table"]
         with _sm701_conn(p["db"]) as conn:
-            db_date = conn.execute("select max(date) from daily_bars").fetchone()[0]
-        out = {"ok": True, "dir": p["dir"], "db_date": db_date or "",
-               "live_db_date": max(db_date or "", _db_latest_date()),
+            db_date = conn.execute(
+                f"select max(date) from {table}").fetchone()[0]
+        main_date = _db_latest_date()
+        live_date = db_date or ""
+        if mk == "cn":
+            live_date = max(live_date, main_date)
+        out = {"ok": True, "market": mk, "dir": p["dir"],
+               "db_date": db_date or "", "live_db_date": live_date,
                "model": p["model"], "pred": p["pred"]}
         prod = p.get("prod")
         if prod:
@@ -495,9 +665,18 @@ def sm701_status():
             out["prod_models"] = {h: os.path.basename(v)
                                   for h, v in prod["models"].items()}
             out["prod_n_feat"] = len(prod["features"])
+        try:
+            pred_mt = os.path.getmtime(p["pred"])
+            model_mts = _sm701_model_mtimes(p)
+            if model_mts and pred_mt + 1.0 < max(model_mts):
+                out["warning"] = (
+                    "历史预测文件早于模型文件；历史段可能来自旧模型，"
+                    "建议重新生成 valid_predictions 后再用")
+        except OSError:
+            pass
         return out
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "market": mk, "error": str(exc)}
 
 
 # 外接算法信号阈值：模型概率滞回映射
@@ -507,71 +686,18 @@ _SM701_SIG_SELL = 0.50
 
 
 def _sm701_live_one(full, dates, progress=None):
-    """多市场单股实时复算：读**副本库同源行情表**（hk_daily/us_daily/fut_daily
-    ——特征与训练同源同口径），取 ≥180 根预热 + 目标日段，三周期模型等权。
+    """多市场单股实时概率：委托 `_sm701_live_market()` 全市场复算。
 
-    返回 {date: prob}。副本库缺最新日时用主库同前缀代码补（重叠段副本优先，
-    接缝仅影响最后一日特征尾部）。缓存按（full, dates, 主库最新日/模型mtime）。"""
-    import pandas as pd
+    v7.3.5：生产特征含横截面排名（r_*），单股特征会让排名恒为 1.0；
+    现改为全市场截面计算后再取该股，且只用副本库（训练口径），
+    不再用主库补最新日（主库 hk/us/fut 代码前缀/价格口径与副本不同）。
+    返回 {date: prob}。"""
     mk = _market_of(full)
-    paths = sm701_paths(market=mk)
+    if mk not in _SM701_MK or mk == "cn":
+        return {}
     sm_code = _sm701_code(full)
-    dates_u = list(dict.fromkeys(d for d in dates if d))
-    if not dates_u:
-        return {}
-    src_max = _db_latest_date()
-    key = (full, tuple(dates_u), src_max, _sm701_cache_epoch(src_max),
-           _sm701_model_mtimes(paths))
-    cache = _SM701_CACHE.setdefault("live_one", {})
-    hit = cache.get(key)
-    if hit is not None:
-        return dict(hit)
-    table = _SM701_MK[mk]["table"]
-    con = _sm701_conn(paths["db"])
-    try:
-        df = pd.read_sql_query(
-            f"SELECT code,date,open,high,low,close,vol FROM {table} "
-            f"WHERE code=? AND date>=? ORDER BY date",
-            con, params=[sm_code, "2010-01-01"])
-    finally:
-        con.close()
-    if df.empty:
-        raise RuntimeError(f"副本库 {table} 无 {sm_code} 行情")
-    # 主库补最新日（副本滞后时；重叠日以副本为准）
-    try:
-        with _db_conn() as conn:
-            extra = pd.read_sql_query(
-                "SELECT code,date,open,high,low,close,vol FROM daily_bars "
-                "WHERE code=? ORDER BY date", conn, params=[full])
-        if not extra.empty:
-            have = set(df["date"])
-            add = extra[~extra["date"].isin(have)]
-            if not add.empty:
-                df = pd.concat([df, add], ignore_index=True)
-                df = df.sort_values("date").reset_index(drop=True)
-    except Exception:
-        log.debug("主库补最新分时数据失败(忽略)", exc_info=True)
-    for c in ("open", "high", "low", "close", "vol"):
-        df[c] = df[c].astype("float64")
-    df["code"] = df["code"].astype("category")
-    mod = _sm701_module(paths)
-    feats = mod._compute_feats(df)
-    date_arr = [str(d) for d in df["date"]]
-    pos = {d: i for i, d in enumerate(date_arr)}
-    want_idx = [i for d in dates_u if (i := pos.get(d)) is not None]
-    if not want_idx:
-        return {}
-    need_from = min(want_idx) - (_SM701_WARMUP_BARS - 1)
-    if need_from < 0:
-        need_from = 0
-    sub = df.iloc[need_from:].reset_index(drop=True)
-    sub_feats = {k: v[need_from:] for k, v in feats.items()}
-    probs = _sm701_predict_feats(sub_feats, paths)
-    sub_dates = [str(d) for d in sub["date"]]
-    pmap = {d: float(p) for d, p in zip(sub_dates, probs) if p == p}
-    out = {d: pmap[d] for d in dates_u if d in pmap}
-    cache[key] = dict(out)
-    return out
+    preds = _sm701_live_market(mk, dates, progress=progress)
+    return {d: pv for (code, d), pv in preds.items() if code == sm_code}
 
 
 def sm701_prob_map(full, dates=None):
@@ -579,8 +705,8 @@ def sm701_prob_map(full, dates=None):
 
     历史段流式读对应市场 valid_predictions[_市场].csv.gz（只留该股，按文件
     mtime 缓存）；dates 中晚于历史末日的交易日走实时复算——cn 全市场口径
-    （_sm701_live_predict），hk/us/fut 单股口径（_sm701_live_one，
-    v6.6.5 多市场）。crypto 无模型返回 {}。"""
+    （_sm701_live_predict），hk/us/fut 也走全市场截面（_sm701_live_market，
+    v7.3.5）。crypto 无模型返回 {}。"""
     if np is None:
         return {}
     mk = _market_of(full)
@@ -595,8 +721,12 @@ def sm701_prob_map(full, dates=None):
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
         pred_mt = 0.0
-    key = (pred_mt, _sm701_model_mtimes(paths),
-           _db_latest_date(paths["db"]))
+    if mk == "cn":
+        latest = _db_latest_date(paths["db"])
+    else:
+        latest = _sm701_table_latest(
+            paths["db"], _SM701_MK[mk]["table"])
+    key = (pred_mt, _sm701_model_mtimes(paths), latest)
     cache = _SM701_CACHE.setdefault("probmap", {})
     hit = cache.get(full)
     if hit and hit[0] == key:
@@ -676,7 +806,11 @@ def _sig_sm701(rows, full, **_kw):
     概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。"""
     if not rows or not full:
         return []
+    if not _sm701_enabled():
+        return []
     try:
+        if not sm701_has_model(_market_of(full)):
+            return []
         probs = sm701_prob_map(full, [r.get("date") for r in rows])
     except Exception:
         log.exception("sm701 单股概率读取失败")
@@ -685,17 +819,41 @@ def _sig_sm701(rows, full, **_kw):
 
 
 # ---- 外接算法开关辅助（该市场是否有 sm701 生产模型集）----
-def sm701_has_model(market, _cache={}):
-    """该市场是否有 sm701 生产模型集（结果缓存；crypto 恒 False）。"""
+_SM701_HAS_CACHE = {}
+
+
+def sm701_has_model(market, refresh=False):
+    """该市场是否有可用的 sm701 生产模型集（60s 缓存，支持模型后装）。
+
+    v7.3.5：旧实现用可变默认参数永久缓存 False，模型后装/路径切换后
+    必须重启；现 60s 内复用、过期重查，refresh=True 立即刷新路径缓存。
+    crypto 恒 False。"""
     if market not in _SM701_MK:
         return False
-    if market not in _cache:
+    now = time.time()
+    hit = _SM701_HAS_CACHE.get(market)
+    if hit and not refresh and now - hit[0] < 60:
+        return hit[1]
+    def _check(refresh_paths):
         try:
-            sm701_paths(market=market)
-            _cache[market] = True
+            p = sm701_paths(market=market, refresh=refresh_paths)
+            prod = p.get("prod")
+            if prod:
+                ok = (all(os.path.isfile(x)
+                          for x in prod["models"].values())
+                      and os.path.isfile(prod.get("manifest") or ""))
+            else:
+                ok = os.path.isfile(p.get("model") or "")
+            return ok and os.path.isfile(p.get("pred") or "")
         except Exception:
-            _cache[market] = False
-    return _cache[market]
+            return False
+
+    ok = _check(refresh)
+    if not ok and not refresh:
+        # 路径缓存可能指向已移动/删除的目录；60s 失败后强制重扫一次
+        ok = _check(True)
+    _SM701_HAS_CACHE[market] = (now, ok)
+    return ok
 
 
 # ---- 外接算法风险参数（多市场直出档，v7.3.0 接替已删除的 test 档参数）----

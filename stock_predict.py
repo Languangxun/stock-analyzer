@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""股票形态相似度预测 · 命令行版（独立单文件，不依赖 stock_gui.py）
+"""股票形态相似度预测 · 命令行版（不依赖 stock_gui.py；sm701 外接算法
+需 external/ 与主文件同目录，数据/模型仍在仓库外）
 
 与 stock_gui.py 共用同一套分析算法（由 build_cli.py 自动生成）：
 价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配，
@@ -128,7 +129,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.3.1"
+APP_VERSION = "7.3.5"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -5487,6 +5488,162 @@ def fetch_order_book(full, ttl=_ORDER_BOOK_TTL):
     raise RuntimeError(f"盘口获取失败: {last}")
 
 
+# ---- 涨跌停股（盘口侧栏；v7.3.3）----
+# 主源东财涨停/跌停池（push2ex，含封板时间/连板数/总家数），失败回退
+# clist 涨跌幅排序 + 本地按板块/ST 涨停价过滤。缓存 60s，失败回退上一轮。
+_ZT_UT = "7eea3edcaed734bea9cbfc24409ed989"
+_ZT_CACHE = {"ts": 0.0, "data": None}
+_ZT_LOCK = threading.Lock()
+_ZT_TTL = 60.0
+
+
+def _zt_full_code(code):
+    """涨停池 6 位代码 → 项目 full code（sh/sz/bj）。"""
+    code = str(code or "")
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("4", "8", "9")):
+        return "bj" + code
+    return "sz" + code
+
+
+def _zt_pool(kind, n, date):
+    """东财涨停/跌停池：返回 (rows, total, qdate)。"""
+    path = "getTopicZTPool" if kind == "up" else "getTopicDTPool"
+    sort = "fbt:asc" if kind == "up" else "fund:desc"
+    u = (f"https://push2ex.eastmoney.com/{path}?ut={_ZT_UT}"
+         f"&dpt=wz.ztzt&Pageindex=0&pagesize={n}"
+         f"&sort={sort}&date={date}")
+    raw = _http_get(u, retries=2, timeout=8,
+                    headers={"Referer": "https://quote.eastmoney.com/"},
+                    src_name="东财涨跌停")
+    d = json.loads(raw)
+    if d.get("rc") not in (0, None):
+        raise RuntimeError(f"东财涨跌停 rc={d.get('rc')}")
+    box = d.get("data") or {}
+    rows = []
+    for it in (box.get("pool") or [])[:n]:
+        code = str(it.get("c") or "")
+        if len(code) != 6:
+            continue
+        rows.append({
+            "code": _zt_full_code(code),
+            "name": it.get("n") or code,
+            "pct": float(it.get("zdp") or 0.0),
+            "boards": it.get("lbc"),
+        })
+    total = box.get("tc")
+    return rows, int(total if total is not None else len(rows)), \
+        str(box.get("qdate") or date)
+
+
+def _zt_clist_fallback(n):
+    """涨停池不可用时：按 f3 排序取前 100，再按板块涨停价精确过滤。"""
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    hosts = ("https://push2delay.eastmoney.com",
+             "https://push2.eastmoney.com",
+             "http://push2.eastmoney.com")
+    today = time.strftime("%Y-%m-%d")
+    out = {"up": [], "down": []}
+    for po, direction in ((1, "up"), (0, "down")):
+        u = ("/api/qt/clist/get?pn=1&pz=100&po=" + str(po) +
+             "&np=1&fltt=2&invt=2&fid=f3&fs=" + fs +
+             f"&fields=f2,f3,f12,f14,f18&ut={UT}")
+        diff = []
+        for host in hosts:
+            try:
+                d = json.loads(_http_get(
+                    host + u, retries=1, timeout=8,
+                    headers={"Referer": "https://quote.eastmoney.com/"},
+                    src_name="东财涨跌停"))
+                diff = (d.get("data") or {}).get("diff") or []
+                if isinstance(diff, dict):
+                    diff = list(diff.values())
+                if diff:
+                    break
+            except Exception:
+                continue
+        for it in diff:
+            code = str(it.get("f12") or "")
+            if len(code) != 6:
+                continue
+            full = _zt_full_code(code)
+            name = it.get("f14") or code
+            lim = _limit_pct(full, name, today)
+            try:
+                px = float(it.get("f2") or 0)
+                prev = float(it.get("f18") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not lim or px <= 0 or prev <= 0:
+                continue
+            if direction == "up":
+                hit_px = prev * (1 + lim / 100.0)
+                ok = px >= round(hit_px + 1e-8, 2) - 0.005
+            else:
+                hit_px = prev * (1 - lim / 100.0)
+                ok = px <= round(hit_px + 1e-8, 2) + 0.005
+            if ok:
+                out[direction].append({
+                    "code": full, "name": name,
+                    "pct": (px / prev - 1) * 100, "boards": None})
+        out[direction].sort(key=lambda x: x["pct"],
+                            reverse=(direction == "up"))
+    return {
+        "up": out["up"][:n], "down": out["down"][:n],
+        "n_up": len(out["up"]), "n_down": len(out["down"]),
+        "qdate": time.strftime("%Y%m%d"), "stale": False, "approx": True,
+    }
+
+
+def fetch_limit_stocks(limit_n=30, ttl=_ZT_TTL):
+    """A股涨跌停股（60s 缓存；东财涨停池优先，clist 过滤兜底）。
+
+    返回 {up/down:[{code,name,pct,boards}], n_up, n_down, qdate, stale}；
+    网络全失败时返回上一轮缓存并标 stale，无缓存返回 None。"""
+    now = time.time()
+    with _ZT_LOCK:
+        hit = _ZT_CACHE["data"]
+        hit_ts = _ZT_CACHE["ts"]
+    if hit and now - hit_ts < ttl:
+        return hit
+
+    today = time.strftime("%Y%m%d")
+    data = None
+    try:
+        up, n_up, qd = _zt_pool("up", limit_n, today)
+        down, n_down, qd2 = _zt_pool("down", limit_n, today)
+        data = {"up": up, "down": down, "n_up": n_up,
+                "n_down": n_down, "qdate": qd2 or qd, "stale": False,
+                "approx": False}
+        if not up and not down:
+            if n_up or n_down:
+                raise RuntimeError("涨跌停池有总数无明细")
+            # 盘前/节假日当天池为空：回退最近交易日池（指数快照/库内锚）
+            prev = _LAST_INDEX_SNAP_DATE[0] or \
+                _index_last_td().replace("-", "")
+            if prev and prev < today:
+                up, n_up, qd = _zt_pool("up", limit_n, prev)
+                down, n_down, qd2 = _zt_pool("down", limit_n, prev)
+                data = {"up": up, "down": down, "n_up": n_up,
+                        "n_down": n_down, "qdate": qd2 or qd,
+                        "stale": False, "approx": False}
+    except Exception as e:
+        log.debug("涨跌停池获取失败，回退 clist: %s", e)
+        try:
+            data = _zt_clist_fallback(limit_n)
+        except Exception as e2:
+            log.debug("涨跌停 clist 兜底失败: %s", e2)
+
+    if data is not None:
+        with _ZT_LOCK:
+            _ZT_CACHE["ts"], _ZT_CACHE["data"] = now, data
+        return data
+    if hit:
+        return {**hit, "stale": True}
+    return None
+
+
 def _batch_tencent(codes):
     """腾讯批量行情。v6.2.4：附带 换手率(38)/动态PE(39)/PB(46) 快照字段。"""
     raw = http_get(QT_URL + ",".join(codes))
@@ -8727,7 +8884,7 @@ def save_strategy(full, strat):
                 purged = 0
                 for k, v in conn.execute(
                         "SELECT key, value FROM meta "
-                        "WHERE key LIKE 'strat:%'").fetchall():
+                        "WHERE key LIKE 'strategy:%'").fetchall():
                     try:
                         ts = float(json.loads(v).get("ts", 0))
                     except Exception:
@@ -11179,7 +11336,8 @@ def _run_ablation_body(full, rows, idx_rows=None, progress=None):
     sig_cache = {}
     # v7.3.0：sm701（外接算法）候选可选参加 A 股消融（[predict] sm701_ablation；
     # 接入总开关 sm701_ext=0 时同样剔除）。其余候选不受影响。
-    _include_701 = CFG.SM701_JOIN_ABLATION and CFG.SM701_EXT_ON
+    _include_701 = (CFG.SM701_JOIN_ABLATION and CFG.SM701_EXT_ON
+                    and sm701_has_model("cn"))
     gens = {k: v for k, v in (
         {"macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
@@ -11426,7 +11584,10 @@ def _fusion_prediction(o_today, pre_open, live, levels,
             # round单调不破坏顺序，但显式再钳一次防浮点/显示反转
             t_pred["hi"][pp]=max(t_pred["hi"][pp], t_pred["cl"][pp])
             t_pred["lo"][pp]=min(t_pred["lo"][pp], t_pred["cl"][pp])
-    pred={"date":"T日预测" if live is not None else ("今日(T)" if pre_open else "T+1预测"),"open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence}
+    # 盘前与盘中都落到「T日预测」：幽灵K线绘制按该 date 识别为虚线空心，
+    # 旧值「今日(T)」不在 ghost_lab，会被当成真实K画成实心（08:55 盘前
+    # 看起来像凭空多出一根 T+1）。展示文案仍由 next_label 承担。
+    pred={"date":"T日预测" if (live is not None or pre_open) else "T+1预测","open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence}
     tpred_bar={"date":"T日预测","open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence} if live is not None else None
     return t_pred,pred,clamped,tpred_bar
 
@@ -11828,9 +11989,13 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
     now_hm = time.strftime("%H%M")
-    stale_today = (bool(snap_d) and snap_d < today_compact
-                   and now_hm < "1500"
-                   and _today_is_session() is not False)
+    session_today = _today_is_session() is not False
+    # 快照时间缺失（无网合成快照/残缺批量源）时没有日期可判盘前：
+    # 工作日未到 15:00 且日K尚无今日bar → 按"今日尚未有行情"处理并锚昨收。
+    # 否则 08:55 盘前会漏判成收盘后，T 日预测/幽灵K被错标成 T+1。
+    no_snap = not snap_d
+    stale_today = (((bool(snap_d) and snap_d < today_compact) or no_snap)
+                   and now_hm < "1500" and session_today)
     pre_open = (not had_today_bar and not post_close
                 and (snap_d >= today_compact or stale_today))
     stale_snap = bool(snap_d) and snap_d < today_compact
@@ -12027,7 +12192,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
             strat = {"algo": "sm701", "mode": "sm701",
                      "params": dict(_SM701_EXT_RISK),
                      "label": f"sm701外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
-        # 未接入外接算法 / crypto：strat 保持 None → 只看行情不出买卖点
+        # 未接入外接算法 / crypto：strat 保持 None → 回退缓存/多维评分
+        # （crypto 无 sm701 模型，实际由 composite 出信号）
     if not strat:
         strat = studio_active_strategy()
     if not strat:
@@ -12044,6 +12210,14 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     if sel_algo not in ALGO_LABEL:
         sel_algo = "composite"
     sel_mode = (strat or {}).get("mode") or CFG.RISK_MODE
+    # v7.3.5：缓存里的 sm701 策略若已被开关关闭/模型缺失，不再沿用，
+    # 回退多维评分（否则图上无买卖点且不触发兜底）。
+    if sel_algo == "sm701" and not _sm701_strategy_usable(mk):
+        log.info("sm701 策略不可用（开关关闭/模型缺失），%s 回退多维评分", full)
+        strat = None
+        sel_algo = "composite"
+        sel_mode = CFG.RISK_MODE
+        rp = CFG.risk_params()
     # ---- auto 风险偏好（v7.3.1）：大盘 BOLL 带内位置三等分动态解析 ----
     # 覆盖交易层参数与 sel_mode（信号兜底/异动覆盖跟随解析档）；算法仍来自
     # 消融缓存（缓存档=选股参考）。选用 hd auto 时消融选型环节不变，
@@ -14295,6 +14469,18 @@ from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
 
+def _sm701_strategy_usable(market):
+    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型存在。
+
+    v7.3.5：用于忽略缓存里残留的 sm701 策略（旧版 sm701_ext=0 只影响
+    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。"""
+    if not CFG.SM701_EXT_ON:
+        return False
+    if market == "cn" and not CFG.SM701_JOIN_ABLATION:
+        return False
+    return sm701_has_model(market)
+
+
 def tier_segments(cal):
     """回测段定义（tranche 起点由各档 reb 决定，见 tier_eval）。"""
     return {
@@ -15784,9 +15970,11 @@ def tier_report_text(capital=100000.0, tiers=None, universe="all"):
         if d.get("source") == "sm701":
             status = sm701_status()
             lines.append(
-                f"  数据源：sm701 副本 {status.get('dir', '-')} "
+                f"  数据源：sm701 库 {status.get('dir', '-')} "
                 f"（日K至 {status.get('db_date', '-')}；"
                 f"{'可用' if status.get('ok') else status.get('error', '不可用')}）")
+            if status.get("warning"):
+                lines.append("  警告：" + status["warning"])
             lines.append(
                 "  注意：sm701 信号为「次日开盘买→收盘卖」的日频截面 alpha"
                 "（A股 T+1 无法当日卖出）；本工具 T 收盘集合口径回测显著为负"

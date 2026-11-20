@@ -18,7 +18,8 @@ CLI_PATH = os.path.join(HERE, "stock_predict.py")
 
 CLI_HEADER = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""股票形态相似度预测 · 命令行版（独立单文件，不依赖 stock_gui.py）
+"""股票形态相似度预测 · 命令行版（不依赖 stock_gui.py；sm701 外接算法
+需 external/ 与主文件同目录，数据/模型仍在仓库外）
 
 与 stock_gui.py 共用同一套分析算法（由 build_cli.py 自动生成）：
 价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配，
@@ -170,7 +171,7 @@ def main():
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(out)
     os.replace(tmp, CLI_PATH)
-    print("已生成 %s (%.1f KB, 算法+缓存内嵌, 独立运行)"
+    print("已生成 %s (%.1f KB, 算法+缓存内嵌；sm701 需 external/ 同目录)"
           % (CLI_PATH, len(out.encode("utf-8")) / 1024))
 
 

@@ -52,6 +52,15 @@ reports/每只股回测_*
 /sm701 (副本)/
 sm701*.db
 sm701*.db-*
+# 私有因子/模型产物：即使被误拷到仓库其它层级也不入库
+**/sm701/
+**/sm701 (副本)/
+**/sm701*.db
+**/sm701*.db-*
+**/features_tech.json
+**/prod_*_tech.txt
+**/valid_predictions*.csv*
+**/lgbm_train_backtest.py
 
 # --- 标准 Python 忽略项 ---
 .env
