@@ -5,6 +5,19 @@
 
 ## 版本历史
 
+> **v7.4.3：合并本地 v7.3.2–7.3.5 热修线（2026-11-20）**：
+> v7.3.2–v7.3.5 曾在本地未提交（涨停池、盘口跟随、盘前 T+1 修正、sm701
+> 多市场全市场截面复算、私有因子安全），与 v7.4.0–v7.4.2 分叉；本版合并：
+> ①**涨跌停股列表/盘口跟随/盘前 T+1 热修**全部并入（v7.3.2–v7.3.4）；
+> ②sm701 多市场全市场截面复算已被 v7.4.0 的 `_sm701_live_predict`（全市场
+> SELECT + `_compute_feats` 截面特征）等价实现，取 v7.4.0 口径（含
+> global_daily/主库兜底/crypto），`_sm701_live_market()` 不再引入；
+> ③**私有因子安全**并入：`.gitignore` 递归排除私有模型/特征/预测/训练脚本，
+> `build_client_zip.py` 打包后私有名称+特征名自检，requirements 补 pandas；
+> ④开关增强：设置→预测参数勾选 sm701 开关，关断时禁用缓存残留 sm701 策略
+> （策略缓存清理前缀 `strat:` → `strategy:`）；
+> `APP_VERSION=7.4.3`，`stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
 > **v7.4.2：quant 每日消融数据接入（2026-11-15）**：
 > ①新增 **`ablation_quant.py`**：从 `https://quant.tail6a6cc8.ts.net/downloads`
 > 的「每日消融数据」下载 `public/ablation/latest.csv`（5460 只 × 保守/稳健/
@@ -65,6 +78,58 @@
 > 原会每轮分析报 `NoneType` 警告并浪费请求）。
 > `APP_VERSION=7.4.0`，`stock_predict.py` 重新生成；README / ARCHITECTURE
 > （2.0/3.4/3.7/3.8 + 变更索引）同步。
+> **v7.3.5：sm701 多市场实时口径热修 + 私有因子安全加固（2026-11-09）**：
+> ① **多市场实时复算改全市场截面**——生产模型含横截面排名特征，旧
+> `_sm701_live_one()` 只装载单只股票，排名恒为 1.0，实时概率与训练/
+> `make_predictions.py` 口径不一致；现 `_sm701_live_market()` 一次读取该
+> 市场全部代码 + 180 根预热，按全市场算特征后取目标 `(code,date)`，并缓存。
+> ② **不再用主库补多市场最新日**——主库 hk/us/fut 与副本库存在代码前缀
+> （`hk00001` vs `00001`）及港股部分标的价格口径差异，混入会污染特征；
+> 现在只读副本库（训练同源），副本落后时该日不预测，由同步脚本补齐。
+> ③ **缓存/性能/校验**：LightGBM booster 按路径+mtime 缓存；生产模型运行时
+> 校验特征列序；`sm701_score_matrix` 缓存 key 改用数据日期而非 DB mtime；
+> 特征工程模块按脚本 mtime 复用；`sm701_has_model()` 60s 可刷新（支持后装）；
+> `sm701_status()` 检测「历史预测文件早于模型文件」并警告（当前 hk 命中，
+> 建议重跑 `production/make_predictions.py --market hk`）。
+> ④ **开关生效**：`sm701_ext=0`/`sm701_ablation=0` 同时禁用缓存里残留的
+> sm701 策略；修正策略缓存清理 `LIKE 'strat:%'→'strategy:%'`；设置→预测参数
+> 新增两个 sm701 开关。
+> ⑤ **私有因子安全**：`.gitignore` 扩展 `**/sm701/`、`production` 特征清单、
+> `prod_*_tech.txt`、`valid_predictions*.csv.gz`、`lgbm_train_backtest.py`
+> （任意层级）；`build_client_zip.py` 打包后增加私有文件名+特征名内容自检，
+> 命中即删除产物并终止；`requirements-client.txt` 补 pandas；明确 CLI 需
+> `external/` 同目录（模型/数据仍仓库外）。
+> `APP_VERSION=7.3.5`，`stock_predict.py` 重新生成；README/ARCHITECTURE 3.7 同步。
+> 2026-11-09 已用当前 hk 三模型重生成 `production/valid_predictions_hk.csv.gz`
+> （1,443,053 行，最后 2026-11-06；旧文件备份 `.bak`），`sm701_status('hk')`
+> 的「历史预测早于模型」警告已清除。
+
+> **v7.3.4：盘口涨跌停列表滚动/布局修正 + 盘口跟随切股（2026-11-09）**：
+> ① 盘口五档改为 20 行固定高度完整显示，涨跌停区占用剩余空间，不再压缩
+> 五档或在其下方留白；涨跌停列表由前6只扩到前30只，固定高度 + 滚动条，
+> 支持滚轮（Linux Button-4/5 与 MouseWheel）翻动，60s 刷新时保留滚动位置。
+> ② 分析完成/点击涨跌停切股时，若「盘口」面板可见，五档自动切换到新股票
+> （原只在分时模式跟随）。`APP_VERSION=7.3.4`，`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 3.13 同步。
+
+> **v7.3.3：盘口侧栏新增涨跌停股列表（60s刷新，点名称一键分析）（2026-11-09）**：
+> 右侧栏「盘口」五档下方新增「涨跌停」区：主源东财涨停/跌停池
+> （`push2ex`，含总家数/连板数），失败回退东财 clist 涨跌幅排序 + 本地按
+> 板块/ST 涨停价过滤；60s 缓存刷新（仅面板可见时拉取，失败回退上一轮并标
+> 「缓存」）；涨停红/跌停绿，显示总家数 + 前6只，点击股票名称直接
+> `run()` 一键分析。`APP_VERSION=7.3.3`，`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 3.13 同步。
+
+> **v7.3.2：盘前快照缺时间 T+1 错标 + 盘前预测K实心热修（2026-11-09）**：
+> ① 08:55 盘前行情源全失败时 `analyze` 用最近收盘合成快照（`time=""`），
+> 旧逻辑 `pre_open` 只认快照日期 → 漏判盘前、`pred.date` 变「T+1预测」，
+> 图上凭空多出一根 T+1 幽灵K；现快照时间缺失时按「工作日 + 未到 15:00 +
+> 日K无今日bar」判盘前（周末仍由 `_today_is_session()=False` 兜住），
+> 锚昨收、标签「今日(T)」。② 盘前 `pred.date` 统一为「T日预测」
+> （原「今日(T)」不在幽灵K绘制映射表，预测K被当成真实K画成实心），
+> 映射表同时兼容旧值；盘前 T 日预测恢复白色虚线空心 + 「T日」标签。
+> `APP_VERSION=7.3.2`，`stock_predict.py` 重新生成；ARCHITECTURE 2.1 与
+> README 分时说明同步。
 
 > **v7.3.1：风险偏好新增 auto（大盘 BOLL 三等分自动切换）+ 组合切换回测（2026-11-08）**：
 > ①**单股**：`ini [predict] risk_mode=auto` 新增——上证收盘在 BOLL(20,2)

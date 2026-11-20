@@ -4,6 +4,8 @@
 
 客户端包 = 运行所需最小集合：GUI/CLI（含 v6.1 三档引擎与 AI 客户端）+ 插件 +
 配置模板 + 说明/许可 + 本地日K缓存 stock_cache.db。
+sm701 只打包 external/ 适配层；私有特征工程/模型/预测数据永不进包，
+打包后自动做文件名与特征名双重自检（v7.3.5）。
 
 默认先 VACUUM 压缩数据库（1GB+ 库可显著减小包体，需约 2 倍空闲磁盘），
 用 --no-vacuum 跳过。
@@ -31,6 +33,17 @@ PLUGIN_FILES = ["__init__.py", "api.py", "base.py", "trade_log.py"]
 # sm701 外接算法适配层（v7.3.0；数据/模型不入包——客户端自备桌面 sm701 目录）
 EXT_DIR = "external"
 EXT_FILES = ["__init__.py", "sm701_ext.py"]
+
+# 私有因子/模型/预测文件禁止入包（v7.3.5 安全自检；sm701 目录永远只在仓库外）
+PRIVATE_NAME_RE = re.compile(
+    r"(^|/)(sm701[^/]*/|features_tech\.json|prod_[^/]*_tech\.txt|"
+    r"valid_predictions[^/]*\.csv(?:\.gz)?$|lgbm_model\.txt|"
+    r"lgbm_train_backtest\.py)", re.I)
+# 适配层只保留“如何接入”，不打包任何私有特征名/模型内容
+PRIVATE_TEXT_MARKERS = (
+    b"r_ret5", b"r_ma20r", b"r_rsi14", b"r_vr20",
+    b"r_vol20", b"r_logvol", b"updays20", b"bollpos",
+)
 
 
 def app_version():
@@ -137,7 +150,26 @@ def main():
                 os.remove(out)
                 raise SystemExit(
                     f"安全检查失败：{name} 内疑似含 API Key，已删除产物并终止发布")
-    print("  安全自检通过：包内无 API Key")
+    # v7.3.5：私有因子/模型/预测文件安全自检（名称 + 适配层特征名残留）
+    with zipfile.ZipFile(out) as z:
+        for name in z.namelist():
+            if PRIVATE_NAME_RE.search(name):
+                os.remove(out)
+                raise SystemExit(
+                    f"安全检查失败：包内含私有模型/因子文件 {name}，已删除产物")
+            if name == "stock_cache.db":
+                continue
+            try:
+                raw = z.read(name)
+            except Exception:
+                continue
+            for marker in PRIVATE_TEXT_MARKERS:
+                if marker in raw:
+                    os.remove(out)
+                    raise SystemExit(
+                        f"安全检查失败：{name} 内疑似含私有特征名 "
+                        f"{marker.decode()}，已删除产物并终止发布")
+    print("  安全自检通过：包内无 API Key、无 sm701 私有模型/特征文件")
     print(f"写入 {out}（{os.path.getsize(out)/1e6:.0f} MB，"
           f"{time.time() - t0:.0f}s）")
 

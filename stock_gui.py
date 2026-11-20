@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.2"
+APP_VERSION = "7.4.3"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -5497,6 +5497,162 @@ def fetch_order_book(full, ttl=_ORDER_BOOK_TTL):
     raise RuntimeError(f"盘口获取失败: {last}")
 
 
+# ---- 涨跌停股（盘口侧栏；v7.3.3）----
+# 主源东财涨停/跌停池（push2ex，含封板时间/连板数/总家数），失败回退
+# clist 涨跌幅排序 + 本地按板块/ST 涨停价过滤。缓存 60s，失败回退上一轮。
+_ZT_UT = "7eea3edcaed734bea9cbfc24409ed989"
+_ZT_CACHE = {"ts": 0.0, "data": None}
+_ZT_LOCK = threading.Lock()
+_ZT_TTL = 60.0
+
+
+def _zt_full_code(code):
+    """涨停池 6 位代码 → 项目 full code（sh/sz/bj）。"""
+    code = str(code or "")
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("4", "8", "9")):
+        return "bj" + code
+    return "sz" + code
+
+
+def _zt_pool(kind, n, date):
+    """东财涨停/跌停池：返回 (rows, total, qdate)。"""
+    path = "getTopicZTPool" if kind == "up" else "getTopicDTPool"
+    sort = "fbt:asc" if kind == "up" else "fund:desc"
+    u = (f"https://push2ex.eastmoney.com/{path}?ut={_ZT_UT}"
+         f"&dpt=wz.ztzt&Pageindex=0&pagesize={n}"
+         f"&sort={sort}&date={date}")
+    raw = _http_get(u, retries=2, timeout=8,
+                    headers={"Referer": "https://quote.eastmoney.com/"},
+                    src_name="东财涨跌停")
+    d = json.loads(raw)
+    if d.get("rc") not in (0, None):
+        raise RuntimeError(f"东财涨跌停 rc={d.get('rc')}")
+    box = d.get("data") or {}
+    rows = []
+    for it in (box.get("pool") or [])[:n]:
+        code = str(it.get("c") or "")
+        if len(code) != 6:
+            continue
+        rows.append({
+            "code": _zt_full_code(code),
+            "name": it.get("n") or code,
+            "pct": float(it.get("zdp") or 0.0),
+            "boards": it.get("lbc"),
+        })
+    total = box.get("tc")
+    return rows, int(total if total is not None else len(rows)), \
+        str(box.get("qdate") or date)
+
+
+def _zt_clist_fallback(n):
+    """涨停池不可用时：按 f3 排序取前 100，再按板块涨停价精确过滤。"""
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    hosts = ("https://push2delay.eastmoney.com",
+             "https://push2.eastmoney.com",
+             "http://push2.eastmoney.com")
+    today = time.strftime("%Y-%m-%d")
+    out = {"up": [], "down": []}
+    for po, direction in ((1, "up"), (0, "down")):
+        u = ("/api/qt/clist/get?pn=1&pz=100&po=" + str(po) +
+             "&np=1&fltt=2&invt=2&fid=f3&fs=" + fs +
+             f"&fields=f2,f3,f12,f14,f18&ut={UT}")
+        diff = []
+        for host in hosts:
+            try:
+                d = json.loads(_http_get(
+                    host + u, retries=1, timeout=8,
+                    headers={"Referer": "https://quote.eastmoney.com/"},
+                    src_name="东财涨跌停"))
+                diff = (d.get("data") or {}).get("diff") or []
+                if isinstance(diff, dict):
+                    diff = list(diff.values())
+                if diff:
+                    break
+            except Exception:
+                continue
+        for it in diff:
+            code = str(it.get("f12") or "")
+            if len(code) != 6:
+                continue
+            full = _zt_full_code(code)
+            name = it.get("f14") or code
+            lim = _limit_pct(full, name, today)
+            try:
+                px = float(it.get("f2") or 0)
+                prev = float(it.get("f18") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not lim or px <= 0 or prev <= 0:
+                continue
+            if direction == "up":
+                hit_px = prev * (1 + lim / 100.0)
+                ok = px >= round(hit_px + 1e-8, 2) - 0.005
+            else:
+                hit_px = prev * (1 - lim / 100.0)
+                ok = px <= round(hit_px + 1e-8, 2) + 0.005
+            if ok:
+                out[direction].append({
+                    "code": full, "name": name,
+                    "pct": (px / prev - 1) * 100, "boards": None})
+        out[direction].sort(key=lambda x: x["pct"],
+                            reverse=(direction == "up"))
+    return {
+        "up": out["up"][:n], "down": out["down"][:n],
+        "n_up": len(out["up"]), "n_down": len(out["down"]),
+        "qdate": time.strftime("%Y%m%d"), "stale": False, "approx": True,
+    }
+
+
+def fetch_limit_stocks(limit_n=30, ttl=_ZT_TTL):
+    """A股涨跌停股（60s 缓存；东财涨停池优先，clist 过滤兜底）。
+
+    返回 {up/down:[{code,name,pct,boards}], n_up, n_down, qdate, stale}；
+    网络全失败时返回上一轮缓存并标 stale，无缓存返回 None。"""
+    now = time.time()
+    with _ZT_LOCK:
+        hit = _ZT_CACHE["data"]
+        hit_ts = _ZT_CACHE["ts"]
+    if hit and now - hit_ts < ttl:
+        return hit
+
+    today = time.strftime("%Y%m%d")
+    data = None
+    try:
+        up, n_up, qd = _zt_pool("up", limit_n, today)
+        down, n_down, qd2 = _zt_pool("down", limit_n, today)
+        data = {"up": up, "down": down, "n_up": n_up,
+                "n_down": n_down, "qdate": qd2 or qd, "stale": False,
+                "approx": False}
+        if not up and not down:
+            if n_up or n_down:
+                raise RuntimeError("涨跌停池有总数无明细")
+            # 盘前/节假日当天池为空：回退最近交易日池（指数快照/库内锚）
+            prev = _LAST_INDEX_SNAP_DATE[0] or \
+                _index_last_td().replace("-", "")
+            if prev and prev < today:
+                up, n_up, qd = _zt_pool("up", limit_n, prev)
+                down, n_down, qd2 = _zt_pool("down", limit_n, prev)
+                data = {"up": up, "down": down, "n_up": n_up,
+                        "n_down": n_down, "qdate": qd2 or qd,
+                        "stale": False, "approx": False}
+    except Exception as e:
+        log.debug("涨跌停池获取失败，回退 clist: %s", e)
+        try:
+            data = _zt_clist_fallback(limit_n)
+        except Exception as e2:
+            log.debug("涨跌停 clist 兜底失败: %s", e2)
+
+    if data is not None:
+        with _ZT_LOCK:
+            _ZT_CACHE["ts"], _ZT_CACHE["data"] = now, data
+        return data
+    if hit:
+        return {**hit, "stale": True}
+    return None
+
+
 def _batch_tencent(codes):
     """腾讯批量行情。v6.2.4：附带 换手率(38)/动态PE(39)/PB(46) 快照字段。"""
     raw = http_get(QT_URL + ",".join(codes))
@@ -8725,7 +8881,7 @@ def save_strategy(full, strat):
                 purged = 0
                 for k, v in conn.execute(
                         "SELECT key, value FROM meta "
-                        "WHERE key LIKE 'strat:%'").fetchall():
+                        "WHERE key LIKE 'strategy:%'").fetchall():
                     try:
                         ts = float(json.loads(v).get("ts", 0))
                     except Exception:
@@ -11177,7 +11333,8 @@ def _run_ablation_body(full, rows, idx_rows=None, progress=None):
     sig_cache = {}
     # v7.3.0：sm701（外接算法）候选可选参加 A 股消融（[predict] sm701_ablation；
     # 接入总开关 sm701_ext=0 时同样剔除）。其余候选不受影响。
-    _include_701 = CFG.SM701_JOIN_ABLATION and CFG.SM701_EXT_ON
+    _include_701 = (CFG.SM701_JOIN_ABLATION and CFG.SM701_EXT_ON
+                    and sm701_has_model("cn"))
     gens = {k: v for k, v in (
         {"macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
@@ -11424,7 +11581,10 @@ def _fusion_prediction(o_today, pre_open, live, levels,
             # round单调不破坏顺序，但显式再钳一次防浮点/显示反转
             t_pred["hi"][pp]=max(t_pred["hi"][pp], t_pred["cl"][pp])
             t_pred["lo"][pp]=min(t_pred["lo"][pp], t_pred["cl"][pp])
-    pred={"date":"T日预测" if live is not None else ("今日(T)" if pre_open else "T+1预测"),"open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence}
+    # 盘前与盘中都落到「T日预测」：幽灵K线绘制按该 date 识别为虚线空心，
+    # 旧值「今日(T)」不在 ghost_lab，会被当成真实K画成实心（08:55 盘前
+    # 看起来像凭空多出一根 T+1）。展示文案仍由 next_label 承担。
+    pred={"date":"T日预测" if (live is not None or pre_open) else "T+1预测","open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence}
     tpred_bar={"date":"T日预测","open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence} if live is not None else None
     return t_pred,pred,clamped,tpred_bar
 
@@ -11826,9 +11986,13 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
     now_hm = time.strftime("%H%M")
-    stale_today = (bool(snap_d) and snap_d < today_compact
-                   and now_hm < "1500"
-                   and _today_is_session() is not False)
+    session_today = _today_is_session() is not False
+    # 快照时间缺失（无网合成快照/残缺批量源）时没有日期可判盘前：
+    # 工作日未到 15:00 且日K尚无今日bar → 按"今日尚未有行情"处理并锚昨收。
+    # 否则 08:55 盘前会漏判成收盘后，T 日预测/幽灵K被错标成 T+1。
+    no_snap = not snap_d
+    stale_today = (((bool(snap_d) and snap_d < today_compact) or no_snap)
+                   and now_hm < "1500" and session_today)
     pre_open = (not had_today_bar and not post_close
                 and (snap_d >= today_compact or stale_today))
     stale_snap = bool(snap_d) and snap_d < today_compact
@@ -12042,6 +12206,14 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     if sel_algo not in ALGO_LABEL:
         sel_algo = "composite"
     sel_mode = (strat or {}).get("mode") or CFG.RISK_MODE
+    # v7.3.5：缓存里的 sm701 策略若已被开关关闭/模型缺失，不再沿用，
+    # 回退多维评分（否则图上无买卖点且不触发兜底）。
+    if sel_algo == "sm701" and not _sm701_strategy_usable(mk):
+        log.info("sm701 策略不可用（开关关闭/模型缺失），%s 回退多维评分", full)
+        strat = None
+        sel_algo = "composite"
+        sel_mode = CFG.RISK_MODE
+        rp = CFG.risk_params()
     # ---- auto 风险偏好（v7.3.1）：大盘 BOLL 带内位置三等分动态解析 ----
     # 覆盖交易层参数与 sel_mode（信号兜底/异动覆盖跟随解析档）；算法仍来自
     # 消融缓存（缓存档=选股参考）。选用 hd auto 时消融选型环节不变，
@@ -14292,6 +14464,18 @@ from external.sm701_ext import (  # noqa: E402,F401
     sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status)
 from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
+
+
+def _sm701_strategy_usable(market):
+    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型存在。
+
+    v7.3.5：用于忽略缓存里残留的 sm701 策略（旧版 sm701_ext=0 只影响
+    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。"""
+    if not CFG.SM701_EXT_ON:
+        return False
+    if market == "cn" and not CFG.SM701_JOIN_ABLATION:
+        return False
+    return sm701_has_model(market)
 
 
 def tier_segments(cal):
@@ -18547,22 +18731,31 @@ class App:
             except Exception:
                 pass
         self._rt_fit_width(name)
+        if name == "盘口":
+            try:
+                self._refresh_order_book()
+                self._refresh_limit_stocks()
+            except Exception:
+                log.debug("切到盘口刷新失败", exc_info=True)
 
     # ---------- 盘口 / 集合竞价侧栏（v7.0.2） ----------
 
     def _build_order_book_panel(self, parent):
-        """右侧栏「盘口」：五档挂单 + 集合竞价状态，3s 自动刷新。"""
+        """右侧栏「盘口」：五档挂单 + 集合竞价状态（3s）；
+        下方涨跌停股列表（60s，点名称一键分析）。"""
         self._ob_data = None
         self._ob_busy = False
         self._ob_code = ""
+        self._zt_data = None
+        self._zt_busy = False
+        self._zt_ts = 0.0
         box = tk.Frame(parent, bg=PANEL_BG)
         box.pack(fill="both", expand=True)
         self._ob_txt = tk.Text(
-            box, width=18, height=18, wrap="none", relief="flat",
+            box, width=18, height=20, wrap="none", relief="flat",
             bg=PANEL_BG, fg=FG_MAIN, insertbackground=FG_MAIN,
             font=("Consolas", 9), padx=6, pady=4, state="disabled",
             cursor="arrow")
-        self._ob_txt.pack(fill="both", expand=True)
         self._ob_txt.tag_configure("title", foreground=TITLE_TXT,
                                    font=("Microsoft YaHei", 9, "bold"))
         self._ob_txt.tag_configure("up", foreground=UP)
@@ -18570,6 +18763,55 @@ class App:
         self._ob_txt.tag_configure("dim", foreground=AXIS_TXT)
         self._ob_txt.tag_configure("auction", foreground=ACCENT,
                                    font=("Microsoft YaHei", 9, "bold"))
+
+        zbox = tk.Frame(box, bg=PANEL_BG)
+        zhead = tk.Frame(zbox, bg=PANEL_BG)
+        zhead.pack(fill="x")
+        tk.Label(zhead, text="涨跌停", bg=PANEL_BG, fg=TITLE_TXT,
+                 anchor="w", font=("Microsoft YaHei", 9, "bold")).pack(
+                     side="left")
+        self._zt_info_var = tk.StringVar(value="60s刷新 · 滚轮")
+        tk.Label(zhead, textvariable=self._zt_info_var, bg=PANEL_BG,
+                 fg=AXIS_TXT, anchor="e",
+                 font=("Microsoft YaHei", 8)).pack(side="right")
+        zbody = tk.Frame(zbox, bg=PANEL_BG)
+        zbody.pack(fill="both", expand=True)
+        self._zt_txt = tk.Text(
+            zbody, width=18, height=8, wrap="none", relief="flat",
+            bg=PANEL_BG, fg=FG_MAIN, insertbackground=FG_MAIN,
+            font=("Consolas", 9), padx=6, pady=2, state="disabled",
+            cursor="arrow")
+        self._zt_txt.pack(side="left", fill="both", expand=True)
+        zsb = ttk.Scrollbar(zbody, orient="vertical",
+                            command=self._zt_txt.yview)
+        zsb.pack(side="right", fill="y")
+        self._zt_txt.configure(yscrollcommand=zsb.set)
+        self._zt_txt.tag_configure("title", foreground=TITLE_TXT,
+                                   font=("Microsoft YaHei", 9, "bold"))
+        self._zt_txt.tag_configure("up", foreground=UP)
+        self._zt_txt.tag_configure("down", foreground=DOWN)
+        self._zt_txt.tag_configure("dim", foreground=AXIS_TXT)
+
+        def _zt_wheel(e):
+            try:
+                if getattr(e, "num", None) == 4:
+                    self._zt_txt.yview_scroll(-3, "units")
+                elif getattr(e, "num", None) == 5:
+                    self._zt_txt.yview_scroll(3, "units")
+                else:
+                    self._zt_txt.yview_scroll(
+                        -3 if getattr(e, "delta", 0) > 0 else 3, "units")
+            except Exception:
+                pass
+            return "break"
+
+        for _wgt in (self._zt_txt, zbody, zhead):
+            _wgt.bind("<MouseWheel>", _zt_wheel)
+            _wgt.bind("<Button-4>", _zt_wheel)
+            _wgt.bind("<Button-5>", _zt_wheel)
+        self._zt_set_text("涨跌停\n加载中...")
+        self._ob_txt.pack(fill="x")
+        zbox.pack(fill="both", expand=True, pady=(4, 0))
         self._ob_set_text("盘口\n加载中...")
         self._safe_after(600, self._ob_tick)
 
@@ -18599,6 +18841,133 @@ class App:
         except Exception:
             log.debug("盘口文本刷新失败", exc_info=True)
 
+    def _zt_set_text(self, txt):
+        """涨跌停区纯文本（加载中/错误提示）。"""
+        w = getattr(self, "_zt_txt", None)
+        if w is None:
+            return
+        try:
+            w.config(state="normal")
+            w.delete("1.0", "end")
+            w.insert("end", txt or "", "dim")
+            w.config(state="disabled")
+        except Exception:
+            log.debug("涨跌停文本刷新失败", exc_info=True)
+
+    def _zt_open_stock(self, full):
+        """点击涨跌停股名称 → 一键分析。"""
+        if not full:
+            return
+        try:
+            self.code_var.set(full)
+            self.run()
+        except Exception:
+            log.exception("涨跌停列表切换股票失败: %s", full)
+
+    def _zt_bind_name(self, tag, full, color):
+        w = getattr(self, "_zt_txt", None)
+        if w is None:
+            return
+        w.tag_configure(tag, foreground=color, underline=True)
+        w.tag_bind(tag, "<Button-1>",
+                   lambda e, f=full: self._zt_open_stock(f))
+        w.tag_bind(tag, "<Enter>",
+                   lambda e: w.config(cursor="hand2"))
+        w.tag_bind(tag, "<Leave>",
+                   lambda e: w.config(cursor="arrow"))
+
+    def _render_limit_stocks(self):
+        """渲染涨跌停列表：家数 + 前 N 只（名称可点击分析）。"""
+        w = getattr(self, "_zt_txt", None)
+        if w is None:
+            return
+        d = getattr(self, "_zt_data", None)
+        try:
+            top = w.yview()[0]
+            w.config(state="normal")
+            w.delete("1.0", "end")
+            if not d:
+                w.insert("end", "涨跌停\n暂无数据（60s后重试）", "dim")
+                w.yview_moveto(top)
+                w.config(state="disabled")
+                return
+            qd = str(d.get("qdate") or "")
+            day = (f"{qd[4:6]}-{qd[6:8]}"
+                   if len(qd) >= 8 and qd != time.strftime("%Y%m%d")
+                   else "")
+            tail = ("  " + day) if day else ""
+            if d.get("stale"):
+                tail += " 缓存"
+            self._zt_info_var.set("60s刷新 · 滚轮" + tail)
+            approx = "≥" if d.get("approx") else ""
+            w.insert("end", "【涨跌停】", "title")
+            w.insert("end", "  涨停 ", "dim")
+            w.insert("end", approx + str(d.get("n_up") or 0), "up")
+            w.insert("end", "  跌停 ", "dim")
+            w.insert("end", approx + str(d.get("n_down") or 0), "down")
+            w.insert("end", "\n", "dim")
+            for direction, mark, color, name_tag in (
+                    ("up", "▲", UP, "up"), ("down", "▼", DOWN, "down")):
+                rows = d.get(direction) or []
+                if not rows:
+                    w.insert("end", f"{mark} 无\n", "dim")
+                    continue
+                for it in rows:
+                    full = it.get("code") or ""
+                    name = it.get("name") or full
+                    try:
+                        pct = float(it.get("pct") or 0.0)
+                    except (TypeError, ValueError):
+                        pct = 0.0
+                    w.insert("end", mark + " ", name_tag)
+                    tag = f"zt:{full}"
+                    w.insert("end", name, (tag,))
+                    self._zt_bind_name(tag, full, color)
+                    w.insert("end", f" {pct:+.1f}%", name_tag)
+                    boards = it.get("boards")
+                    if direction == "up" and isinstance(boards, int) \
+                            and boards > 1:
+                        w.insert("end", f" {boards}板", "dim")
+                    w.insert("end", "\n")
+            w.insert("end", "前30只 · 点名称 → 分析", "dim")
+            w.yview_moveto(top)
+            w.config(state="disabled")
+        except Exception:
+            log.debug("涨跌停列表渲染失败", exc_info=True)
+
+    def _zt_done(self, data, err):
+        self._zt_busy = False
+        if _CUR_MARKET[0] != "cn":
+            self._zt_data = None
+            self._zt_set_text("涨跌停\n仅支持 A 股")
+            return
+        if data:
+            self._zt_data = data
+            self._zt_ts = time.time()
+            self._render_limit_stocks()
+            return
+        if err and getattr(self, "_zt_data", None) is None:
+            self._zt_set_text(
+                "涨跌停\n获取失败（60s后重试）\n" + str(err)[:60])
+        elif getattr(self, "_zt_data", None) is None:
+            self._zt_set_text("涨跌停\n暂无数据（60s后重试）")
+
+    def _refresh_limit_stocks(self, force=False):
+        """拉取涨跌停股；60s 内命中缓存，仅 A 股模式展示。"""
+        if getattr(self, "_zt_busy", False):
+            return
+        now = time.time()
+        if not force and now - getattr(self, "_zt_ts", 0.0) < _ZT_TTL:
+            return
+        if _CUR_MARKET[0] != "cn":
+            self._zt_data = None
+            self._zt_ts = now
+            self._zt_set_text("涨跌停\n仅支持 A 股")
+            return
+        self._zt_busy = True
+        self._zt_ts = now
+        self._run_bg(lambda: fetch_limit_stocks(30), self._zt_done)
+
     def _ob_tick(self):
         try:
             w = getattr(self, "_ob_txt", None)
@@ -18607,6 +18976,8 @@ class App:
             if (getattr(self, "_rt_choice", "") == "盘口"
                     and w.winfo_ismapped()):
                 self._refresh_order_book()
+                # 涨跌停列表 60s 刷新（_refresh_limit_stocks 内部再判 TTL）
+                self._refresh_limit_stocks()
         except Exception:
             log.debug("盘口轮询异常", exc_info=True)
         try:
@@ -21714,6 +22085,13 @@ class App:
         self._refresh_names()
         if not getattr(self, "compact", False):
             self._update_sectors()   # 切换市场立即换面板内容
+        # 涨跌停列表是 A股专用；切市场后立即清空/重拉，避免沿用旧市场
+        try:
+            self._zt_ts = 0.0
+            if getattr(self, "_rt_choice", "") == "盘口":
+                self._refresh_limit_stocks(force=True)
+        except Exception:
+            log.debug("切市场刷新涨跌停失败", exc_info=True)
 
     def _auto_switch_market(self, full):
         """run() 时检测代码所属市场 ≠ 当前模式 → 自动切换（v7.0.1）。"""
@@ -21774,6 +22152,12 @@ class App:
         self._save_ini()
         self._set_info()
         self._rerender()
+        # 盘口面板可见时，切股/分析完成后五档自动跟随新股票
+        try:
+            if getattr(self, "_rt_choice", "") == "盘口":
+                self._refresh_order_book()
+        except Exception:
+            log.debug("盘口跟随切股失败", exc_info=True)
         self._notify_plugins("on_analysis", res)
         try:
             self._ai_on_res_loaded(res)
@@ -22598,6 +22982,7 @@ class App:
 
         yo = yc = None
         ghost_lab = {"T+1预测": "T+1", "T日预测": "T日",
+                     "今日(T)": "T日",   # 兼容旧/外部 res 的盘前预测日期
                      "T+5预测": "T+5", "T+10预测": "T+10"}
         n_real = len(bars) - 1 - int(v.get("ghost_n", 0))
         for i, b in enumerate(bars):
@@ -22615,7 +23000,11 @@ class App:
                                fill=TPRED_C, dash=(3, 2))
                 cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
                                     fill="", outline=TPRED_C, dash=(4, 3))
-                cv.create_text(x, max(ty - 9, g["T"] + 6), text=ghost_lab[b["date"]],
+                # 预测K相邻且价位接近时（盘前 T日/T+5/T+10 常挤在一起），
+                # 标签逐个上移错开，避免叠成 "T日T+5T+10" 一团。
+                _gi = max(0, i - n_real)
+                cv.create_text(x, max(ty - 9 - _gi * 11, g["T"] + 6),
+                               text=ghost_lab[b["date"]],
                                fill=TPRED_C, font=("Consolas", 7, "bold"))
                 continue
             up = b["close"] >= b["open"]
@@ -26132,6 +26521,20 @@ class App:
             row=13 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(8, 0))
 
+        # sm701 外接算法开关（v7.3.5）：总开关 + A股消融候选开关。
+        # 模型/特征/数据均在仓库外，本程序只读接入，私有因子不入包。
+        sm701_ext_var = tk.BooleanVar(value=bool(CFG.SM701_EXT_ON))
+        ttk.Checkbutton(frm, text="sm701 外接算法（多市场直出 + A股消融接入；"
+                                  "关闭=断开）",
+                        variable=sm701_ext_var).grid(
+            row=14 + len(prows), column=0, columnspan=3, sticky="w",
+            pady=(6, 0))
+        sm701_abl_var = tk.BooleanVar(value=bool(CFG.SM701_JOIN_ABLATION))
+        ttk.Checkbutton(frm, text="sm701 参加 A股单股消融候选"
+                                  "（关闭=仅多市场直出）",
+                        variable=sm701_abl_var).grid(
+            row=15 + len(prows), column=0, columnspan=3, sticky="w")
+
         # ---- 使用注意（基于n=4500+回测的诚实边界）----
         notes = (
             "【适合】\n"
@@ -26147,7 +26550,7 @@ class App:
             "· 本工具不做仓位/风控，据此操作盈亏自负")
         ttk.Label(frm, text=notes, justify="left", foreground=AXIS_TXT,
                   font=("Microsoft YaHei", 8)).grid(
-            row=14 + len(prows), column=0, columnspan=3, sticky="w",
+            row=16 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(12, 0))
 
         # ---- 外部策略：股票策略工坊导入（v6.6.0，存 ini [studio]）----
@@ -26779,6 +27182,17 @@ class App:
                        "1" if CFG.ANALOG_OVERRIDE else "0")
                 pnotes.append(
                     f"异动相似覆盖={'开' if CFG.ANALOG_OVERRIDE else '关'}")
+                CFG.SM701_EXT_ON = bool(sm701_ext_var.get())
+                cp.set("predict", "sm701_ext",
+                       "1" if CFG.SM701_EXT_ON else "0")
+                pnotes.append(
+                    f"sm701外接={'开' if CFG.SM701_EXT_ON else '关'}")
+                CFG.SM701_JOIN_ABLATION = bool(sm701_abl_var.get())
+                cp.set("predict", "sm701_ablation",
+                       "1" if CFG.SM701_JOIN_ABLATION else "0")
+                pnotes.append(
+                    "sm701消融候选="
+                    f"{'开' if CFG.SM701_JOIN_ABLATION else '关'}")
                 _av = ("all" if ablview_var.get() == "全部组合"
                        else "three")
                 CFG.ABLATION_VIEW = _av

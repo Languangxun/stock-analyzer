@@ -97,8 +97,7 @@
 - **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
   > **sm70x 直出**（`sm701_paths(market)` 生产集
   `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
-  `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；
-- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
+  `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
   （杠杆 `leverage_市场`，T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
   （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
 - 涨跌停：`_limit_pct` 非 cn 返回 None（钳制/异常校验自动放行）。
@@ -227,6 +226,12 @@ AI 找源（AI 只提议 URL，`_probe_kline_url` 实测有数据才采用）。
   仍按今日(T)预测并锚定「今日之前最后一根已收盘日K」，不误标 T+1。盘中若已有
   真实 T 日 bar，`slice_view` 把 T 日预测以同 x 虚线空心叠加在真实 K 上，不再
   额外追加一根（避免视觉上像 T+1）；盘前无真实 bar 才单独画 T 日幽灵。
+  **v7.3.2 快照缺失盘前判定**：行情源全失败时 `analyze` 会用最近收盘合成快照
+  （`time` 为空），旧 `pre_open` 只认快照日期，08:55 盘前会漏判成收盘后、
+  把 T 日预测错标成 T+1；现改为「工作日 + 15:00 前 + 日K无今日bar」即按盘前
+  处理（周末由 `_today_is_session()=False` 兜住），锚昨收、`next_label` 今日(T)；
+  盘前 `pred.date` 统一为「T日预测」，幽灵K绘制恢复白色虚线空心（`ghost_lab`
+  同时兼容旧值「今日(T)」）。
 
 **美股可选源 Twelve Data（v7.1.0）**：长桥 OpenAPI 需开户实名，故改用免费层只需邮箱注册的
 Twelve Data（`https://api.twelvedata.com`，Basic：800 次/天、8 次/分钟，含美股实时行情与日K）。
@@ -690,6 +695,13 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
     0 时 hk/us/futures/crypto 策略链不直出（只看行情）、A股消融剔除候选；
     `[predict] sm701_ablation`（默认 1）控制「sm701上涨概率」是否参加
     A 股单股策略消融（关 = sm701 仅多市场直出/独立使用）；
+    两项均可在 设置→预测参数 勾选；`sm701_ext=0`/`sm701_ablation=0`
+    时同时禁用缓存里残留的 sm701 策略并修正清理前缀（v7.3.5）；
+  - **私有因子安全（v7.3.5）**：适配层只含接入逻辑，不含特征清单/模型/预测
+    数据；`.gitignore` 递归排除 `sm701/`、`production` 特征清单、模型/预测
+    文件和 `lgbm_train_backtest.py`；`build_client_zip.py` 打包后自检私有
+    文件名与特征名，命中即删除产物；`requirements-client.txt` 补 pandas，
+    CLI/客户端需 `external/` 与主文件同目录，模型/数据仍只在仓库外；
   - **口径冲突（v6.4.0 备案，历史）**：sm701 标签为
     `next_ret = close[t+1]/open[t+1] − 1`（t+1 开盘买 → t+1 收盘卖），是
     A 股 T+1 下不可实现的当日回转口径；本引擎统一「T-1 信号 → T 日收盘成交」，
@@ -990,6 +1002,16 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   集合竞价/竞价撮合/连续竞价/收盘竞价，显示竞价参考价、匹配量、今开、买卖
   五档与委比；切到分时视图时 `_toggle_minute()` 自动把右侧栏切到「盘口」并
   开始刷新，切股时同步重拉；指数无五档时给出提示。
+  **涨跌停股（v7.3.3）**：盘口五档下方新增「涨跌停」区，`fetch_limit_stocks()`
+  主源东财涨停/跌停池（`push2ex`，返回总家数/连板数），失败回退
+  `clist` 涨跌幅排序 + `_limit_pct()` 板块/ST 涨停价精确过滤；60s 缓存，
+  仅「盘口」面板可见时由 `_ob_tick` 触发拉取，失败回退上一轮并标「缓存」；
+  列表显示总家数 + 前 30 只，固定高度 + 滚动条，支持 Linux 滚轮
+  （Button-4/5）与 MouseWheel 翻动，60s 刷新保留滚动位置；股票名称带
+  `zt:<full>` tag，点击回调 `_zt_open_stock()` → `run()` 一键分析。
+  **v7.3.4 布局/跟随**：五档 Text 固定 20 行完整显示，涨跌停区占剩余高度；
+  分析完成时若「盘口」可见，`_loaded()` 调 `_refresh_order_book()` 跟随新股票
+  （原仅分时模式切股刷新）。
 
 ### 3.14 18 策略共振综合荐股（v6.1.6）
 - **来源**：移植 `chaodi_strategies/et_engine`（通达信口径）进 `stock_gui.py` 算法区，
@@ -1250,10 +1272,14 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
-| **v7.4.2**<br>（2026-11-15） | **quant 每日消融接入**：新增 `ablation_quant.py`——下载 `https://quant.tail6a6cc8.ts.net/downloads` 的 `public/ablation/latest.csv`（5460 只 × 三档策略 + 验证指标）与 `latest.json`，按「策略名·风险档」反查 `algo`，生成与 `run_ablation()` 同构的 `research/ablation_gui_cache.json`（原始数据留档 `research/ablation_quant/`，均忽略）；GUI 数据工具新增「立即同步最新消融 / 应用推荐档到全部策略缓存」，启动 4s 后自动同步（12h 新鲜度、`[predict] ablation_sync/ablation_url` 可配）；`_ensure_strategy()` 在 quant 批次比旧缓存新时直接换推荐档并重分析（不跑本地消融），三档/全组合窗标注数据源=quant；`APP_VERSION=7.4.2`，`stock_predict.py` 重新生成 |
+| **v7.4.3**<br>（2026-11-20） | **合并本地 v7.3.2–7.3.5 热修线**：涨跌停列表/盘口跟随/盘前 T+1 热修并入；sm701 多市场截面复算以 v7.4.0 `_sm701_live_predict` 口径为准（`_sm701_live_market` 不再引入）；私有因子安全并入（`.gitignore` 递归排除 + `build_client_zip.py` 自检 + requirements 补 pandas）；设置页 sm701 开关 + 关断禁用缓存残留策略（清理前缀 `strat:`→`strategy:`）；`APP_VERSION=7.4.3`，`stock_predict.py` 重新生成 |
+| | **v7.4.2**<br>（2026-11-15） | **quant 每日消融接入**：新增 `ablation_quant.py`——下载 `https://quant.tail6a6cc8.ts.net/downloads` 的 `public/ablation/latest.csv`（5460 只 × 三档策略 + 验证指标）与 `latest.json`，按「策略名·风险档」反查 `algo`，生成与 `run_ablation()` 同构的 `research/ablation_gui_cache.json`（原始数据留档 `research/ablation_quant/`，均忽略）；GUI 数据工具新增「立即同步最新消融 / 应用推荐档到全部策略缓存」，启动 4s 后自动同步（12h 新鲜度、`[predict] ablation_sync/ablation_url` 可配）；`_ensure_strategy()` 在 quant 批次比旧缓存新时直接换推荐档并重分析（不跑本地消融），三档/全组合窗标注数据源=quant；`APP_VERSION=7.4.2`，`stock_predict.py` 重新生成 |
 | **v7.4.1**<br>（2026-11-15） | **修复消融选型崩溃 + 本地消融开关**：①`_pick_one_from_pool()` 保守档误用未定义 `p`（应为 `pool`）→ 全量消融必崩 `cannot access local variable 'p'`，修复后 42 候选选型恢复；②ini `[predict] local_ablation`（默认 1）+ 设置→预测参数「允许本地消融」：0 时 GUI 不跑 `run_ablation`（过期缓存沿用旧策略、无缓存提示从 quant 导入 `research/ablation_gui_cache.json` / `strategy_ablation_per_stock.json`），CLI/研究脚本不受影响；`APP_VERSION=7.4.1`，`stock_predict.py` 重新生成 |
 | **v7.4.0**<br>（2026-11-14） | **sm 系列模型接入优化（sm701 新克隆）**：①`external/sm701_ext.py` 模型加载兼容 CRLF（Windows git 检出的 `production/prod_*.txt` 原会被 LightGBM 判为 Model format error）+ Booster 按 (mtime,size) 缓存（首次 ~2.4s/个→0ms）；②数据/预测缺失降级：`sm701_paths()` 不再强制要求 `stock_cache.db` / `valid_predictions*.csv.gz`——A股用主库行情实时复算（单股复用 `sm701_score_matrix` 一次全市场矩阵，无历史时最多 250 日）、非 cn 读取 sm701 原生表或桌面 `global_daily.db`（统一 `daily_bars.market` + `stocks` 名称，crypto `BTCUSDT↔BTC/USDT` 映射），最后回退主库同前缀行情；③新增 **crypto** 生产三模型（`prod_crypto_h{1,5,10}_tech.txt`；h10 需 `crypto_hourly` 的 11 个分时特征，缺失时跳过、h1/h5 等权）；④路径新增 `SM70_DIR/DB/MODEL/PRED` 别名并探测桌面其它 `sm70*`；⑤`_sm701_market_bars/_sm701_market_pool` 支持 global 统一表（hk 2667/us 3000（上限）/fut 82 只）；⑥`fetch_sector_context()` 非 cn 直接跳过（原东财 secid 仅沪深口径，会报 NoneType 警告）；`APP_VERSION=7.4.0`，`stock_predict.py` 重新生成；2.0/2.1/3.4/3.7/3.8 节与 README/CHANGELOG 同步 |
-| **v7.3.1**<br>（2026-11-08） | **风险偏好新增 auto（大盘 BOLL 三等分）**：①`[predict] risk_mode=auto`——`auto_boll_zone()` 用上证收盘 BOLL(20,2) 带内位置三等分解析风险档（下1/3→保守/中1/3→稳健/上1/3→激进；无前视、60s 缓存），覆盖交易层参数与信号兜底/异动覆盖档；消融算法不变；`RISK_AI_GUIDE["auto"]` + `ai_risk_mode()` 解析 auto；②`backtests/backtest_tiers_auto.py` 组合切换回测（同套三等分逐日映射三档、切换日换仓，费用/整手/闸门/熔断全复用 tier_sim_phase，含**最低 5 元佣金**；固定三档同引擎基线），产物 `research/tiers_auto.*`；3.2/4.x 节更新 |
+| **v7.3.5**<br>（2026-11-09） | **sm701 多市场实时口径热修 + 私有因子安全加固**：①`_sm701_live_market()` 全市场截面复算（修复单股横截面排名恒 1.0；只读副本库，去掉主库代码前缀/港股价格口径混用）；②booster 路径+mtime 缓存、生产特征列序运行时校验、`sm701_score_matrix` key 改数据日期、特征工程按 mtime 复用、`sm701_has_model` 60s 刷新；③`sm701_ext=0`/`sm701_ablation=0` 禁用缓存残留 sm701 策略，修策略缓存清理 `strategy:` 前缀，设置页加两开关；④安全：`.gitignore` 递归排除私有模型/特征/预测/训练脚本，`build_client_zip.py` 私有名称+特征名自检，requirements 补 pandas；`APP_VERSION=7.3.5`，`stock_predict.py` 重新生成；3.7 节与 README/CHANGELOG 同步 |
+| **v7.3.4**<br>（2026-11-09） | **盘口涨跌停列表滚动/布局修正 + 盘口跟随切股**：①五档 Text 固定 20 行完整显示，涨跌停区占剩余高度（不再压缩五档/底部留白）；列表前6→前30，固定高度+滚动条，滚轮 Button-4/5/MouseWheel 可翻，60s 刷新保留滚动位置；②分析完成/点击涨跌停切股时，若盘口面板可见，`_loaded()` 自动 `_refresh_order_book()` 跟随新股票（原仅分时模式）；`APP_VERSION=7.3.4`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
+| **v7.3.3**<br>（2026-11-09） | **盘口侧栏新增涨跌停股列表**：五档下方「涨跌停」区，`fetch_limit_stocks()` 主源东财 `push2ex` 涨停/跌停池（总家数/连板），失败回退 `clist` 涨跌幅排序 + `_limit_pct()` 本地涨停价过滤；60s 缓存、仅盘口可见时拉取、失败回退上轮标「缓存」；显示总家数+前6只，点名称经 `_zt_open_stock()` → `run()` 一键分析；`APP_VERSION=7.3.3`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
+| **v7.3.2**<br>（2026-11-09） | **盘前快照缺时间 T+1 错标热修**：①行情源全失败→合成快照 `time=""` 时，`pre_open` 改按「工作日 + 15:00 前 + 日K无今日bar」判定，08:55 盘前不再把 T 日预测/幽灵K错标 T+1，锚昨收、标「今日(T)」；②盘前 `pred.date` 由「今日(T)」统一为「T日预测」，`ghost_lab` 兼容旧值，预测K恢复白色虚线空心 + 「T日」标签；`APP_VERSION=7.3.2`，`stock_predict.py` 重新生成；2.1 节与 README 同步 || **v7.3.1**<br>（2026-11-08） | **风险偏好新增 auto（大盘 BOLL 三等分）**：①`[predict] risk_mode=auto`——`auto_boll_zone()` 用上证收盘 BOLL(20,2) 带内位置三等分解析风险档（下1/3→保守/中1/3→稳健/上1/3→激进；无前视、60s 缓存），覆盖交易层参数与信号兜底/异动覆盖档；消融算法不变；`RISK_AI_GUIDE["auto"]` + `ai_risk_mode()` 解析 auto；②`backtests/backtest_tiers_auto.py` 组合切换回测（同套三等分逐日映射三档、切换日换仓，费用/整手/闸门/熔断全复用 tier_sim_phase，含**最低 5 元佣金**；固定三档同引擎基线），产物 `research/tiers_auto.*`；3.2/4.x 节更新 |
 | **v7.3.0**<br>（2026-11-08） | **sm701 隔离为外接算法 + test 实验档删除**：①算法本体（模型定位/副本库只读/概率复算/买卖点信号，~620 行）从 `stock_gui.py` 迁出到 `external/sm701_ext.py`（唯一入口；`init_host(globals())` 惰性注入宿主 np/db_conn/_market_of/tier_load_panel，模块不反向 import 主程序；适配层入库，sm701 数据+模型目录 `.gitignore` 排除、git 不分发）；②`test`（sm701 实验组合档 + 风险偏好）删除——TIER_CFG×4/TIER_BENCH/RISK_PARAMS/荐股窗/工具菜单/CLI --tier test 全部退役，旧 ini `risk_mode=test` 自动迁移回稳健；A股消融子的「排除 test」漏斗删除；③**外接算法开关（可选参加 A股消融或指定市场）**：`[predict] sm701_ext`（默认 1；0=hk/us/futures 只看行情、A股消融剔除候选）+ `[predict] sm701_ablation`（默认 1；0=不参加 A股单股消融）；多市场直出风控改 `external/sm701_ext.EXT_RISK`（=原 test 宽松参数）；④港股外接算法**全库回测**（`backtest_sm701_markets.py --market hk --top 0`：主库 ≥300 根 2596 只，落盘样本外概率直出滞回信号）产物 `research/sm701_markets_full.*`；⑤`backtests/compare_tier_sm701.py` test 行退出；2.0/3.4/3.7/1.1 节更新 |
 | **v7.2.2**<br>（2026-11-07） | **非 DeepSeek 模型工具取数**：`AIAgent.use_tools` 去掉 `_ai_is_deepseek()` 限制，`[deepseek] tools` 开启时 Claude Haiku/GLM/Kimi 等 OpenAI 兼容模型同走「首轮核心快照 + tools 按需取数」；工具轮仅 DeepSeek 回传 `reasoning_content`，其他网关省略以避免 400；不支持 tools 时自动回退全文上下文；实测 `claude-haiku-5-5` 调用 `get_prediction` 并基于结果作答；3.9 节与 README/CHANGELOG 同步 |
 | **v7.2.1**<br>（2026-11-07） | **AI 分析报错修复**：①`KeyError: 'open'` 根因——`_batch_tencent`/`_batch_sina` 只缓存现价/涨幅，tick 覆盖 `res["quote"]` 后 AI prompt/报告取 `q["open"]` 崩溃、首轮上下文变空；批量源补齐 OHLC、`quote_cache` 只写完整快照、残缺缓存视为未命中、`_quote_ensure()` 分析/tick 兜底、prompt/报告安全格式化；上下文异常回退最小股票快照；②`get_ai_key()` 按 ini `api_key_source` 选 Key，环境变量不再覆盖显式 ini Key（修 opencode 网关 401）；③修复设置保存 `_ind_mk` 自我赋值 `UnboundLocalError`；3.9 节更新 |
