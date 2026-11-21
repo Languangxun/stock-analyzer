@@ -16,3 +16,5 @@
 - `python3 -m py_compile stock_gui.py stock_predict.py`
 - `python3 test_settings.py`（GUI 冒烟，需图形环境）
 - 涉及数据源：`python3 stock_firstaid.py --check`
+- 涉及发布/外接模型/`.gitignore`：`python3 check_open_source.py`（开源仓库
+  不得包含 sm70x 模型/行情库/特征/预测或 API Key）

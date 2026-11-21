@@ -41,7 +41,9 @@
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 抽取拼装），**勿手改** |
 | `auto_lines.py` | **纯脚本自动画线**（v7.4.6）：读缓存日K，多尺度枢轴 + ATR/成交量加权 + 多轮精修输出支撑/压力/趋势/通道/箱体；CLI 可独立运行，GUI「自动画线」按钮复用 |
 | `studio_strategies/` | 从「股票策略工坊」导入的自定义策略 JSON 副本（v6.6.0；规则引擎读取，设置→外部策略维护） |
-| `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号；缺库/缺预测文件自动降级；适配层代码入库，仅 sm701/global 数据目录不入库 |
+| `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆；v7.5.2 兼容 sm702/UTC crypto）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号/`sm70x_series()` 关于页署名；缺库/缺预测文件自动降级；适配层代码入库，仅 sm70x/global 数据目录不入库 |
+| `assets/smlogo.png` | 关于页「Powered by」品牌图（v7.5.2；仅检测到外接 sm70x 时加载，不是模型/数据） |
+| `check_open_source.py` | **开源隔离自检**（v7.5.2）：扫描 git 跟踪 + 未忽略新文件，拦截 sm70x 目录/行情库/特征/模型/预测、改名 LightGBM 模型内容与 API Key |
 | `build_cli.py` | GUI → CLI 打包器；按锚点注释抽取「缓存块」「算法块」，并做 tkinter 残留 / 语法校验 |
 | `run_backtest.sh` | **一键全量回测**（GUI 工具菜单/数据工具页与桌面快捷方式共用入口）：全期/样本外/强势段 → 全市场逐股，`--yearly` 加逐年；日志 `research/oneclick_backtest_*.log`，结束自动打开仪表盘；GUI 侧由 `_ext_spawn` 子进程承载、日志回流 |
 | `stock_firstaid.py` | 数据源急救箱（独立于 GUI）：候选域体检 `--check` / 把实测可用K线源写回 ini / `--ai` 求救（AI 只提议 URL，实测验证后才采用） |
@@ -59,8 +61,11 @@
 2. **生成物不可手改**：`stock_predict.py` 由脚本生成；改算法后必须 `python build_cli.py`。
 3. **口径隔离（v6.1.2）**：标的池有 4 个口径（`all`/`main`/`etf`/`all_etf`），
    **横截面排名在各自基数池内做**（`tier_rank_base`），加入 ETF 后既有全A/主板数字仍逐项可比。
-4. **发布安全（v6.1.1 起）**：`build_client_zip.py` **绝不打包本地 `stock_gui.ini`**（内含 API Key），
-   改为空 Key 模板，且打包后**全包扫描 `sk-` 模式**，命中即删除产物并中止发布。
+4. **发布安全（v6.1.1 起；v7.5.2 扩展）**：`build_client_zip.py` **绝不打包本地
+   `stock_gui.ini`**（内含 API Key），改为空 Key 模板，且打包后**全包扫描
+   `sk-` / `sk_` / `oc_sk_` 模式**，并用 `check_open_source.py` 扫描 git
+   跟踪/未忽略文件中的 sm70x 模型、行情库、特征、预测与改名模型内容，
+   命中即删除产物/失败退出。
 5. **研究产物不入仓的边界**：单文件 >100MB 的逐对象消融明细（`strategy_ablation_per_stock.json`）
    加入 `.gitignore`，随 Release 研究包分发。
 
@@ -94,6 +99,12 @@
   特征口径一致（`_sm701_market_bars`，实现位于 `external/sm701_ext.py`
   外接算法适配层），无库时 Yahoo chart v8 兜底
   （`_yf_chart`，urllib 走 `_http_get` 继承节流/熔断/离线/代理路由）；
+  **v7.5.2 加密 UTC / 同源补最新**：crypto 日K按 UTC 00:00 切日，缓存只收
+  **已完成 UTC 日**（`_market_last_expected` 返回 UTC 昨日），盘中半根由
+  `analyze` 的 UTC 快照实时 bar 合成、不写库；每个 UTC 日首次访问强制
+  回补一次刚收完的昨日 bar（`_MKT_FINALIZED`，只拉一次）。sm70x 副本库最新日落后于应有完成日时，
+  `_get_daily_market` 用 Yahoo 补齐缺失/最新段（重叠日仍以 sm70x 同源为准），
+  避免 crypto 副本停在旧日期时反复判过期或半根K不更新；
   **美股另可选 Twelve Data（v7.1.0）**：配 key 后快照与日K优先走 TD，Yahoo 退为兜底；
 - **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
   > **sm70x 直出**（`sm701_paths(market)` 生产集
@@ -427,6 +438,11 @@ key 读取顺序：环境变量 `TWELVE_DATA_API_KEY` → `stock_gui.ini [data] 
 
 输出 T 日（盘中锚今开）与 T+1 的 **P10/P25/P50/P75/P90** 区间（加权分位数）+ **上行概率**（样本次日收涨占比加权）；
 多日预测 T+1..T+10 叠加均值回归衰减 `decay = max(0.6, 1 − 0.04(d−1))`。
+**多日累计高/低（v7.5.1）**：不再把每日 `hi[75]`/`lo[25]` 连乘，而是对每个历史样本
+把 1..d 日收盘乘成路径，逐日记录路径最高/最低（含起点，保证高≥开、低≤开），
+再在样本间取**路径最高 P75 / 路径最低 P25**；单日收益先按当前标的涨跌停钳制，
+跨板样本不会把路径拉出非法幅度。日线 `cl/hi/lo` 分位字段保留原口径，
+幽灵K线/报告表使用路径累计高/低。
 **OHLC 一致性钳制（v6.5.1 热修①）**：收/高/低三组分位数独立校准+`INTERVAL_K` 放大会致尾部分位交叉
 （如 P10 收<低），`_fusion_prediction`/`_multi_day_prediction` 现逐分位强制 `lo<=cl<=hi`
 且预测高≥开/收、低≤开/收（区间只向外扩，P50/上行概率/信号与回测口径不变）。
@@ -697,18 +713,28 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
     `lgbm_train_backtest._compute_feats` → 生产三模型打分等权平均；
     已对拍末交易日 2026-09-30 实时复算与落盘 prob 逐值一致（sh600000=0.42401537）；
     缓存 key 用「取数库最新日K日 + 当日 30 分钟桶 + 模型 mtime」（v6.6.5），
-    `_SM701_CACHE`/`_SM701_LOCK` 移入 external 模块；
+    `_SM701_CACHE`/`_SM701_LOCK` 移入 external 模块；v7.5.2 crypto 的
+    「当日」/30 分钟桶按 **UTC** 判断（`_sm701_cache_epoch(src_max, market)`），
+    主库最新日按市场代码前缀取（`_main_latest_market`，避免加密周末推进
+    或 A 股收盘日互相顶高缓存 key）；
   - **开关（v7.3.0）**：`ini [predict] sm701_ext`（默认 1）外接接入——
     0 时 hk/us/futures/crypto 策略链不直出（只看行情）、A股消融剔除候选；
     `[predict] sm701_ablation`（默认 1）控制「sm701上涨概率」是否参加
     A 股单股策略消融（关 = sm701 仅多市场直出/独立使用）；
     两项均可在 设置→预测参数 勾选；`sm701_ext=0`/`sm701_ablation=0`
     时同时禁用缓存里残留的 sm701 策略并修正清理前缀（v7.3.5）；
-  - **私有因子安全（v7.3.5）**：适配层只含接入逻辑，不含特征清单/模型/预测
-    数据；`.gitignore` 递归排除 `sm701/`、`production` 特征清单、模型/预测
-    文件和 `lgbm_train_backtest.py`；`build_client_zip.py` 打包后自检私有
-    文件名与特征名，命中即删除产物；`requirements-client.txt` 补 pandas，
-    CLI/客户端需 `external/` 与主文件同目录，模型/数据仍只在仓库外；
+  - **私有因子安全（v7.3.5；v7.5.2 sm70x 全系列）**：适配层只含接入逻辑，
+    不含特征清单/模型/预测数据；`.gitignore` 递归排除 `sm70*/`、行情库、
+    `production` 特征清单、模型/预测文件和 `lgbm_train_backtest.py`；
+    `build_client_zip.py` 打包后自检私有文件名与特征名（sm70x 正则覆盖
+    sm701/sm702），命中即删除产物；新增 `check_open_source.py` 对
+    git 跟踪/未忽略文件做发布前自检（含改名 LightGBM 模型内容、API Key）；
+    `requirements-client.txt` 补 pandas，CLI/客户端需 `external/` 与主文件
+    同目录，模型/数据仍只在仓库外；
+  - **关于页署名（v7.5.2）**：`sm70x_series()` 扫描真实存在的 sm70N 目录
+    （或显式 `SM70_DIR`），只有存在模型/数据入口时，设置→关于才显示
+    「外接算法：sm701 / sm702（已连接）」与 `assets/smlogo.png`
+    「Powered by」品牌图；开源无模型环境返回空列表，不显示任何 SM 标识；
   - **口径冲突（v6.4.0 备案，历史）**：sm701 标签为
     `next_ret = close[t+1]/open[t+1] − 1`（t+1 开盘买 → t+1 收盘卖），是
     A 股 T+1 下不可实现的当日回转口径；本引擎统一「T-1 信号 → T 日收盘成交」，
@@ -839,21 +865,29 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   `get_etf_constituents` 工具输出统计表；`get_kline`/`get_indicators`/
   `get_intraday` 增加可选 `code`，可查成分股等其它标的（`get_intraday` 即
   当日/最近交易日分时）。
-- **外部环境搜索（2026-11-05）**：`get_external_env` **仅调用 DeepSeek 官方
-  Search API**（`deepseek_search` / `/v1/tools/search`）；默认两路查询——
+- **外部环境搜索（2026-11-05；v7.5.0 多引擎）**：`get_external_env` 在
+  DeepSeek 官方接口下仍调用 `/v1/tools/search`；非官方网关改走
+  `ai_foreign_search()`——移植 quant（`ai-quant/scripts/foreign_search.py`）
+  的检索栈：必应主搜索 + Google News / DuckDuckGo 并行抓取，无聚焦词时加
+  WSJ/Investing 财经 RSS 最新流（按 `days` 过滤，最多补充约 1/4 条）；
+  按检索词覆盖率 + 日期排序、URL 去重；默认两路查询——
   「黄金/原油/美股/港股/A股/美元/美债 最新走势」与「特朗普/关税/地缘政治/
-  市场影响」，均带 `after:` 近 N 天，合并按 title+url 去重后给摘要；支持
-  `query` 聚焦、15 分钟内存缓存；成功请求计入 `usage.search_calls`；
-  AI 提示词要求涉及外部环境先调用、不得臆测。
-- **联网资讯（2026-11-04）**：`deepseek_search()` 封装 DeepSeek 官方
-  `POST /v1/tools/search`（仅 `api.deepseek.com`；其他 OpenAI 兼容网关自动改用
-  Google News RSS 免 Key 兜底）；`ai_stock_news()` 在【开始分析】首轮前于后台检索个股近 30 天
-  新闻/公告/业绩（含代码去前缀与 `after:` 时间算子；取 5 条 title/summary/date/site
-  压成短文本），同股 30 分钟内存缓存（失败/空结果 5 分钟），避免重复计费；
-  检索结果作为「联网资讯」段拼入首轮用户上下文（提示 AI 与行情交叉验证）；
+  市场影响」，均带近 N 天时效（`after:` 由 `days` 接管）；支持 `query`
+  聚焦、15 分钟内存缓存；成功请求计入 `usage.search_calls`；AI 提示词要求
+  涉及外部环境先调用、不得臆测。
+- **联网资讯（2026-11-04；v7.5.0 多引擎）**：`deepseek_search()` 封装
+  DeepSeek 官方 `POST /v1/tools/search`（仅 `api.deepseek.com`）；其他
+  OpenAI 兼容网关（opencode-go / Kimi / GLM / Claude 等）自动改用
+  `ai_foreign_search()` 多引擎检索（必应 / Google News / DuckDuckGo，
+  免 Key，纯标准库；复用 `_open_url` 代理优先/直连兜底，Bing/DDG 跳转链接
+  还原、DDG lite 降级、失败按引擎跳过）。`ai_stock_news()` 检索个股近 30 天
+  新闻/公告/业绩（含代码去前缀；`after:` 在搜索引擎侧转成 `when:Nd`/
+  `df=` 时效参数；取 5 条 title/summary/date/site 压成短文本），同股 30 分钟
+  内存缓存（失败/空结果 5 分钟）；`search_news` 工具支持 `query`/`days`/
+  `count`；检索结果作为「联网资讯」段拼入上下文（提示 AI 与行情交叉验证）；
   设置→AI 接口「联网检索」开关持久化 `[deepseek] web_search`（默认 1）；
-  无 Key/接口不支持/网络失败均静默返回空串，不阻断分析；Search 按成功请求计费
-  （约 $0.75/千次）；
+  无 Key/接口不支持/网络失败均静默返回空串，不阻断分析；官方 Search 按成功
+  请求计费（约 $0.75/千次），多引擎免 Key；
 - **市场简报主线程安全（v6.5.2 热修②）**：`ai_market_brief()` 曾在 GUI 主线程直接构建激进档
   板块轮动闸门（`tier_load_panel` 冷缓存 18~170s + `tier_build_features` ~20s），AI 页点
   【开始分析】即无响应。现拆三层：`ai_market_brief()`（主线程安全）只做轻量指数简报，
@@ -1335,6 +1369,9 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.2**<br>（2026-11-21） | **加密盘中 UTC + 关于页外接品牌 + 开源模型隔离**：①crypto 日K/实时 bar/缓存桶全部按 UTC 切日——`_market_last_expected` 返回 UTC 昨日，`_get_daily_market` 只缓存已完成 UTC 日并清理旧半根，盘中实时 bar 由 UTC 快照 7×24 合成，`market_phase_text` 显示 UTC 盘中；②`_sm701_cache_epoch(src_max, market)` 对 crypto 用 UTC 30 分钟桶，`_main_latest_market` 按市场前缀取主库最新日；③sm70x 副本库落后时 Yahoo 补齐最新已完成段（重叠日同源优先）；④`sm70x_series()` + 关于页「已连接 / Powered by」品牌图（`assets/smlogo.png`，仅外接模型存在时）；⑤`.gitignore`/`build_client_zip.py` 扩到 sm70x 全系列，新增 `check_open_source.py`（模型内容/密钥自检）；`APP_VERSION=7.5.2`，`stock_predict.py` 重新生成；2.0/3.7 节与 README/CHANGELOG 同步 |
+| **v7.5.1**<br>（2026-11-21） | **多日幽灵K线影线修正**：`_multi_day_prediction()` 的累计高/低由「每日 `hi[75]`/`lo[25]` 连乘」改为「逐样本路径累计最高/最低后取 P75/P25」——对每个历史样本乘出 1..d 日收盘路径，逐日记录路径最高/最低（含起点，单日先按当前标的涨跌停钳制），再跨样本取分位；`cum_cl_raw` 也改用路径累计 P50。日线 `cl/hi/lo` 分位保留原口径；T+5/T+10 幽灵K与报告表影线明显收敛；3.2 节与 README/CHANGELOG 同步 |
+| **v7.5.0**<br>（2026-11-21） | **AI Agent 接入 quant 多引擎搜索**：移植 `ai-quant/scripts/foreign_search.py` 检索栈到 `stock_gui.py`——`ai_foreign_search()` 并行抓取必应 / Google News / DuckDuckGo（宏观另加 WSJ/Investing RSS），Bing/DDG 跳转还原、DDG lite 降级、按检索词覆盖率+日期排序、URL 去重；RSS 按 `days` 过滤且最多补充约 1/4；非 DeepSeek 官方网关的 `deepseek_search()` 由「Google News RSS 单源」改走该多引擎（免 Key）；`ai_stock_news`/`search_news`/`get_external_env` 接 `days`/`engines`，`after:` 自动转 `when:Nd`/`df=`；会话「联网」开关显式传入 `ai_stock_news`；DeepSeek 官方仍走 `/v1/tools/search`；3.9 节与 README/CHANGELOG 同步 |
 | **v7.4.9**<br>（2026-11-21） | **本机消融固定走 quant**：本机 ini `local_ablation=0`+`ablation_sync=1`；`load_research_ablation()` 对 quant 批次按 ts/文件 mtime 取新+30天有效期（修复周更批次被 5 天 TTL 整批误杀）；`local_ablation=0` 旧策略过期强制换 quant 推荐档；缓存缺失/过期自动下载，未覆盖 ETF/指数明确提示；3.8 节与 README/CHANGELOG 同步 |
 | **v7.4.8**<br>（2026-11-21） | **自选股右键菜单自动隐藏**：菜单 `<Leave>` 400ms 后 `unpost`，`<Enter>` 取消定时；命令项先收起再执行；新增 `_watch_menu_schedule_hide/_hide_watch_menu`；2.1 节与 README/CHANGELOG 同步 |
 | **v7.4.7**<br>（2026-11-21） | **自选股右键上移/下移/置顶**：`<Button-3>` 菜单，置顶项置前并显示「★」，已置顶时菜单变「取消置顶」；上移/下移限制在置顶组/普通组内；`pinned_<市场>` 与 `codes_<市场>` 同步存 ini；`_normalize_watch_order` 去重+置顶前置；2.1 节与 README/CHANGELOG 同步 |

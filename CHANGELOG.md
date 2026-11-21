@@ -5,6 +5,62 @@
 
 ## 版本历史
 
+> **v7.5.2：加密盘中 UTC 口径 + 关于页外接品牌 + 开源模型隔离（2026-11-21）**：
+> ①**加密 7×24 按 UTC 切日**：`_market_last_expected()` 对 crypto 返回
+> **UTC 昨日**（当日 UTC 日K要到次日 00:00 UTC 才完成），
+> `_market_today()` / `_get_daily_market()` 用 UTC 日过滤并清理旧版本
+> 误存的“当日半根K”；每个 UTC 日首次访问强制回补一次刚收完的昨日 bar
+> （`_MKT_FINALIZED`，同一 UTC 日只拉一次）；
+> 盘中实时 T 日 K 由 UTC 快照合成（不再受 A 股 9:30~15:00 限制）；
+> `market_phase_text()` 显示「HH:MM UTC 盘中（7×24）」；
+> ②**sm70x 缓存桶改 UTC**：`_sm701_cache_epoch(src_max, market)` 对 crypto
+> 按 UTC 日判断 30 分钟盘中桶（原实现北京 00:00~08:00 会把 UTC 当日当历史、
+> 盘中概率被永久缓存）；主库最新日按市场代码前缀取
+> （`_main_latest_market`，避免加密周末推进顶高 A 股“最新日”）；
+> ③**数据源补最新**：sm70x 副本库落后时 crypto/hk/us/fut 用 Yahoo 补齐
+> 最新已完成段（重叠日仍以同源 sm70x 为准），修复 crypto 副本停在
+> 2026-11-07 时每次分析都判过期反复联网/半根K不更新；
+> ④**关于页外接署名**：检测到 sm701/sm702 等真实外接目录时显示
+> 「外接算法：sm701 / sm702（已连接）」+「Powered by」品牌图
+> （`assets/smlogo.png`）；开源无模型环境不显示任何 SM 标识；
+> ⑤**开源隔离**：`.gitignore` 从 `sm701/` 扩到 `sm70*` 全系列，
+> 新增 `check_open_source.py`（扫描 git 跟踪/未忽略文件 + LightGBM
+> 模型内容 + API Key），`build_client_zip.py` 私有文件正则同步扩到
+> sm70x 并移除打包模板误留的 Key；`APP_VERSION=7.5.2`，
+> `stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.5.1：多日预测幽灵K线影线修正（2026-11-21）**：
+> ①**根因**：`_multi_day_prediction()` 原先把每日 `hi[75]`/`lo[25]`
+> 连乘作为累计高/低——P75×P75×… 不是累计路径的 P75，T+5/T+10 幽灵K
+> 因此出现 7%~12% 的夸张上下影线；且与主 T+1（P50）口径不一致；
+> ②**改法**：对每个历史样本把 1..d 日收盘乘成路径，逐日记录路径最高/
+> 最低（含起点，保证高≥开、低≤开），单日收益先按当前标的涨跌停钳制，
+> 再在样本间取**路径最高 P75 / 路径最低 P25**；`cum_cl_raw` 同步改用
+> 路径累计 P50（不再连乘每日 P50）；
+> ③日线 `cl/hi/lo` 分位字段保留原口径（AI 工具仍可看单日分位），
+> 幽灵K线/报告表/`get_prediction` 多日输出改用路径累计高/低；
+> 实测 `sh601298` T+5 上/下影由 0.72/0.52 收敛到 0.44/0.24，T+10 由
+> 0.60/0.37 收敛到 0.34/0.28；`APP_VERSION=7.5.1`，
+> `stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.5.0：AI Agent 接入 quant 多引擎搜索（2026-11-21）**：
+> ①移植 quant 的 `foreign_search.py` 检索栈到 `stock_gui.py`——新增
+> `ai_foreign_search()`：必应主搜索 + Google News / DuckDuckGo 并行抓取，
+> 宏观检索另加 WSJ/Investing 财经 RSS；纯标准库、复用 `_open_url` 的
+> 代理优先/直连兜底；Bing `/ck/a` 与 DDG `/l/` 跳转链接还原、DDG lite
+> 降级、失败按引擎跳过、按检索词覆盖率 + 日期排序、URL 去重；财经 RSS
+> 按 `days` 过滤且最多补充约 1/4 条，避免无关头条刷屏；
+> ②非 DeepSeek 官方网关（opencode-go / Kimi / GLM 等）的
+> `deepseek_search()` 由「Google News RSS 单源」改走上述多引擎，免 Key；
+> DeepSeek 官方仍走 `/v1/tools/search`；
+> ③`ai_stock_news()` / `search_news` / `get_external_env` 接入
+> `days`/`engines`：`search_news` 新增 `days`（1-90，默认 30），
+> `after:` 时间算子自动转 Google News `when:Nd` / DDG `df=`；
+> 外部环境有聚焦词只走搜索结果源、无聚焦词才加财经 RSS，避免无关头条；
+> ④AI Agent 会话「联网」开关显式传入 `ai_stock_news`（此前只读 ini，
+> 会话内开启/关闭可能不生效）；设置页与工具说明同步为多引擎；
+> `APP_VERSION=7.5.0`，`stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
 > **v7.4.9：本机消融固定走 quant 机（2026-11-21）**：
 > ①本机 `stock_gui.ini [predict] local_ablation=0` + `ablation_sync=1`：
 > 不再本地跑 `run_ablation`，统一消费 quant 每日/每周消融批次；

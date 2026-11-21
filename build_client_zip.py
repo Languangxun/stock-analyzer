@@ -4,8 +4,9 @@
 
 客户端包 = 运行所需最小集合：GUI/CLI（含 v6.1 三档引擎与 AI 客户端）+ 插件 +
 配置模板 + 说明/许可 + 本地日K缓存 stock_cache.db。
-sm701 只打包 external/ 适配层；私有特征工程/模型/预测数据永不进包，
-打包后自动做文件名与特征名双重自检（v7.3.5）。
+sm70x 只打包 external/ 适配层与关于页品牌图；私有特征工程/模型/预测数据
+永不进包，打包后自动做文件名与特征名双重自检（v7.3.5；v7.5.2 扩到
+sm701/sm702 全系列）。
 
 默认先 VACUUM 压缩数据库（1GB+ 库可显著减小包体，需约 2 倍空闲磁盘），
 用 --no-vacuum 跳过。
@@ -33,16 +34,22 @@ PLUGIN_FILES = ["__init__.py", "api.py", "base.py", "trade_log.py"]
 # sm701 外接算法适配层（v7.3.0；数据/模型不入包——客户端自备桌面 sm701 目录）
 EXT_DIR = "external"
 EXT_FILES = ["__init__.py", "sm701_ext.py"]
+# 关于页品牌图（v7.5.2；仅外接模型存在时显示，不是模型/数据）
+ASSET_DIR = "assets"
+ASSET_FILES = ["smlogo.png"]
 
-# 私有因子/模型/预测文件禁止入包（v7.3.5 安全自检；sm701 目录永远只在仓库外）
+# 私有因子/模型/预测文件禁止入包（v7.3.5 安全自检；sm70x 目录永远只在仓库外）
+# v7.5.2：正则从 sm701 扩到 sm70x 全系列（sm701/sm702/…），并补行情库名。
 PRIVATE_NAME_RE = re.compile(
-    r"(^|/)(sm701[^/]*/|features_tech\.json|prod_[^/]*_tech\.txt|"
-    r"valid_predictions[^/]*\.csv(?:\.gz)?$|lgbm_model\.txt|"
-    r"lgbm_train_backtest\.py)", re.I)
+    r"(^|/)(sm70[0-9]*[^/]*/|sm70[0-9]*\.(?:db|txt)|features_tech\.json|"
+    r"prod_[^/]*_tech\.txt|valid_predictions[^/]*\.csv(?:\.gz)?$|"
+    r"lgbm_model\.txt|lgbm_train_backtest\.py|global_daily[^/]*\.db|"
+    r"crypto_(?:daily|hourly)[^/]*\.db)", re.I)
 # 适配层只保留“如何接入”，不打包任何私有特征名/模型内容
 PRIVATE_TEXT_MARKERS = (
     b"r_ret5", b"r_ma20r", b"r_rsi14", b"r_vr20",
     b"r_vol20", b"r_logvol", b"updays20", b"bollpos",
+    b"num_tree_per_iteration=",     # 改名 LightGBM 文本模型头部（v7.5.2）
 )
 
 
@@ -66,7 +73,7 @@ theme = dark
 updown = red_up
 
 [deepseek]
-api_key = oc_sk_67f7c7bce761_RzohBmpBLYX5lu7yEWHpBvMmwi_DdcmQ
+api_key =
 api_key_source = ini
 model = claude-haiku-5-5
 base_url = https://opencode.ai/inference/go/openai/v1
@@ -130,14 +137,20 @@ def main():
             if os.path.exists(p):
                 z.write(p, f"{EXT_DIR}/{f}")
                 print(f"  + {EXT_DIR}/{f}")
+        for f in ASSET_FILES:
+            p = os.path.join(HERE, ASSET_DIR, f)
+            if os.path.exists(p):
+                z.write(p, f"{ASSET_DIR}/{f}")
+                print(f"  + {ASSET_DIR}/{f}")
         # 只写空 Key 模板（安全：本地 ini 含 API Key，绝不入包）
         z.writestr("stock_gui.ini", INI_TEMPLATE)
         print("  + stock_gui.ini（空 Key 模板，非本地配置）")
         z.write(DB, "stock_cache.db")
         print("  + stock_cache.db")
-    # 打包后自检：全包扫描，确认没有任何 API Key 痕迹（sk- 开头的长串）
+    # 打包后自检：全包扫描，确认没有任何 API Key 痕迹
+    # （兼容 sk- / sk_ / oc_sk_ 前缀；v7.5.2 修正模板误留 Key）
     import re as _re
-    key_re = _re.compile(r"sk-[A-Za-z0-9_\-]{16,}")
+    key_re = _re.compile(r"(?:oc_)?sk[-_][A-Za-z0-9_\-]{16,}")
     with zipfile.ZipFile(out) as z:
         for name in z.namelist():
             if name == "stock_cache.db":

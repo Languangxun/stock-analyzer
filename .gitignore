@@ -49,25 +49,29 @@ research/perstock_backtest_v*/
 # 每只股回测导出（数据工具生成，可重跑；规范产物在 research/perstock_backtest_v*/）
 reports/每只股回测_*
 
-# sm701 外接算法（v7.3.0；v7.4.0 兼容 global_daily）：数据+模型目录在桌面
-# （~/桌面/sm701），本地只读接入，绝不入仓库；若误拷进仓库按目录/库文件一并
-# 忽略。适配层 external/sm701_ext.py 本身入库（无 sm701 数据）。
-/sm701/
-/sm701 (副本)/
-sm701*.db
-sm701*.db-*
+# sm70x 外接算法（v7.3.0；v7.4.0 兼容 global_daily；v7.5.2 sm701/sm702
+# 全系列）：数据+模型目录在桌面（~/桌面/sm701、sm702），本地只读接入，
+# 绝不入仓库；若误拷进仓库按目录/库文件一并忽略。
+# 适配层 external/sm701_ext.py 本身入库（无 sm70x 模型/数据）。
+/sm70*/
+/sm70*.db
+/sm70*.db-*
+/sm70*.txt
 
 # 私有因子/模型产物：即使被误拷到仓库其它层级也不入库
-**/sm701/
-**/sm701 (副本)/
-**/sm701*.db
-**/sm701*.db-*
+**/sm70*/
+**/sm70*.db
+**/sm70*.db-*
+**/sm70*.txt
 **/features_tech.json
 **/prod_*_tech.txt
 **/valid_predictions*.csv*
 **/lgbm_train_backtest.py
-# global 多市场行情库（v7.4.0；默认读 ~/桌面/global_daily.db，只读）
+**/lgbm_model.txt
+# 多市场行情库（v7.4.0；默认读 ~/桌面/global_daily.db，只读）
 global_daily*.db
+crypto_daily*.db*
+crypto_hourly*.db*
 # 浏览器重复下载的 stock_cache (1).db 等
 stock_cache*.db
 stock_cache*.db-*

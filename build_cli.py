@@ -57,6 +57,8 @@ sm701 外接算法（v7.3.0；v7.4.0 兼容新克隆）：适配层在
              CRLF/缺失预测文件均可自动降级。A 股作为候选参加单股消融
              （ini [predict] sm701_ablation=0 可关）；hk/us/futures/crypto
              由市场策略链直出买卖点（sm701_ext=0 则只看行情）。
+             crypto 日K/盘中缓存按 UTC 切日，副本库落后时自动用 Yahoo
+             补齐最新已完成段（v7.5.2）。
 """
 
 '''

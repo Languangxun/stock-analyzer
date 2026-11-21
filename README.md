@@ -1,4 +1,4 @@
-# stock-analyzer · v7.4.9
+# stock-analyzer · v7.5.2
 
 **多市场统计研究工具（A股 / 港股 / 美股 / 期货 / 加密）**：历史形态相似度匹配 +
 sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本地桌面 GUI 与命令行两种
@@ -17,6 +17,9 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   断开则只看行情）；
   策略工坊策略可按市场绑定应用（优先于 sm701）；
   自选池、交易记录账本、指标参数均按市场独立（期货/加密支持杠杆与 T+0）；
+  **加密按 UTC 切日**（v7.5.2）：日K只缓存已完成的 UTC 昨日，盘中实时
+  T 日 bar 由 UTC 快照合成（7×24，显示「UTC 盘中」），不再套 A 股
+  9:30~15:00；sm70x 副本库落后时自动用 Yahoo 补齐最新段；
   网页面板含「多市场 sm701 信号概览」。
 - **三档组合策略（稳健 / 均衡 / 激进）——v6.2.3 定版，稳健档 v6.3.1 收紧、v6.4.2 再收紧，v6.5.0 重构**：信号只用 T-1 及以前数据、T 日收盘成交，
   含滑点/佣金/印花税/涨跌停/整手/停牌/退市的完整交易约束；**激进 = 板块轮动策略**——
@@ -36,6 +39,8 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   `test`=sm701 模型直出、不消融）信号回放、筹码分布（同花顺口径）、
   MA/BOLL/MACD/KDJ/RSI/ADX、T+1/T+5 预测与幽灵K线；**预测匹配只参考自身**
   （v6.5.3：大盘指数项默认不再参与 L1 打分/样本筛选/池匹配，量能与板块照旧；
+  v7.5.1：多日 T+5/T+10 幽灵K的最高/最低改为按历史样本**路径累计**取
+  P75/P25，不再把每日分位连乘，影线不再被逐日放大；
   旧口径 ini `[predict] match_idx_env=1` 恢复）；预测价位已按板块涨跌停钳制
   （v6.5.2热修②）；节假日锚新增**死锁保险**（v6.5.4：指数日K长期断更不再把
   全库锁死在旧数据，自动退回自然日历强制回补）；**策略消融优先读全市场批量结果**
@@ -98,7 +103,9 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   策略工坊绑定优先。v7.4.0：行情库兼容 `~/桌面/global_daily.db`（统一
   `daily_bars.market` 表）；模型 .txt 被 git 转成 CRLF 也能加载；`stock_cache.db` /
   历史预测文件缺失时自动降级（主库行情 + 实时复算）；路径可用
-  `SM70_DIR/DB/MODEL/PRED`（兼容 `SM701_*`）。
+  `SM70_DIR/DB/MODEL/PRED`（兼容 `SM701_*`）。**关于页**仅在检测到
+  sm701/sm702 等真实外接目录时显示「已连接 + Powered by」品牌图
+  （v7.5.2），开源无模型环境不显示任何 SM 标识。
   **注意**：sm701 是「次日开盘买→收盘卖」的日内口径，A 股 T+1 不可当日卖出，
  与本仓库 T 收盘口径回测错位（详见「三档策略」末 sm701 对照节），仅作研究观察；
 - **quant 每日消融数据接入（v7.4.2；v7.4.9 quant-only）**：
@@ -123,7 +130,8 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   **AI Agent 嵌入主界面右侧栏**（竖栏约 29% 宽度，Tk 原生聊天界面；
   右侧栏下拉选择「AI Agent」）：可切换股票/模型，深度思考开关/强度、
   工具取数、联网开关均为一次性会话选项（不写设置），输入栏下方显示
-  token/缓存命中率/预计成本；
+  token/缓存命中率/预计成本；联网检索接入 quant 多引擎（必应 / Google News /
+  DuckDuckGo，宏观另加 WSJ/Investing RSS）；
   **OpenAI 兼容模型支持按需工具取数**（首轮只给核心快照，AI 自行调用
   K线/指标/预测/样本/市场/筹码/财报/分时/资讯工具；DeepSeek 官方、
   Claude Haiku、GLM、Kimi 等均可）、**深度思考默认开且强度 max**
@@ -445,6 +453,9 @@ python backfill_full.py --workers 6 --throttle 0.45  # 全市场深历史回填�
 >   `crypto_hourly` 的 11 个分时特征，缺失时自动只用 h1/h5 等权；
 >   ④路径新增 `SM70_DIR/SM70_DB/SM70_MODEL/SM70_PRED` 别名，并探测桌面其它
 >   `sm70*` 目录（sm702 等后续系列模型可复用同一适配层）。
+> - **v7.5.2**：crypto 日K/盘中缓存按 UTC 切日；sm70x 副本库落后时用
+>   Yahoo 补最新已完成段；关于页显示真实外接系列与品牌图；开源仓库
+>   通过 `python3 check_open_source.py` 自检无 sm70x 模型/行情库/密钥。
 
 ### sm701 全库对照（v6.6.4，是否替换三档生产策略）
 
@@ -924,9 +935,11 @@ python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sa
   `get_chips_action`/`get_fundamentals`/`get_intraday`/`get_strategy`/
   `search_news`/`get_external_env`/`get_etf_constituents`/`show_table` 补齐数据
   （最多 8 轮；OpenAI 兼容模型通用，失败自动回退完整上下文）；
-  **外部环境**：`get_external_env` **仅调用 DeepSeek 官方 Search API**，默认检索
-  近 7 天全球市场/商品（黄金/原油/美股/港股/A股/美元/美债）与地缘政治/
-  特朗普/关税/美联储事件，合并去重；可传 `query` 聚焦；15 分钟缓存；
+  **外部环境**：`get_external_env` 走**多引擎联网检索**（移植 quant 的
+  `foreign_search` 检索栈：必应主搜索 + Google News / DuckDuckGo；无聚焦词时
+  加 WSJ/Investing 财经 RSS），默认检索近 7 天全球市场/商品（黄金/原油/
+  美股/港股/A股/美元/美债）与地缘政治/特朗普/关税/美联储事件，合并去重；
+  可传 `query` 聚焦；15 分钟缓存；DeepSeek 官方接口仍走官方 Search；
   **ETF 成分股 / 当日分时**：`get_etf_constituents` 拉取完整持仓（年报/中报）
   与最新季报前 10，附权重/现价/当日/5日/20日涨跌/量比并生成统计表；
   `get_kline`/`get_indicators`/`get_intraday` 均可传 `code` 查成分股或其它标的；
@@ -939,9 +952,12 @@ python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sa
   色块**（ACCENT等色虚线+AI标签，工具栏“AI线”开关显隐，随平移/缩放保留）；
   **K3.1pro 等模型兼容**：任意代码围栏（ai-lines/json/无标记）或裸 JSON 均可
   解析，工具模式优先调用 `draw_lines` 提交结构化画线；
-  **联网检索**：由 AI 按需调用 `search_news`（近 30 天新闻/公告/业绩，同股
-  30 分钟缓存；DeepSeek 官方 Search 约 $0.75/千次，其他网关 Google News RSS
-  免 Key）；侧栏内可关闭；
+  **联网检索**：由 AI 按需调用 `search_news`（近 30 天新闻/公告/业绩，可传
+  `query`/`days`；同股 30 分钟缓存）。**v7.5.0 起非 DeepSeek 网关接入 quant
+  多引擎检索栈**——必应主搜索 + Google News / DuckDuckGo 并行抓取，
+  按检索词覆盖率 + 日期排序、URL 去重，免 Key；宏观查询可加 WSJ/Investing
+  财经 RSS（按 `days` 过滤、最多补充约 1/4 条，避免无关头条刷屏）。
+  DeepSeek 官方接口仍用官方 Search（约 $0.75/千次）；侧栏内可关闭；
 - **K线手动画线（v7.4.4）**：主图**按住鼠标右键拖拽画直线**、
   **按住 Ctrl+左键拖拽画方框**，端点自动吸附最近K线中心与该K线 OHLC
   （10px 阈值；第二点靠近起点时强制水平/同K对齐，方便画支撑压力）；
@@ -1057,12 +1073,16 @@ python auto_lines.py --csv bars.csv --days 240
 - **客户端数据包与研究产物**：见
   <https://github.com/Languangxun/stock-analyzer/releases>（客户端/研究包以最新 Release 为准，
   包名 `stock-analyzer-client-v<版本>-<日期>.zip` + `research_v<版本>.zip`）。
+- **开源模型隔离（v7.5.2）**：GitHub 仓库只带 `external/sm701_ext.py`
+  适配层，不带 sm701/sm702 的模型、特征、预测或行情库；提交/发布前可运行
+  `python3 check_open_source.py`（扫描 git 跟踪 + 未忽略新文件、LightGBM
+  模型内容与 API Key，命中即失败）。`.gitignore` 已递归排除 `sm70*`。
 
 ## 项目文件
-| `CHANGELOG.md` | 版本摘要与历史变更（本 README 不再堆变更流水） |
 
 | 文件 | 说明 |
 |---|---|
+| `CHANGELOG.md` | 版本摘要与历史变更（本 README 不再堆变更流水） |
 | `stock_gui.py` | 本地 GUI + **三档组合引擎/信号源权威实现**（`tier_*`、`_sig_*`、`pick_ablation_multi`）+ AI 客户端 + AI Agent Web 服务 |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 从 GUI 自动抽取）：`--tiers` / `--tiers-backtest` / `--picks-backtest` / `--ai-tier` / `--universe` |
 | `studio_strategies/` | 从股票策略工坊导入的自定义策略 JSON 副本（v6.6.0；设置→外部策略维护，启用后替代单股消融并改用止损/止盈/最长持有参数） |
@@ -1074,7 +1094,9 @@ python auto_lines.py --csv bars.csv --days 240
 | `backtests/backtest_strategy_ablation.py` | 全对象多算法消融（**逐个对象覆盖**，**13 类算法**含 L2 同行业+行业ETF/异动相似，× 3 档，多指标结合，numpy 加速，AI 不参与，输出覆盖率清单） |
 | `backtests/`（其余） | 历史研究回测脚本（因子消融、退出消融、横截面实验、激进双引擎等），保留作研究记录 |
 | `build_cli.py` | GUI → CLI 打包器，保证算法同步 |
-| `build_client_zip.py` | 生成客户端发布包（**空 Key 模板 + 打包后全包 Key 自检**） |
+| `build_client_zip.py` | 生成客户端发布包（**空 Key 模板 + 打包后全包 Key/私有模型自检**；sm70x 正则覆盖 sm701/sm702 全系列） |
+| `check_open_source.py` | **开源模型隔离自检**（git 跟踪 + 未忽略文件、sm70x 目录/行情库/特征/预测、改名 LightGBM 模型内容、API Key） |
+| `assets/smlogo.png` | 关于页「Powered by」品牌图（仅检测到外接 sm70x 时显示） |
 | `sync_adjust.py` | 批量刷新 `adjust` 现价缩放系数 + 末根毛刺修复（乘法后复权 → 前复权） |
 | `stock_firstaid.py` | **数据源急救箱**（独立于 GUI）：体检全部候选域 `--check`、把实测可用K线源写回 ini、`--ai` 向 DeepSeek 求救（只提议URL，程序实测验证后才采用） |
 | `progress.py` | **后台长任务进度看板**（纯标准库）：显示深历史拉取/四口径回测/因子实验室阶段与产物，以及全量策略消融进度（④，读 `research/ablation_progress.json`，与 GUI「进度查询」同源）；`python3 progress.py -w 30` 自动刷新 |

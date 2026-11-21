@@ -17,6 +17,13 @@ sm701（桌面算法库，sm70x 系列）作为**外接算法**接入本项目�
   三模型已接入；crypto h10 依赖 crypto_hourly 分时特征，缺失时自动只用
   h1/h5 等权）。
 
+v7.5.2 加密 UTC 口径:
+  - crypto 日K按 UTC 自然日切分（当日 bar 要到次日 00:00 UTC 才完成），
+    最新日判断 / 盘中 30 分钟缓存桶均改用 UTC；北京时区凌晨不再把
+    UTC 当日未完成 bar 当成“昨日”缓存，也不会整天反复判过期。
+  - `sm70x_series()` 返回已连接的 sm701 / sm702 / 其它 sm70x 系列目录名，
+    仅供关于页署名（开源仓库无模型时不显示任何 sm70x 标识）。
+
 v7.4.0 兼容性增强:
   - 模型文件 CRLF 容错：sm701 仓库在 Windows 检出后 `production/prod_*.txt`
     可能被 git 转成 CRLF，LightGBM 直接报 Model format error；加载时统一
@@ -663,6 +670,46 @@ _DB_LATEST_CACHE = {}           # (path, table) -> (ts, date)；MAX(date) 无
                                 # date 索引，主库/副本全表扫 0.6~2s，60s
                                 # 缓存供 sm701 缓存 key 等高频调用方复用
 
+# 主库 daily_bars 按项目代码前缀区分市场（v7.5.2：市场各自取最新日，
+# 避免加密周末推进把 A 股“最新日”顶高、或反之）。
+_MAIN_CODE_PREFIX = {"cn": ("sh", "sz", "bj"), "hk": ("hk",),
+                     "us": ("us",), "futures": ("fu",),
+                     "crypto": ("crypto",)}
+
+
+def _sm701_utc_today():
+    """UTC 自然日（YYYY-MM-DD）——crypto 24/7 日K/盘中缓存口径。"""
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _main_latest_market(market):
+    """主库该市场最新日K日期（按代码前缀，60s 缓存；失败返回空串）。"""
+    prefixes = _MAIN_CODE_PREFIX.get(market)
+    key = ("main-mk", market)
+    hit = _DB_LATEST_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        with _db_conn() as conn:
+            if prefixes:
+                # 前缀区间走 (code,date) 索引；比 LIKE/OR 全表扫快一个量级
+                # （cn 三前缀 ~1.1s，crypto 仅 ~3ms）。
+                d = max(
+                    conn.execute(
+                        "select max(date) from daily_bars "
+                        "where code>=? and code<?",
+                        (p, p[:-1] + chr(ord(p[-1]) + 1))
+                    ).fetchone()[0] or ""
+                    for p in prefixes)
+            else:
+                d = conn.execute(
+                    "select max(date) from daily_bars").fetchone()[0] or ""
+    except sqlite3.Error:
+        return ""
+    _DB_LATEST_CACHE[key] = (now, d)
+    return d
+
 
 def _db_latest_date(path=None, table="daily_bars"):
     """行情库最新交易日；path 为空时读主库。失败返回空串。
@@ -697,12 +744,19 @@ def _db_latest_date(path=None, table="daily_bars"):
         return ""
 
 
-def _sm701_cache_epoch(src_max):
-    """当日数据的缓存桶：src_max 为今天时按 30 分钟分桶（盘中数据会变），
-    历史日期恒为 0（收盘定型，稳定缓存）。配合 key 用数据指纹替代
-    库文件 mtime——预取/回填写库改变 mtime 但数据未推进，不应触发
-    sm701 全市场重算（v6.6.5 修复：曾致 sm701 股票每次分析卡 100s+）。"""
-    if src_max and src_max >= time.strftime("%Y-%m-%d"):
+def _sm701_cache_epoch(src_max, market="cn"):
+    """当日数据的缓存桶：src_max 为市场“今天”时按 30 分钟分桶（盘中数据
+    会变），历史日期恒为 0（收盘定型，稳定缓存）。
+
+    v7.5.2：crypto 按 UTC 自然日判断（24/7）——原实现用本机日期，
+    北京时区 00:00~08:00 时 UTC 当日 < 本机“明天”，盘中数据被永久
+    缓存；08:00~24:00 又可能把 UTC 前一日当历史。其余市场仍用本机日。
+    配合 key 用数据指纹替代库文件 mtime——预取/回填写库改变 mtime 但
+    数据未推进，不应触发 sm701 全市场重算（v6.6.5 修复：曾致 sm701
+    股票每次分析卡 100s+）。"""
+    today = _sm701_utc_today() if market == "crypto" else time.strftime(
+        "%Y-%m-%d")
+    if src_max and src_max >= today:
         return int(time.time() // 1800)
     return 0
 
@@ -733,7 +787,7 @@ def _sm701_live_predict(target_dates, cal, progress=None):
     db = paths.get("db")
     sm_max = _db_latest_date(db) if db else ""
     src_db, src_max = (db or _DB_PATH()), sm_max
-    main_max = _db_latest_date()
+    main_max = _main_latest_market("cn")
     if not db or main_max > sm_max:
         src_db, src_max = _DB_PATH(), main_max
     use_main = os.path.abspath(src_db) == os.path.abspath(_DB_PATH())
@@ -810,7 +864,7 @@ def sm701_score_matrix(progress=None):
         db_mt = os.path.getmtime(db) if db else 0.0
     except OSError:
         db_mt = 0.0
-    main_max = _db_latest_date()
+    main_max = _main_latest_market("cn")
     key = (tuple(codes[:3]), len(codes), cal[0], cal[-1], db_mt,
            _sm701_model_mtimes(paths), pred_mt, main_max,
            _sm701_cache_epoch(main_max))
@@ -841,24 +895,72 @@ def sm701_score_matrix(progress=None):
     return F
 
 
+def _sm_series_name(base):
+    """目录名 → sm70x 系列名（`sm701 (副本)`→sm701；非 sm70N 返回空串）。"""
+    name = os.path.basename(os.path.abspath(base))
+    if name.endswith(" (副本)"):
+        name = name[:-len(" (副本)")]
+    return name if name.startswith("sm70") and name[4:].isdigit() else ""
+
+
+def sm70x_series():
+    """已连接的 sm70x 系列目录名（sm701/sm702/…），供关于页署名。
+
+    v7.5.2：只返回真实存在且带模型/数据入口的目录——开源仓库没有
+    sm70x 目录时返回空列表，关于页不显示任何外接算法标识/品牌图。
+    自定义 SM70_DIR 只要含 `lgbm_train_backtest.py` + production 也计入。
+    """
+    hit = _SM701_CACHE.get("series")
+    now = time.time()
+    if hit and now - hit[0] < 60:
+        return list(hit[1])
+    out = []
+    env_dir = _env_first("SM70_DIR", "SM701_DIR")
+    env_abs = (os.path.abspath(os.path.expanduser(env_dir))
+               if env_dir else "")
+    for raw in _sm701_dirs():
+        base = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(base):
+            continue
+        name = _sm_series_name(base)
+        # 只认 sm70N 目录或显式 SM70_DIR，避免把 sm702_export_* 等备份
+        # 目录当成“已连接系列”。
+        if not name and base != env_abs:
+            continue
+        has_entry = any(os.path.exists(os.path.join(base, f)) for f in (
+            "lgbm_train_backtest.py", "production", "features.py",
+            "stock_cache.db", "global_daily.db", "crypto_daily.db",
+            "crypto_hourly.db"))
+        if not has_entry:
+            continue
+        label = name or os.path.basename(base)
+        if label.lower() not in (x.lower() for x in out):
+            out.append(label)
+    out.sort()
+    _SM701_CACHE["series"] = (now, out)
+    return list(out)
+
+
 def sm701_status(market="cn"):
     """sm70x 外接算法数据/模型状态，供报告和排障展示。
 
     v7.4.0：库/历史预测可以缺失（新克隆只有代码+模型）——`db_fallback`
     表示回退主库行情、`pred_ok=False` 表示全量实时复算；并标注各市场
     是否具备生产模型集。
+    v7.5.2：`live_db_date` 同时比较 sm70x 库与主库该市场前缀的最新日
+    （crypto 按 UTC 口径另由行情层处理）；`series_all` 供关于页署名。
     """
     try:
         p = sm701_paths(market=market)
         db = p.get("db")
         db_date = _sm701_market_latest(db, market) if db else ""
-        live_db_date = (max(db_date, _sm701_market_latest(db, market))
-                        if db else
-                        max(db_date, _db_latest_date()))
+        main_date = _main_latest_market(market)
+        live_db_date = max(db_date, main_date)
         out = {"ok": True, "dir": p["dir"], "series": p.get("series", ""),
+               "series_all": sm70x_series(),
                "market": p["market"], "db": db or "",
                "db_fallback": not db, "db_date": db_date,
-               "live_db_date": live_db_date,
+               "main_date": main_date, "live_db_date": live_db_date,
                "model": p["model"], "pred": p["pred"],
                "pred_ok": bool(p.get("pred"))}
         prod = p.get("prod")
@@ -899,10 +1001,11 @@ def _sm701_live_one(full, dates, progress=None):
         return {}
     db = paths.get("db")
     sm_max = _sm701_market_latest(db, mk) if db else ""
-    main_max = _db_latest_date()
+    main_max = _main_latest_market(mk)
     src_max = max(sm_max, main_max)
     key = (full, tuple(dates_u), os.path.abspath(db) if db else "main",
-           src_max, _sm701_cache_epoch(src_max), _sm701_model_mtimes(paths))
+           src_max, _sm701_cache_epoch(src_max, mk),
+           _sm701_model_mtimes(paths))
     cache = _SM701_CACHE.setdefault("live_one", {})
     hit = cache.get(key)
     if hit is not None:
@@ -999,9 +1102,10 @@ def sm701_prob_map(full, dates=None):
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
         pred_mt = 0.0
-    key = (pred_mt, _sm701_model_mtimes(paths),
-           (_sm701_market_latest(paths.get("db"), mk)
-            if paths.get("db") else ""), _db_latest_date())
+    src_max = max((_sm701_market_latest(paths.get("db"), mk)
+                   if paths.get("db") else ""), _main_latest_market(mk))
+    key = (pred_mt, _sm701_model_mtimes(paths), src_max,
+           _sm701_cache_epoch(src_max, mk))
     cache = _SM701_CACHE.setdefault("probmap", {})
     hit = cache.get(full)
     if hit and hit[0] == key:

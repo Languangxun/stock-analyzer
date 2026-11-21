@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.9"
+APP_VERSION = "7.5.2"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -1001,7 +1001,8 @@ def get_ai_key() -> str:
 
 def _ai_web_search_enabled() -> bool:
     """ini [deepseek] web_search：AI 分析前自动联网检索个股资讯。
-    默认开（DeepSeek 官方走 Search API；其他 OpenAI 兼容网关走 RSS 兜底）。"""
+    默认开（DeepSeek 官方走 Search API；其他 OpenAI 兼容网关走 quant
+    多引擎检索：必应 / Google News / DuckDuckGo）。"""
     return _ai_ini_get("deepseek", "web_search", "1") != "0"
 
 
@@ -6087,6 +6088,11 @@ def fetch_daily(full):
 _MARKET_LABELS = {"cn": "A股", "hk": "港股", "us": "美股",
                   "futures": "期货", "crypto": "加密"}
 _CUR_MARKET = ["cn"]            # 当前模式（normalize 的无前缀输入归一用）
+# crypto 每个 UTC 日首次访问：强制回补一次刚收完的 UTC 昨日 bar（兼容旧
+# 版本留下的半根，也吸收数据源在 00:00 后的最终修订）。
+# {code: (utc_today, 下次允许重试的 epoch)}——成功=两天后（本日不再拉），
+# 失败=10 分钟后（离线时不至于每次刷新都撞网络）。
+_MKT_FINALIZED = {}
 
 _MARKET_POOLS = {
     "hk": [("00700", "腾讯控股"), ("09988", "阿里巴巴-W"),
@@ -6276,12 +6282,29 @@ def _sm701_market_pool(market):
     return out
 
 
+def _market_today(full=""):
+    """市场“今天”的日期串：crypto 按 UTC 自然日，其余按本机时区。
+
+    v7.5.2：加密 7×24，日K以 UTC 00:00 切日（sm701 crypto 训练口径），
+    不能再用北京日期——否则 00:00~08:00 北京时会把 UTC 当日未完成 bar
+    当成“昨日”写入缓存，或把“应有最新日”多算一天导致每刷必联网。
+    """
+    if full and _market_of(full) == "crypto":
+        return time.strftime("%Y-%m-%d", time.gmtime())
+    return time.strftime("%Y-%m-%d")
+
+
 def _market_last_expected(full):
-    """多市场日K应最新的自然日（周六日回退到周五；crypto 按 UTC 当日）。"""
+    """多市场日K应最新的**已完成**交易日。
+
+    - crypto：UTC 昨日。当日 UTC 日K要到次日 00:00 UTC 才收完，盘中
+      只用于内存实时 bar，不写入日K缓存（避免把半根K当成已收盘）；
+    - 其余市场：周六日回退到周五（本机自然日口径）。
+    """
     import datetime
-    d = datetime.date.today()
     if _market_of(full) == "crypto":
-        return d.strftime("%Y-%m-%d")
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+    d = datetime.date.today()
     while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d.strftime("%Y-%m-%d")
@@ -6531,32 +6554,78 @@ def fetch_market_quote(full):
 
 
 def _get_daily_market(full, tail=None):
-    """多市场日K（hk/us/fu/crypto）：库缓存 → Yahoo → 入库。
+    """多市场日K（hk/us/fu/crypto）：库缓存 → 同源库/Yahoo → 入库。
 
     复用 daily_bars（code 前缀区分市场；vol 单位为股，同市场自洽）；
-    新鲜判定按市场日历（周六日回退周五，crypto 按当日）；yf 返回全历史，
-    差量时整只替换（同源同口径，无接缝风险）。失败回退本地缓存。"""
+    新鲜判定按市场日历（周六日回退周五）；yf 返回全历史，差量时整只替换
+    （同源同口径，无接缝风险）。失败回退本地缓存。
+
+    v7.5.2 加密 UTC：日K缓存只收**已完成**的 UTC 日（UTC 昨日）——当日
+    00:00 UTC 才收完，盘中半根由 analyze 的快照实时 bar 合成，绝不写库；
+    sm70x 副本库落后时用 Yahoo 补齐最新已完成段（原实现副本非空即不再
+    走 Yahoo，crypto 副本停在 11-07 时会每天反复判过期）。"""
     _fstat_inc("calls")
-    today = time.strftime("%Y-%m-%d")
+    mk = _market_of(full)
+    today = _market_today(full)
     fresh = _market_last_expected(full)
     with db_conn() as conn:
         rows = _db_rows(conn, full)
-    need = (not rows or len(rows) < 60 or rows[-1]["date"] < fresh)
+    if mk == "crypto":
+        # 旧版本可能写入 UTC 当日半根日K（本地日期口径），先清掉，避免
+        # 次日被当成“已完成”永久沿用。
+        stale = [r for r in rows if r["date"] >= today]
+        if stale:
+            with db_conn(commit=True) as conn:
+                conn.execute(
+                    "DELETE FROM daily_bars WHERE code=? AND date>=?",
+                    (full, today))
+            rows = [r for r in rows if r["date"] < today]
+    # 每个 UTC 日首次访问：强制回补一次刚收完的 UTC 昨日 bar——兼容旧
+    # 版本留下的半根，也吸收数据源在 00:00 后的最终修订；只拉这一次。
+    _fin = _MKT_FINALIZED.get(full)
+    finalize = bool(mk == "crypto" and rows
+                    and rows[-1]["date"] == fresh
+                    and not (_fin and _fin[0] == today
+                             and time.time() < _fin[1]))
+    need = (not rows or len(rows) < 60 or rows[-1]["date"] < fresh
+            or finalize)
     if rows and not need:
         _fstat_inc("hit")
         return _display_rows(full, rows, tail)
+
+    def _keep(r):
+        """日K是否可入库：crypto 仅已完成 UTC 日；其余收盘后允许今日。"""
+        if mk == "crypto":
+            return r["date"] < today
+        return (r["date"] < today
+                or (_allow_today_bar() and r["date"] == today))
+
     t_pull = time.time()
     info = {}
     try:
         # v6.6.5 同源优先：hk/us/fut 直读 sm701 副本库（训练数据源，特征
-        # 口径与模型一致）；副本无该股 → Yahoo 兜底。crypto 仅 Yahoo。
-        remote = _sm701_market_bars(full)
-        if remote:
+        # 口径与模型一致）；副本无该股/落后 → Yahoo 补齐。crypto 同日K
+        # 只取已完成 UTC 日（副本库较新时仍优先同源）。
+        remote = [r for r in _sm701_market_bars(full) if _keep(r)]
+        if remote and remote[-1]["date"] < fresh:
+            try:
+                yahoo = [r for r in fetch_market_daily(full) if _keep(r)]
+            except Exception as e:
+                flog.info("多市场 Yahoo 补最新失败 %s: %s", full, e)
+                yahoo = []
+            if yahoo:
+                # 重叠日以 sm70x 同源数据为准，Yahoo 只补缺口/更新日。
+                merged = {r["date"]: r for r in remote}
+                for r in yahoo:
+                    merged.setdefault(r["date"], r)
+                remote = [merged[d] for d in sorted(merged)]
+                info["src"] = "sm701副本库+yahoo"
+            else:
+                info["src"] = "sm701副本库"
+        elif remote:
             info["src"] = "sm701副本库"
         else:
-            remote = [r for r in fetch_market_daily(full)
-                      if r["date"] < today or _allow_today_bar()
-                      and r["date"] == today]
+            remote = [r for r in fetch_market_daily(full) if _keep(r)]
             if not remote:
                 raise RuntimeError("多市场空K线")
             info["src"] = _MKT_DAILY_SRC["src"]
@@ -6578,6 +6647,9 @@ def _get_daily_market(full, tail=None):
               r["close"], r["vol"]) for r in remote])
         rows = _db_rows(conn, full)
     _fstat_inc("pull_ok")
+    if mk == "crypto":
+        ok = any(r["date"] >= fresh for r in remote)
+        _MKT_FINALIZED[full] = (today, time.time() + (172800 if ok else 600))
     flog.info("多市场入库 %s 源=%s %d根 合并后=%d根(末日%s) 耗时=%.0fms",
               full, info.get("src") or "?", len(remote), len(rows),
               rows[-1]["date"] if rows else "-",
@@ -8666,11 +8738,13 @@ def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
     return selected
 
 
-def market_phase_text(time_str):
+def market_phase_text(time_str, market=None):
     """行情快照时间(YYYYMMDDHHMMSS...) -> 'HH:MM 市场阶段'。
 
     快照日期非今日时（休市/停牌/数据未更新）标注日期，避免把上一交易日的
-    16:14 显示成"今天已收盘"（时间不匹配的观感问题）。"""
+    16:14 显示成"今天已收盘"（时间不匹配的观感问题）。
+    v7.5.2：crypto 的 Yahoo 快照/日K均为 UTC，按 UTC 日显示 7×24 盘中，
+    不再套 A 股 9:30~15:00 的交易阶段。"""
     s = time_str or ""
     try:
         hhmm = int(s[8:12])
@@ -8678,9 +8752,13 @@ def market_phase_text(time_str):
         return "时间未知"
     hm = f"{hhmm // 100}:{hhmm % 100:02d}"
     snap_d = s[:8].replace("-", "")
-    if (len(snap_d) == 8 and snap_d.isdigit()
-            and snap_d != time.strftime("%Y%m%d")):
-        return f"{snap_d[4:6]}-{snap_d[6:8]} {hm} 收盘（快照非今日）"
+    today = (_market_today("crypto") if market == "crypto"
+             else time.strftime("%Y-%m-%d")).replace("-", "")
+    if (len(snap_d) == 8 and snap_d.isdigit() and snap_d != today):
+        suffix = "行情" if market and market != "cn" else "收盘"
+        return f"{snap_d[4:6]}-{snap_d[6:8]} {hm} {suffix}（快照非今日）"
+    if market == "crypto":
+        return hm + " UTC 盘中（7×24）"
     if hhmm < 915:
         return hm + " 盘前"
     if hhmm < 925:
@@ -11670,7 +11748,12 @@ def _calculate_confidence(levels):
 def _multi_day_prediction(o_today, levels, max_days=10, lim=None):
     """多日预测：基于样本的统计分布，预测T+1到T+max_days的走势。
     带均值回归修正：长期预测向零回归，减少累积误差。
-    使用动态三级权重 + 样本质量权重。"""
+    使用动态三级权重 + 样本质量权重。
+
+    v7.5.1：累计高/低改为「按样本路径取分位」——对每个历史样本把
+    1..d 日的收盘乘成路径、逐日记录路径最高/最低，再在样本间取
+    P75 高 / P25 低；不再把每日分位连乘（P75×P75×… 不是累计 P75，
+    会把 T+5/T+10 幽灵K的影线放得过大）。日线 cl/hi/lo 分位保留原口径。"""
     LW = _dynamic_lv_weights(levels)
     tot_w = sum(LW.get(k, 0.0) for k, _ in levels) or 1.0
 
@@ -11688,10 +11771,52 @@ def _multi_day_prediction(o_today, levels, max_days=10, lim=None):
                 w = lw / len(smp) if smp else 0
                 pairs.extend((s[field], w) for s in smp if s.get(field) is not None)
         return pairs
-    
+
+    # 逐样本路径：收盘乘数、路径最高/最低（含起点，保证高≥开、低≤开）。
+    # 单日收益先按当前标的涨跌停钳制，避免跨板样本把路径拉出非法幅度。
+    def _path_pairs():
+        out = {d: {"cl": [], "hi": [], "lo": []}
+               for d in range(1, max_days + 1)}
+        for k, smp in levels:
+            lw = LW.get(k, 0.0) / tot_w
+            if not smp:
+                continue
+            if CFG.SIMILARITY_WEIGHTING:
+                tw = sum(s.get("weight", 1.0) for s in smp) or 1.0
+                weighted = [(s, lw * s.get("weight", 1.0) / tw)
+                            for s in smp]
+            else:
+                w = lw / len(smp)
+                weighted = [(s, w) for s in smp]
+            for s, w in weighted:
+                close_mult = 1.0
+                hi_mult = 1.0
+                lo_mult = 1.0
+                for d in range(1, max_days + 1):
+                    cl = s.get(f"n{d}_cl")
+                    if cl is None:
+                        break
+                    hi = s.get(f"n{d}_hi")
+                    lo = s.get(f"n{d}_lo")
+                    hi = cl if hi is None else hi
+                    lo = cl if lo is None else lo
+                    if lim and lim > 0:
+                        cl = min(max(cl, -lim), lim)
+                        hi = min(max(hi, cl), lim)
+                        lo = max(min(lo, cl), -lim)
+                    prev_mult = close_mult
+                    close_mult = prev_mult * (1.0 + cl)
+                    hi_mult = max(hi_mult, (1.0 + hi) * prev_mult)
+                    lo_mult = min(lo_mult, (1.0 + lo) * prev_mult)
+                    out[d]["cl"].append((close_mult - 1.0, w))
+                    out[d]["hi"].append((hi_mult - 1.0, w))
+                    out[d]["lo"].append((lo_mult - 1.0, w))
+        return out
+
+    cum_pairs = _path_pairs()
     PS = (10, 25, 50, 75, 90)
     multi_pred = []
-    
+
     for d in range(1, max_days + 1):
         cl_field = f"n{d}_cl"
         hi_field = f"n{d}_hi"
@@ -11742,29 +11867,40 @@ def _multi_day_prediction(o_today, levels, max_days=10, lim=None):
         decay = 1.0 - 0.04 * (d - 1)
         decay = max(0.6, decay)
         
-        # 计算累计涨跌幅
-        if d == 1:
-            day_pred["cum_cl"] = day_pred["cl"][50]
-            day_pred["cum_hi"] = day_pred["hi"][75]
-            day_pred["cum_lo"] = day_pred["lo"][25]
+        # 累计涨跌幅：优先用样本路径分位（P50 收 / P75 路径高 / P25 路径低）；
+        # 路径缺失时回退旧口径（逐日分位连乘），保证表格不空。
+        cp = cum_pairs.get(d) or {}
+        if cp.get("cl"):
+            day_pred["cum_cl_raw"] = wpct(cp["cl"], 50)
+            day_pred["cum_hi_raw"] = (wpct(cp["hi"], 75)
+                                      if cp.get("hi")
+                                      else day_pred["cum_cl_raw"])
+            day_pred["cum_lo_raw"] = (wpct(cp["lo"], 25)
+                                      if cp.get("lo")
+                                      else day_pred["cum_cl_raw"])
+        elif d == 1:
+            day_pred["cum_cl_raw"] = day_pred["cl"][50]
+            day_pred["cum_hi_raw"] = day_pred["hi"][75]
+            day_pred["cum_lo_raw"] = day_pred["lo"][25]
         else:
             prev = multi_pred[-1]
-            day_pred["cum_cl"] = (1 + prev["cum_cl"]) * (1 + day_pred["cl"][50]) - 1
-            day_pred["cum_hi"] = (1 + prev["cum_hi"]) * (1 + day_pred["hi"][75]) - 1
-            day_pred["cum_lo"] = (1 + prev["cum_lo"]) * (1 + day_pred["lo"][25]) - 1
-        
+            day_pred["cum_cl_raw"] = (
+                (1 + prev["cum_cl_raw"]) * (1 + day_pred["cl"][50]) - 1)
+            day_pred["cum_hi_raw"] = (
+                (1 + prev["cum_hi_raw"]) * (1 + day_pred["hi"][75]) - 1)
+            day_pred["cum_lo_raw"] = (
+                (1 + prev["cum_lo_raw"]) * (1 + day_pred["lo"][25]) - 1)
+
         # 应用均值回归修正
-        day_pred["cum_cl_raw"] = day_pred["cum_cl"]
-        day_pred["cum_cl"] = day_pred["cum_cl"] * decay
-        day_pred["cum_hi"] = day_pred["cum_hi"] * decay
-        day_pred["cum_lo"] = day_pred["cum_lo"] * decay
-        
+        day_pred["cum_cl"] = day_pred["cum_cl_raw"] * decay
+        day_pred["cum_hi"] = day_pred["cum_hi_raw"] * decay
+        day_pred["cum_lo"] = day_pred["cum_lo_raw"] * decay
+
         # 预测价格
         day_pred["price_cl"] = o_today * (1 + day_pred["cum_cl"])
         day_pred["price_hi"] = o_today * (1 + day_pred["cum_hi"])
         day_pred["price_lo"] = o_today * (1 + day_pred["cum_lo"])
-        # 多日价格一致性：cum_hi取hi75、cum_lo取lo25，趋势相反时
-        # 会出现 price_hi<price_cl / price_lo>price_cl，钳制保证表格自洽。
+        # 多日价格一致性：路径高/低理论上已包住收盘，浮点/衰减后仍显式钳制。
         day_pred["price_hi"] = max(day_pred["price_hi"], day_pred["price_cl"])
         day_pred["price_lo"] = min(day_pred["price_lo"], day_pred["price_cl"])
         
@@ -11786,9 +11922,10 @@ def _build_ghosts(o_today, multi_pred):
             idx = int(label[2:]) - 2
             if 0 <= idx < len(multi_pred):
                 o = multi_pred[idx]["price_cl"]      # 前一预测日收盘为开
-        hi = day_pred.get("price_hi") or day_pred["close"]
-        lo = day_pred.get("price_lo") or day_pred["close"]
-        cl = day_pred.get("price_cl") or day_pred["close"]
+        cl = (day_pred.get("price_cl")
+              or (day_pred.get("cl") or {}).get(50) or 0)
+        hi = day_pred.get("price_hi") or cl
+        lo = day_pred.get("price_lo") or cl
         hi = max(hi, o, cl)
         lo = min(lo, o, cl)
         return {"date": f"{label}预测", "open": round(o, 2),
@@ -11864,7 +12001,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     q = _quote_ensure(q, rows[-1]["close"] if rows else 0.0)
 
     # 识别今日盘中bar（缓存库只存已收盘日K，实时bar由快照合成）
-    today_str = time.strftime("%Y-%m-%d")
+    mk = _market_of(full)
+    today_str = _market_today(full)
     today_compact = today_str.replace("-", "")
     live = None
     snap_full = (q.get("time") or "")
@@ -11873,18 +12011,25 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         hhmm = int(snap_full[8:12])
     except ValueError:
         hhmm = 0
-    # 盘中 live 仅限连续竞价（9:30~15:00）；9:15~9:30 集合竞价/撮合阶段
-    # 没有真实日K，不能再合成 T 日 bar（否则 T 日 K 提前上色，预测错位一天）
-    if (snap_d == today_compact and q["price"] > 0 and 930 <= hhmm < 1500):
+    # A股/港美期：盘中 live 仅限连续竞价（9:30~15:00）；9:15~9:30 集合
+    # 竞价/撮合阶段没有真实日K，不能再合成 T 日 bar（否则 T 日 K 提前上色，
+    # 预测错位一天）。crypto 7×24：Yahoo 时间戳为 UTC，UTC 当日任何时刻
+    # 都可合成实时 bar（v7.5.2）。
+    live_ok = bool(snap_d == today_compact and q["price"] > 0)
+    if mk != "crypto":
+        live_ok = live_ok and 930 <= hhmm < 1500
+    if live_ok and not (rows and rows[-1]["date"] == today_str):
         pc0 = q["prev_close"] or (rows[-1]["close"] if rows else 0)
         lo0 = q["low"] if q["low"] > 0 else min(q["price"], q["open"] or q["price"])
         live = {"date": today_str, "open": q["open"] or pc0,
                 "close": q["price"],
                 "high": max(q["high"], q["price"]),
                 "low": min(lo0, q["price"]), "vol": 0.0}
-    had_today_bar = live is not None
-    post_close = bool(snap_d == today_compact and q["price"] > 0
-                      and hhmm >= 1500)      # 已收盘：快照为今日最终价
+    had_today_bar = bool(live is not None
+                         or (rows and rows[-1]["date"] == today_str))
+    # crypto 无收盘概念；今日 UTC 日K由实时 bar 表示，不算 post_close。
+    post_close = bool(mk != "crypto" and snap_d == today_compact
+                      and q["price"] > 0 and hhmm >= 1500)
     if len(rows) < 30:
         raise ValueError(
             f"该股上市不足30个交易日(现仅{len(rows)}根日K)，"
@@ -11996,7 +12141,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     snap_d = (q.get("time") or "")[:8].replace("-", "")
     today_compact = today_str.replace("-", "")
     now_hm = time.strftime("%H%M")
-    session_today = _today_is_session() is not False
+    session_today = (True if mk == "crypto"
+                     else _today_is_session() is not False)
     # 快照时间缺失（无网合成快照/残缺批量源）时没有日期可判盘前：
     # 工作日未到 15:00 且日K尚无今日bar → 按"今日尚未有行情"处理并锚昨收。
     # 否则 08:55 盘前会漏判成收盘后，T 日预测/幽灵K被错标成 T+1。
@@ -12025,8 +12171,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         anchor = "今收"
     gap_today = (o_today / prev_close - 1) * 100
 
-    # 市场阶段（按行情快照时间）
-    phase = market_phase_text(q.get("time"))
+    # 市场阶段（按行情快照时间；crypto 用 UTC 7×24 口径）
+    phase = market_phase_text(q.get("time"), _market_of(full))
     # 标签必须跟 pred 的实际目标一致：盘前/盘中共用「今日(T)」，
     # 收盘后/非今日快照才是下一交易日，避免把 T 日预测写成 T+1。
     next_label = ("今日(T)" if ((pre_open or live is not None)
@@ -14471,7 +14617,8 @@ from external.sm701_ext import (  # noqa: E402,F401
     _sm701_cache_epoch, _sm701_code, _sm701_conn, _sm701_module,
     _sm701_predict_feats, _sm701_live_one, _sm701_live_predict,
     _sm701_read_bars, _sm701_stock_info, sm701_has_model, sm701_market_pool,
-    sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status)
+    sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status,
+    sm70x_series)
 from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
@@ -16356,14 +16503,40 @@ def fetch_ai_models(api_key: str, base_url: str = "", timeout: int = 20) -> list
     return sorted(set(out))
 
 
-# ================= DeepSeek Search（AI 分析自动联网资讯） =================
+# ================= 联网检索（AI 分析自动资讯；DeepSeek 官方 + 多引擎） =================
 # 文档：https://api-docs.deepseek.com/guides/search
-# 仅官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关走 Google News RSS 兜底。
+# DeepSeek 官方接口提供 /v1/tools/search；其他 OpenAI 兼容网关走多引擎检索。
+# 多引擎检索移植自 ai-quant/scripts/foreign_search.py（quant 侧验证过的检索栈）：
+# 必应主搜索 + Google News / DuckDuckGo + WSJ/Investing 财经 RSS，纯标准库，
+# 复用 _open_url 的代理优先/直连兜底，结果统一压成既有 title/summary/date 结构。
 AI_SEARCH_COUNT = 5
-AI_SEARCH_TTL = 1800          # 同股资讯缓存 30 分钟（避免重复计费）
+AI_SEARCH_TTL = 1800          # 同股资讯缓存 30 分钟（避免重复检索）
 AI_SEARCH_FAIL_TTL = 300      # 失败/空结果缓存 5 分钟，网络恢复后尽快重试
 _AI_SEARCH_CACHE = {}         # code -> {"exp": float, "txt": str}
 _AI_SEARCH_LOCK = threading.Lock()
+
+# 个股/新闻查询用搜索引擎（RSS 源不按检索词过滤，不参与个股查询）
+AI_SEARCH_ENGINES = ("bing", "google-news", "duckduckgo")
+# 宏观/地缘环境用完整 quant 栈（财经 RSS 提供最新市场流）
+AI_SEARCH_MACRO_ENGINES = ("bing", "wsj", "investing", "google-news",
+                           "duckduckgo")
+_AI_SEARCH_RSS = {
+    "wsj": [
+        ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+         "WSJ Markets"),
+        ("https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
+         "WSJ World"),
+        ("https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+         "WSJ Business"),
+    ],
+    "investing": [
+        ("https://www.investing.com/rss/news.rss", "Investing All"),
+        ("https://www.investing.com/rss/news_25.rss", "Investing Stocks"),
+        ("https://www.investing.com/rss/news_14.rss", "Investing Forex"),
+        ("https://www.investing.com/rss/news_20.rss",
+         "Investing Commodities"),
+    ],
+}
 
 
 def _ai_is_deepseek(base_url="") -> bool:
@@ -16399,84 +16572,413 @@ def _ai_thinking_params(thinking=None, effort=None) -> dict:
     return {"thinking": {"type": "enabled"}, "reasoning_effort": eff}
 
 
-def _gnrss_search(query, count=AI_SEARCH_COUNT, timeout=12):
-    """免 Key 兜底联网检索：Google News RSS（同 DeepSeek Search 结果结构）。
-    DeepSeek 官方缓存已带上代理优先，此处复用同一代理/直连策略。"""
-    import xml.etree.ElementTree as ET
-    import email.utils as _em
+def _ai_srch_query(q):
+    """清理检索词：去掉 after:/before:（时效改由 days 控制）并压缩空白。"""
+    q = re.sub(r"\b(?:after|before):\S+", " ", str(q or ""))
+    return re.sub(r"\s+", " ", q).strip()[:128]
 
-    u = ("https://news.google.com/rss/search?q="
-         + urllib.parse.quote(query)
-         + "&hl=zh-CN&gl=CN&ceid=CN:zh")
-    openers = ([_PROXY_OPENER]
-               if _PROXY_OPENER is not None and not _proxy_dead() else []) \
-        + [urllib.request.build_opener()]
-    raw = None
-    last = None
-    for op in openers:
-        try:
-            req = urllib.request.Request(u, headers={
-                "User-Agent": AI_UA,
-                "Accept": "application/rss+xml,text/xml,*/*"})
-            with op.open(req, timeout=timeout) as r:
-                raw = r.read().decode("utf-8", "replace")
-            break
-        except Exception as e:
-            last = e
+
+def _ai_srch_cjk(q):
+    return bool(re.search(r"[\u4e00-\u9fff]", q or ""))
+
+
+def _ai_srch_text(raw):
+    """HTML/XML 片段转纯文本（去脚本/样式/标签 + 反转义）。"""
+    import html as _html
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", raw or "",
+                  flags=re.S | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text,
+                  flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", _html.unescape(text)).strip()
+
+
+def _ai_srch_clean_url(url):
+    """还原 Bing /url?q=、/ck/a?u=a1... 与 DDG /l/?uddg= 跳转链接。"""
+    import base64
+    import html as _html
+    url = _html.unescape(str(url or "")).strip()
+    if url.startswith("/url?q="):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        url = (qs.get("q") or [""])[0]
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.netloc.endswith("duckduckgo.com") and p.path.startswith("/l/"):
+            url = (urllib.parse.parse_qs(p.query).get("uddg") or [""])[0] \
+                or url
+    except Exception:
+        pass
+    try:
+        p = urllib.parse.urlparse(url)
+        if "bing.com" in p.netloc and p.path.startswith("/ck/"):
+            u = (urllib.parse.parse_qs(p.query).get("u") or [""])[0]
+            if u.startswith("a1"):
+                raw = u[2:]
+                raw += "=" * (-len(raw) % 4)
+                url = base64.urlsafe_b64decode(
+                    raw).decode("utf-8", "replace")
+    except Exception:
+        pass
+    return url
+
+
+def _ai_srch_site(link, fallback=""):
+    try:
+        host = (urllib.parse.urlsplit(link).hostname or "").lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host or fallback
+
+
+_AI_SRCH_STOP = ("最新消息", "最新", "消息", "公告", "业绩", "新闻", "行情",
+                 "走势", "宏观", "市场影响", "相关", "今日", "今天")
+
+
+def _ai_srch_score(q, text):
+    """检索词覆盖率（0~1）：中文按 2 字滑窗、英文按词，长词权重更高。
+    用于把「贵州省百科」这类只命中半个词的泛结果排到相关新闻之后。"""
+    text = str(text or "").lower()
+    if not text:
+        return 0.0
+    ql = str(q or "").lower()
+    for w in _AI_SRCH_STOP:
+        ql = ql.replace(w, " ")
+    ql = re.sub(r"[^\w\u4e00-\u9fff]+", " ", ql)
+    total = hit = 0
+    for w in ql.split():
+        if re.fullmatch(r"[\u4e00-\u9fff]+", w):
+            parts = ([w] if len(w) <= 2
+                     else [w[i:i + 2] for i in range(len(w) - 1)])
+        else:
+            parts = [w] if len(w) >= 2 else []
+        for part in parts:
+            total += len(part)
+            if part in text:
+                hit += len(part)
+    return (hit / total) if total else 0.0
+
+
+def _ai_srch_parse_bing(raw):
+    out = []
+    for m in re.finditer(r'<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>(.*?)</li>',
+                         raw or "", flags=re.S | re.I):
+        block = m.group(1)
+        am = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                       block, flags=re.S | re.I)
+        if not am:
             continue
-    if not raw:
-        raise last or RuntimeError("联网检索失败")
+        url = _ai_srch_clean_url(am.group(1))
+        title = _ai_srch_text(am.group(2))
+        sm = re.search(r'<p[^>]*>(.*?)</p>', block, flags=re.S | re.I)
+        summary = _ai_srch_text(sm.group(1)) if sm \
+            else _ai_srch_text(block)[:300]
+        if title and url.startswith("http"):
+            out.append({"title": title, "url": url, "summary": summary,
+                        "engine": "bing"})
+    return out
 
-    def _parse(xml):
-        def _iso(dstr):
+
+def _ai_srch_parse_ddg(raw):
+    out = []
+    for m in re.finditer(
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>'
+            r'(.*?)</a>(.*?)(?=<a[^>]+class="[^"]*result__a|$)',
+            raw or "", flags=re.S | re.I):
+        url = _ai_srch_clean_url(m.group(1))
+        title = _ai_srch_text(m.group(2))
+        block = m.group(3) or ""
+        sm = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</',
+                       block, flags=re.S | re.I)
+        summary = _ai_srch_text(sm.group(1)) if sm \
+            else _ai_srch_text(block)[:300]
+        if title and url.startswith("http"):
+            out.append({"title": title, "url": url, "summary": summary,
+                        "engine": "duckduckgo"})
+    return out
+
+
+def _ai_srch_parse_ddg_lite(raw):
+    out = []
+    for m in re.finditer(
+            r'<a[^>]+href="([^"]+)"[^>]*class=[\'"][^\'"]*result-link[^\'"]*'
+            r'[\'"][^>]*>(.*?)</a>', raw or "", flags=re.S | re.I):
+        url = _ai_srch_clean_url(m.group(1))
+        title = _ai_srch_text(m.group(2))
+        if title and url.startswith("http"):
+            out.append({"title": title, "url": url, "summary": "",
+                        "engine": "duckduckgo"})
+    return out
+
+
+def _ai_srch_date(pub):
+    import email.utils as _em
+    pub = (pub or "").strip()
+    try:
+        return _em.parsedate_to_datetime(pub).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", pub)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return ""
+
+
+def _ai_srch_parse_google_news(raw):
+    import xml.etree.ElementTree as ET
+    out = []
+    try:
+        root = ET.fromstring(raw or "")
+    except Exception:
+        return out
+    for item in root.iter("item"):
+        title = _ai_srch_text(item.findtext("title") or "")
+        link = (item.findtext("link") or "").strip()
+        desc = _ai_srch_text(item.findtext("description") or "")
+        source = _ai_srch_text(item.findtext("source") or "")
+        if source and title.endswith(" - " + source):
+            title = title[:-len(source) - 3].strip()
+        if desc and source and desc.endswith(source):
+            desc = desc[:-len(source)].strip()
+        if title and link.startswith("http"):
+            out.append({"title": title, "url": link,
+                        "summary": desc[:600],
+                        "date": _ai_srch_date(item.findtext("pubDate")),
+                        "site": source[:40], "engine": "google-news"})
+    return out
+
+
+def _ai_srch_parse_rss(raw, engine, source_name=""):
+    """通用 RSS 2.0 解析（WSJ/Investing 等财经源共用）。"""
+    import xml.etree.ElementTree as ET
+    out = []
+    try:
+        root = ET.fromstring(raw or "")
+    except Exception:
+        return out
+    for item in root.iter("item"):
+        title = _ai_srch_text(item.findtext("title") or "")
+        link = (item.findtext("link") or "").strip()
+        desc = _ai_srch_text(item.findtext("description") or "")
+        if title and link.startswith("http"):
+            out.append({"title": title, "url": link,
+                        "summary": desc[:600],
+                        "date": _ai_srch_date(item.findtext("pubDate")),
+                        "site": source_name or engine, "engine": engine})
+    return out
+
+
+def _ai_srch_parse(engine, raw):
+    if engine == "google-news":
+        return _ai_srch_parse_google_news(raw)
+    if engine == "duckduckgo":
+        return _ai_srch_parse_ddg(raw) or _ai_srch_parse_ddg_lite(raw)
+    if engine == "bing":
+        return _ai_srch_parse_bing(raw)
+    return []
+
+
+def _ai_srch_engine_url(engine, q, count, days, cjk):
+    if engine == "google-news":
+        loc = ("hl=zh-CN&gl=CN&ceid=CN:zh" if cjk
+               else "hl=en-US&gl=US&ceid=US:en")
+        return ("https://news.google.com/rss/search?q="
+                + urllib.parse.quote_plus(f"{q} when:{days}d")
+                + "&" + loc)
+    if engine == "bing":
+        return ("https://www.bing.com/search?q="
+                + urllib.parse.quote_plus(q)
+                + f"&count={max(10, count)}&setlang="
+                + ("zh-Hans" if cjk else "en"))
+    if engine == "duckduckgo":
+        df = "d" if days <= 1 else "w" if days <= 7 else "m"
+        return ("https://html.duckduckgo.com/html/?q="
+                + urllib.parse.quote_plus(q) + f"&df={df}")
+    return ""
+
+
+def _ai_srch_fetch(url, timeout):
+    """检索请求：复用 _open_url 的代理优先/直连兜底，返回解码文本。"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": AI_UA,
+        "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                   "q=0.9,*/*;q=0.8"),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+    })
+    raw = _open_url(req, url, timeout)
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _ai_srch_recent(date, days):
+    """RSS 条目是否在近 N 天内；无日期/解析失败时保留（无法判断）。"""
+    d = str(date or "")[:10]
+    if not d:
+        return True
+    try:
+        dt = datetime.date.fromisoformat(d)
+    except ValueError:
+        return True
+    return dt >= datetime.date.today() - datetime.timedelta(days=days)
+
+
+def _ai_srch_rss(engine, timeout, per_feed, days=7):
+    """并行抓取一组财经 RSS（WSJ/Investing），按日期排序并按 days 过滤。"""
+    feeds = _AI_SEARCH_RSS.get(engine) or []
+    if not feeds:
+        return []
+    out = []
+    with ThreadPoolExecutor(max_workers=min(4, len(feeds))) as ex:
+        futs = {ex.submit(_ai_srch_fetch, url, timeout): name
+                for url, name in feeds}
+        for fut in as_completed(futs):
+            name = futs[fut]
             try:
-                return _em.parsedate_to_datetime(dstr).strftime("%Y-%m-%d")
-            except Exception:
-                return (dstr or "")[:10]
+                rows = _ai_srch_parse_rss(fut.result(), engine, name)
+            except Exception as e:
+                log.info("联网检索 %s(%s) 失败: %s", engine, name, e)
+                continue
+            rows = [r for r in rows if _ai_srch_recent(r.get("date"), days)]
+            rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+            out.extend(rows[:per_feed])
+    out.sort(key=lambda r: r.get("date") or "", reverse=True)
+    return out
 
-        items = []
-        for it in ET.fromstring(xml).iter("item"):
-            title = re.sub(r"\s+", " ", (it.findtext("title") or "")).strip()
-            link = (it.findtext("link") or "").strip()
-            date = _iso((it.findtext("pubDate") or "").strip())
-            src_el = it.find("source")
-            site = (src_el.text or "").strip() if src_el is not None else ""
-            desc = re.sub(r"<[^>]+>", " ", (it.findtext("description") or ""))
-            snippet = re.sub(r"\s+", " ", desc).strip()
-            items.append({"title": title, "summary": snippet,
-                          "snippet": snippet, "date": date,
-                          "site_name": site, "link": link})
-            if len(items) >= max(1, count):
+
+def _ai_srch_engine(engine, q, count, days, cjk, timeout):
+    """单引擎检索；失败重试一次，DDG 空结果再降级到 lite 版。"""
+    url = _ai_srch_engine_url(engine, q, count, days, cjk)
+    if not url:
+        return []
+    rows = []
+    for attempt in range(2):
+        try:
+            rows = _ai_srch_parse(engine, _ai_srch_fetch(url, timeout))
+        except Exception as e:
+            log.info("联网检索 %s 失败(%d/2): %s", engine, attempt + 1, e)
+            rows = []
+        if rows:
+            break
+        time.sleep(0.4)
+    if engine == "duckduckgo" and not rows:
+        try:
+            lite = ("https://lite.duckduckgo.com/lite/?q="
+                    + urllib.parse.quote_plus(q)
+                    + ("&df=d" if days <= 1 else
+                       "&df=w" if days <= 7 else "&df=m"))
+            rows = _ai_srch_parse_ddg_lite(
+                _ai_srch_fetch(lite, timeout))
+        except Exception as e:
+            log.info("联网检索 duckduckgo-lite 失败: %s", e)
+    return rows
+
+
+def ai_foreign_search(query, engines=None, count=AI_SEARCH_COUNT, days=7,
+                      timeout=10):
+    """多引擎联网检索（移植 quant 的 foreign_search 检索栈）。
+
+    引擎：bing（主搜索）/ google-news / duckduckgo / wsj / investing。
+    各引擎并行抓取，按检索词覆盖率 + 日期排序、URL 去重；财经 RSS 只作
+    补充（每次最多约 1/4 条），避免无关头条刷屏。
+    返回 [{title, summary, snippet, date, site_name, link, engine}]。
+    任何引擎失败都只跳过该源，全部失败返回 []。"""
+    q = _ai_srch_query(query)
+    if not q:
+        return []
+    count = max(1, min(20, int(count or AI_SEARCH_COUNT)))
+    days = max(1, min(365, int(days or 7)))
+    timeout = max(3.0, min(30.0, float(timeout or 10)))
+    engines = [str(e).strip().lower() for e in
+               (engines or AI_SEARCH_ENGINES) if str(e).strip()]
+    if not engines:
+        engines = list(AI_SEARCH_ENGINES)
+    cjk = _ai_srch_cjk(q)
+    buckets = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(engines))) as ex:
+        futs = {}
+        for engine in engines:
+            if engine in _AI_SEARCH_RSS:
+                fut = ex.submit(_ai_srch_rss, engine, timeout,
+                                max(3, count // 2), days)
+            else:
+                fut = ex.submit(_ai_srch_engine, engine, q, count, days,
+                                cjk, timeout)
+            futs[fut] = engine
+        for fut in as_completed(futs):
+            engine = futs[fut]
+            try:
+                buckets[engine] = fut.result() or []
+            except Exception as e:
+                log.info("联网检索 %s 失败: %s", engine, e)
+                buckets[engine] = []
+    # 全局按检索词覆盖率排序（同分按日期，再按引擎顺序）：
+    # 非 RSS 结果用实际覆盖率；RSS 财经流不按检索词过滤，给固定中性分
+    # 0.4（高于半词垃圾、低于命中部分关键词的新闻），并限制补充条数。
+    scored = []
+    for engine in engines:
+        is_rss = engine in _AI_SEARCH_RSS
+        for row in buckets.get(engine) or []:
+            if is_rss:
+                sc = 0.4
+            else:
+                sc = _ai_srch_score(
+                    q, str(row.get("title") or "") + " "
+                    + str(row.get("summary") or row.get("snippet") or ""))
+            scored.append((sc, str(row.get("date") or ""), is_rss, row))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    out, seen, low = [], set(), 0
+    rss_cap = max(1, count // 4)
+    rss_n = 0
+    for _sc, _date, is_rss, row in scored:
+        # 低相关度（半词命中）最多补 2 条，避免「贵州省旅游」这类泛结果
+        # 把结果列表刷满；RSS 财经流最多补 count/4 条。
+        if is_rss:
+            if rss_n >= rss_cap:
+                continue
+        elif _sc < 0.5:
+            if low >= 2:
                 break
-        return items
-
-    items = _parse(raw)
-    if not items:
-        # 0 条时自动简化检索词重试一次（去掉 after: 与引号等强约束）
-        q2 = re.sub(r"after:\S+", "", query).replace('"', " ").strip()
-        if q2 and q2 != query:
-            u2 = ("https://news.google.com/rss/search?q="
-                  + urllib.parse.quote(q2)
-                  + "&hl=zh-CN&gl=CN&ceid=CN:zh")
-            for op in openers:
-                try:
-                    req = urllib.request.Request(u2, headers={
-                        "User-Agent": AI_UA,
-                        "Accept": "application/rss+xml,text/xml,*/*"})
-                    with op.open(req, timeout=timeout) as r:
-                        items = _parse(r.read().decode("utf-8", "replace"))
-                    break
-                except Exception as e:
-                    last = e
-                    continue
-            items = items or []
-    return items
+            low += 1
+        title = re.sub(r"\s+", " ",
+                       str(row.get("title") or "")).strip()
+        summary = re.sub(r"\s+", " ",
+                         str(row.get("summary")
+                             or row.get("snippet") or "")).strip()
+        link = str(row.get("url") or row.get("link") or "").strip()
+        if not title and not summary:
+            continue
+        key = (re.sub(r"[?#].*$", "", link).lower().rstrip("/")
+               if link else title.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if is_rss:
+            rss_n += 1
+        site = str(row.get("site") or row.get("site_name") or "")
+        out.append({
+            "title": title, "summary": summary, "snippet": summary,
+            "date": str(row.get("date") or "")[:10],
+            "site_name": site[:40] or _ai_srch_site(link),
+            "link": link, "url": link,
+            "engine": str(row.get("engine") or ""),
+        })
+        if len(out) >= count:
+            return out
+    return out
 
 
 def deepseek_search(api_key, query, count=AI_SEARCH_COUNT, timeout=12,
-                    base_url=""):
+                    base_url="", days=7, engines=None):
     """联网检索（纯标准库）。DeepSeek 官方 → /v1/tools/search；
-    其他 OpenAI 兼容网关（opencode-go 等）→ Google News RSS 免 Key 兜底。
+    其他 OpenAI 兼容网关（opencode-go 等）→ quant 多引擎检索（免 Key）。
     返回 results 列表；网络异常抛给调用方兜底，静默失败返回 []。"""
     q = (query or "").strip()
     if not q:
@@ -16490,13 +16992,14 @@ def deepseek_search(api_key, query, count=AI_SEARCH_COUNT, timeout=12,
             return rs
         return []          # DeepSeek 官方正常响应但无结果：不再兜底
     if not url and not _ai_is_deepseek(base_url):
-        # 非 DeepSeek 官方（例如 opencode-go）→ RSS 兜底，不需要 Key
-        return _gnrss_search(q, count, timeout)
+        # 非 DeepSeek 官方（例如 opencode-go）→ 多引擎检索，不需要 Key
+        return ai_foreign_search(q, engines=engines, count=count,
+                                 days=days, timeout=timeout)
     return []
 
 
 def _fmt_search_results(results, limit=None):
-    """把 Search API 结果压成适合塞进 prompt 的短文本。"""
+    """把 Search API / 多引擎结果压成适合塞进 prompt 的短文本。"""
     lines = []
     for i, r in enumerate((results or [])[:limit or AI_SEARCH_COUNT], 1):
         if not isinstance(r, dict):
@@ -16508,8 +17011,9 @@ def _fmt_search_results(results, limit=None):
             continue
         if len(summary) > 360:
             summary = summary[:360].rstrip() + "…"
-        meta = "，".join(x for x in (str(r.get("date") or "")[:10],
-                                     str(r.get("site_name") or "").strip())
+        site = (str(r.get("site_name") or "").strip()
+                or _ai_srch_site(str(r.get("link") or r.get("url") or "")))
+        meta = "，".join(x for x in (str(r.get("date") or "")[:10], site)
                          if x)
         line = f"{i}. {title or summary[:40]}"
         if meta:
@@ -16520,16 +17024,19 @@ def _fmt_search_results(results, limit=None):
     return "\n".join(lines)
 
 
-def ai_stock_news(code="", name="", timeout=12):
-    """AI 分析前自动检索个股近期资讯（DeepSeek Search）。
+def ai_stock_news(code="", name="", timeout=12, enabled=None):
+    """AI 分析前自动检索个股近期资讯（官方 Search / quant 多引擎）。
 
-    返回可直接拼入 prompt 的格式化文本；未开启/非官方接口/无 Key/失败均返回
-    空串，绝不阻断分析。同股 30 分钟内复用缓存，避免重复请求计费。"""
+    enabled=None 读 ini；AI Agent 会话内“联网”开关可显式传入。
+    返回可直接拼入 prompt 的格式化文本；未开启/无结果/失败均返回空串，
+    绝不阻断分析。同股 30 分钟内复用缓存，避免重复检索。"""
     ck = (code or name or "").strip()
-    if not ck or not _ai_web_search_enabled():
+    if enabled is None:
+        enabled = _ai_web_search_enabled()
+    if not ck or not enabled:
         return ""
     key = get_ai_key()
-    # 非官方网关（opencode-go 等）也走免 Key RSS 兜底，不再拒单
+    # 非官方网关（opencode-go 等）走 quant 多引擎检索，不需要 Key
     now = time.time()
     with _AI_SEARCH_LOCK:
         ent = _AI_SEARCH_CACHE.get(ck)
@@ -16546,11 +17053,12 @@ def ai_stock_news(code="", name="", timeout=12):
                               "最新消息 公告 业绩", f"after:{since}") if x])
     txt = ""
     try:
-        results = deepseek_search(key, q, timeout=timeout)
+        results = deepseek_search(key, q, timeout=timeout, days=30,
+                                  engines=AI_SEARCH_ENGINES)
         txt = _fmt_search_results(results)
         log.info("联网检索 %s：%d 条资讯", ck, len(results or []))
     except Exception as e:
-        log.warning("DeepSeek 联网检索失败(忽略): %s", e)
+        log.warning("联网检索失败(忽略): %s", e)
     ttl = AI_SEARCH_TTL if txt else AI_SEARCH_FAIL_TTL
     with _AI_SEARCH_LOCK:
         _AI_SEARCH_CACHE[ck] = {"exp": now + ttl, "txt": txt}
@@ -17447,7 +17955,11 @@ def _ai_tool_prediction(ctx, args):
                 "lo25": round(d["lo"][25], 2),
                 "up_prob": round(d.get("up_prob") or 0, 3),
                 "cum_cl_pct": round((d.get("cum_cl") or 0) * 100, 2),
+                "cum_hi_pct": round((d.get("cum_hi") or 0) * 100, 2),
+                "cum_lo_pct": round((d.get("cum_lo") or 0) * 100, 2),
                 "price_cl": round(d.get("price_cl") or 0, 2),
+                "price_hi": round(d.get("price_hi") or 0, 2),
+                "price_lo": round(d.get("price_lo") or 0, 2),
             })
         except (KeyError, TypeError):
             continue
@@ -17458,6 +17970,8 @@ def _ai_tool_prediction(ctx, args):
         "today_up_prob": tp.get("up_prob"),
         "next_day": res.get("pred"),
         "t5": res.get("t5_pred"),
+        "multi_day_note": ("最高/最低为 1..N 日路径累计 P75/P25；"
+                           "hi75/lo25 为单日分位"),
         "multi_day": multi,
         "ghosts": res.get("ghosts"),
         "sample_stats": stats,
@@ -17608,15 +18122,18 @@ def _ai_tool_news(ctx, args):
         return "联网检索已在本次会话关闭。"
     q = str(args.get("query") or "").strip()[:128]
     count = _ai_tool_int(args.get("count"), 5, 1, 10)
+    days = _ai_tool_int(args.get("days"), 30, 1, 90)
     if not q:
         txt = ctx.get("news")
         if txt is None:
-            txt = ai_stock_news(ctx.get("code") or "", ctx.get("name") or "")
+            txt = ai_stock_news(ctx.get("code") or "", ctx.get("name") or "",
+                                enabled=bool(search_on))
         return txt or "（近30天未检索到相关资讯）"
     key = get_ai_key()
-    # 非官方网关（opencode-go 等）走 RSS 兜底，不再一律拒绝
+    # 非官方网关（opencode-go 等）走 quant 多引擎检索，不再一律拒绝
     try:
-        rs = deepseek_search(key, q, count=count)
+        rs = deepseek_search(key, q, count=count, days=days,
+                             engines=AI_SEARCH_ENGINES)
         if rs and isinstance(ctx.get("usage"), dict):
             ctx["usage"]["search_calls"] = int(
                 ctx["usage"].get("search_calls", 0)) + 1
@@ -17664,14 +18181,14 @@ def _ai_ext_query(q, days):
 
 
 def _ai_tool_external(ctx, args):
-    """外部宏观/地缘环境：仅用 DeepSeek 官方 Search API。"""
+    """外部宏观/地缘环境：DeepSeek 官方 Search 或 quant 多引擎检索。"""
     search_on = ctx.get("search")
     if search_on is None:
         search_on = _ai_web_search_enabled()
     if not search_on:
         return "联网检索已在本次会话关闭。"
     key = get_ai_key()
-    # 非官方网关（opencode-go 等）走 RSS 兜底，不再一律拒绝
+    # 非官方网关（opencode-go 等）走 quant 多引擎检索，不再一律拒绝
     q = str(args.get("query") or "").strip()[:128]
     days = _ai_tool_int(args.get("days"), 7, 1, 30)
     count = _ai_tool_int(args.get("count"), 10, 5, 15)
@@ -17694,9 +18211,13 @@ def _ai_tool_external(ctx, args):
     sections = []
     seen = set()
     n_ok = 0
+    # 无聚焦词时用完整 quant 栈（含 WSJ/Investing 财经 RSS 最新流）；
+    # 有聚焦词则只走按检索词过滤的搜索引，避免无关财经头条混入。
+    engines = AI_SEARCH_ENGINES if q else AI_SEARCH_MACRO_ENGINES
     for title, query in queries:
         try:
-            rs = deepseek_search(key, query, count=count)
+            rs = deepseek_search(key, query, count=count, days=days,
+                                 engines=engines)
         except Exception as e:
             sections.append(f"【{title}】检索失败: {e}")
             continue
@@ -17717,7 +18238,7 @@ def _ai_tool_external(ctx, args):
     if n_ok and isinstance(ctx.get("usage"), dict):
         ctx["usage"]["search_calls"] = int(
             ctx["usage"].get("search_calls", 0)) + n_ok
-    out = f"DeepSeek 官方联网搜索（近{days}天）\n" + "\n\n".join(sections)
+    out = f"联网搜索（近{days}天）\n" + "\n\n".join(sections)
     with _AI_EXT_LOCK:
         _AI_EXT_CACHE[ck] = {"ts": now, "txt": out}
         if len(_AI_EXT_CACHE) > 100:
@@ -17936,17 +18457,22 @@ def ai_tool_specs():
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {
             "name": "search_news",
-            "description": "联网检索个股近期新闻/公告/业绩；可自定义检索词。",
+            "description": "联网检索个股近期新闻/公告/业绩/主题事件；可自定义"
+                           "检索词。多引擎（必应/Google News/DuckDuckGo），"
+                           "DeepSeek 官方接口则走官方 Search。",
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string",
                           "description": "检索词，≤128字；留空=默认近30天个股资讯"},
+                "days": {"type": "integer", "description": "近N天，1-90",
+                         "default": 30},
                 "count": {"type": "integer", "description": "结果数，1-10",
                           "default": 5}}}}},
         {"type": "function", "function": {
             "name": "get_external_env",
             "description": "查询外部宏观/地缘环境（黄金/原油/美股/港股/A股/美元/"
-                           "美债/特朗普/关税/美联储等），仅使用 DeepSeek 官方"
-                           "联网搜索，返回近N天新闻摘要。可传 query 聚焦事件，"
+                           "美债/特朗普/关税/美联储等），多引擎联网检索（必应/"
+                           "Google News/DuckDuckGo；无聚焦词时加 WSJ/Investing"
+                           "财经 RSS），返回近N天新闻摘要。可传 query 聚焦事件，"
                            "如“特朗普 关税”。",
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string",
@@ -18118,6 +18644,46 @@ def _deepseek_chat_tools(api_key, messages, tool_ctx, model=None,
                 "content": result,
             })
     return last or "（工具调用轮次已达上限，请重试。）", ""
+
+
+def _load_sm_brand_logo(master, width=560):
+    """加载外接 sm70x 品牌图（仅在关于页检测到外接模型时调用）。
+
+    优先仓库/客户端包 `assets/smlogo.png`，其次桌面同名图；有 Pillow 时
+    高质量缩放，无 Pillow 时用 Tk `subsample` 兜底。失败返回 None，
+    绝不阻断设置窗打开。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    paths = [
+        os.path.join(here, "assets", "smlogo.png"),
+        os.path.join(home, "桌面", "smlogo.png"),
+        os.path.join(home, "Desktop", "smlogo.png"),
+        os.path.join(home, "图片", "smlogo.png"),
+        os.path.join(home, "Pictures", "smlogo.png"),
+    ]
+    path = next((p for p in paths if os.path.isfile(p)), "")
+    if not path:
+        return None
+    try:
+        from PIL import Image, ImageTk
+        im = Image.open(path).convert("RGB")
+        if im.width > width:
+            im = im.resize(
+                (width, max(1, int(im.height * width / im.width))),
+                Image.LANCZOS)
+        return ImageTk.PhotoImage(im, master=master)
+    except Exception:
+        log.debug("品牌图 Pillow 加载失败，回落 Tk PhotoImage", exc_info=True)
+    try:
+        img = tk.PhotoImage(master=master, file=path)
+        factor = max(1, int(round(img.width() / float(width))))
+        if factor > 1:
+            img = img.subsample(factor, factor)
+        return img
+    except Exception:
+        log.debug("品牌图加载失败（忽略）", exc_info=True)
+        return None
 
 
 class App:
@@ -22411,7 +22977,9 @@ class App:
             if tb:                               # T日预测叠加层同步外扩
                 tb["high"] = max(tb["high"], live["high"])
                 tb["low"] = min(tb["low"], live["low"])
-        res["phase"] = market_phase_text(q.get("time"))
+        res["phase"] = market_phase_text(
+            q.get("time"), q.get("market") or _market_of(
+                res.get("full_code") or ""))
         self._set_info(q)
         self._rerender()
         self._notify_plugins("on_tick", q)
@@ -25098,6 +25666,7 @@ class App:
         multi = res.get("multi_pred")
         if multi:
             p("■ 多日预测趋势")
+            p("  （最高/最低=1..N日路径累计 P75/P25，非单日振幅）")
             p(f"{'周期':<8}{'收盘预测':>8}{'最高预测':>8}{'最低预测':>8}{'上行概率':>8}{'累计涨跌':>8}")
             for mp in multi:
                 p(f"{mp['label']:<8}"
@@ -25922,7 +26491,7 @@ class App:
                     f" [{det}]\n")
         if news:
             txt += (
-                "\n【联网资讯（DeepSeek Search 自动检索，仅作参考；"
+                "\n【联网资讯（自动联网检索，仅作参考；"
                 "可能含过时/无关/营销内容，请与行情数据交叉验证，勿盲从）】\n"
                 + news + "\n"
             )
@@ -25983,7 +26552,7 @@ class App:
             "get_intraday（当日/最近交易日分时，可传 code）、get_strategy"
             "（策略参数）、search_news（个股资讯）、get_etf_constituents"
             "（ETF成分股+权重/涨跌/量比，分析ETF优先调用）、get_external_env"
-            "（外部宏观/地缘/黄金原油/美股港股/特朗普/关税等，DeepSeek 官方"
+            "（外部宏观/地缘/黄金原油/美股港股/特朗普/关税等，多引擎联网"
             "搜索）、get_user_drawings（读取用户主图手动画线）、draw_lines"
             "（提交/更新主图画线）。至少获取日K、指标、预测与资讯后再给最终结论；"
             "分析ETF时先取成分股；涉及外部环境（全球市场/黄金原油/美股港股/"
@@ -27759,11 +28328,11 @@ class App:
                                             pady=4)
         search_var = tk.BooleanVar(value=_ai_web_search_enabled())
         ttk.Checkbutton(
-            frm, text="AI 分析前自动检索个股最新资讯（Search / RSS）",
+            frm, text="AI 分析前自动检索个股最新资讯（Search / 多引擎）",
             variable=search_var).grid(row=6, column=1, columnspan=2,
                                       sticky="w", pady=4)
-        ttk.Label(frm, text="官方 DeepSeek Search 约 $0.75/千次；其他网关走 "
-                            "Google News RSS 免 Key；失败自动跳过",
+        ttk.Label(frm, text="DeepSeek 官方 Search 约 $0.75/千次；其他网关走 "
+                            "必应/Google News/DuckDuckGo 多引擎免 Key；失败自动跳过",
                   foreground=AXIS_TXT,
                   font=("Microsoft YaHei", 8)).grid(
                       row=7, column=1, columnspan=2, sticky="w")
@@ -28782,6 +29351,28 @@ class App:
         about.insert("end", "邮箱：kingrux106@gmail.com\n")
         about.insert("end", "QQ：2180287399\n")
         about.config(state="disabled")
+
+        # v7.5.2：仅当检测到 sm701/sm702 等外接系列时，关于页显示
+        # “已连接 + Powered by”品牌图；开源仓库无模型时不出现任何
+        # SM 标识（不误导用户以为已接入私有算法）。
+        try:
+            series = sm70x_series()
+        except Exception:
+            series = []
+            log.debug("sm70x 系列探测失败（关于页不显示品牌）", exc_info=True)
+        if series:
+            ttk.Label(
+                frm, text="外接算法：" + " / ".join(series) + "（已连接）"
+            ).grid(row=31, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            brand = ttk.Frame(frm)
+            brand.grid(row=32, column=0, columnspan=3, sticky="w",
+                       pady=(6, 0))
+            logo = _load_sm_brand_logo(brand)
+            if logo:
+                ttk.Label(brand, text="Powered by").pack(anchor="w")
+                self._sm_brand_logo = logo      # 防止 PhotoImage 被回收
+                tk.Label(brand, image=logo, bg="#000000", bd=0).pack(
+                    anchor="w", pady=(2, 0))
 
         # 内容区全部子控件绑定滚轮（含各区与关于控件）；
         # 默认显示「外观」页，定位放到布局完成之后
