@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.6"
+APP_VERSION = "7.4.7"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -18165,6 +18165,8 @@ class App:
         self.api_key = ""
         self.api_key_source = ""
         self._watchlists = {}       # v6.6.5：自选池按市场分开 {market: [codes]}
+        self._watch_pins = {}       # 置顶代码（按市场；始终排在自选池最前）
+        self._wl_menu_code = ""     # 右键菜单当前代码
         self._wl_quotes = {}         # 自选池实时快照（名称/现价/涨幅）
         self._wl_busy = False
         self.ai_text = ""
@@ -18731,6 +18733,7 @@ class App:
                                    stretch=True)
             self.watch_list.pack(fill="both", expand=True)
             self.watch_list.bind("<Double-Button-1>", self._on_pick)
+            self.watch_list.bind("<Button-3>", self._watch_context_menu)
             bf = ttk.Frame(self._wf_content)
             bf.pack(fill="x", pady=(4, 0))
             ttk.Button(bf, text="+ 加自选", width=8,
@@ -25094,6 +25097,116 @@ class App:
     def watchlist(self, codes):
         self._watchlists[_CUR_MARKET[0]] = list(codes or [])
 
+    def _normalize_watch_order(self, mk=None):
+        """去重并把置顶代码排到最前；pins 与 codes 始终一致。"""
+        mk = mk or _CUR_MARKET[0]
+        seen = set()
+        wl = []
+        for c in (self._watchlists.get(mk) or []):
+            if c and c not in seen:
+                seen.add(c)
+                wl.append(c)
+        pins = []
+        pseen = set()
+        for c in (getattr(self, "_watch_pins", {}) or {}).get(mk) or []:
+            if c in seen and c not in pseen:
+                pseen.add(c)
+                pins.append(c)
+        self._watchlists[mk] = pins + [c for c in wl if c not in pseen]
+        self._watch_pins = getattr(self, "_watch_pins", {})
+        self._watch_pins[mk] = pins
+        return self._watchlists[mk]
+
+    def _watch_is_pinned(self, code):
+        return code in ((getattr(self, "_watch_pins", {}) or {})
+                        .get(_CUR_MARKET[0]) or [])
+
+    def _watch_bounds(self, code):
+        """返回 (最小索引, 最大索引, 当前索引)；置顶/普通分组内移动。"""
+        wl = self._normalize_watch_order()
+        try:
+            idx = wl.index(code)
+        except ValueError:
+            return 0, -1, -1
+        n_pin = len((getattr(self, "_watch_pins", {}) or {})
+                    .get(_CUR_MARKET[0]) or [])
+        if self._watch_is_pinned(code):
+            return 0, max(0, n_pin - 1), idx
+        return min(n_pin, len(wl) - 1), len(wl) - 1, idx
+
+    def _watch_move(self, delta):
+        """右键上移/下移：只在置顶组或普通组内交换，不跨过分组边界。"""
+        code = getattr(self, "_wl_menu_code", "") or (
+            self.watch_list.selection()[0]
+            if self.watch_list.selection() else "")
+        if not code:
+            return
+        lo, hi, idx = self._watch_bounds(code)
+        new = idx + int(delta)
+        if idx < 0 or new < lo or new > hi:
+            return
+        wl = self._watchlists[_CUR_MARKET[0]]
+        wl[idx], wl[new] = wl[new], wl[idx]
+        self._save_ini()
+        self._render_watchlist()
+
+    def _watch_toggle_pin(self):
+        """置顶/取消置顶：置顶排到最前；取消后落在置顶组之后。"""
+        code = getattr(self, "_wl_menu_code", "") or (
+            self.watch_list.selection()[0]
+            if self.watch_list.selection() else "")
+        if not code:
+            return
+        mk = _CUR_MARKET[0]
+        wl = self._normalize_watch_order(mk)
+        pins = self._watch_pins.get(mk) or []
+        if code in pins:
+            pins = [c for c in pins if c != code]
+            self._watch_pins[mk] = pins
+            wl.remove(code)
+            wl.insert(min(len(pins), len(wl)), code)
+        else:
+            pins.insert(0, code)
+            self._watch_pins[mk] = pins
+            wl.remove(code)
+            wl.insert(0, code)
+        self._save_ini()
+        self._render_watchlist()
+
+    def _watch_context_menu(self, event):
+        """自选池右键：上移 / 下移 / 置顶（已置顶则取消置顶）。"""
+        try:
+            row = self.watch_list.identify_row(event.y)
+        except Exception:
+            row = ""
+        if not row:
+            return
+        self._wl_menu_code = row
+        try:
+            self.watch_list.selection_set(row)
+            self.watch_list.focus(row)
+        except Exception:
+            pass
+        lo, hi, idx = self._watch_bounds(row)
+        pinned = self._watch_is_pinned(row)
+        m = tk.Menu(self.root, tearoff=0, bg=PANEL_BG, fg=FG_MAIN,
+                    activebackground=BTN_HOVER, activeforeground=FG_MAIN,
+                    font=("Microsoft YaHei", 9))
+        m.add_command(label="上移", command=lambda: self._watch_move(-1),
+                      state=("normal" if idx > lo else "disabled"))
+        m.add_command(label="下移", command=lambda: self._watch_move(1),
+                      state=("normal" if idx < hi else "disabled"))
+        m.add_separator()
+        m.add_command(label=("取消置顶" if pinned else "置顶"),
+                      command=self._watch_toggle_pin)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+
     def _load_config(self):
         cp = configparser.ConfigParser()
         if os.path.exists(INI_PATH):
@@ -25105,11 +25218,16 @@ class App:
                     raw = cp.get("watchlist", f"codes_{mk}", fallback="")
                     self._watchlists[mk] = [
                         c.strip() for c in raw.split(",") if c.strip()]
+                    praw = cp.get("watchlist", f"pinned_{mk}", fallback="")
+                    self._watch_pins[mk] = [
+                        c.strip() for c in praw.split(",") if c.strip()]
+                    self._normalize_watch_order(mk)
                 legacy = [c.strip() for c in
                           cp.get("watchlist", "codes", fallback="").split(",")
                           if c.strip()]
                 if legacy and not self._watchlists.get("cn"):
                     self._watchlists["cn"] = legacy
+                    self._normalize_watch_order("cn")
                 self._last_code = cp.get("ui", "last", fallback="")
                 self.settings["theme"] = cp.get("ui", "theme",
                                                 fallback="dark")
@@ -25165,6 +25283,10 @@ class App:
         for mk in _MARKET_LABELS:
             cp.set("watchlist", f"codes_{mk}",
                    ",".join(self._watchlists.get(mk, [])))
+            pins = [c for c in (getattr(self, "_watch_pins", {}) or {})
+                    .get(mk, [])
+                    if c in (self._watchlists.get(mk) or [])]
+            cp.set("watchlist", f"pinned_{mk}", ",".join(pins))
         cp.remove_option("watchlist", "codes")
         if not cp.has_section("ui"):
             cp.add_section("ui")
@@ -25211,6 +25333,9 @@ class App:
     def _render_watchlist(self):
         if getattr(self, "compact", False) or not hasattr(self, "watch_list"):
             return                  # 小屏无自选池面板
+        self._normalize_watch_order()
+        pins = (getattr(self, "_watch_pins", {}) or {}).get(
+            _CUR_MARKET[0], [])
         try:
             sel = self.watch_list.selection()
         except Exception:
@@ -25240,11 +25365,12 @@ class App:
                 px, prev = q.get("price"), q.get("prev_close")
                 if px and prev:
                     chg = (px / prev - 1) * 100
+            pin = "★ " if c in pins else ""
             if chg is None:
-                txt = f"{c} {name} -".rstrip()
+                txt = f"{pin}{c} {name} -".rstrip()
                 tag = "flat"
             else:
-                txt = f"{c} {name} {chg:+.2f}%".rstrip()
+                txt = f"{pin}{c} {name} {chg:+.2f}%".rstrip()
                 tag = "up" if chg >= 0 else "down"
             if wl_font is not None:
                 try:
@@ -25308,6 +25434,11 @@ class App:
         real = sel[0]
         if real in self.watchlist:
             self.watchlist.remove(real)
+            mk = _CUR_MARKET[0]
+            pins = [c for c in (self._watch_pins.get(mk) or [])
+                    if c != real]
+            self._watch_pins[mk] = pins
+            self._wl_menu_code = ""
             self._save_ini()
             self._render_watchlist()
 
