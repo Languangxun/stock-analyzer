@@ -39,6 +39,7 @@
 |---|---|
 | `stock_gui.py` | **唯一算法源**：内嵌缓存层 + 数据获取 + 指标 + 分析 + **三档组合引擎** + **13 类消融信号** + AI 客户端 + Tkinter GUI |
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 抽取拼装），**勿手改** |
+| `auto_lines.py` | **纯脚本自动画线**（v7.4.6）：读缓存日K，多尺度枢轴 + ATR/成交量加权 + 多轮精修输出支撑/压力/趋势/通道/箱体；CLI 可独立运行，GUI「自动画线」按钮复用 |
 | `studio_strategies/` | 从「股票策略工坊」导入的自定义策略 JSON 副本（v6.6.0；规则引擎读取，设置→外部策略维护） |
 | `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号；缺库/缺预测文件自动降级；适配层代码入库，仅 sm701/global 数据目录不入库 |
 | `build_cli.py` | GUI → CLI 打包器；按锚点注释抽取「缓存块」「算法块」，并做 tkinter 残留 / 语法校验 |
@@ -882,6 +883,15 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   点阵区间（按日期映射当前视野，越界不画）；AI完成（首轮/追问/缓存复用）即解析并
   `_rerender()`，工具栏“AI线”开关显隐，清空对话/新一轮提问/切换股票同步清线；
   当前为完成后即画，token流式未做。
+  **v7.4.6 K3.1pro 兼容**：`parse_ai_lines()` 改走 `_ai_find_draw_obj()`——
+  任意代码围栏（```ai-lines/```json/无标记）或裸 JSON 均可，支持嵌套对象、
+  宽松日期/数字、中英文 kind、`levels/segs/notes/zones` 别名与数组/字典写法；
+  系统提示新增画线硬性要求；工具模式新增 **`draw_lines`**（结构化提交画线，
+  不再依赖模型输出文本块），无工具时仍回退 ai-lines 文本。
+  **AI 读取用户画线**：`_sync_user_lines()` 把 `user_drawings.json` 当前股票的
+  直线/方框挂到 `res["user_lines"]`（切股/增删画线同步），首轮上下文附
+  方向/涨跌幅/跨度摘要，新增 **`get_user_drawings`** 工具供追问时读取；
+  AI 不删除/覆盖用户画线。
 
 ### 3.10 荐股权限 / AI 自动选档（v6.1）
 - **权限**（存 `stock_gui.ini [picks]`）：行业多选（128 行业）+ 板块勾选（主板/创业板/科创板/**ETF**），空选=不限制；
@@ -990,6 +1000,28 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   打开前先销毁旧实例防堆叠；**v6.5.8 起工具窗去掉 `transient`**——多数窗口管理器
   不给 transient 子窗最小化按钮，现为独立顶层窗（可最小化、任务栏独立、可切回主界面），
   其余三窗保持 transient 置顶与居中/聚焦。
+
+- **K线手动画线（v7.4.4）**：仅日K主图生效（分时 `minute_mode` 禁用）。
+  事件：`cv_main` 绑定 `<ButtonPress-3>/<B3-Motion>/<ButtonRelease-3>` 画直线；
+  `<ButtonPress-1>` 在 `event.state & 0x4`（Ctrl）时改画方框，否则仍走原平移逻辑。
+  `_user_draw_snap()`：X 吸附最近 K 线中心，Y 优先吸附该 K 线 OHLC（10px，
+  紧凑屏 12px），否则取两位小数；第二点与起点 Y 差 ≤5px 时强制同价（水平线），
+  同一根 K 时强制同 X（垂直线）。端点以 `{date, price}` 锚定存
+  `user_drawings.json`（`USER_LINES_PATH`，按 `full_code` 分组、单股上限
+  200 条、原子写、git 忽略）；`_draw_user_lines()` 用 `disp_rows` 日期→当前
+  视野序号映射，经 Liang-Barsky 裁剪后以 `DRAW_C`（随主题）绘制，线端带小圆点、
+  方框用 `gray12` 点阵填充。拖动时虚线预览 + 实时价格标签，Esc/`_rerender()`/
+  切股取消；主工具栏「撤销画线 / 清画线」，工具窗口顶部「常用操作」栏收容
+  **每日荐股 / 复制报告 / 导出报告 / 样本明细 / 更新缓存** 五项（主工具栏精简；
+  紧凑模式仍走 `_tools_menu`）。平移缩放重启后锚点不变。
+
+- **画线指导侧栏（v7.4.5）**：右侧栏注册 `_rt_panels["画线指导"]`，下拉自动出现；
+  `_build_drawing_guide_panel()` 创建只读 `Text` + 滚动条，`_fill_drawing_guide()`
+  把模块底部内嵌的 `DRAWING_GUIDE_TEXT`（桌面《金融市场技术分析.pdf》31 页的
+  pdftotext 文字整理版，按缩进/短标题映射 h1/h2/h3/b1~b4 标签；CLI 不抽取）
+  分层渲染；`_find_drawing_guide_pdf()` 依次查找 `~/桌面` / `~/Desktop` /
+  程序目录同名 PDF，找到时面板右上角显示「打开原版PDF」（`webbrowser` 打开
+  `file://`），便于查看原稿图表；找不到 PDF 仅隐藏按钮，文字版仍可用。
 
 - **分时视图（2026-11-05；v7.0.5 价格线白色）**：分时主图价格线（`TPRED_C`，
   暗色纯白/亮色黑，与黄色虚线 VWAP 区分）/VWAP/昨收基准 + 右侧涨跌幅轴；
@@ -1127,6 +1159,27 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
 - **CLI 同步**：规则引擎与 `analyze` 接入位于算法块，`stock_predict.py`
   由 `build_cli.py` 生成后同样读取 `[studio]` 与 `studio_strategies/`；
   本次同时给 CLI 生成头补 `import datetime`（`last_completed_td` 曾 NameError）。
+
+### 3.17 纯脚本自动画线（v7.4.6，`auto_lines.py`）
+- **定位**：纯标准库、不调 AI；既可 CLI 独立运行，也可被 GUI「自动画线」按钮
+  导入；不依赖 tkinter，可直接用于研究/批量生成画线 JSON。
+- **数据**：`load_bars_db()` 读 `stock_cache.db` 最近 N 根（默认 240），按
+  `adjust.k` 还原展示价；`load_bars_csv()` 支持外部 CSV；不足 30 根直接报错。
+- **多轮优化**：每轮降低容差并重新生成/精修候选——①多尺度分形枢轴
+  （2/3/5/8/13 根，ATR 突出度 + 近端权重去重）；②水平位价格聚类 +
+  触及/反弹/跌破/成交量节点加权；③枢轴两点趋势线 → 触及/违约评分 →
+  Theil-Sen 精修 → 非极大抑制；④对侧极值分位生成平行通道线（每侧保留最佳）；
+  ⑤近期震荡箱体；`meta.round_log` 输出每轮候选数/选中数/最高分。
+  **重复抑制**：趋势/通道最终每侧 1 条、同侧水平位按
+  `max(1.5×容差, 1.3%现价)` 留间距、箱体交集 >35% 合并，
+  避免同一位置叠多条线。
+- **输出**：与 ai-lines 同构的 `lines/segs/notes/zones` + `meta`（代码/ATR/轮次/
+  耗时），GUI `parse_ai_lines()` 可直接消费；`--report` 输出每轮日志与线位。
+- **GUI 接入**：工具栏「自动画线」在独立线程调用
+  `auto_draw(rows[-240:], rounds=3)`，结果存 `self._auto_lines[full_code]`
+  （会话缓存，切股/刷新保留）；`_draw_auto_lines()` 以 `C_ORANGE` 绘制并打
+  `auto_lines` tag；「自动线」勾选显隐，小屏工具菜单同入口。
+  `build_client_zip.py` 将 `auto_lines.py` 一并打包。
 
 ---
 
@@ -1272,6 +1325,9 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.4.6**<br>（2026-11-21） | **AI画线兼容 K3.1pro + AI读取用户画线 + 纯脚本自动画线**：①`parse_ai_lines` 支持任意围栏/裸 JSON/嵌套/宽松日期数字/中英文 kind，system 加硬性画线要求，新增 `draw_lines` 工具；②`res["user_lines"]` + 首轮摘要 + `get_user_drawings` 工具，让 AI 读取手工直线/方框；③新增 `auto_lines.py`（多尺度枢轴、水平位/趋势线/通道/箱体、多轮精修与轮次日志、趋势/通道每侧1条+水平位最小间距+箱体合并去重），GUI「自动画线」+ orange「自动线」图层，CLI 可独立运行；`auto_lines.py` 入客户端包；3.9/3.17 节与 README/CHANGELOG 同步 |
+| **v7.4.5**<br>（2026-11-21） | **右侧栏「画线指导」**：下拉开源新增面板，内置桌面《金融市场技术分析.pdf》31页文字整理版（`DRAWING_GUIDE_TEXT`，缩进/短标题映射 h1/h2/h3/b1~b4，只读滚动）；`_find_drawing_guide_pdf()` 依次查 `~/桌面`/`~/Desktop`/程序目录，命中则显示「打开原版PDF」（`webbrowser file://`）看图表，缺失不影响文字版；侧栏宽度自适应；3.13 节与 README/CHANGELOG 同步 |
+| **v7.4.4**<br>（2026-11-21） | **K线手动画线**：主图右键拖拽=直线、Ctrl+左键拖拽=方框，端点自动吸附最近K线中心与 OHLC（10/12px），第二点靠近起点强制水平/同K；`{date,price}` 锚定、平移缩放重启保持，`user_drawings.json` 按代码持久化（git 忽略）；Liang-Barsky 越界裁剪 + 拖动虚线预览 + Esc 取消；主工具栏「撤销画线 / 清画线」，每日荐股/复制报告/导出报告/样本明细/更新缓存移入工具窗顶部「常用操作」（小屏工具菜单）；分时禁用；3.13 节与 README/CHANGELOG 同步 |
 | **v7.4.3**<br>（2026-11-20） | **合并本地 v7.3.2–7.3.5 热修线**：涨跌停列表/盘口跟随/盘前 T+1 热修并入；sm701 多市场截面复算以 v7.4.0 `_sm701_live_predict` 口径为准（`_sm701_live_market` 不再引入）；私有因子安全并入（`.gitignore` 递归排除 + `build_client_zip.py` 自检 + requirements 补 pandas）；设置页 sm701 开关 + 关断禁用缓存残留策略（清理前缀 `strat:`→`strategy:`）；`APP_VERSION=7.4.3`，`stock_predict.py` 重新生成 |
 | | **v7.4.2**<br>（2026-11-15） | **quant 每日消融接入**：新增 `ablation_quant.py`——下载 `https://quant.tail6a6cc8.ts.net/downloads` 的 `public/ablation/latest.csv`（5460 只 × 三档策略 + 验证指标）与 `latest.json`，按「策略名·风险档」反查 `algo`，生成与 `run_ablation()` 同构的 `research/ablation_gui_cache.json`（原始数据留档 `research/ablation_quant/`，均忽略）；GUI 数据工具新增「立即同步最新消融 / 应用推荐档到全部策略缓存」，启动 4s 后自动同步（12h 新鲜度、`[predict] ablation_sync/ablation_url` 可配）；`_ensure_strategy()` 在 quant 批次比旧缓存新时直接换推荐档并重分析（不跑本地消融），三档/全组合窗标注数据源=quant；`APP_VERSION=7.4.2`，`stock_predict.py` 重新生成 |
 | **v7.4.1**<br>（2026-11-15） | **修复消融选型崩溃 + 本地消融开关**：①`_pick_one_from_pool()` 保守档误用未定义 `p`（应为 `pool`）→ 全量消融必崩 `cannot access local variable 'p'`，修复后 42 候选选型恢复；②ini `[predict] local_ablation`（默认 1）+ 设置→预测参数「允许本地消融」：0 时 GUI 不跑 `run_ablation`（过期缓存沿用旧策略、无缓存提示从 quant 导入 `research/ablation_gui_cache.json` / `strategy_ablation_per_stock.json`），CLI/研究脚本不受影响；`APP_VERSION=7.4.1`，`stock_predict.py` 重新生成 |

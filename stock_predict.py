@@ -131,7 +131,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.3"
+APP_VERSION = "7.4.6"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -4749,6 +4749,7 @@ HOVER_BG = "#222a34"
 SEL_BG = "#2b3a4d"
 ACCENT = "#4da3ff"
 LOG_BG = "#0d1116"
+DRAW_C = "#00d4ff"   # 用户手动画线/方框（随主题切换，区别于 AI 线的 ACCENT）
 
 # ---- 可切换主题 ----
 THEMES = {
@@ -4761,7 +4762,7 @@ THEMES = {
         BTN_BG="#222a33", BTN_FG="#d7dee6", BTN_HOVER="#2b3540",
         BTN_BORDER="#333e4a",
         BORDER="#2a3340", HOVER_BG="#222a34", SEL_BG="#2b3a4d",
-        ACCENT="#4da3ff", LOG_BG="#0d1116",
+        ACCENT="#4da3ff", LOG_BG="#0d1116", DRAW_C="#00d4ff",
         MA_COLORS={5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff",
                    30: "#7bf08b", 60: "#e8c14a"},
         C_ORANGE="#ffa94d", C_BLUE="#5dade2",
@@ -4776,7 +4777,7 @@ THEMES = {
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef2f7",
         BTN_BORDER="#c9d1d9",
         BORDER="#d9dee5", HOVER_BG="#eef2f7", SEL_BG="#d8e8ff",
-        ACCENT="#1971c2", LOG_BG="#f7f8fa",
+        ACCENT="#1971c2", LOG_BG="#f7f8fa", DRAW_C="#0b7285",
         MA_COLORS={5: "#e8590c", 10: "#1971c2", 20: "#ae3ec9",
                    30: "#2f9e44", 60: "#b08900"},
         C_ORANGE="#e8590c", C_BLUE="#1971c2",
@@ -4792,7 +4793,7 @@ THEMES = {
         BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#2a2a2a",
         BTN_BORDER="#ffffff",
         BORDER="#ffffff", HOVER_BG="#2a2a2a", SEL_BG="#555500",
-        ACCENT="#ffee00", LOG_BG="#000000",
+        ACCENT="#ffee00", LOG_BG="#000000", DRAW_C="#00ffff",
         MA_COLORS={5: "#ffb000", 10: "#00d4ff", 20: "#ff7ae0",
                    30: "#39ff88", 60: "#ffee00"},
         C_ORANGE="#ffb000", C_BLUE="#00b7ff",
@@ -16040,6 +16041,14 @@ AI_SYSTEM_PROMPT = (
     "禁止模棱两可、禁止罗列所有可能性。结论先行，再用不超过3条核心依据支撑，"
     "最后一行给风险提示。回答简洁，不写套话。")
 
+# 画线硬性要求（v7.4.6）：Kimi 等模型常忽略正文末尾的 schema，放到 system
+# 提示里可显著提高遵从率；工具模式优先调用 draw_lines，无工具再输出文本块。
+AI_DRAW_SYSTEM_HINT = (
+    "\n【画线硬性要求】只要回答涉及行情/买卖点/支撑压力，最终回答前必须完成"
+    "画线：工具列表中存在 draw_lines 时必须调用它（至少1条水平价位 + 1条"
+    "斜线/趋势线）；没有工具能力时，在正文末尾输出 ```ai-lines JSON 代码块。"
+    "日期用 YYYY-MM-DD，价位用数字；不要只在正文描述而不提交画线。")
+
 # 风险偏好 → AI 行为约束（v6.1.7 热修②）。
 # 档次排序：保守 < 稳健 < 激进（v6.2.3 起三档）。
 # 目的：AI 结论必须随所选风险偏好变化，不再一律"等趋势企稳再观望"。
@@ -16096,8 +16105,8 @@ def ai_risk_mode(res=None):
 
 
 def ai_system_prompt(mode=""):
-    """AI 系统提示词 = 通用分析要求 + 当前风险偏好行为约束。"""
-    return AI_SYSTEM_PROMPT + "\n" + ai_risk_guide(mode)
+    """AI 系统提示词 = 通用分析要求 + 当前风险偏好行为约束 + 画线硬性要求。"""
+    return AI_SYSTEM_PROMPT + "\n" + ai_risk_guide(mode) + AI_DRAW_SYSTEM_HINT
 
 AI_CACHE_MAX = 24          # 单股缓存对话条数上限（含首条数据上下文）
 
@@ -16521,7 +16530,9 @@ _AI_ZONES_MAX = 3
 _AI_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 AI_DRAW_SCHEMA = (
-    "\n【画线/标注输出：正文结束后另起一段，只输出以下代码块，无其它文字】\n"
+    "\n【画线/标注输出】优先调用 draw_lines 工具提交（工具模式下最终回答前"
+    "必须调用一次）；没有工具能力时，在正文结束后另起一段只输出以下代码块，"
+    "无其它文字：\n"
     "```ai-lines\n"
     '{"lines": [{"price": 5.32, "label": "买点", "kind": "buy"}],\n'
     ' "segs": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
@@ -16545,120 +16556,372 @@ AI_DRAW_SCHEMA = (
 )
 
 
+_AI_KIND_ALIAS = {
+    "buy": "buy", "买": "buy", "买点": "buy", "买入": "buy",
+    "sell": "sell", "卖": "sell", "卖点": "sell", "卖出": "sell",
+    "stop": "stop", "止损": "stop", "止损位": "stop",
+    "support": "support", "支撑": "support", "支撑位": "support",
+    "支撑线": "support",
+    "resistance": "resistance", "阻力": "resistance", "压力": "resistance",
+    "压力位": "resistance", "阻力位": "resistance",
+    "target": "target", "目标": "target", "目标位": "target",
+    "trend": "trend", "趋势": "trend", "趋势线": "trend",
+    "channel": "channel", "通道": "channel", "通道线": "channel",
+    "ray": "ray", "射线": "ray",
+    "zone": "zone", "区间": "zone", "箱体": "zone", "矩形": "zone",
+    "risk": "risk", "风险": "risk", "风险区": "risk",
+    "note": "note", "标注": "note", "备注": "note", "文字": "note",
+    "warning": "warning", "警告": "warning",
+}
+_AI_KIND_LABEL = {
+    "buy": "买点", "sell": "卖点", "stop": "止损", "support": "支撑",
+    "resistance": "压力", "target": "目标", "trend": "趋势线",
+    "channel": "通道", "ray": "射线", "zone": "区间", "risk": "风险",
+    "note": "标注", "warning": "警告",
+}
+_AI_DRAW_KEYS = (
+    "lines", "levels", "horizontal", "price_levels",
+    "segs", "segments", "trend_lines", "trendlines", "channels",
+    "notes", "labels", "marks", "texts",
+    "zones", "rects", "boxes", "ranges", "areas",
+)
+
+
+def _ai_num(v):
+    """宽松数字：支持 5.32 / \"5.32\" / \"5.32元\" / \"1,234.5\"。"""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+    s = str(v).strip()
+    if not s or "%" in s:
+        return None
+    s = s.replace(",", "").replace("，", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        f = float(m.group(0))
+    except ValueError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _ai_norm_date(s):
+    """宽松日期：2026-09-01 / 2026/9/1 / 2026.09.01 / 20260901。"""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})", s)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+
 def _ai_date_ok(s):
-    return bool(_AI_DATE_RE.match((s or "").strip()))
+    return bool(_ai_norm_date(s))
+
+
+def _ai_norm_kind(kind, allowed, default):
+    k = str(kind or "").strip().lower().replace("_", "-")
+    if k in allowed:
+        return k
+    if k in _AI_KIND_ALIAS and _AI_KIND_ALIAS[k] in allowed:
+        return _AI_KIND_ALIAS[k]
+    for key, val in _AI_KIND_ALIAS.items():
+        if key and key in k and val in allowed:
+            return val
+    return default
+
+
+def _ai_norm_point(p, other=None):
+    """返回 (date, price)；兼容 dict/两点数组/单价格。"""
+    date = price = None
+    if isinstance(p, dict):
+        date = p.get("date") or p.get("day") or p.get("time")
+        price = p.get("price")
+        if price is None:
+            price = p.get("level")
+        if price is None:
+            price = p.get("value")
+        if price is None:
+            price = p.get("p")
+        if price is None:
+            price = p.get("y")
+        if date is None and isinstance(p.get("x"), str):
+            date = p.get("x")
+    elif isinstance(p, (list, tuple)) and len(p) >= 2:
+        a, b = p[0], p[1]
+        da, db = _ai_norm_date(a), _ai_norm_date(b)
+        if da:
+            date, price = a, b
+        elif db:
+            date, price = b, a
+        else:
+            price = a if _ai_num(a) is not None else b
+            date = other
+    else:
+        price = p
+        date = other
+    if date is None and other is not None:
+        if isinstance(other, dict):
+            date = other.get("date") or other.get("day") or other.get("time")
+            if price is None:
+                price = other.get("price", other.get("level"))
+        else:
+            date = other
+    return _ai_norm_date(date), _ai_num(price)
+
+
+def _ai_list(d, keys):
+    """读取数组字段；兼容 {"items":[...]} 与 {标签: 价位} 两种写法。"""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            if isinstance(v.get("items"), list):
+                return v["items"]
+            out = []
+            for kk, vv in v.items():
+                if isinstance(vv, (int, float, str)):
+                    out.append({"price": vv, "label": kk})
+                elif isinstance(vv, dict):
+                    e = dict(vv)
+                    e.setdefault("label", kk)
+                    out.append(e)
+            if out:
+                return out
+    return []
+
+
+def _ai_looks_like_draw(d):
+    """判断 dict 是否像画线对象（避免把普通 lines 文本数组误当画线）。"""
+    if not isinstance(d, dict):
+        return False
+    for k in ("segs", "segments", "trend_lines", "trendlines", "channels",
+              "notes", "labels", "marks", "texts",
+              "zones", "rects", "boxes", "ranges", "areas",
+              "levels", "horizontal", "price_levels"):
+        if k in d:
+            return True
+    v = d.get("lines")
+    if isinstance(v, list):
+        for e in v[:5]:
+            if isinstance(e, (int, float)):
+                return True
+            if isinstance(e, str) and _ai_num(e) is not None:
+                return True
+            if isinstance(e, dict) and any(
+                    k in e for k in ("price", "level", "value", "y")):
+                return True
+        return False
+    return isinstance(v, dict)
+
+
+def _ai_draw_obj(d):
+    """判断/拆出含画线字段的 JSON 对象（也接受数组包裹）。"""
+    if isinstance(d, list):
+        for it in d:
+            got = _ai_draw_obj(it)
+            if got is not None:
+                return got
+        return None
+    if not _ai_looks_like_draw(d):
+        if isinstance(d, dict):
+            for k in ("ai_lines", "drawing", "chart", "result", "data"):
+                v = d.get(k)
+                if isinstance(v, dict):
+                    got = _ai_draw_obj(v)
+                    if got is not None:
+                        return got
+        return None
+    return d
+
+
+def _ai_parse_json_fragment(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    for txt in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+        try:
+            d = json.loads(txt)
+        except Exception:
+            m = re.search(r"\{", txt)
+            if not m:
+                continue
+            try:
+                d, _ = json.JSONDecoder().raw_decode(txt, m.start())
+            except Exception:
+                continue
+        got = _ai_draw_obj(d)
+        if got is not None:
+            return got
+    return None
+
+
+def _ai_find_draw_obj(text, span=False):
+    """从任意文本中找画线 JSON（任意代码围栏/裸 JSON 均可）。"""
+    empty = (None, None, None) if span else None
+    if not text or not isinstance(text, str):
+        return empty
+    # 1) 代码块：```ai-lines / ```json / 无语言标记 都接受
+    for m in re.finditer(r"```[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\n?(.*?)```",
+                         text, re.S):
+        obj = _ai_parse_json_fragment(m.group(2))
+        if obj is not None:
+            return (obj, m.start(), m.end()) if span else obj
+    # 2) 裸 JSON：从每个 { 尝试平衡解析（兼容嵌套 objects；限次数防长文）
+    dec = json.JSONDecoder()
+    tries = 0
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        tries += 1
+        if tries > 200:
+            break
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except Exception:
+            continue
+        got = _ai_draw_obj(obj)
+        if got is not None:
+            return (got, i, end) if span else got
+    return empty
+
+
+def _ai_has_draw_obj(text):
+    return _ai_find_draw_obj(text) is not None
+
+
+def parse_ai_lines_obj(d, lo, hi):
+    """校验/归一化画线 dict，返回 (levels, segs, notes, zones)。"""
+    levels, segs, notes, zones = [], [], [], []
+    d = _ai_draw_obj(d)
+    if not d or not (lo and hi) or hi <= 0 or lo <= 0:
+        return levels, segs, notes, zones
+
+    for e in _ai_list(d, ("lines", "levels", "horizontal",
+                          "price_levels"))[:_AI_LINES_MAX]:
+        if isinstance(e, (int, float, str)):
+            e = {"price": e}
+        if not isinstance(e, dict):
+            continue
+        px = _ai_num(e.get("price", e.get("level", e.get("value",
+                                                       e.get("y")))))
+        if px is None or not (lo <= px <= hi):
+            continue
+        kind = _ai_norm_kind(e.get("kind") or e.get("label") or e.get("name"),
+                             _AI_LINE_KINDS, "support")
+        lab = str(e.get("label") or e.get("text") or e.get("name")
+                  or _AI_KIND_LABEL.get(kind, "线"))[:10]
+        if lab:
+            levels.append({"price": round(px, 2), "label": lab,
+                           "kind": kind})
+
+    for s in _ai_list(d, ("segs", "segments", "trend_lines", "trendlines",
+                          "channels"))[:_AI_SEGS_MAX]:
+        if not isinstance(s, dict):
+            continue
+        da, pa = _ai_norm_point(
+            s.get("a", s.get("start", s.get("p1", s.get("from")))))
+        db, pb = _ai_norm_point(
+            s.get("b", s.get("end", s.get("p2", s.get("to")))))
+        if not (da and db and pa is not None and pb is not None):
+            continue
+        if not (math.isfinite(pa) and math.isfinite(pb)):
+            continue
+        if not (lo <= pa <= hi and lo <= pb <= hi):
+            continue
+        kind = _ai_norm_kind(s.get("kind") or s.get("label") or s.get("name"),
+                             _AI_SEG_KINDS, "trend")
+        lab = str(s.get("label") or s.get("text") or s.get("name")
+                  or _AI_KIND_LABEL.get(kind, "趋势线"))[:10]
+        ext = s.get("extend", False)
+        if isinstance(ext, str):
+            ext_l = ext.strip().lower()
+            extend = ext_l in ("1", "true", "yes", "right", "both")
+            extend_both = ext_l == "both"
+        else:
+            extend = bool(ext)
+            extend_both = False
+        segs.append({"a": {"date": da, "price": round(pa, 2)},
+                     "b": {"date": db, "price": round(pb, 2)},
+                     "label": lab, "kind": kind, "extend": extend,
+                     "extend_both": extend_both,
+                     "dash": bool(s.get("dash", True))})
+
+    for n in _ai_list(d, ("notes", "labels", "marks", "texts"))[:_AI_NOTES_MAX]:
+        txt = ""
+        if isinstance(n, (list, tuple)) and len(n) >= 3:
+            date, px = _ai_norm_point(n[:2])
+            txt = str(n[2] or "")[:20]
+        elif isinstance(n, dict):
+            date, px = _ai_norm_point(n)
+            txt = str(n.get("text") or n.get("label") or n.get("content")
+                      or n.get("note") or "")[:20]
+        else:
+            continue
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if not (date and px is not None and txt):
+            continue
+        if not (math.isfinite(px) and lo <= px <= hi):
+            continue
+        kind = _ai_norm_kind(
+            (n.get("kind") or n.get("label") or n.get("content"))
+            if isinstance(n, dict) else "",
+            _AI_NOTE_KINDS, "note")
+        notes.append({"date": date, "price": round(px, 2),
+                      "text": txt[:20], "kind": kind})
+
+    for z in _ai_list(d, ("zones", "rects", "boxes", "ranges",
+                          "areas"))[:_AI_ZONES_MAX]:
+        if not isinstance(z, dict):
+            continue
+        da, pa = _ai_norm_point(
+            z.get("a", z.get("start", z.get("from", z.get("p1")))))
+        db, pb = _ai_norm_point(
+            z.get("b", z.get("end", z.get("to", z.get("p2")))))
+        if (not da or not db) and ("top" in z or "bottom" in z):
+            da = _ai_norm_date(z.get("start_date") or z.get("start")
+                               or z.get("from"))
+            db = _ai_norm_date(z.get("end_date") or z.get("end")
+                               or z.get("to"))
+            pa = _ai_num(z.get("top", z.get("high", z.get("y1"))))
+            pb = _ai_num(z.get("bottom", z.get("low", z.get("y2"))))
+        if not (da and db and pa is not None and pb is not None):
+            continue
+        if not (math.isfinite(pa) and math.isfinite(pb)):
+            continue
+        if not (lo <= pa <= hi and lo <= pb <= hi):
+            continue
+        kind = _ai_norm_kind(z.get("kind") or z.get("label") or z.get("name"),
+                             _AI_ZONE_KINDS, "zone")
+        lab = str(z.get("label") or z.get("text") or z.get("name")
+                  or _AI_KIND_LABEL.get(kind, "区间"))[:10]
+        zones.append({"a": {"date": da, "price": round(pa, 2)},
+                      "b": {"date": db, "price": round(pb, 2)},
+                      "label": lab, "kind": kind})
+    return levels, segs, notes, zones
 
 
 def parse_ai_lines(text, lo, hi):
-    """解析AI画线块，返回 (levels, segs, notes, zones)。非法/越界静默丢弃。
-    levels: [{"price","label","kind"}]
-    segs:   [{"a":{"date","price"},"b":{...},"label","kind","extend",
-              "extend_both","dash"}]
-    notes:  [{"date","price","text","kind"}]
-    zones:  [{"a":{"date","price"},"b":{...},"label","kind"}]
-    lo/hi 为允许的价格区间。"""
-    levels, segs, notes, zones = [], [], [], []
-    if not text or not (lo and hi) or hi <= 0 or lo <= 0:
-        return levels, segs, notes, zones
-    try:
-        m = re.search(r"```ai-lines\s*(\{.*?\})\s*```", text, re.S)
-        raw = m.group(1) if m else None
-        if raw is None:
-            m2 = None
-            for m2 in re.finditer(
-                    r'\{[^{}]*"(?:lines|segs|notes|zones)"[^{}]*\}', text):
-                pass
-            raw = m2.group(0) if m2 else None
-        if not raw:
-            return levels, segs, notes, zones
-        try:
-            d = json.loads(raw)
-        except Exception:
-            return levels, segs, notes, zones  # 残缺JSON静默丢弃
-        if not isinstance(d, dict):
-            return levels, segs, notes, zones
-        for e in (d.get("lines") or [])[:_AI_LINES_MAX]:
-            try:
-                px = float(e.get("price"))
-                lab = str(e.get("label") or "")[:10]
-                kind = str(e.get("kind") or "")
-                if kind not in _AI_LINE_KINDS or not lab:
-                    continue
-                if not (math.isfinite(px) and lo <= px <= hi):
-                    continue
-                levels.append({"price": round(px, 2), "label": lab,
-                               "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for s in (d.get("segs") or [])[:_AI_SEGS_MAX]:
-            try:
-                a, b = s.get("a") or {}, s.get("b") or {}
-                pa, pb = float(a.get("price")), float(b.get("price"))
-                da, db = str(a.get("date") or ""), str(b.get("date") or "")
-                lab = str(s.get("label") or "")[:10]
-                if not (math.isfinite(pa) and math.isfinite(pb)):
-                    continue
-                if not (lo <= pa <= hi and lo <= pb <= hi):
-                    continue
-                if not (_ai_date_ok(da) and _ai_date_ok(db)):
-                    continue
-                kind = str(s.get("kind") or "trend").lower()
-                if kind not in _AI_SEG_KINDS:
-                    kind = "trend"
-                ext = s.get("extend", False)
-                if isinstance(ext, str):
-                    ext_l = ext.strip().lower()
-                    extend = ext_l in ("1", "true", "yes", "right", "both")
-                    extend_both = ext_l == "both"
-                else:
-                    extend = bool(ext)
-                    extend_both = False
-                segs.append({"a": {"date": da[:10], "price": round(pa, 2)},
-                             "b": {"date": db[:10], "price": round(pb, 2)},
-                             "label": lab, "kind": kind, "extend": extend,
-                             "extend_both": extend_both,
-                             "dash": bool(s.get("dash", True))})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for n in (d.get("notes") or [])[:_AI_NOTES_MAX]:
-            try:
-                da = str(n.get("date") or "")
-                px = float(n.get("price"))
-                txt = re.sub(r"\s+", " ", str(n.get("text") or "")).strip()[:20]
-                kind = str(n.get("kind") or "note").lower()
-                if kind not in _AI_NOTE_KINDS:
-                    kind = "note"
-                if not txt or not _ai_date_ok(da):
-                    continue
-                if not (math.isfinite(px) and lo <= px <= hi):
-                    continue
-                notes.append({"date": da[:10], "price": round(px, 2),
-                              "text": txt, "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for z in (d.get("zones") or [])[:_AI_ZONES_MAX]:
-            try:
-                a, b = z.get("a") or {}, z.get("b") or {}
-                pa, pb = float(a.get("price")), float(b.get("price"))
-                da, db = str(a.get("date") or ""), str(b.get("date") or "")
-                lab = str(z.get("label") or "")[:10]
-                kind = str(z.get("kind") or "zone").lower()
-                if kind not in _AI_ZONE_KINDS:
-                    kind = "zone"
-                if not (math.isfinite(pa) and math.isfinite(pb)):
-                    continue
-                if not (lo <= pa <= hi and lo <= pb <= hi):
-                    continue
-                if not (_ai_date_ok(da) and _ai_date_ok(db)):
-                    continue
-                zones.append({"a": {"date": da[:10], "price": round(pa, 2)},
-                              "b": {"date": db[:10], "price": round(pb, 2)},
-                              "label": lab, "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-    except Exception:
-        log.exception("AI画线块解析失败(忽略)")
-    return levels, segs, notes, zones
+    """解析AI画线数据（兼容 ai-lines/json 围栏与裸 JSON）。"""
+    d = _ai_find_draw_obj(text)
+    if d is None:
+        return [], [], [], []
+    return parse_ai_lines_obj(d, lo, hi)
 
 
 def ai_session_load(code, model=""):
@@ -17398,6 +17661,77 @@ def _ai_tool_etf(ctx, args):
     return "\n".join(lines)
 
 
+def _ai_user_lines_txt(res, limit=16):
+    """用户手动画线的紧凑文字摘要（给 AI 首轮上下文）。"""
+    res = res or {}
+    items = res.get("user_lines") or []
+    if not items:
+        return ""
+    rows = res.get("disp_rows") or []
+    idx = {r.get("date"): i for i, r in enumerate(rows)}
+    out = ["【用户手动画线（只读；代表用户关注的支撑/压力/趋势）】"]
+    shown = items[-max(1, int(limit)):]
+    for it in shown:
+        try:
+            a, b = it.get("a") or {}, it.get("b") or {}
+            da, db = str(a.get("date") or ""), str(b.get("date") or "")
+            pa, pb = float(a.get("price")), float(b.get("price"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if it.get("kind") == "rect":
+            lo, hi = sorted((pa, pb))
+            w = (hi / lo - 1) * 100 if lo > 0 else 0
+            out.append(f"- 方框：{da} ~ {db}，价格 {lo:.2f}~{hi:.2f}"
+                       f"（宽度{w:.1f}%）")
+        else:
+            chg = (pb / pa - 1) * 100 if pa > 0 else 0
+            direction = ("上升" if chg > 0.5
+                         else ("下降" if chg < -0.5 else "水平"))
+            ia, ib = idx.get(da[:10]), idx.get(db[:10])
+            span = (f"，{abs(ib - ia)}个交易日" if ia is not None
+                    and ib is not None else "")
+            out.append(f"- 直线（{direction}）：{da} {pa:.2f} → {db} "
+                       f"{pb:.2f}（{chg:+.1f}%{span}）")
+    if len(items) > len(shown):
+        out.append(f"（共{len(items)}条，仅列最近{len(shown)}条）")
+    out.append("请结合这些线分析；不要删除或覆盖用户画线。")
+    return "\n".join(out)
+
+
+def _ai_tool_user_lines(ctx, args):
+    """返回用户手动画线（日期+价格），供 AI 判断用户关注位。"""
+    res = (ctx or {}).get("res") or {}
+    items = res.get("user_lines") or []
+    return _ai_tool_json({
+        "code": res.get("full_code") or "",
+        "count": len(items),
+        "items": items,
+        "summary": _ai_user_lines_txt(res, limit=40),
+    })
+
+
+def _ai_tool_draw_lines(ctx, args):
+    """draw_lines 工具：把模型的结构化画线交给主线程落图。"""
+    cb = (ctx or {}).get("on_lines")
+    if not callable(cb):
+        return "当前会话未启用主图画线（仅 GUI 可用）。"
+    if not isinstance(args, dict) or not any(k in args
+                                             for k in _AI_DRAW_KEYS):
+        return "参数为空：请提供 lines / segs / notes / zones。"
+    lv, sg_, nt, zn = parse_ai_lines_obj(args, 0.01, 1e12)
+    if not (lv or sg_ or nt or zn):
+        return ("画线参数校验失败：请检查日期 YYYY-MM-DD、价格数字，"
+                "以及 a/b 均含 date+price。")
+    try:
+        cb(args)
+    except Exception as e:
+        log.exception("draw_lines 工具落图失败")
+        return f"画线提交失败：{type(e).__name__}: {e}"[:300]
+    return (f"已提交主图画线：水平线{len(lv)}、斜线{len(sg_)}、"
+            f"标注{len(nt)}、区间{len(zn)}。请继续给出最终结论；"
+            "不要重复提交相同画线。")
+
+
 _AI_TOOL_FUNCS = {
     "get_kline": _ai_tool_kline,
     "get_indicators": _ai_tool_indicators,
@@ -17411,6 +17745,8 @@ _AI_TOOL_FUNCS = {
     "search_news": _ai_tool_news,
     "get_external_env": _ai_tool_external,
     "get_etf_constituents": _ai_tool_etf,
+    "get_user_drawings": _ai_tool_user_lines,
+    "draw_lines": _ai_tool_draw_lines,
     "show_table": _ai_tool_show_table,
 }
 
@@ -17511,6 +17847,64 @@ def ai_tool_specs():
                           "default": 20},
                 "code": {"type": "string",
                          "description": "可选ETF代码，如 510300"}}}}},
+        {"type": "function", "function": {
+            "name": "get_user_drawings",
+            "description": "读取用户在主图上手动画的直线/方框（日期+价格）。"
+                           "分析用户关注位、支撑压力或趋势意图时调用。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "draw_lines",
+            "description": "在K线主图提交画线/标注（涉及行情/买卖点时，最终"
+                           "回答前优先调用）。支持水平价位、趋势线/射线、文字"
+                           "标注、矩形区间；日期 YYYY-MM-DD、价格用数字。",
+            "parameters": {"type": "object", "properties": {
+                "lines": {"type": "array", "description": "水平价位≤8",
+                          "items": {"type": "object", "properties": {
+                              "price": {"type": "number"},
+                              "label": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_LINE_KINDS)}},
+                              "required": ["price"]}},
+                "segs": {"type": "array", "description": "斜线/趋势线/通道/"
+                          "射线≤6",
+                         "items": {"type": "object", "properties": {
+                             "a": {"type": "object", "properties": {
+                                 "date": {"type": "string"},
+                                 "price": {"type": "number"}},
+                                 "required": ["date", "price"]},
+                             "b": {"type": "object", "properties": {
+                                 "date": {"type": "string"},
+                                 "price": {"type": "number"}},
+                                 "required": ["date", "price"]},
+                             "label": {"type": "string"},
+                             "kind": {"type": "string",
+                                      "enum": list(_AI_SEG_KINDS)},
+                             "extend": {"type": "boolean"},
+                             "dash": {"type": "boolean"}},
+                             "required": ["a", "b"]}},
+                "notes": {"type": "array", "description": "文字标注≤6",
+                          "items": {"type": "object", "properties": {
+                              "date": {"type": "string"},
+                              "price": {"type": "number"},
+                              "text": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_NOTE_KINDS)}},
+                              "required": ["date", "price", "text"]}},
+                "zones": {"type": "array", "description": "矩形区间≤3",
+                          "items": {"type": "object", "properties": {
+                              "a": {"type": "object", "properties": {
+                                  "date": {"type": "string"},
+                                  "price": {"type": "number"}},
+                                  "required": ["date", "price"]},
+                              "b": {"type": "object", "properties": {
+                                  "date": {"type": "string"},
+                                  "price": {"type": "number"}},
+                                  "required": ["date", "price"]},
+                              "label": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_ZONE_KINDS)}},
+                              "required": ["a", "b"]}},
+            }}}},
         {"type": "function", "function": {
             "name": "show_table",
             "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"

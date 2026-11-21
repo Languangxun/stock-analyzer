@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.3"
+APP_VERSION = "7.4.6"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -4730,6 +4730,7 @@ HOVER_BG = "#222a34"
 SEL_BG = "#2b3a4d"
 ACCENT = "#4da3ff"
 LOG_BG = "#0d1116"
+DRAW_C = "#00d4ff"   # 用户手动画线/方框（随主题切换，区别于 AI 线的 ACCENT）
 
 # ---- 可切换主题 ----
 THEMES = {
@@ -4742,7 +4743,7 @@ THEMES = {
         BTN_BG="#222a33", BTN_FG="#d7dee6", BTN_HOVER="#2b3540",
         BTN_BORDER="#333e4a",
         BORDER="#2a3340", HOVER_BG="#222a34", SEL_BG="#2b3a4d",
-        ACCENT="#4da3ff", LOG_BG="#0d1116",
+        ACCENT="#4da3ff", LOG_BG="#0d1116", DRAW_C="#00d4ff",
         MA_COLORS={5: "#ffb86b", 10: "#7cc4ff", 20: "#f0a6ff",
                    30: "#7bf08b", 60: "#e8c14a"},
         C_ORANGE="#ffa94d", C_BLUE="#5dade2",
@@ -4757,7 +4758,7 @@ THEMES = {
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef2f7",
         BTN_BORDER="#c9d1d9",
         BORDER="#d9dee5", HOVER_BG="#eef2f7", SEL_BG="#d8e8ff",
-        ACCENT="#1971c2", LOG_BG="#f7f8fa",
+        ACCENT="#1971c2", LOG_BG="#f7f8fa", DRAW_C="#0b7285",
         MA_COLORS={5: "#e8590c", 10: "#1971c2", 20: "#ae3ec9",
                    30: "#2f9e44", 60: "#b08900"},
         C_ORANGE="#e8590c", C_BLUE="#1971c2",
@@ -4773,7 +4774,7 @@ THEMES = {
         BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#2a2a2a",
         BTN_BORDER="#ffffff",
         BORDER="#ffffff", HOVER_BG="#2a2a2a", SEL_BG="#555500",
-        ACCENT="#ffee00", LOG_BG="#000000",
+        ACCENT="#ffee00", LOG_BG="#000000", DRAW_C="#00ffff",
         MA_COLORS={5: "#ffb000", 10: "#00d4ff", 20: "#ff7ae0",
                    30: "#39ff88", 60: "#ffee00"},
         C_ORANGE="#ffb000", C_BLUE="#00b7ff",
@@ -16067,6 +16068,76 @@ def slice_view(res, show_n, pan=0):
 
 # ================= GUI =================
 
+# 用户手动画线（右键直线 / Ctrl+左键方框）持久化：按股票代码分组，
+# 端点锚定「日期+价格」，平移/缩放/重启后仍落在原 K 线上。
+USER_LINES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "user_drawings.json")
+USER_LINES_MAX = 200          # 单只股票最多保留条数，防文件无限膨胀
+
+
+def _user_drawings_load():
+    """读取手动画线文件；损坏/缺字段静默丢弃（不影响主程序启动）。"""
+    try:
+        with open(USER_LINES_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        log.warning("读取手动画线失败（按空处理）", exc_info=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for code, items in raw.items():
+        if not isinstance(code, str) or not isinstance(items, list):
+            continue
+        clean = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            kind = it.get("kind")
+            if kind not in ("line", "rect"):
+                continue
+            pts = []
+            ok = True
+            for key in ("a", "b"):
+                p = it.get(key)
+                if not isinstance(p, dict):
+                    ok = False
+                    break
+                try:
+                    date = str(p.get("date") or "")
+                    price = float(p.get("price"))
+                except (TypeError, ValueError):
+                    ok = False
+                    break
+                if len(date) < 8 or not math.isfinite(price) or price <= 0:
+                    ok = False
+                    break
+                pts.append({"date": date, "price": round(price, 4)})
+            if ok:
+                clean.append({"kind": kind, "a": pts[0], "b": pts[1]})
+        if clean:
+            out[code] = clean[-USER_LINES_MAX:]
+    return out
+
+
+def _user_drawings_save(data):
+    """原子写入手动画线文件（临时文件 + os.replace）。"""
+    tmp = USER_LINES_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, USER_LINES_PATH)
+    except OSError:
+        log.warning("保存手动画线失败", exc_info=True)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
 class Chart(tk.Canvas):
     def __init__(self, master, height):
         super().__init__(master, height=height, bg=BG, highlightthickness=0)
@@ -16079,6 +16150,14 @@ AI_SYSTEM_PROMPT = (
     "（或加仓/持有/减仓），给出唯一首选方向、具体价位区间与建议仓位；"
     "禁止模棱两可、禁止罗列所有可能性。结论先行，再用不超过3条核心依据支撑，"
     "最后一行给风险提示。回答简洁，不写套话。")
+
+# 画线硬性要求（v7.4.6）：Kimi 等模型常忽略正文末尾的 schema，放到 system
+# 提示里可显著提高遵从率；工具模式优先调用 draw_lines，无工具再输出文本块。
+AI_DRAW_SYSTEM_HINT = (
+    "\n【画线硬性要求】只要回答涉及行情/买卖点/支撑压力，最终回答前必须完成"
+    "画线：工具列表中存在 draw_lines 时必须调用它（至少1条水平价位 + 1条"
+    "斜线/趋势线）；没有工具能力时，在正文末尾输出 ```ai-lines JSON 代码块。"
+    "日期用 YYYY-MM-DD，价位用数字；不要只在正文描述而不提交画线。")
 
 # 风险偏好 → AI 行为约束（v6.1.7 热修②）。
 # 档次排序：保守 < 稳健 < 激进（v6.2.3 起三档）。
@@ -16136,8 +16215,8 @@ def ai_risk_mode(res=None):
 
 
 def ai_system_prompt(mode=""):
-    """AI 系统提示词 = 通用分析要求 + 当前风险偏好行为约束。"""
-    return AI_SYSTEM_PROMPT + "\n" + ai_risk_guide(mode)
+    """AI 系统提示词 = 通用分析要求 + 当前风险偏好行为约束 + 画线硬性要求。"""
+    return AI_SYSTEM_PROMPT + "\n" + ai_risk_guide(mode) + AI_DRAW_SYSTEM_HINT
 
 AI_CACHE_MAX = 24          # 单股缓存对话条数上限（含首条数据上下文）
 
@@ -16561,7 +16640,9 @@ _AI_ZONES_MAX = 3
 _AI_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 AI_DRAW_SCHEMA = (
-    "\n【画线/标注输出：正文结束后另起一段，只输出以下代码块，无其它文字】\n"
+    "\n【画线/标注输出】优先调用 draw_lines 工具提交（工具模式下最终回答前"
+    "必须调用一次）；没有工具能力时，在正文结束后另起一段只输出以下代码块，"
+    "无其它文字：\n"
     "```ai-lines\n"
     '{"lines": [{"price": 5.32, "label": "买点", "kind": "buy"}],\n'
     ' "segs": [{"a": {"date": "2026-09-01", "price": 4.80},\n'
@@ -16585,120 +16666,372 @@ AI_DRAW_SCHEMA = (
 )
 
 
+_AI_KIND_ALIAS = {
+    "buy": "buy", "买": "buy", "买点": "buy", "买入": "buy",
+    "sell": "sell", "卖": "sell", "卖点": "sell", "卖出": "sell",
+    "stop": "stop", "止损": "stop", "止损位": "stop",
+    "support": "support", "支撑": "support", "支撑位": "support",
+    "支撑线": "support",
+    "resistance": "resistance", "阻力": "resistance", "压力": "resistance",
+    "压力位": "resistance", "阻力位": "resistance",
+    "target": "target", "目标": "target", "目标位": "target",
+    "trend": "trend", "趋势": "trend", "趋势线": "trend",
+    "channel": "channel", "通道": "channel", "通道线": "channel",
+    "ray": "ray", "射线": "ray",
+    "zone": "zone", "区间": "zone", "箱体": "zone", "矩形": "zone",
+    "risk": "risk", "风险": "risk", "风险区": "risk",
+    "note": "note", "标注": "note", "备注": "note", "文字": "note",
+    "warning": "warning", "警告": "warning",
+}
+_AI_KIND_LABEL = {
+    "buy": "买点", "sell": "卖点", "stop": "止损", "support": "支撑",
+    "resistance": "压力", "target": "目标", "trend": "趋势线",
+    "channel": "通道", "ray": "射线", "zone": "区间", "risk": "风险",
+    "note": "标注", "warning": "警告",
+}
+_AI_DRAW_KEYS = (
+    "lines", "levels", "horizontal", "price_levels",
+    "segs", "segments", "trend_lines", "trendlines", "channels",
+    "notes", "labels", "marks", "texts",
+    "zones", "rects", "boxes", "ranges", "areas",
+)
+
+
+def _ai_num(v):
+    """宽松数字：支持 5.32 / \"5.32\" / \"5.32元\" / \"1,234.5\"。"""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+    s = str(v).strip()
+    if not s or "%" in s:
+        return None
+    s = s.replace(",", "").replace("，", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        f = float(m.group(0))
+    except ValueError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _ai_norm_date(s):
+    """宽松日期：2026-09-01 / 2026/9/1 / 2026.09.01 / 20260901。"""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})", s)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+        if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+
 def _ai_date_ok(s):
-    return bool(_AI_DATE_RE.match((s or "").strip()))
+    return bool(_ai_norm_date(s))
+
+
+def _ai_norm_kind(kind, allowed, default):
+    k = str(kind or "").strip().lower().replace("_", "-")
+    if k in allowed:
+        return k
+    if k in _AI_KIND_ALIAS and _AI_KIND_ALIAS[k] in allowed:
+        return _AI_KIND_ALIAS[k]
+    for key, val in _AI_KIND_ALIAS.items():
+        if key and key in k and val in allowed:
+            return val
+    return default
+
+
+def _ai_norm_point(p, other=None):
+    """返回 (date, price)；兼容 dict/两点数组/单价格。"""
+    date = price = None
+    if isinstance(p, dict):
+        date = p.get("date") or p.get("day") or p.get("time")
+        price = p.get("price")
+        if price is None:
+            price = p.get("level")
+        if price is None:
+            price = p.get("value")
+        if price is None:
+            price = p.get("p")
+        if price is None:
+            price = p.get("y")
+        if date is None and isinstance(p.get("x"), str):
+            date = p.get("x")
+    elif isinstance(p, (list, tuple)) and len(p) >= 2:
+        a, b = p[0], p[1]
+        da, db = _ai_norm_date(a), _ai_norm_date(b)
+        if da:
+            date, price = a, b
+        elif db:
+            date, price = b, a
+        else:
+            price = a if _ai_num(a) is not None else b
+            date = other
+    else:
+        price = p
+        date = other
+    if date is None and other is not None:
+        if isinstance(other, dict):
+            date = other.get("date") or other.get("day") or other.get("time")
+            if price is None:
+                price = other.get("price", other.get("level"))
+        else:
+            date = other
+    return _ai_norm_date(date), _ai_num(price)
+
+
+def _ai_list(d, keys):
+    """读取数组字段；兼容 {"items":[...]} 与 {标签: 价位} 两种写法。"""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            if isinstance(v.get("items"), list):
+                return v["items"]
+            out = []
+            for kk, vv in v.items():
+                if isinstance(vv, (int, float, str)):
+                    out.append({"price": vv, "label": kk})
+                elif isinstance(vv, dict):
+                    e = dict(vv)
+                    e.setdefault("label", kk)
+                    out.append(e)
+            if out:
+                return out
+    return []
+
+
+def _ai_looks_like_draw(d):
+    """判断 dict 是否像画线对象（避免把普通 lines 文本数组误当画线）。"""
+    if not isinstance(d, dict):
+        return False
+    for k in ("segs", "segments", "trend_lines", "trendlines", "channels",
+              "notes", "labels", "marks", "texts",
+              "zones", "rects", "boxes", "ranges", "areas",
+              "levels", "horizontal", "price_levels"):
+        if k in d:
+            return True
+    v = d.get("lines")
+    if isinstance(v, list):
+        for e in v[:5]:
+            if isinstance(e, (int, float)):
+                return True
+            if isinstance(e, str) and _ai_num(e) is not None:
+                return True
+            if isinstance(e, dict) and any(
+                    k in e for k in ("price", "level", "value", "y")):
+                return True
+        return False
+    return isinstance(v, dict)
+
+
+def _ai_draw_obj(d):
+    """判断/拆出含画线字段的 JSON 对象（也接受数组包裹）。"""
+    if isinstance(d, list):
+        for it in d:
+            got = _ai_draw_obj(it)
+            if got is not None:
+                return got
+        return None
+    if not _ai_looks_like_draw(d):
+        if isinstance(d, dict):
+            for k in ("ai_lines", "drawing", "chart", "result", "data"):
+                v = d.get(k)
+                if isinstance(v, dict):
+                    got = _ai_draw_obj(v)
+                    if got is not None:
+                        return got
+        return None
+    return d
+
+
+def _ai_parse_json_fragment(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    for txt in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+        try:
+            d = json.loads(txt)
+        except Exception:
+            m = re.search(r"\{", txt)
+            if not m:
+                continue
+            try:
+                d, _ = json.JSONDecoder().raw_decode(txt, m.start())
+            except Exception:
+                continue
+        got = _ai_draw_obj(d)
+        if got is not None:
+            return got
+    return None
+
+
+def _ai_find_draw_obj(text, span=False):
+    """从任意文本中找画线 JSON（任意代码围栏/裸 JSON 均可）。"""
+    empty = (None, None, None) if span else None
+    if not text or not isinstance(text, str):
+        return empty
+    # 1) 代码块：```ai-lines / ```json / 无语言标记 都接受
+    for m in re.finditer(r"```[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\n?(.*?)```",
+                         text, re.S):
+        obj = _ai_parse_json_fragment(m.group(2))
+        if obj is not None:
+            return (obj, m.start(), m.end()) if span else obj
+    # 2) 裸 JSON：从每个 { 尝试平衡解析（兼容嵌套 objects；限次数防长文）
+    dec = json.JSONDecoder()
+    tries = 0
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        tries += 1
+        if tries > 200:
+            break
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except Exception:
+            continue
+        got = _ai_draw_obj(obj)
+        if got is not None:
+            return (got, i, end) if span else got
+    return empty
+
+
+def _ai_has_draw_obj(text):
+    return _ai_find_draw_obj(text) is not None
+
+
+def parse_ai_lines_obj(d, lo, hi):
+    """校验/归一化画线 dict，返回 (levels, segs, notes, zones)。"""
+    levels, segs, notes, zones = [], [], [], []
+    d = _ai_draw_obj(d)
+    if not d or not (lo and hi) or hi <= 0 or lo <= 0:
+        return levels, segs, notes, zones
+
+    for e in _ai_list(d, ("lines", "levels", "horizontal",
+                          "price_levels"))[:_AI_LINES_MAX]:
+        if isinstance(e, (int, float, str)):
+            e = {"price": e}
+        if not isinstance(e, dict):
+            continue
+        px = _ai_num(e.get("price", e.get("level", e.get("value",
+                                                       e.get("y")))))
+        if px is None or not (lo <= px <= hi):
+            continue
+        kind = _ai_norm_kind(e.get("kind") or e.get("label") or e.get("name"),
+                             _AI_LINE_KINDS, "support")
+        lab = str(e.get("label") or e.get("text") or e.get("name")
+                  or _AI_KIND_LABEL.get(kind, "线"))[:10]
+        if lab:
+            levels.append({"price": round(px, 2), "label": lab,
+                           "kind": kind})
+
+    for s in _ai_list(d, ("segs", "segments", "trend_lines", "trendlines",
+                          "channels"))[:_AI_SEGS_MAX]:
+        if not isinstance(s, dict):
+            continue
+        da, pa = _ai_norm_point(
+            s.get("a", s.get("start", s.get("p1", s.get("from")))))
+        db, pb = _ai_norm_point(
+            s.get("b", s.get("end", s.get("p2", s.get("to")))))
+        if not (da and db and pa is not None and pb is not None):
+            continue
+        if not (math.isfinite(pa) and math.isfinite(pb)):
+            continue
+        if not (lo <= pa <= hi and lo <= pb <= hi):
+            continue
+        kind = _ai_norm_kind(s.get("kind") or s.get("label") or s.get("name"),
+                             _AI_SEG_KINDS, "trend")
+        lab = str(s.get("label") or s.get("text") or s.get("name")
+                  or _AI_KIND_LABEL.get(kind, "趋势线"))[:10]
+        ext = s.get("extend", False)
+        if isinstance(ext, str):
+            ext_l = ext.strip().lower()
+            extend = ext_l in ("1", "true", "yes", "right", "both")
+            extend_both = ext_l == "both"
+        else:
+            extend = bool(ext)
+            extend_both = False
+        segs.append({"a": {"date": da, "price": round(pa, 2)},
+                     "b": {"date": db, "price": round(pb, 2)},
+                     "label": lab, "kind": kind, "extend": extend,
+                     "extend_both": extend_both,
+                     "dash": bool(s.get("dash", True))})
+
+    for n in _ai_list(d, ("notes", "labels", "marks", "texts"))[:_AI_NOTES_MAX]:
+        txt = ""
+        if isinstance(n, (list, tuple)) and len(n) >= 3:
+            date, px = _ai_norm_point(n[:2])
+            txt = str(n[2] or "")[:20]
+        elif isinstance(n, dict):
+            date, px = _ai_norm_point(n)
+            txt = str(n.get("text") or n.get("label") or n.get("content")
+                      or n.get("note") or "")[:20]
+        else:
+            continue
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if not (date and px is not None and txt):
+            continue
+        if not (math.isfinite(px) and lo <= px <= hi):
+            continue
+        kind = _ai_norm_kind(
+            (n.get("kind") or n.get("label") or n.get("content"))
+            if isinstance(n, dict) else "",
+            _AI_NOTE_KINDS, "note")
+        notes.append({"date": date, "price": round(px, 2),
+                      "text": txt[:20], "kind": kind})
+
+    for z in _ai_list(d, ("zones", "rects", "boxes", "ranges",
+                          "areas"))[:_AI_ZONES_MAX]:
+        if not isinstance(z, dict):
+            continue
+        da, pa = _ai_norm_point(
+            z.get("a", z.get("start", z.get("from", z.get("p1")))))
+        db, pb = _ai_norm_point(
+            z.get("b", z.get("end", z.get("to", z.get("p2")))))
+        if (not da or not db) and ("top" in z or "bottom" in z):
+            da = _ai_norm_date(z.get("start_date") or z.get("start")
+                               or z.get("from"))
+            db = _ai_norm_date(z.get("end_date") or z.get("end")
+                               or z.get("to"))
+            pa = _ai_num(z.get("top", z.get("high", z.get("y1"))))
+            pb = _ai_num(z.get("bottom", z.get("low", z.get("y2"))))
+        if not (da and db and pa is not None and pb is not None):
+            continue
+        if not (math.isfinite(pa) and math.isfinite(pb)):
+            continue
+        if not (lo <= pa <= hi and lo <= pb <= hi):
+            continue
+        kind = _ai_norm_kind(z.get("kind") or z.get("label") or z.get("name"),
+                             _AI_ZONE_KINDS, "zone")
+        lab = str(z.get("label") or z.get("text") or z.get("name")
+                  or _AI_KIND_LABEL.get(kind, "区间"))[:10]
+        zones.append({"a": {"date": da, "price": round(pa, 2)},
+                      "b": {"date": db, "price": round(pb, 2)},
+                      "label": lab, "kind": kind})
+    return levels, segs, notes, zones
 
 
 def parse_ai_lines(text, lo, hi):
-    """解析AI画线块，返回 (levels, segs, notes, zones)。非法/越界静默丢弃。
-    levels: [{"price","label","kind"}]
-    segs:   [{"a":{"date","price"},"b":{...},"label","kind","extend",
-              "extend_both","dash"}]
-    notes:  [{"date","price","text","kind"}]
-    zones:  [{"a":{"date","price"},"b":{...},"label","kind"}]
-    lo/hi 为允许的价格区间。"""
-    levels, segs, notes, zones = [], [], [], []
-    if not text or not (lo and hi) or hi <= 0 or lo <= 0:
-        return levels, segs, notes, zones
-    try:
-        m = re.search(r"```ai-lines\s*(\{.*?\})\s*```", text, re.S)
-        raw = m.group(1) if m else None
-        if raw is None:
-            m2 = None
-            for m2 in re.finditer(
-                    r'\{[^{}]*"(?:lines|segs|notes|zones)"[^{}]*\}', text):
-                pass
-            raw = m2.group(0) if m2 else None
-        if not raw:
-            return levels, segs, notes, zones
-        try:
-            d = json.loads(raw)
-        except Exception:
-            return levels, segs, notes, zones  # 残缺JSON静默丢弃
-        if not isinstance(d, dict):
-            return levels, segs, notes, zones
-        for e in (d.get("lines") or [])[:_AI_LINES_MAX]:
-            try:
-                px = float(e.get("price"))
-                lab = str(e.get("label") or "")[:10]
-                kind = str(e.get("kind") or "")
-                if kind not in _AI_LINE_KINDS or not lab:
-                    continue
-                if not (math.isfinite(px) and lo <= px <= hi):
-                    continue
-                levels.append({"price": round(px, 2), "label": lab,
-                               "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for s in (d.get("segs") or [])[:_AI_SEGS_MAX]:
-            try:
-                a, b = s.get("a") or {}, s.get("b") or {}
-                pa, pb = float(a.get("price")), float(b.get("price"))
-                da, db = str(a.get("date") or ""), str(b.get("date") or "")
-                lab = str(s.get("label") or "")[:10]
-                if not (math.isfinite(pa) and math.isfinite(pb)):
-                    continue
-                if not (lo <= pa <= hi and lo <= pb <= hi):
-                    continue
-                if not (_ai_date_ok(da) and _ai_date_ok(db)):
-                    continue
-                kind = str(s.get("kind") or "trend").lower()
-                if kind not in _AI_SEG_KINDS:
-                    kind = "trend"
-                ext = s.get("extend", False)
-                if isinstance(ext, str):
-                    ext_l = ext.strip().lower()
-                    extend = ext_l in ("1", "true", "yes", "right", "both")
-                    extend_both = ext_l == "both"
-                else:
-                    extend = bool(ext)
-                    extend_both = False
-                segs.append({"a": {"date": da[:10], "price": round(pa, 2)},
-                             "b": {"date": db[:10], "price": round(pb, 2)},
-                             "label": lab, "kind": kind, "extend": extend,
-                             "extend_both": extend_both,
-                             "dash": bool(s.get("dash", True))})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for n in (d.get("notes") or [])[:_AI_NOTES_MAX]:
-            try:
-                da = str(n.get("date") or "")
-                px = float(n.get("price"))
-                txt = re.sub(r"\s+", " ", str(n.get("text") or "")).strip()[:20]
-                kind = str(n.get("kind") or "note").lower()
-                if kind not in _AI_NOTE_KINDS:
-                    kind = "note"
-                if not txt or not _ai_date_ok(da):
-                    continue
-                if not (math.isfinite(px) and lo <= px <= hi):
-                    continue
-                notes.append({"date": da[:10], "price": round(px, 2),
-                              "text": txt, "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-        for z in (d.get("zones") or [])[:_AI_ZONES_MAX]:
-            try:
-                a, b = z.get("a") or {}, z.get("b") or {}
-                pa, pb = float(a.get("price")), float(b.get("price"))
-                da, db = str(a.get("date") or ""), str(b.get("date") or "")
-                lab = str(z.get("label") or "")[:10]
-                kind = str(z.get("kind") or "zone").lower()
-                if kind not in _AI_ZONE_KINDS:
-                    kind = "zone"
-                if not (math.isfinite(pa) and math.isfinite(pb)):
-                    continue
-                if not (lo <= pa <= hi and lo <= pb <= hi):
-                    continue
-                if not (_ai_date_ok(da) and _ai_date_ok(db)):
-                    continue
-                zones.append({"a": {"date": da[:10], "price": round(pa, 2)},
-                              "b": {"date": db[:10], "price": round(pb, 2)},
-                              "label": lab, "kind": kind})
-            except (ValueError, TypeError, AttributeError):
-                continue
-    except Exception:
-        log.exception("AI画线块解析失败(忽略)")
-    return levels, segs, notes, zones
+    """解析AI画线数据（兼容 ai-lines/json 围栏与裸 JSON）。"""
+    d = _ai_find_draw_obj(text)
+    if d is None:
+        return [], [], [], []
+    return parse_ai_lines_obj(d, lo, hi)
 
 
 def ai_session_load(code, model=""):
@@ -17438,6 +17771,77 @@ def _ai_tool_etf(ctx, args):
     return "\n".join(lines)
 
 
+def _ai_user_lines_txt(res, limit=16):
+    """用户手动画线的紧凑文字摘要（给 AI 首轮上下文）。"""
+    res = res or {}
+    items = res.get("user_lines") or []
+    if not items:
+        return ""
+    rows = res.get("disp_rows") or []
+    idx = {r.get("date"): i for i, r in enumerate(rows)}
+    out = ["【用户手动画线（只读；代表用户关注的支撑/压力/趋势）】"]
+    shown = items[-max(1, int(limit)):]
+    for it in shown:
+        try:
+            a, b = it.get("a") or {}, it.get("b") or {}
+            da, db = str(a.get("date") or ""), str(b.get("date") or "")
+            pa, pb = float(a.get("price")), float(b.get("price"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if it.get("kind") == "rect":
+            lo, hi = sorted((pa, pb))
+            w = (hi / lo - 1) * 100 if lo > 0 else 0
+            out.append(f"- 方框：{da} ~ {db}，价格 {lo:.2f}~{hi:.2f}"
+                       f"（宽度{w:.1f}%）")
+        else:
+            chg = (pb / pa - 1) * 100 if pa > 0 else 0
+            direction = ("上升" if chg > 0.5
+                         else ("下降" if chg < -0.5 else "水平"))
+            ia, ib = idx.get(da[:10]), idx.get(db[:10])
+            span = (f"，{abs(ib - ia)}个交易日" if ia is not None
+                    and ib is not None else "")
+            out.append(f"- 直线（{direction}）：{da} {pa:.2f} → {db} "
+                       f"{pb:.2f}（{chg:+.1f}%{span}）")
+    if len(items) > len(shown):
+        out.append(f"（共{len(items)}条，仅列最近{len(shown)}条）")
+    out.append("请结合这些线分析；不要删除或覆盖用户画线。")
+    return "\n".join(out)
+
+
+def _ai_tool_user_lines(ctx, args):
+    """返回用户手动画线（日期+价格），供 AI 判断用户关注位。"""
+    res = (ctx or {}).get("res") or {}
+    items = res.get("user_lines") or []
+    return _ai_tool_json({
+        "code": res.get("full_code") or "",
+        "count": len(items),
+        "items": items,
+        "summary": _ai_user_lines_txt(res, limit=40),
+    })
+
+
+def _ai_tool_draw_lines(ctx, args):
+    """draw_lines 工具：把模型的结构化画线交给主线程落图。"""
+    cb = (ctx or {}).get("on_lines")
+    if not callable(cb):
+        return "当前会话未启用主图画线（仅 GUI 可用）。"
+    if not isinstance(args, dict) or not any(k in args
+                                             for k in _AI_DRAW_KEYS):
+        return "参数为空：请提供 lines / segs / notes / zones。"
+    lv, sg_, nt, zn = parse_ai_lines_obj(args, 0.01, 1e12)
+    if not (lv or sg_ or nt or zn):
+        return ("画线参数校验失败：请检查日期 YYYY-MM-DD、价格数字，"
+                "以及 a/b 均含 date+price。")
+    try:
+        cb(args)
+    except Exception as e:
+        log.exception("draw_lines 工具落图失败")
+        return f"画线提交失败：{type(e).__name__}: {e}"[:300]
+    return (f"已提交主图画线：水平线{len(lv)}、斜线{len(sg_)}、"
+            f"标注{len(nt)}、区间{len(zn)}。请继续给出最终结论；"
+            "不要重复提交相同画线。")
+
+
 _AI_TOOL_FUNCS = {
     "get_kline": _ai_tool_kline,
     "get_indicators": _ai_tool_indicators,
@@ -17451,6 +17855,8 @@ _AI_TOOL_FUNCS = {
     "search_news": _ai_tool_news,
     "get_external_env": _ai_tool_external,
     "get_etf_constituents": _ai_tool_etf,
+    "get_user_drawings": _ai_tool_user_lines,
+    "draw_lines": _ai_tool_draw_lines,
     "show_table": _ai_tool_show_table,
 }
 
@@ -17551,6 +17957,64 @@ def ai_tool_specs():
                           "default": 20},
                 "code": {"type": "string",
                          "description": "可选ETF代码，如 510300"}}}}},
+        {"type": "function", "function": {
+            "name": "get_user_drawings",
+            "description": "读取用户在主图上手动画的直线/方框（日期+价格）。"
+                           "分析用户关注位、支撑压力或趋势意图时调用。",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {
+            "name": "draw_lines",
+            "description": "在K线主图提交画线/标注（涉及行情/买卖点时，最终"
+                           "回答前优先调用）。支持水平价位、趋势线/射线、文字"
+                           "标注、矩形区间；日期 YYYY-MM-DD、价格用数字。",
+            "parameters": {"type": "object", "properties": {
+                "lines": {"type": "array", "description": "水平价位≤8",
+                          "items": {"type": "object", "properties": {
+                              "price": {"type": "number"},
+                              "label": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_LINE_KINDS)}},
+                              "required": ["price"]}},
+                "segs": {"type": "array", "description": "斜线/趋势线/通道/"
+                          "射线≤6",
+                         "items": {"type": "object", "properties": {
+                             "a": {"type": "object", "properties": {
+                                 "date": {"type": "string"},
+                                 "price": {"type": "number"}},
+                                 "required": ["date", "price"]},
+                             "b": {"type": "object", "properties": {
+                                 "date": {"type": "string"},
+                                 "price": {"type": "number"}},
+                                 "required": ["date", "price"]},
+                             "label": {"type": "string"},
+                             "kind": {"type": "string",
+                                      "enum": list(_AI_SEG_KINDS)},
+                             "extend": {"type": "boolean"},
+                             "dash": {"type": "boolean"}},
+                             "required": ["a", "b"]}},
+                "notes": {"type": "array", "description": "文字标注≤6",
+                          "items": {"type": "object", "properties": {
+                              "date": {"type": "string"},
+                              "price": {"type": "number"},
+                              "text": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_NOTE_KINDS)}},
+                              "required": ["date", "price", "text"]}},
+                "zones": {"type": "array", "description": "矩形区间≤3",
+                          "items": {"type": "object", "properties": {
+                              "a": {"type": "object", "properties": {
+                                  "date": {"type": "string"},
+                                  "price": {"type": "number"}},
+                                  "required": ["date", "price"]},
+                              "b": {"type": "object", "properties": {
+                                  "date": {"type": "string"},
+                                  "price": {"type": "number"}},
+                                  "required": ["date", "price"]},
+                              "label": {"type": "string"},
+                              "kind": {"type": "string",
+                                       "enum": list(_AI_ZONE_KINDS)}},
+                              "required": ["a", "b"]}},
+            }}}},
         {"type": "function", "function": {
             "name": "show_table",
             "description": "在 AI 窗口单独渲染一张统计表（如预测分位、回测统计、"
@@ -17729,6 +18193,10 @@ class App:
         self.res = None
         self.view = None
         self.scales = {}
+        self._user_lines = _user_drawings_load()   # 用户手动画线（按代码分组）
+        self._udraw = None                          # 正在拖拽的画线状态
+        self._auto_lines = {}                       # 脚本自动画线（会话缓存）
+        self._auto_busy = False
         self._axis_lpad = 0            # 轴标签左边距让位（_draw_main 计算）
         self.show_n = tk.IntVar(value=30 if self.compact else 60)
         self.ind_name = tk.StringVar(value="MACD")
@@ -17746,6 +18214,8 @@ class App:
         self._minute_busy = False
         self._minute_ts = 0.0
         self.show_ai_lines = tk.BooleanVar(value=True)  # AI画线显隐（v6.5.2）
+        self.show_auto_lines = tk.BooleanVar(value=True)  # 脚本自动画线显隐
+        self._auto_lines = {}          # {full_code: auto_lines dict} 会话内缓存
         self.boll_on = {"up": tk.BooleanVar(value=True),
                         "mid": tk.BooleanVar(value=True),
                         "low": tk.BooleanVar(value=True)}  # BOLL 三轨分别开关
@@ -18010,12 +18480,10 @@ class App:
                             variable=self.minute_mode,
                             command=self._toggle_minute).pack(side="left",
                                                               padx=2)
-            # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
+            # 小屏：荐股/报告/样本/缓存/指数 全部收进【工具】菜单
             ttk.Button(top2, text="工具", width=4,
                        command=lambda: self._tools_menu(top2)
                        ).pack(side="right", padx=2)
-            ttk.Button(top2, text="荐股", width=4,
-                       command=self._open_picks).pack(side="right", padx=2)
         else:
             ttk.Separator(top, orient="vertical").pack(side="left", fill="y",
                                                        padx=8)
@@ -18048,6 +18516,23 @@ class App:
                            bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
                            activeforeground=FG_MAIN,
                            selectcolor=FIELD_BG).pack(side="left")
+            tk.Checkbutton(top, text="自动线", variable=self.show_auto_lines,
+                           command=self._rerender, font=("Consolas", 8),
+                           bg=DARK_BG, fg=C_ORANGE, activebackground=DARK_BG,
+                           activeforeground=C_ORANGE,
+                           selectcolor=FIELD_BG).pack(side="left")
+            tk.Button(top, text="撤销画线", command=self.undo_user_line,
+                      font=("Consolas", 8), bg=DARK_BG, fg=FG_MAIN,
+                      activebackground=BTN_HOVER, activeforeground=FG_MAIN,
+                      bd=0, padx=4).pack(side="left")
+            tk.Button(top, text="清画线", command=self.clear_user_lines,
+                      font=("Consolas", 8), bg=DARK_BG, fg=DRAW_C,
+                      activebackground=BTN_HOVER, activeforeground=DRAW_C,
+                      bd=0, padx=4).pack(side="left")
+            tk.Button(top, text="自动画线", command=self.auto_draw_lines,
+                      font=("Consolas", 8), bg=DARK_BG, fg=C_ORANGE,
+                      activebackground=BTN_HOVER, activeforeground=C_ORANGE,
+                      bd=0, padx=4).pack(side="left")
             tk.Checkbutton(top, text="分时", variable=self.minute_mode,
                            command=self._toggle_minute, font=("Consolas", 8),
                            bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
@@ -18077,17 +18562,6 @@ class App:
                            selectcolor=FIELD_BG).pack(side="left")
             ttk.Separator(top, orient="vertical").pack(side="left", fill="y",
                                                        padx=8)
-            ttk.Button(top, text="每日荐股", command=self._open_picks
-                       ).pack(side="left", padx=2)
-            ttk.Button(top, text="复制报告",
-                       command=self.copy_report).pack(side="left", padx=2)
-            ttk.Button(top, text="导出报告",
-                       command=self.export_report).pack(side="left", padx=2)
-            ttk.Button(top, text="样本明细",
-                       command=self.show_samples).pack(side="left", padx=2)
-            if CACHE_OK:
-                ttk.Button(top, text="更新缓存",
-                           command=self.refresh_cache).pack(side="left", padx=2)
             self.btn_ai = ttk.Button(top, text="工具", command=self.open_tools)
             self.btn_ai.pack(side="left", padx=2)
             ttk.Button(top, text="⚙设置",
@@ -18194,6 +18668,12 @@ class App:
                                     padx=6, pady=4, spacing1=1, spacing3=1)
             self.side_txt.pack(fill="both", expand=True)
             self._rt_panels["预测参考"] = pred
+
+            # 画线指导侧栏（v7.4.4）：内置《金融市场技术分析》文字版 + 原版PDF
+            dg = tk.Frame(self._rt_content, bg=PANEL_BG)
+            self._rt_panels["画线指导"] = dg
+            self._rt_names.append("画线指导")
+            self._build_drawing_guide_panel(dg)
 
             # 盘口 / 集合竞价侧栏（分时视图自动切到这里；v7.0.2）
             ob = tk.Frame(self._rt_content, bg=PANEL_BG)
@@ -18334,6 +18814,12 @@ class App:
             cv.bind("<B1-Motion>", self._drag_move)
             cv.bind("<ButtonRelease-1>", self._drag_end)
             cv.bind("<Double-Button-1>", self._drag_reset)
+        # 用户画线（仅主图）：右键拖拽=直线；Ctrl+左键拖拽=方框（见 _drag_start）
+        self.cv_main.bind("<ButtonPress-3>",
+                          lambda e: self._user_draw_begin(e, "line"))
+        self.cv_main.bind("<B3-Motion>", self._user_draw_move)
+        self.cv_main.bind("<ButtonRelease-3>", self._user_draw_end)
+        self.cv_main.bind("<Escape>", lambda e: self._user_draw_cancel())
     # ---------- 折叠 ----------
 
     def _open_picks(self):
@@ -18590,9 +19076,16 @@ class App:
         m = tk.Menu(self.root, tearoff=0, bg=PANEL_BG, fg=FG_MAIN,
                     activebackground=BTN_HOVER, activeforeground=FG_MAIN,
                     font=("Microsoft YaHei", 10))
+        m.add_command(label="每日荐股", command=self._open_picks)
+        m.add_command(label="自动画线（脚本·多轮优化）",
+                      command=self.auto_draw_lines)
+        m.add_checkbutton(label="显示自动线", variable=self.show_auto_lines,
+                          command=self._rerender)
         m.add_command(label="复制报告", command=self.copy_report)
         m.add_command(label="导出报告", command=self.export_report)
         m.add_command(label="样本明细", command=self.show_samples)
+        m.add_command(label="撤销上一条画线", command=self.undo_user_line)
+        m.add_command(label="清空手动画线", command=self.clear_user_lines)
         m.add_command(label="五大指数", command=self._open_idx_window)
         m.add_command(label="基本面信息（历史财报）",
                       command=self.open_fundamentals)
@@ -18737,6 +19230,133 @@ class App:
                 self._refresh_limit_stocks()
             except Exception:
                 log.debug("切到盘口刷新失败", exc_info=True)
+
+    # ---------- 画线指导侧栏（v7.4.4） ----------
+
+    def _build_drawing_guide_panel(self, parent):
+        """右侧栏「画线指导」：内置 PDF 文字版 + 打开桌面原版 PDF。"""
+        self._dg_pdf = _find_drawing_guide_pdf()
+        top = tk.Frame(parent, bg=PANEL_BG)
+        top.pack(fill="x", padx=2, pady=(0, 3))
+        tk.Label(top, text="画线指导 · 文字版", bg=PANEL_BG, fg=TITLE_TXT,
+                 font=("Microsoft YaHei", 8)).pack(side="left")
+        if self._dg_pdf:
+            ttk.Button(top, text="打开原版PDF",
+                       command=self._open_drawing_guide_pdf
+                       ).pack(side="right", padx=(4, 0))
+        wrap = tk.Frame(parent, bg=PANEL_BG)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, width=max(32, self._rt_chars - 2),
+                      wrap="char", font=("Microsoft YaHei", 9),
+                      relief="flat", bg=PANEL_BG, fg=FG_MAIN,
+                      insertbackground=FG_MAIN, selectbackground=SEL_BG,
+                      padx=6, pady=4, spacing1=1, spacing3=1)
+        sb = ttk.Scrollbar(wrap, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        self.dg_txt = txt
+        self._fill_drawing_guide(txt)
+        txt.config(state="disabled")
+
+    def _fill_drawing_guide(self, txt):
+        """按缩进/短标题把 PDF 文字版渲染为带层级样式的只读文本。"""
+        txt.tag_configure(
+            "title", font=("Microsoft YaHei", 13, "bold"),
+            foreground=ACCENT, justify="center", spacing1=2, spacing3=8)
+        txt.tag_configure(
+            "h1", font=("Microsoft YaHei", 11, "bold"),
+            foreground=ACCENT, spacing1=14, spacing3=6)
+        txt.tag_configure(
+            "h2", font=("Microsoft YaHei", 9, "bold"),
+            foreground=TITLE_TXT, spacing1=10, spacing3=3)
+        txt.tag_configure(
+            "h3", font=("Microsoft YaHei", 9, "bold"),
+            foreground=FG_MAIN, spacing1=6, spacing3=2)
+        txt.tag_configure(
+            "h4", font=("Microsoft YaHei", 8, "bold"),
+            foreground=FG_MAIN, spacing1=4, spacing3=1)
+        txt.tag_configure(
+            "hint", font=("Microsoft YaHei", 8), foreground=AXIS_TXT,
+            spacing1=1, spacing3=6, spacing2=1)
+        for k, (lm1, lm2) in (("b1", (6, 20)), ("b2", (18, 32)),
+                              ("b3", (32, 46)), ("b4", (46, 60))):
+            txt.tag_configure(
+                k, font=("Microsoft YaHei", 9), foreground=FG_MAIN,
+                lmargin1=lm1, lmargin2=lm2, spacing1=1, spacing2=1,
+                spacing3=2)
+
+        txt.insert(
+            "end", "操作：右键拖拽画直线，Ctrl+左键拖拽画方框；"
+                   "端点自动吸附最近K线中心与 OHLC（开/高/低/收）。\n", "hint")
+        if self._dg_pdf:
+            txt.insert("end", "下文为《金融市场技术分析》PDF 文字版；"
+                              "图表请点右上角【打开原版PDF】。\n\n", "hint")
+        else:
+            txt.insert("end", "下文为《金融市场技术分析》PDF 文字版；"
+                              "未找到桌面原版PDF（图表不可用）。\n\n", "hint")
+
+        def level(ind):
+            if ind <= 0:
+                return 0
+            if ind <= 3:
+                return 1
+            if ind <= 5:
+                return 2
+            if ind <= 7:
+                return 3
+            return 4
+
+        def is_short_heading(s):
+            return (len(s) <= 14
+                    and not re.search(r"[，。；：、？！,.;:?!]", s)
+                    and not re.match(r"^\d+[.、]", s))
+
+        items = []
+        for raw in (DRAWING_GUIDE_TEXT or "").splitlines():
+            if not raw.strip():
+                continue
+            items.append((len(raw) - len(raw.lstrip(" ")), raw.strip()))
+        for i, (ind, text) in enumerate(items):
+            lv = level(ind)
+            nxt_ind = items[i + 1][0] if i + 1 < len(items) else -1
+            prefix = ""
+            if lv == 0:
+                if text == "金融市场技术分析":
+                    tag = "title"
+                elif text == "内容目录" or re.match(r"^\d{2}\s", text):
+                    tag = "h1"
+                else:
+                    tag = "h2"
+            elif lv == 1:
+                if is_short_heading(text) and nxt_ind > ind:
+                    tag = "h2"
+                else:
+                    tag = "b1"
+                    if not re.match(r"^\d+[.、]", text):
+                        prefix = "• "
+            elif is_short_heading(text) and nxt_ind > ind:
+                # 短标题：下一段缩进更深 → 作为小标题，否则当正文要点
+                tag = "h3" if lv == 2 else "h4"
+            else:
+                tag = f"b{lv}"
+                if not re.match(r"^\d+[.、]", text):
+                    prefix = "• " if lv <= 2 else "– "
+            txt.insert("end", prefix + text + "\n", tag)
+
+    def _open_drawing_guide_pdf(self):
+        """调用系统默认程序打开桌面原版 PDF（含图）。"""
+        p = getattr(self, "_dg_pdf", "") or _find_drawing_guide_pdf()
+        if not p:
+            messagebox.showinfo(
+                "画线指导", "未找到桌面《金融市场技术分析.pdf》。\n"
+                             "可把原版 PDF 放到桌面，或与 stock_gui.py 同目录。")
+            return
+        try:
+            if not webbrowser.open("file://" + urllib.parse.quote(p)):
+                raise RuntimeError("系统未找到可打开 PDF 的默认程序")
+        except Exception as e:
+            messagebox.showerror("画线指导", f"打开 PDF 失败：{e}")
 
     # ---------- 盘口 / 集合竞价侧栏（v7.0.2） ----------
 
@@ -20469,6 +21089,9 @@ class App:
         类似同花顺键盘精灵——新一次搜索从空的搜索栏开始；
         同一次搜索会话内（如连续输入 600519）则正常追加。
         """
+        if e.keysym == "Escape" and getattr(self, "_udraw", None):
+            self._user_draw_cancel()
+            return "break"
         ch = e.char
         if not ch or not ch.isprintable() or e.keysym in ("Return", "KP_Enter",
                                                           "Escape", "Tab"):
@@ -22148,6 +22771,7 @@ class App:
         if self.res is not None and res["full_code"] != self.res["full_code"]:
             self._ai_msgs = []
         self.res = res
+        self._sync_user_lines()
         self.ai_text = ""
         self._save_ini()
         self._set_info()
@@ -22589,6 +23213,8 @@ class App:
 
     def _rerender(self):
         self._drag_job = None
+        if getattr(self, "_udraw", None):
+            self._user_draw_cancel()    # 窗口缩放/行情刷新会清空画布，先取消预览
         if self.minute_mode.get():
             # 分时模式：独立渲染（数据已在缓存，盘中由 _tick 定时刷新）
             self._draw_minute_view()
@@ -22660,6 +23286,8 @@ class App:
 
     def _on_wheel(self, event):
         """滚轮：上下缩放，Shift+滚轮左右平移。"""
+        if getattr(self, "_udraw", None):
+            return                      # 画线拖拽中不缩放
         if not self.res:
             return
         if event.state & 0x1:  # Shift held → pan
@@ -22734,11 +23362,22 @@ class App:
         self._rerender()
 
     def _drag_start(self, event):
+        # Ctrl+左键：主图画方框（自动吸附）；不进入平移
+        if (event.state & 0x4) and event.widget is self.cv_main \
+                and not self.minute_mode.get():
+            self._user_draw_begin(event, "rect")
+            return
+        if getattr(self, "_udraw", None):
+            return
         self._drag_x = event.x
         self._drag_pan = self.view_pan
         self._drag_moved = False
 
     def _drag_move(self, event):
+        if getattr(self, "_udraw", None):
+            if self._udraw.get("kind") == "rect":
+                self._user_draw_move(event)
+            return
         if not self.res or not hasattr(self, "_drag_x") \
                 or self._drag_x is None:
             return
@@ -22758,6 +23397,10 @@ class App:
                 self._drag_job = self.root.after(60, self._rerender)
 
     def _drag_end(self, event):
+        if getattr(self, "_udraw", None):
+            if self._udraw.get("kind") == "rect":
+                self._user_draw_end(event)
+            return
         self._drag_x = None
         # 拖动结束时立即补一次最终位置重绘
         if getattr(self, "_drag_job", None):
@@ -22765,12 +23408,329 @@ class App:
             self._drag_job = None
             self._rerender()
 
-    def _drag_reset(self, _event):
+    def _drag_reset(self, event):
         """双击图表：回到最新K线（清除平移）。"""
+        if getattr(self, "_udraw", None) or (getattr(event, "state", 0) & 0x4):
+            return
         if self.view_pan:
             self.view_pan = 0
             self.progress_var.set("已回到最新")
             self._rerender()
+
+    # ---------- 用户画线（右键直线 / Ctrl+左键方框，自动吸附） ----------
+
+    def _user_draw_plot(self):
+        """主图坐标信息；分时/无数据时返回 None（画线只在日K主图生效）。"""
+        if self.minute_mode.get() or not self.res or not self.view:
+            return None
+        sg = self.scales.get("main")
+        if not sg or sg.get("minute"):
+            return None
+        bars = self.view.get("bars") or []
+        if not bars:
+            return None
+        n_total = len(self.res.get("disp_rows") or [])
+        n_real = max(0, min(n_total - int(self.view.get("off", 0)),
+                            len(bars)))
+        if n_real <= 0:
+            return None
+        return sg, bars, n_real
+
+    def _user_draw_snap(self, event, start=None):
+        """鼠标坐标 → (K线序号, 日期, 价格)。
+
+        自动吸附：X 吸到最近的 K 线中心，Y 优先吸该 K 线 OHLC（阈值内），
+        否则取两位小数；第二点靠近起点水平/同 K 时强制对齐（画水平线）。
+        """
+        plot = self._user_draw_plot()
+        if not plot:
+            return None
+        sg, bars, n_real = plot
+        xmin = sg["L"]
+        xmax = sg["w"] - sg["R"]
+        ymin = sg["T"]
+        ymax = sg["T"] + sg["ph"]
+        if not (xmin <= event.x <= xmax and ymin <= event.y <= ymax):
+            return None
+        bw = sg["bw"]
+        if bw <= 0:
+            return None
+        idx = int(round((event.x - xmin) / bw - 0.5))
+        idx = max(0, min(n_real - 1, idx))
+        lo, hi = sg["lo_v"], sg["hi_v"]
+        span = max(1e-9, hi - lo)
+        ph = max(1e-9, sg["ph"])
+        y = max(min(event.y, ymax), ymin)
+        price = hi - (y - ymin) / ph * (hi - lo)
+        b = bars[idx]
+        snap_px = 12 if getattr(self, "compact", False) else 10
+        best, best_dy = None, None
+        for key in ("open", "high", "low", "close"):
+            try:
+                val = float(b.get(key))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(val):
+                continue
+            yy = ymin + (hi - val) / span * sg["ph"]
+            dy = abs(yy - y)
+            if best_dy is None or dy < best_dy:
+                best, best_dy = val, dy
+        if best is not None and best_dy is not None and best_dy <= snap_px:
+            price = best
+        else:
+            price = round(price, 2)
+        y = ymin + (hi - price) / span * sg["ph"]
+        x = xmin + bw * (idx + 0.5)
+        if start is not None:
+            if abs(y - start["y"]) <= 5:      # 水平线吸附
+                price, y = start["price"], start["y"]
+            if idx == start["idx"]:            # 同一根 K → 垂直线
+                x = start["x"]
+        return {"idx": idx, "date": sg["dates"][idx],
+                "price": round(float(price), 2), "x": x, "y": y}
+
+    def _user_draw_clear_preview(self, u):
+        cv = self.cv_main
+        for key in ("item", "dot", "txt"):
+            it = (u or {}).get(key)
+            if it is None:
+                continue
+            try:
+                cv.delete(it)
+            except tk.TclError:
+                pass
+
+    def _user_draw_begin(self, event, kind):
+        if getattr(self, "_udraw", None):
+            return
+        p = self._user_draw_snap(event)
+        if not p:
+            return
+        cv = self.cv_main
+        u = {"kind": kind, "a": p, "b": p}
+        try:
+            if kind == "rect":
+                u["item"] = cv.create_rectangle(
+                    p["x"], p["y"], p["x"], p["y"],
+                    outline=DRAW_C, width=2, dash=(4, 3))
+            else:
+                u["item"] = cv.create_line(
+                    p["x"], p["y"], p["x"], p["y"],
+                    fill=DRAW_C, width=2, dash=(4, 3))
+            u["dot"] = cv.create_oval(p["x"] - 3, p["y"] - 3,
+                                      p["x"] + 3, p["y"] + 3,
+                                      fill=DRAW_C, outline=DRAW_C)
+            u["txt"] = cv.create_text(p["x"] + 6, p["y"] - 8,
+                                      text=f"{p['price']:.2f}", anchor="w",
+                                      fill=DRAW_C,
+                                      font=("Consolas", 8, "bold"))
+        except tk.TclError:
+            self._user_draw_clear_preview(u)
+            return
+        self._udraw = u
+        self._drag_x = None
+        for attr in ("_wheel_job", "_drag_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.hover_var.set("画线：拖动鼠标，松开保存；Esc 取消")
+
+    def _user_draw_move(self, event):
+        u = getattr(self, "_udraw", None)
+        if not u:
+            return
+        p = self._user_draw_snap(event, start=u["a"])
+        if not p:
+            return
+        u["b"] = p
+        cv = self.cv_main
+        try:
+            if u["kind"] == "rect":
+                cv.coords(u["item"], u["a"]["x"], u["a"]["y"],
+                          p["x"], p["y"])
+            else:
+                cv.coords(u["item"], u["a"]["x"], u["a"]["y"],
+                          p["x"], p["y"])
+            cv.coords(u["dot"], p["x"] - 3, p["y"] - 3,
+                      p["x"] + 3, p["y"] + 3)
+            cv.coords(u["txt"], p["x"] + 6, p["y"] - 8)
+            cv.itemconfigure(u["txt"], text=f"{p['price']:.2f}")
+        except tk.TclError:
+            self._udraw = None
+            return
+        self.hover_var.set(
+            f"{u['a']['date']} {u['a']['price']:.2f} → "
+            f"{p['date']} {p['price']:.2f}")
+
+    def _user_draw_end(self, event):
+        u = getattr(self, "_udraw", None)
+        if not u:
+            return
+        p = self._user_draw_snap(event, start=u["a"])
+        if p:
+            u["b"] = p
+        a, b, kind = u["a"], u["b"], u["kind"]
+        if kind == "line":
+            ok = abs(b["x"] - a["x"]) >= 3 or abs(b["y"] - a["y"]) >= 3
+        else:
+            ok = abs(b["x"] - a["x"]) >= 3 and abs(b["y"] - a["y"]) >= 3
+        self._udraw = None
+        self._user_draw_clear_preview(u)
+        code = (self.res or {}).get("full_code")
+        if not ok or not code:
+            self.hover_var.set("")
+            return
+        items = self._user_lines.setdefault(code, [])
+        items.append({"kind": kind,
+                      "a": {"date": a["date"], "price": a["price"]},
+                      "b": {"date": b["date"], "price": b["price"]}})
+        if len(items) > USER_LINES_MAX:
+            del items[:-USER_LINES_MAX]
+        _user_drawings_save(self._user_lines)
+        self._sync_user_lines()
+        self.hover_var.set("已保存画线（右键直线 / Ctrl+左键方框，Esc 取消）")
+        self._rerender()
+
+    def _user_draw_cancel(self):
+        u = getattr(self, "_udraw", None)
+        self._udraw = None
+        if u:
+            self._user_draw_clear_preview(u)
+            self.hover_var.set("")
+
+    def _user_lines_code(self):
+        return (self.res or {}).get("full_code")
+
+    def _sync_user_lines(self):
+        """把当前股票手动画线挂到 res，供 AI 上下文/工具读取。"""
+        res = getattr(self, "res", None)
+        if not res:
+            return
+        code = res.get("full_code")
+        items = (self._user_lines or {}).get(code) or []
+        res["user_lines"] = [dict(it) for it in items]
+
+    def undo_user_line(self):
+        """撤销当前股票最后一条手动画线。"""
+        code = self._user_lines_code()
+        if not code:
+            self.progress_var.set("先分析一只股票再操作画线")
+            return
+        items = self._user_lines.get(code) or []
+        if not items:
+            self.progress_var.set("当前股票没有手动画线")
+            return
+        items.pop()
+        if not items:
+            self._user_lines.pop(code, None)
+        _user_drawings_save(self._user_lines)
+        self._sync_user_lines()
+        self._rerender()
+        self.progress_var.set("已撤销上一条手动画线")
+
+    def clear_user_lines(self):
+        """清空当前股票的全部手动画线（带确认）。"""
+        code = self._user_lines_code()
+        if not code:
+            self.progress_var.set("先分析一只股票再操作画线")
+            return
+        items = self._user_lines.get(code) or []
+        if not items:
+            self.progress_var.set("当前股票没有手动画线")
+            return
+        if not messagebox.askyesno(
+                "清空画线", f"清空 {code} 的全部手动画线（{len(items)} 条）？"):
+            return
+        self._user_lines.pop(code, None)
+        _user_drawings_save(self._user_lines)
+        self._sync_user_lines()
+        self._rerender()
+        self.progress_var.set("已清空手动画线")
+
+    def auto_draw_lines(self):
+        """纯脚本自动画线：后台多轮优化，结果缓存在会话内。"""
+        res = getattr(self, "res", None)
+        if not res:
+            self.progress_var.set("先分析一只股票再自动画线")
+            return
+        if getattr(self, "_auto_busy", False):
+            self.progress_var.set("自动画线进行中，请稍候")
+            return
+        rows = res.get("disp_rows") or []
+        code = res.get("full_code") or ""
+        if len(rows) < 40 or not code:
+            self.progress_var.set("K线不足，无法自动画线")
+            return
+        self._auto_busy = True
+        self.progress_var.set("自动画线：脚本多轮优化中…")
+        try:
+            n_view = int(self.show_n.get())
+        except Exception:
+            n_view = 60
+        n_auto = max(120, min(600, n_view * 2))
+
+        def work():
+            out = err = None
+            try:
+                import auto_lines
+                out = auto_lines.auto_draw(rows[-n_auto:], rounds=3,
+                                           max_bars=n_auto)
+            except Exception as e:
+                log.exception("自动画线脚本失败")
+                err = e
+            self._safe_after(0,
+                             lambda: self._auto_draw_done(code, out, err))
+
+        threading.Thread(target=work, daemon=True,
+                         name=f"auto-lines-{code}").start()
+
+    def _auto_draw_done(self, code, out, err):
+        self._auto_busy = False
+        if err or not out:
+            self.progress_var.set(f"自动画线失败：{err or '无结果'}")
+            return
+        if not self.res or self.res.get("full_code") != code:
+            return
+        self._auto_lines[code] = out
+        self.show_auto_lines.set(True)
+        self._rerender()
+        meta = out.get("meta") or {}
+        self.progress_var.set(
+            f"自动画线完成：{len(out.get('lines') or [])}水平线 / "
+            f"{len(out.get('segs') or [])}趋势通道 / "
+            f"{len(out.get('zones') or [])}区间"
+            f"（{meta.get('elapsed_sec', 0):.2f}s，{meta.get('rounds', 3)}轮）")
+
+    @staticmethod
+    def _clip_segment(x1, y1, x2, y2, xmin, ymin, xmax, ymax):
+        """Liang-Barsky 线段裁剪，避免画线越出主图污染坐标轴。"""
+        dx, dy = x2 - x1, y2 - y1
+        u1, u2 = 0.0, 1.0
+        for p, q in ((-dx, x1 - xmin), (dx, xmax - x1),
+                     (-dy, y1 - ymin), (dy, ymax - y1)):
+            if p == 0:
+                if q < 0:
+                    return None
+                continue
+            r = q / p
+            if p < 0:
+                if r > u2:
+                    return None
+                if r > u1:
+                    u1 = r
+            else:
+                if r < u1:
+                    return None
+                if r < u2:
+                    u2 = r
+        if u1 > u2:
+            return None
+        return (x1 + u1 * dx, y1 + u1 * dy, x1 + u2 * dx, y1 + u2 * dy)
 
     # ---------- 绘图工具 ----------
 
@@ -23213,6 +24173,13 @@ class App:
                 cv.create_text(tx + tw / 2, ty, text=txt, fill=col,
                                font=_font)
 
+        # 脚本自动画线（多轮优化）：orange 实线/虚线，标签带“自动·”
+        self._draw_auto_lines(cv, g, xs, ymap)
+
+        # 用户手动画线（右键直线 / Ctrl+左键方框）：日期+价格锚定，
+        # 平移/缩放/重启后仍落在原 K 线上；端点自动吸附 OHLC。
+        self._draw_user_lines(cv, g, xs, ymap)
+
         # 现价标签挂在最后一根真实K线上（跳过幽灵K线）
         pb_i = len(bars) - 1
         while pb_i >= 0 and bars[pb_i]["date"] in ghost_lab:
@@ -23258,6 +24225,168 @@ class App:
             cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
                            font=("Consolas", 7), fill=AXIS_TXT)
         self._finish_panel(cv, g, "main", lo, hi, v["dates"])
+
+    def _draw_user_lines(self, cv, g, xs, ymap):
+        """绘制用户手动画线（日期+价格锚定，按当前视野映射，越界裁剪）。"""
+        res = getattr(self, "res", None)
+        if not res or self.minute_mode.get():
+            return
+        items = (self._user_lines or {}).get(res.get("full_code")) or []
+        rows = res.get("disp_rows") or []
+        if not items or not rows:
+            return
+        off = int((self.view or {}).get("off", 0))
+        didx = {r.get("date"): i - off for i, r in enumerate(rows)}
+        xmin, xmax = g["L"], g["w"] - g["R"]
+        ymin, ymax = g["T"], g["T"] + g["ph"]
+        for it in items:
+            try:
+                ia = didx.get(it["a"]["date"])
+                ib = didx.get(it["b"]["date"])
+                if ia is None or ib is None:
+                    continue
+                pa = float(it["a"]["price"])
+                pb = float(it["b"]["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            x1, y1 = xs(ia), ymap(pa)
+            x2, y2 = xs(ib), ymap(pb)
+            if it.get("kind") == "rect":
+                rx1, rx2 = sorted((x1, x2))
+                ry1, ry2 = sorted((y1, y2))
+                rx1, rx2 = max(rx1, xmin), min(rx2, xmax)
+                ry1, ry2 = max(ry1, ymin), min(ry2, ymax)
+                if rx2 - rx1 < 1 or ry2 - ry1 < 1:
+                    continue
+                cv.create_rectangle(rx1, ry1, rx2, ry2, fill=DRAW_C,
+                                    stipple="gray12", outline=DRAW_C,
+                                    width=max(1, ind_w()))
+                continue
+            seg = self._clip_segment(x1, y1, x2, y2,
+                                     xmin, ymin, xmax, ymax)
+            if not seg:
+                continue
+            cv.create_line(*seg, fill=DRAW_C, width=max(2, ind_w() + 1),
+                           capstyle="round")
+            for px, py in ((x1, y1), (x2, y2)):
+                if xmin - 1 <= px <= xmax + 1 \
+                        and ymin - 1 <= py <= ymax + 1:
+                    cv.create_oval(px - 2.5, py - 2.5, px + 2.5, py + 2.5,
+                                   fill=DRAW_C, outline="")
+
+    def _draw_auto_lines(self, cv, g, xs, ymap):
+        """绘制纯脚本自动画线（orange 图层；与 AI 线/用户线分层）。"""
+        res = getattr(self, "res", None)
+        if not res or not self.show_auto_lines.get():
+            return
+        data = (getattr(self, "_auto_lines", {}) or {}).get(
+            res.get("full_code"))
+        if not data:
+            return
+        rows = res.get("disp_rows") or []
+        if not rows:
+            return
+        off = int((self.view or {}).get("off", 0))
+        didx = {r.get("date"): i - off for i, r in enumerate(rows)}
+        xmin, xmax = g["L"], g["w"] - g["R"]
+        ymin, ymax = g["T"], g["T"] + g["ph"]
+        bot = ymax
+        col = globals().get("C_ORANGE", "#ffa94d")
+        font = ("Microsoft YaHei", 8)
+        # 区间
+        for z in (data.get("zones") or [])[:3]:
+            try:
+                ia = didx.get((z.get("a") or {}).get("date"))
+                ib = didx.get((z.get("b") or {}).get("date"))
+                pa = float((z.get("a") or {})["price"])
+                pb = float((z.get("b") or {})["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ia is None or ib is None:
+                continue
+            x1, x2 = sorted((xs(ia), xs(ib)))
+            y1, y2 = sorted((ymap(pa), ymap(pb)))
+            x1, x2 = max(x1, xmin), min(x2, xmax)
+            y1, y2 = max(y1, ymin), min(y2, ymax)
+            if x2 - x1 < 1 or y2 - y1 < 1:
+                continue
+            cv.create_rectangle(x1, y1, x2, y2, fill=col,
+                                stipple="gray12", outline=col,
+                                width=max(1, ind_w()), tags="auto_lines")
+            lab = f"自动·{z.get('label') or '区间'}"
+            cv.create_text(x1 + 3, y1 + 8, text=lab, anchor="w",
+                           fill=col, font=font, tags="auto_lines")
+        # 水平位
+        for lv in (data.get("lines") or [])[:8]:
+            try:
+                pv = float(lv.get("price"))
+            except (TypeError, ValueError):
+                continue
+            yy = ymap(pv)
+            if not (ymin <= yy <= ymax):
+                continue
+            cv.create_line(xmin, yy, xmax, yy, fill=col,
+                           dash=(4, 3), width=max(1, ind_w()),
+                           tags="auto_lines")
+            txt = f"自动·{lv.get('label') or '位'} {pv:.2f}"
+            tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
+            tx = max(xmax - 4, xmin + 6 + tw)
+            ly = max(yy - 8, ymin + 8)
+            cv.create_rectangle(tx - tw - 4, ly - 8, tx + 4, ly + 8,
+                                fill=PANEL_BG, outline=col, tags="auto_lines")
+            cv.create_text(tx, ly, text=txt, anchor="e", fill=col,
+                           font=font, tags="auto_lines")
+        # 趋势 / 通道
+        for sg_ in (data.get("segs") or [])[:6]:
+            try:
+                a, b = sg_.get("a") or {}, sg_.get("b") or {}
+                ia = didx.get(a.get("date"))
+                ib = didx.get(b.get("date"))
+                if ia is None or ib is None:
+                    continue
+                x1, y1 = xs(ia), ymap(float(a["price"]))
+                x2, y2 = xs(ib), ymap(float(b["price"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if sg_.get("extend") and x2 != x1:
+                t = (xmax - x1) / (x2 - x1)
+                x2, y2 = xmax, y1 + t * (y2 - y1)
+            seg = self._clip_segment(x1, y1, x2, y2,
+                                     xmin, ymin, xmax, ymax)
+            if not seg:
+                continue
+            kw = {"fill": col, "width": max(1, ind_w() + 1)}
+            if sg_.get("dash", False):
+                kw["dash"] = (5, 3)
+            kw["tags"] = "auto_lines"
+            cv.create_line(*seg, **kw)
+            lab = sg_.get("label")
+            if lab:
+                stxt = f"自动·{lab}"
+                stw = self._text_px(cv, stxt, 8, "Microsoft YaHei")
+                stx = min(seg[2] + 4, xmax - stw - 4)
+                sty = max(ymin + 8, min(seg[3] - 9, bot - 8))
+                cv.create_text(stx, sty, text=stxt, anchor="w",
+                               fill=col,
+                               font=("Microsoft YaHei", 8, "bold"),
+                               tags="auto_lines")
+        # 文字标注
+        for nt in (data.get("notes") or [])[:6]:
+            try:
+                i = didx.get(nt.get("date"))
+                if i is None:
+                    continue
+                x, y = xs(i), ymap(float(nt["price"]))
+                txt = f"自动·{nt.get('text') or ''}"
+            except (KeyError, TypeError, ValueError):
+                continue
+            tw = self._text_px(cv, txt, 8, "Microsoft YaHei")
+            tx = min(x + 6, xmax - tw - 6)
+            ty = min(max(y - 12, ymin + 10), bot - 8)
+            cv.create_rectangle(tx - 2, ty - 8, tx + tw + 4, ty + 8,
+                                fill=PANEL_BG, outline=col, tags="auto_lines")
+            cv.create_text(tx + tw / 2, ty, text=txt, fill=col,
+                           font=font, tags="auto_lines")
 
     # ---------- 成交量 ----------
 
@@ -23487,6 +24616,8 @@ class App:
     # ---------- 十字光标 ----------
 
     def _on_motion(self, event, key):
+        if getattr(self, "_udraw", None):
+            return          # 画线拖拽中，避免十字光标抢状态栏/重绘
         if getattr(self, "_drag_x", None) is not None:
             return          # 拖拽平移中，不画十字光标（避免拖拽卡顿）
         if self.minute_mode.get():
@@ -24542,6 +25673,9 @@ class App:
                 "可能含过时/无关/营销内容，请与行情数据交叉验证，勿盲从）】\n"
                 + news + "\n"
             )
+        user_txt = _ai_user_lines_txt(res)
+        if user_txt:
+            txt += "\n" + user_txt + "\n"
         txt += AI_DRAW_SCHEMA
         return txt
 
@@ -24597,14 +25731,21 @@ class App:
             "（策略参数）、search_news（个股资讯）、get_etf_constituents"
             "（ETF成分股+权重/涨跌/量比，分析ETF优先调用）、get_external_env"
             "（外部宏观/地缘/黄金原油/美股港股/特朗普/关税等，DeepSeek 官方"
-            "搜索）。至少获取日K、指标、预测与资讯后再给最终结论；分析ETF时先取"
-            "成分股；涉及外部环境（全球市场/黄金原油/美股港股/地缘政治/特朗普/"
-            "关税/美联储）时先调用 get_external_env，不要臆测；看成分股盘中走势"
-            "用 get_intraday(code=...)。侧边栏已自动加载当前标的分时（ETF 还自动"
-            "加载成分股表），可直接引用；需要更细数据再调用工具。画线前确认日期"
-            "在最近60个交易日内、价位在近60日区间±30%内。\n"
-            + AI_DRAW_SCHEMA
+            "搜索）、get_user_drawings（读取用户主图手动画线）、draw_lines"
+            "（提交/更新主图画线）。至少获取日K、指标、预测与资讯后再给最终结论；"
+            "分析ETF时先取成分股；涉及外部环境（全球市场/黄金原油/美股港股/"
+            "地缘政治/特朗普/关税/美联储）时先调用 get_external_env，不要臆测；"
+            "看成分股盘中走势用 get_intraday(code=...)。侧边栏已自动加载当前标的"
+            "分时（ETF 还自动加载成分股表），可直接引用；需要更细数据再调用工具。"
+            "分析支撑压力/趋势时先调用 get_user_drawings 参考用户已有画线；"
+            "最终回答前必须调用 draw_lines 提交画线（若工具不可用，再输出 "
+            "ai-lines 文本块）。画线日期须在最近60个交易日内、价位在近60日区间"
+            "±30%内。\n"
         )
+        user_txt = _ai_user_lines_txt(res)
+        if user_txt:
+            txt += "\n" + user_txt + "\n"
+        txt += AI_DRAW_SCHEMA
         return txt
 
     def _apply_ai_lines(self, text, clear_first=False):
@@ -24796,8 +25937,24 @@ class App:
         # 可随意切到主界面，同时保持非模态（v6.5.2 热修①）。
         self._center_win(win, _w, _h)
 
+        # 主工具栏移入的常用操作（v7.4.4）：窗口顶部一键可达
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(bar, text="常用操作：").pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="每日荐股", command=self._open_picks
+                   ).pack(side="left", padx=2)
+        ttk.Button(bar, text="复制报告", command=self.copy_report
+                   ).pack(side="left", padx=2)
+        ttk.Button(bar, text="导出报告", command=self.export_report
+                   ).pack(side="left", padx=2)
+        ttk.Button(bar, text="样本明细", command=self.show_samples
+                   ).pack(side="left", padx=2)
+        if CACHE_OK:
+            ttk.Button(bar, text="更新缓存", command=self.refresh_cache
+                       ).pack(side="left", padx=2)
+
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        nb.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self._tools_nb = nb
 
         # ── 胜率计算（收益曲线 + 全期/训练/验证 + IC 明细）──
@@ -27477,10 +28634,21 @@ def _ai_cost_info(usage, model=""):
 
 
 def _ai_strip_lines_block(text):
-    """聊天显示用：去掉 ai-lines 代码块（仍回传主图解析）。"""
+    """聊天显示用：去掉画线 JSON 块（任何语言围栏/裸 JSON；仍回传主图解析）。"""
     if not text:
         return text or ""
-    return re.sub(r"```ai-lines.*?```", "", text, flags=re.S).strip()
+
+    def _repl(m):
+        return "" if _ai_parse_json_fragment(m.group(2)) is not None \
+            else m.group(0)
+
+    out = re.sub(r"```[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\n?(.*?)```",
+                 _repl, text, flags=re.S)
+    obj, s, e = _ai_find_draw_obj(out, span=True)
+    if obj is not None:
+        out = out[:s] + out[e:]
+    out = re.sub(r"```[ \t]*[A-Za-z0-9_+\-]*[ \t]*\n?\s*```", "", out)
+    return out.strip()
 
 
 def _ai_tool_fallback_error(e):
@@ -27522,6 +28690,7 @@ class AIAgent:
         self.use_tools = bool(self.opts["tools"])
         self.fallback = False
         self._q = ""
+        self._draw_tool_used = False
         self.settings = {}
         self.refresh_settings()
 
@@ -27612,6 +28781,7 @@ class AIAgent:
             self.error = ""
             self.status = "idle"
             self.fallback = False
+            self._draw_tool_used = False
         if self.on_lines:
             try:
                 self.on_lines("")
@@ -27632,6 +28802,7 @@ class AIAgent:
             self._usage0 = dict(self.usage)
             first = not self.api_msgs
             self._q = text
+            self._draw_tool_used = False
             display = text or "开始分析"
             if first:
                 ctx = (self.brief_prompt if self.use_tools
@@ -27686,7 +28857,8 @@ class AIAgent:
             ctx = {"res": self.res, "code": self.code, "name": self.name,
                    "news": None, "usage": self.usage,
                    "search": self.opts["search"],
-                   "on_table": self._on_table}
+                   "on_table": self._on_table,
+                   "on_lines": self._on_draw_lines}
 
             def ev(kind, name="", args=None, cid=""):
                 if kind == "round":
@@ -27732,9 +28904,21 @@ class AIAgent:
             self.tables.append(table)
         self._push("table", table)
 
+    def _on_draw_lines(self, data):
+        """draw_lines 工具回调：转成 ai-lines 文本交给主线程落图。"""
+        self._draw_tool_used = True
+        if not self.on_lines:
+            return
+        try:
+            txt = "```ai-lines\n" + json.dumps(data, ensure_ascii=False) + "\n```"
+            self.on_lines(txt)
+        except Exception:
+            log.exception("draw_lines 回传主图失败(忽略)")
+
     def _finish(self, text, reasoning, reasons):
         display = _ai_strip_lines_block(text or "")
-        has_lines = "```ai-lines" in (text or "")
+        has_text_lines = _ai_has_draw_obj(text or "")
+        has_lines = has_text_lines or self._draw_tool_used
         joined = "\n\n".join(dict.fromkeys([r for r in reasons if r]))
         delta = {k: int(self.usage.get(k, 0)) - int(self._usage0.get(k, 0))
                  for k in set(self.usage) | set(self._usage0)}
@@ -27750,7 +28934,7 @@ class AIAgent:
                 "usage": turn_usage})
             self.busy = False
             self.status = "idle"
-        if has_lines and self.on_lines:
+        if has_text_lines and self.on_lines:
             try:
                 self.on_lines(text or "")
             except Exception:
@@ -27786,6 +28970,838 @@ def _cleanup():
 
 
 atexit.register(_cleanup)
+
+
+# ================= 画线指导（内置文字版，v7.4.4） =================
+# 来源：桌面《金融市场技术分析.pdf》（31 页）的 pdftotext 文字整理版；
+# 侧栏只读展示，图表请点面板右上角「打开原版PDF」查看。版权归原作者/整理者。
+DRAWING_GUIDE_PDF_CANDIDATES = (
+    "~/桌面/金融市场技术分析.pdf",
+    "~/Desktop/金融市场技术分析.pdf",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "金融市场技术分析.pdf"),
+)
+
+
+def _find_drawing_guide_pdf():
+    """返回桌面/本目录下原版 PDF 路径，找不到返回空串。"""
+    for p in DRAWING_GUIDE_PDF_CANDIDATES:
+        p = os.path.expanduser(p)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+DRAWING_GUIDE_TEXT = """\
+金融市场技术分析
+
+内容目录
+
+    01 道氏理论
+
+    02 技术分析的前提
+
+    03 趋势
+
+    04 价格形态
+
+    05 时间周期
+
+    06 资金管理和交易策略
+
+    07 艾略特波浪理论
+
+    08 摆动指数和相反意见理论
+
+    09 移动平均线
+
+    10 交易量和持仓量
+
+01 道氏理论
+
+  基本原则
+
+    1.平均价格包容消化一切因素
+
+    2.市场具有三种趋势
+
+     主要趋势
+
+         通常持续一年以上，有时甚至好几年
+
+     次要趋势
+
+         代表主要趋势中的调整行情，通常持续三个星期到三个月。通常可回撤50%
+
+     短暂趋势
+
+         通常持续不到三个星期
+
+    3.大趋势可分为三个阶段
+
+     积累阶段
+
+         经济方面的坏消息已被市场所包容消化，聪明钱开始逐步买进
+
+     大众参与阶段
+
+         投资人开始跟进买入，价格快步上扬
+
+     派发阶段
+
+         新闻好消息连篇，大众投资者积极跟风，投机性交易量日益增长，聪明钱开始卖出
+
+    4.各种平均价格必须相互验证
+
+     工业股指与铁路股指应相互验证，为标志牛市的发生，两种平均价格都必须涨过个各自前一轮中趋势的峰值
+
+    5.交易量必须验证趋势
+
+     如果大趋势向上，那么在价格上涨的同时，交易量应该日益增加，反之亦然
+
+    6.唯有发生了确凿无疑的反转信号之后，我们才能判断一个既定的趋势已经终结
+
+     如出现两个依次下降的峰和两个依次下降的谷
+
+02 技术分析的前提
+
+  市场行为包容消化一切
+
+  价格以趋势方式演变
+
+  历史会重演
+
+03 趋势
+
+  趋势具有三种方向：上升、下降、横向延伸
+
+  趋势具有三种类型（规模）：主要趋势、次要趋势、短暂趋势
+
+  支撑和阻挡
+
+    在上升趋势中，如果新的一轮调整一直下降到前一个低点的水平，这或许就是该上升趋势即将终结或至少蜕化成横向延伸趋势的信号
+
+    一旦在上升趋势中市场不能越过前一个高点，或下降趋势中市场无力跌破前一个低谷支撑，便发出了现行趋势即将有变的第一个警告信号
+
+    支撑水平和阻挡水平可以互换角色
+
+    支撑或阻挡区的重要程度
+
+     市场在该处所经历的时间（越久越重要）
+
+     交易量（越大越重要）
+
+     交易活动发生时间距当前的远近（如果某个支撑/阻力位最近刚刚被市场测试过，那么它对当前市场的参考意义会比较强。）
+
+     价格从支撑或阻挡水平弹开的距离越大，则该支撑或阻挡的重要程度越强
+
+  趋势线
+
+    为了验证趋势线的有效性，必须看到价格第三次触及该线，并再次反弹出去
+
+    不仅可以确定市场调整阶段价格的极限位置，更重要的是可以显示出在何种情况下原趋势正在发生变故
+
+    趋势线的重要程度
+
+     持续的时间越长，越重要
+
+     所经过的试探的次数越多，越重要
+
+    如何对待对趋势线的细小穿越（当天价格一度滑过原趋势线，而后收市价格又回到该趋势线之上）
+
+     折中方法：既保留原趋势线，也作出新趋势线，根据未来趋势判断真正有效的趋势线
+
+    什么是对趋势线的有效突破？
+
+     价格过滤器：对于长期趋势线的突破，一般要求收市价格穿过趋势线的幅度至少达到3%（基于此时趋势线的价格），短线交易的话为1%
+
+     时间过滤器：“两天原则”，市场必须连续两天收市在该趋势线的另一侧
+
+    一旦趋势线被突破，那么价格离开趋势线的目标距离通常同反转以前价格在趋势线另一边曾达到的竖直距离相等
+
+    扇形原理
+
+     即有时候上升趋势线被跌破后，价格先是有所下跌，然后再度上弹，回到原上升趋势线的下边，如此几次后可画出三条趋势线
+
+     其中第三条趋势线被突破是趋势反转的有效信号
+
+    趋势线的相对陡峭程度
+
+     若过于陡峭的趋势线被突破了，可能只是意味着趋势将调整回45°线上下，而不是趋势的逆转。若趋势线过于平缓，则不太可靠
+
+  管道线
+
+    管道线的重要程度
+
+     持续的时间越长，越重要
+
+     所经过的试探的次数越多，越重要
+
+    管道线的突破表示趋势开始加速，如上升管道线的突破表示上升趋势开始加速，此时可作为增加多头头寸的依据
+
+    当价格无力到达管道线时，意味着趋势的减弱，即管道另一边被突破的概率增大了
+
+    可以利用管道线对基本趋势线进行调整
+
+    管道线具有测算意义
+
+       当价格在管道的两条边线上发生了突破，价格通常将顺着突破方向达到与管道宽度相等的距离
+
+    基本的趋势线比管道线更重要，也更可靠
+
+  百分比回撤
+
+    适用于任何规模的趋势（主要趋势、次要趋势、短暂趋势）
+
+    如果先前的趋势能够持续下去的话，那么调整必须在回撤66%处打住，若价格越过66%处，则下一步可能回撤100%
+
+  速度线
+
+    如上升趋势处于调整时，一般调整到2/3线处，若此线被超越，则可能跌倒1/3线处，若此线也被跌破，则可能价格一路下跌直至趋势起点水平
+
+    速度线一旦被突破，支撑/阻挡角色会反转
+
+    在其基础上还有江恩和菲波纳奇扇形线
+
+  反转日
+
+    上升趋势中，某日价格达到新高，但当天收市价却低于前一日收市价（类似于在新高出现了看跌吞没），下降趋势亦然
+
+    反转日价格变化范围越大，交易量越重，则反转信号越强
+
+    出现在周线图和月线图时（即反转周，反转月），信号更强
+
+  跳空
+
+    突破跳空
+
+       通常发生在市场顶部/底部的重要突破处
+
+     通常伴随高额交易量
+
+     一般不会被填回
+
+     若被填回则可能原来的突破并不成立
+
+    中继跳空
+
+     在某个市场运动的中间阶段
+
+     一般不会被填回
+
+     通常出现在整个趋势的中点，可据此测算该趋势今后的发展余地
+
+    衰竭跳空
+
+     出现在接近市场运动的尾声处
+
+     当收市价格低于这种最后的跳空后，表明衰竭跳空已经形成
+
+04 价格形态
+
+  反转形态
+
+    基本要领
+
+     1.反转形态存在的前提是市场上实现确有趋势存在
+
+     2.现行趋势即将反转的第一个信号，经常是重要的趋势线被突破
+
+     3.形态的规模越大，则随之而来的市场动作越大
+
+     4.顶部形态所经历的时间通常短于底部形态，但其波动性较强
+
+     5.底部形态的价格范围通常较小，但其酝酿时间较长
+
+     6.交易量在验证向上突破信号的可靠性方面，更具参考价值（顶部反转时交易量相对不那么重要，因为市场有“重力”）
+
+    头肩形（头肩顶）
+
+     交易量会在每个峰处逐渐减轻（重点是第三个峰处交易量应比前两个显著减轻，第二个峰交易量不是必需条件）（当顶部形态完成时，市场突破颈线时的交易量急剧扩张并不是至关重要的，当然，此处交易量越大越好）
+
+     当收市价位于颈线之下时，形态完成
+
+     测算最近价格目标时，自颈线上的突破点起，向下投射从头部（不是左肩或右肩）到颈线的竖直距离（一般最少都会有这么多）
+
+     突破颈线后，通常出现回向颈线的反扑现象，但不应再返回颈线的另一边（若突破颈线时交易量极重，则反扑余地大大减小）（若反扑时收市价突破了颈线，则是严重警讯，表明此次反转形态可能是无效信号）
+
+     另外，除非确实发生了向下突破，否则始终存在以下可能性：并不是真正的头肩顶，在未来某一时刻，上升趋势也许仍将恢复
+
+     头肩顶的颈线通常倾斜向上，然而偶尔也会向下倾斜，这种倾斜是市场疲弱的一种表现，通常其随之而来的右肩也会很弱
+
+    倒头肩形（头肩底）
+
+     对于倒头肩形（头肩底）来说，基本表现与头肩顶一致，只是对于头肩底来说，当颈线向上突破后，市场更惯于反扑，因为存在“重力”
+
+     头肩底形态中，交易量更为重要，在头肩底形态的头部的上冲阶段，不但交易量水平要增加，而且经常要超过左肩的上冲对应的交易量水平。并且当突破颈线时，交易量应该急剧扩张
+
+     头肩底的颈线大多稍顷向下
+
+     头肩底的交易策略
+
+       可以在头部的底点上冲的距离的55%或66%回撤位置买进
+
+       若市场下方有跳空，可在跳空处买进
+
+       可沿着右肩画出一条短期的下降趋势线，一旦此线被向上突破，则买进
+
+    三重顶和三重底
+
+    双重顶（M顶）和双重底（W底）
+
+     有时双重顶的第二个峰可能会比第一个峰高，此时会出现问题（因为此时貌似上升趋势已恢复），此时需要使用过滤器来突破成立与否，如价格过滤器（3%过滤器）或时间过滤器（连续两天收市于第一个峰之上）
+
+     双重顶的支撑点位是两峰之间的谷底，只有突破这个点位时形态才完成（不是突破趋势线）
+
+     在顶部，价格必须真正跌破前一个低点，才能表明双重顶成立（因为从技术角度看，沿着颈线的趋势继续发展的可能性更大，所以明智的做法是等到收市价跌破后再采取相应动作）
+
+     双峰之间持续的时间越长，形态的高度越大，则即将来临的反转的潜力越大
+
+     一般的，在最有效的双重顶或底形态中，市场至少应该在双峰或双谷之间持续一个月（更大范围可持续两三个月到数年）
+
+    圆顶和圆底
+
+     通常出现在周线和月线图中，持续的时间长达数年，持续的时间越长，形态越有意义
+
+    V形反转
+
+     极经常出现在市场单向持续过久，过度延伸，一路上很少调整或只有微小调整的情况下
+
+     V形反转发生时，有时成交量极大，这是V形反转可以给我们的唯一信号
+
+  持续形态
+
+    三角形
+
+     通常属于持续型形态，但有时也会作为反转形态出现（如上升/下降三角形），通常持续时间较短暂（三角形属于中等形态，即他的形成过程通常花费一个月以上的时间，但一般少于三个月，所以一般在日线图上看，持续时间短于一个月的三角形可能属于其他形态类别如三角旗形），偶尔也可能出现在长线图表上。
+
+     对称三角形
+
+       属于中性形态（即非看涨或看跌），它表示既有趋势暂时处于修正状态，会在对称三角形趋势线被突破后恢复原来的趋势
+
+       具有两条逐渐聚拢的趋势线，上面的直线下倾，下面的直线上倾，左侧顶点到下直线的垂直线称为底边，两条直线在右侧的相交处称为顶点
+
+       一般价格会在三角形底边到顶点横向宽度的2/3~3/4处突破，若超出3/4的范围仍未突破，则这个三角形开始丧失其潜力
+
+       价格突破后有时也会向趋势线反扑一下
+
+       趋势线在未来可构成支撑线或阻挡线
+
+       在突破后，顶点也会构成重要的支撑或阻挡水平
+
+       在三角形内，价格摆动的幅度越来越小，交易量也应日益萎缩，但当趋势线被突破时，交易量应该明显的增加，在随后的反扑中，交易量较弱
+
+       测算技术
+
+           测出底边距离，然后从突破点或顶点起，顺势测出相等的距离
+
+           从底边的端点出发，做出平行于下边趋势线的平行线，这条管道线就是上升趋势上方的目标价格，一般行情向上触及管道线的时间，恰好和三角形两边在顶点处汇合的时间一致
+
+     上升三角形
+
+       下边线上倾，上边线水平。属于看涨形态，通常以向上的突破作为完结的标志，突破发生时交易量应急剧增加
+
+       测算技术：先在左侧底边测得形态的高度，然后从突破点起，向上投射出相同的距离
+
+       同对称三角形一样，其交易量形态很相似
+
+     下降三角形
+
+       上边线下倾，下边线水平。属于看跌形态，通常以向下的突破作为完结的标志，突破发生时交易量应急剧增加
+
+     扩大形态（喇叭形）
+
+         与对称三角形相反，两条边线相互扩大，同时交易量随着价格摆幅日益增大，常发生在市场的主要顶部过程中（它更偏向反转形态，而不是持续形态）
+
+    旗形与三角旗形
+
+     表示市场充满活力，但暂时处于休整状态
+
+     剧烈的，几乎是直线的市场运动，是旗形和三角旗形出现的先决条件
+
+     两个形态都是短期的，应当在1-3个星期内完成，在下降趋势中该形态持续时间往往更短，通常不超过两周
+
+     两种形态还有一个重要的先决条件就是随着两个形态的逐渐形成，交易量应该显著的枯竭
+
+     旗形是由两条向当前趋势相反的方向倾斜的、相互平行的趋势线围成的
+
+     三角旗形就像是一个小的对称三角形，但通常持续时间不超过3周
+
+     仅在极少数情况下引发市场的反转
+
+     如现在是上涨趋势，在该形态出现前，会有陡峭的价格上升以及重大的伴随交易量，在该形态过程中会伴随交易量的急剧萎缩，在后来向上突破时有会伴随交易量的急剧迸发
+
+     两种形态的完成均以对趋势线的突破为标志，同时通常向上突破时的交易量因素比向下突破时起着更为关键的验证作用
+
+     测算技术：这类形态一般出现在整个趋势中的中点，从之前趋势中的突破点量出到此形态的竖直距离，然后从此形态的突破点量出相等的竖直距离，即为目标价格
+
+    楔形
+
+     与对称三角形相似，但其具有明显的倾角，其倾斜方向与流行趋势相反
+
+     通常持续一个月以上，但不超过三个月
+
+     常出现在趋势的中间，属持续形态，也可能出现在顶部或底部过程中，标志趋势的反转
+
+     当在顶部时，即上升趋势接近尾声时，可能会出现一个倾角向上的上升楔形，在正常的上升趋势下应该是出现一个倾角向下的下降楔形，所以此上升的楔形是一个看跌形态
+
+     总结即上升楔形看跌，下降楔形看涨
+
+    矩形
+
+     既存趋势的调整阶段，最终市场将顺着之前的方向
+
+     通常属于1-3个月的类别
+
+     但必须时刻提防其演变成反转形态，如头肩顶/底
+
+     在这种形态中，交易量很重要，应关注交易量在哪个方向上更重（如价格上冲时交易量较重而下撤时交易量较轻，那么该形态可能时上升趋势中的持续形态）
+
+     摆动指数在此横向交易区间中特别有用，但是一旦发生突破，其效用便会下降
+
+     测算技术：从顶到底量出交易区间的高度，然后从突破点起，顺势投射相等的竖直距离
+
+    对等运动
+
+     只有当市场运动相当有序并且节奏分明的情况下，本方法才有用
+
+     即在趋势运动的中途，会出现1/3或1/2的回撤，然后又沿着之前的趋势延伸
+
+     测算技术：根据原趋势AB浪的高度，从回撤阶段的底C点起，向上测量相等的距离
+
+    持续头肩形形态
+
+     与头肩顶/底恰好是倒置的，当持续形头肩形的颈线被突破时，标志着将继续原趋势
+
+05 时间周期
+
+  基本原理
+
+    叠加原理
+
+     所有的价格变化均为一切有效周期简单相加的结果
+
+    谐波原理
+
+     相邻的周期长度之间通常存在倍数关系
+
+    同步原理
+
+     指一种强烈的倾向性，即不同长度的周期常常在同一时刻达到谷底
+
+    比例原理
+
+     在周期长度与波幅之间具备一定的比例关系
+
+    变通原理
+
+     指上述原理都只是市场的强烈的倾向性，而不是严格不变的规则
+
+    基准原理
+
+     认为尽管各种市场之间均存在一定差异，也容许有变通，但仍然存在一系列基准的谐波周期，适用于所有市场
+
+  周期分类
+
+    长期周期
+
+     长度为2年或2年以上
+
+    季节性周期
+
+     1年
+
+    基本周期
+
+     9-26周
+
+    交易周期
+
+     4周
+
+  股票市场周期
+
+    股票市场最强劲的三个月区间是11月至次年1月
+
+    2月相对疲软
+
+    3、4月较为坚挺
+
+    一年中最弱的月份是9月
+
+    一年中最强的月份是12月
+
+  一月晴雨表
+
+    指的是S&P500指数1月里的行情，决定了股票市场全年的总体格局
+
+  大选年周期（四年周期）
+
+    大选年（1年）通常表现强劲
+
+    大选年之后一年和任期中的年份（2年和3年）通常表现疲软
+
+    下届大选前1年（4年）通常表现坚挺
+
+06 资金管理和交易策略
+
+  在交易中，我们必须考虑3个方面
+
+    价格预测
+
+    交易策略（时机抉择）
+
+    资金管理
+
+  资金管理
+
+    总投资额必须限制在全部组别资本的50%以内
+
+    在任何单个的市场上所投入的总资金必须限制在总资本的10%到15%以内
+
+    在任何单个市场上的最大亏损金额必须限制在总资本的5%以内
+
+    在任何一个市场群类上所投入的保证金总额必须限制在总资本的20%-25%以内
+
+    分散投资与集中投资
+
+    设置保护性止损指令
+
+     空头头寸，止损应设置于有效阻挡点位上侧；多头头寸，止损应设置于有效支撑点位下侧
+
+    报偿-风险比
+
+     通用的标准为3:1，在考虑一笔交易时，其获利的潜力必须至少3倍于可能的亏损，我们才能够付诸实施
+
+  交易策略
+
+    采用复合头寸
+
+     即把交易单位分为交易头寸和跟势头寸
+
+     跟势头寸图谋长期的有利之处，对于它们我们应设置较远的止损指令
+
+     交易头寸来从事频繁出入市的短线交易，如果市场已经达到了第一个目标，接近了某个阻挡区，同时摆动指数也显示出超买状态，那么我们可以针对交易头寸部分平仓获利，或者安排较近的止损指令，目的是为了确保利润，如果之后趋势又恢复了，那么我们就把已平仓的头寸重新补回来
+
+     在突破前预先入市，开小头寸，在突破时再添加一点头寸，最后等突破后市场反扑时再追加一点头寸
+
+07 艾略特波浪理论
+
+  波浪理论具有3个重要方面——形态、比例和时间，重要性依次下降
+
+  一个完整的周期包含8浪——5浪上升，3浪下降（是对于上涨趋势而言），每个大周期中又
+
+  包含着小周期，周而复始
+
+    在牛市中，如果我们看到一组5浪结构的下跌，那么这可能只是更大一组3浪调整的第一浪，市场的下跌可能还没走完。在熊市中，一组3浪结构的上涨，那么这可能只是更大一组5浪调整的第一浪，市场的上涨可能还没走完，而5浪结构的上涨则说明会出现更实在的向上运动，其本身甚至可能构成了新牛市的第一浪
+
+  波浪理论的本意是应用于股市平均指数的，对个股来说，其表现并不尽人意（越大的市场波
+
+  浪理论越好用，比如黄金）
+
+  调整浪（属于3浪结构）
+
+    调整浪绝不会以5浪结构出现
+
+    锯齿形
+
+     可细分为5-3-5的波浪序列
+
+     存在一种变体——双锯齿形，是由两个5-3-5序列通过中间的a-b-c形态连接而成的
+
+    平台形
+
+     可细分为3-3-5的波浪序列
+
+     在平台形调整的情况下，b浪可能达到乃至超过a浪的顶点
+
+    三角形
+
+     即持续形态中的三角形，通常出现在第4浪中，也可能在a-b-c序列的b浪出现，因此既看涨又看跌
+
+    双三浪结构
+
+    三三浪结构
+
+  交替规则
+
+    认为市场通常不会接连以同样的方式演变，如果上次的顶部或底部是这个样子，那么下次很可能会是另一个样子（不要指望同一类形态连续地出现）
+
+  艾略特波浪理论亦可采用价格管道进行分析
+
+  有时某一主浪会延长，那么另外两个主浪则在时间和幅度两方面相当
+
+  通常来看，第4浪会在5浪走完后的熊市起到显著的支撑作用
+
+  4浪不可与1浪有重叠（在股市上这是个铁律，但在期货市场中不严格如此）
+
+08 摆动指数和相反意见理论
+
+  摆动指数
+
+    基本说明
+
+     摆动指数必须依附于基本的趋势分析
+
+     非常适用于当市场进入无趋势阶段时，价格通常在水平区间中上下波动的情况下
+
+     但也不止用于水平向的交易区间内，当在趋势阶段时，可以把摆动指数与价格图表参照使用，当市场出现超买/超卖状态时，它也能及早提醒交易者
+
+     同时，当趋势的动力正在衰退，而尚未在价格上明显显露出来的时候，我们能从摆动指数上找到线索（如相互背离）
+
+     摆动指数最重要的3种用途
+
+       当摆动指数达到上边界或下边界的极限值时，最有意义，即超买/超卖
+
+       当摆动指数位于极限位置，并且摆动指数与价格变化之间出现了相互背离现象时，通常构成重要的预警信号（背离现象分析是摆动指数最大的长处）
+
+       如果摆动指数顺着市场趋势的方向穿越零线，可能是重要的买卖信号
+
+     摆动指数何时最为有效
+
+       当市场处于横向延伸状态时，摆动指数的功效比平常更出色
+
+       当市场横向震荡后突破时(即重要趋势初期)，摆动指数一般会处在极端位置，此时我们应该优先考虑突破趋势，而把摆动指数丢在一边，之后随着趋势日渐成熟，再增加摆动指数再我们考虑中的分量
+
+    动力指数
+
+     基本说明
+
+       动力指数应当配合市场的趋势状况来使用
+
+       是摆动指数分析的一种最基本的应用，动力指数显示的是价格变化的速度，而不是价格水平本身
+
+       动力指数的曲线超前于价格变化
+
+       同时若指数在零线上方且距离零线过远时则表明市场进入超买状态，反之则进入超卖状态
+
+       时间跨度更长的动力指数更有利于捕捉主要的市场转折
+
+     分析方法
+
+       如果价格处于上升至中，并且动力指数曲线居于零线上方，且步步上扬，则上升趋势正在加速
+
+       若动力指数曲线从上升转为持平发展，则意味着当前收市价的上涨幅度与十天前的涨幅大小一样，尽管价格或许依然上涨，但上升速度已趋平稳
+
+       若动力指数开始向零线回落，那么价格的上升趋势可能依然存在，但速度则趋于减小，上升动力正在衰退
+
+       在顺应市场趋势的前提下，可以参考将动力指数对零线的穿越构成买卖信号，向上穿越零线时构成买入信号，向下穿越零线时构成卖出信号
+
+    利用两条移动平均线构造刷形图摆动指数
+
+     有助于识别相互背离现象
+
+     有助于标识长期趋势中出现的短暂偏移，即短期平均线与长期平均线相聚过远的情形
+
+     能够显示两条移动平均线的交叉，此时该摆动指数穿越零线
+
+     刷形图的真正价值在于有效地揭示了两条线的差距的扩大或缩小的情形，即趋势动力减弱
+
+    商品管道指数（CCI）
+
+     一般用作超买/超卖指标
+
+     一般超过+100视为超买，低于-100视为超卖
+
+    相对力度指标（RSI）
+
+     RSI的标准时间跨度是14天，但也可自行设置时间跨度，时间跨度设置的越大，摆动指数越平缓，幅度也狭窄（因此如设置时间跨度为7天，则会更频繁地进入上下两边的极端区域，因此在短线交易中7天RSI更实用）
+
+     一般数值超过70为超买，低于30为超卖。不过在牛市和熊市中，RSI会发生漂移现象，80为超买，20为超卖
+
+       在RSI高于70或低于30的情况下，如果在RSI的图线同价格图线之间呈现出相互背离的情形，就构成了严重的警告讯号
+
+     衰竭动作（背离现象）
+
+       条件是发生在RSI超过70或低于30的情况下
+
+       顶部衰竭动作，是指在上升趋势中，RSI的新一轮峰值（在70以上）无力超过前一个峰值，随后，又向下跌破了前一个低谷，标志着市场顶部的形成
+
+       底部衰竭动作，是指在下降趋势中，RSI的新一轮谷值（在30以下）无力跌过前一个谷值，随后，又向上突破了前一个峰值，标志着市场底部的形成
+
+     在趋势强烈的市场环境中，无论上升还是下降趋势，在趋势发生之后不久，通常在相应的摆动指数图上会出现极端数值，这种情况是正常的，不应凭此判断市场处于超买或超卖状态，而且在强烈的上升趋势中，超买的市场状态常常能持续一段时日
+
+     在RSI曲线上也可进行趋势线分析和价格形态分析（如头肩形），突破/跌破趋势线时分别构成买入/卖出信号，且RSI的中间值50常常起到支撑/阻挡作用
+
+       许多交易商会在RSI跌倒30以下时，寻找买入机会,假如后来RSI形成背离现象或双重底，一旦未来RSI向上穿越30线，便认为这是验证信号，表明RSI趋势反转向上
+
+    随机指数（%K和%D）
+
+     目的在于揭示最近的价格在过去一定日子里的价格区间中的相对位置，其中%D线是%K线的3天移动平均线，原本的%K线经两次平滑后分别形成快随机指数和慢随机指数
+
+     主要的信号是当%D线处于超买或超卖区时，%D线与相应的价格图线之间的相互背离现象，同时如果上述因素具备的情况下，当%K线穿过慢的%D线的时候，就算构成了真正的买、卖信号
+
+       当%D指数上升到80以上之后，如果再度下跌到80以下，则发出卖出信号；反之当指数下跌到20以下之后，再度上升到20以上，则发出买入信号
+
+     我们可以把日线图和周线图的随机指数分析结合起来，采用周线图的随机指数信号判断市场方向，同时采用日线图的信号来抉择买卖时机。还可以把随机指数和RSI结合起来
+
+    拉里·威廉斯指数（%R）
+
+     与随机指数的概念类似，也表示当日的收市价在过去一定天数里的全部价格范围中的相对位置
+
+     分析方法与其他摆动指数相似
+
+    移动平均线相互验证（MACD）
+
+     具有摆动指数的各种特征
+
+     其中MACD刷形图真正意义在于揭示两条MACD曲线的差距扩大或缩小的情形
+
+     MACD刷形图的转折信号总是领先于穿越零线的实际信号，刷形图的最好用法就是为手上已有头寸寻求早一步的了结信号
+
+  相反意见理论
+
+    当绝大多数人看法一致时，他们一般是错误的一方（当大部分人都看好一个市场时，他们会把资金全部投入市场，他们自己便处于超买状态，那么未来还有谁来继续买入把市场推的更高？）。那么我们的正确做法是确定大部分人的行为，然后反其道而行之
+
+    当看涨意见一致数字大于90%或小于20%时，通常我们可以考虑建立相反头寸，数字高于75%或低于25%，我们就处于危险区，市场可能即将反转
+
+    同时，相反意见理论能够显示大户与小户的实力对比（如果市场上80%的人都开多，那么剩下的20%的人必定资金雄厚，才能容纳80%的人的多头头寸）
+
+    如果此时看涨意见一致数字处于超买范围时，市场传来利好消息，但价格无力对利好消息作出反应，那么这就是个清晰的警讯，表明市场可能反转（市场包容了所有的好消息，一旦有看跌消息，就会把价格推下去）
+
+    一般来说，我们反而要顺着意见一致数字的趋势方向进行交易，知道它达到极限为止
+
+09 移动平均线
+
+  基本说明
+
+    实质上是一种追踪趋势的工具（所以当市场处于良好趋势阶段时，移动平均线的工作状态最佳，而市场忽上忽下，进入横向延伸阶段时，则表现糟糕，而后者所占的时间常常达到了1/3~1/2）移动平均线在相当多的时间内不能发挥所长，因此不能过分依赖移动平均线技术
+
+    当市场是趋势性的时，更适合使用移动平均线技术，当市场是非趋势性的时，更适合使用摆动指数技术
+
+    当收市价格升高到移动平均线之上时，便产生了买入信号，反之亦然
+
+    为了验证信号，一般也需要移动平均线本身朝着价格穿越的方向变化
+
+    较短期的平均值产生较多的伪信号
+
+    只要趋势持续，那么较长期的平均线就作用良好，当趋势处于反转过程时，较短期的平均线更适用
+
+  双线相交法
+
+    即快线向上穿过慢线，构成金叉，买入信号，快线向下穿过慢线，构成死叉，卖出信号
+
+  三重交叉法
+
+    最常用的三重交叉法系统为4-9-18天移动平均线的组合
+
+    若在下降趋势中，4天平均线向上越过了9和18天平均线后，构成买入的预警信号，随后，一旦9天平均线也向上越过18天平均线，则说明上述买入信号成立
+
+  移动平均线包络带
+
+    博林杰带（布林带）
+
+     通常采用20日移动平均线，移动平均线分别向上和向下偏移两个标准差
+
+     一般在如上升趋势恢复后，市场价格就会保持在上侧布林带和20日移动平均线之间的上半个区间中
+
+     布林带可以用来测算价格目标，当价格从下方交易线上触底反弹，并向上穿越了20日移动平均线，则上方的交易线就成为本轮行情的价格目标，反之亦然。同时在上升趋势中，若价格向下穿越20日移动平均线时，则构成了趋势向下反转的警告信号
+
+     布林带的两条交易线不同寻常的相互远离或收缩时，常常是一个信号，表示当前趋势也许即将终结
+
+     如果把布林带和超买/超卖摆动指数结合起来使用效果最佳
+
+    在进行长期分析时，人们一般采取10周移动平均线并给它加上5%的包络线；或者采用40周移动平均线和10%包络线
+
+  移动平均线与周期现象密切相关
+
+    移动平均线与周期现象密切相关，因此我们应该对不同的市场，使用不同天数的移动平均线，从而找出最适合此市场主流周期的移动平均线
+
+    每个周期都倾向于按照两倍的因子，与其上一级长周期，或者下一级短周期以谐波方式相互呼应。也就是说上一级长周期是本周期长度的双倍，下一级短周期则是本周期长度的一半
+
+    四周规则
+
+     主要应用于期货交易
+
+     属于趋势顺应系统，永远顺应趋势
+
+     只要价格涨过前四个日历周内的最高价，则平回空头头寸，开立多头头寸
+
+     只要价格跌过前四个日历周内的最低价，则平回多头头寸，建立空头头寸
+
+     可以将四周规则看作一种技术指标，识别价格突破、趋势反转等信号，其可以起到与过滤器类似的验证效果（一周和二周规则则是极佳的过滤器）比如当移动平均线金叉的时候，为了确保是否可根据这个信号开头寸，我们必须根据二周规则，考察其在相同方向是否也出现了突破信号
+
+     也可以根据四周规则设定止损点，若市场急剧上升，为了使系统更灵敏，也可以根据二周或一周规则来设定止损点，比如将止损点设定在过去两周的最低价下方
+
+     当市场处于横向延伸的情形时，可以将时间跨度扩展到八周，这样就能避免开立短线的头寸，免得陷于时机不成熟的趋势信号中
+
+  在周线图上，移动平均线具有极高的参考价值，13周移动平均线很有价值。在长期的移动平
+
+  均线中，10/13周与30周平均线可组合使用
+
+10 交易量和持仓量
+
+  如果交易量和持仓量均上升，那么当前趋势可能按照现有方向继续发展（无论上涨还是下跌）
+
+  ，如果二者均下降，那么可视为当前趋势或将终结的预警
+
+  若价格上升，但交易量却有所下降，那么就发生了背离现象，上升趋势出现预警
+
+  在下降趋势中，当价格下跌时交易量应该较重，而在价格上弹时较轻，反之亦然（即较重的
+
+  交易量应该发生在与市场流行的趋势一致的方向上）
+
+  权衡交易量（OBV）法
+
+    此方法中，具有重要意义的是OBV线的方向（趋势），而不是实际数字
+
+    正常来说OBV的趋势应和价格趋势一致，当OBV与价格趋势不一致时，便构成了相互背离现象，成为趋势反转预警
+
+    分析方法同价格分析一致
+
+  持仓量
+
+    持仓量代表市场上多头一边或空头一边未平仓的合约总数，而不是两方总和（因为只有买方卖方会同起来才会生成一张合约）
+
+    在上升趋势中，持仓量增加是看涨信号
+
+    在上升趋势中，持仓量减少是看跌信号
+
+    在下降趋势中，持仓量增加是看跌信号
+
+    在下降趋势中，持仓量减少是看涨信号
+
+    持仓量具备重要意义的其他情形
+
+     当市场运动接近尾声时，持仓量已经随价格趋势增加到一定高度了，此时一旦持仓量不增加乃至减少，则是趋势即将生变的预警
+
+     如果在市场顶部，持仓量处于高水平，而价格下跌突如其来，那么这是一个看跌信号
+
+     如果在市场顶部，持仓量不同寻常的高航，那就非常危险，大大增加了市场向下的压力（仅适用于期货市场）
+
+     市场横向延伸区间，持仓量逐渐累计增加，那么一旦发生向上或向下的价格突破，随后而来的价格运动会加剧
+
+     在价格形态完成时，持仓量的增加可视为新趋势可靠程度的作证（但是可能持仓量会有短期的稍减，因为当形态完成时可能会有错误方向的头寸平仓）
+
+  胀爆和抛售高潮
+
+    胀爆
+
+     主要出现在市场顶部
+
+     常常伴随着持仓量的下降，出现在最后一涨中
+
+     具体情况是，当价格经过长期的上涨后，突然急剧上冲，与此同时交易量也大为增加，但是持仓量却显著下降，于是标志着顶部的到来
+
+    抛售高潮
+
+     主要出现在市场底部
+
+     具体情况是，价格在长期下跌的基础上，突然急剧地坠落，与此同时交易量大大加重，而持仓量却大幅下降，于是标志着底部的到来
+
+  交易商分类报告
+
+    由商品期货委员会（CFTC）发布，把持仓量数字划分成三类来源：大户保值商（商业用户）、大户投机商（大户交易商）、散户（小型交易商）
+
+    分析要领是：一般认为大户保值商是正确的，而散户通常是错误的
+
+    举例来说，市场底部的看涨信号可能就发生在当大户保值商重仓持有净多头，而大户投机商和散户重仓持有净空头的时候。在上涨行情里，市场顶部反转信号可能就是当大户交易商和散户同时重仓持有净多头，而大户保值商却变成了重仓净空头时即商业用户大多是正确的
+
+  认售期权/认购期权比
+
+    如果比数很高，则标志着市场处于超卖状态，如果比数很低，则表示市场可能处于超买状态
+"""
+
 
 
 def main():

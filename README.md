@@ -1,4 +1,4 @@
-# stock-analyzer · v7.3.0
+# stock-analyzer · v7.4.6
 
 **多市场统计研究工具（A股 / 港股 / 美股 / 期货 / 加密）**：历史形态相似度匹配 +
 sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本地桌面 GUI 与命令行两种
@@ -861,7 +861,8 @@ python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sa
 ### 生产端 · GUI（`python stock_gui.py`）
 
 - **搜索**：任意位置按键即聚焦搜索框；输入代码/名称带候选下拉与自动补全（缓存加载）；
-- **更新缓存范围弹窗（v6.6.1）**：工具栏/小屏工具菜单点「更新缓存」先选
+- **更新缓存范围弹窗（v6.6.1）**：工具窗口顶部「常用操作」/小屏工具菜单点
+  「更新缓存」先选
   **全A**（刷新代码表 + 全市场日K增量）/ **自选**（仅自选池）/ **单股**
   （默认预填当前分析代码）；只拉缺失或过期数据，已最新自动跳过，全A/自选
   后台显示进度；
@@ -932,9 +933,32 @@ python backtests/backtest_factor_ablation.py --stage all --sample 1500 --chip-sa
   档位不同时会在上下文注明）；
   AI结论中的价位自动画到K线主图，支持**水平线/斜线/趋势线/射线/文字标注/区间
   色块**（ACCENT等色虚线+AI标签，工具栏“AI线”开关显隐，随平移/缩放保留）；
+  **K3.1pro 等模型兼容**：任意代码围栏（ai-lines/json/无标记）或裸 JSON 均可
+  解析，工具模式优先调用 `draw_lines` 提交结构化画线；
   **联网检索**：由 AI 按需调用 `search_news`（近 30 天新闻/公告/业绩，同股
   30 分钟缓存；DeepSeek 官方 Search 约 $0.75/千次，其他网关 Google News RSS
   免 Key）；侧栏内可关闭；
+- **K线手动画线（v7.4.4）**：主图**按住鼠标右键拖拽画直线**、
+  **按住 Ctrl+左键拖拽画方框**，端点自动吸附最近K线中心与该K线 OHLC
+  （10px 阈值；第二点靠近起点时强制水平/同K对齐，方便画支撑压力）；
+  画线按「日期+价格」锚定，平移/缩放/重启后仍跟随原K线，本地存
+  `user_drawings.json`（按股票代码分组，git 忽略）；工具栏「撤销画线」、
+  「清画线」，小屏工具菜单「撤销上一条画线 / 清空手动画线」，Esc 取消当前绘制；
+  **AI 可读取用户画线**：首轮上下文自动附方向/涨跌幅/跨度摘要，追问时可调用
+  `get_user_drawings`；手势线不会被 AI 删除或覆盖；
+  主工具栏精简：**每日荐股 / 复制报告 / 导出报告 / 样本明细 / 更新缓存**
+  已收进「工具」窗口顶部「常用操作」栏（小屏为工具菜单）；
+- **纯脚本自动画线（v7.4.6，`auto_lines.py`）**：不调 AI，直接读本地日K，
+  多轮优化水平支撑/压力、趋势线、通道线与震荡箱体；**输出前去重**——
+  趋势/通道每侧最多 1 条、同侧水平位最小间距、套娃箱体合并；GUI 工具栏
+  「自动画线」一键落图（orange「自动线」图层，可勾选显隐，会话内切股/刷新保留）；
+  也可独立运行：
+  `python auto_lines.py 600000 --days 240 --rounds 3 --report reports/auto_600000.md`；
+  报告含每轮候选数/最高分/最终线位，便于复核调参；
+- **画线指导侧栏（v7.4.5）**：右侧栏下拉新增 **「画线指导」**，内置
+  《金融市场技术分析.pdf》31 页文字整理版（分层标题/要点，可滚动）；
+  面板右上角 **【打开原版PDF】** 调用系统程序查看图表。PDF 放桌面或
+  与 `stock_gui.py` 同目录即可；文字版已内置，找不到 PDF 也能正常阅读；
 
 ### 生产端 · CLI（`python stock_predict.py`）
 
@@ -950,6 +974,14 @@ python stock_predict.py --tiers --ai-tier            # 荐股前由 AI 在三档
 python stock_predict.py --tiers-backtest             # 全期组合回测摘要
 python stock_predict.py --picks-backtest             # 荐股收益回测（逐笔，全期）
 python stock_predict.py --picks-backtest --picks-seg val   # 指定区间
+```
+
+纯脚本自动画线（独立于 AI）：
+
+```bash
+python auto_lines.py 600000 --days 240 --rounds 3 --verbose
+python auto_lines.py sh600000 --out /tmp/auto.json --report /tmp/auto.md
+python auto_lines.py --csv bars.csv --days 240
 ```
 
 依赖：`numpy + scikit-learn + lightgbm`（基础功能纯标准库可跑，组合引擎需要 numpy）。
