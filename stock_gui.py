@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.7"
+APP_VERSION = "7.4.8"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -18167,6 +18167,7 @@ class App:
         self._watchlists = {}       # v6.6.5：自选池按市场分开 {market: [codes]}
         self._watch_pins = {}       # 置顶代码（按市场；始终排在自选池最前）
         self._wl_menu_code = ""     # 右键菜单当前代码
+        self._watch_menu_job = None  # 右键菜单自动隐藏定时器
         self._wl_quotes = {}         # 自选池实时快照（名称/现价/涨幅）
         self._wl_busy = False
         self.ai_text = ""
@@ -25173,6 +25174,46 @@ class App:
         self._save_ini()
         self._render_watchlist()
 
+    def _watch_menu_cancel_hide(self):
+        job = getattr(self, "_watch_menu_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._watch_menu_job = None
+
+    def _watch_menu_schedule_hide(self, menu, delay=400):
+        """鼠标移出菜单 400ms 后自动收起（移回则取消）。"""
+        self._watch_menu_cancel_hide()
+
+        def _hide():
+            self._watch_menu_job = None
+            self._hide_watch_menu(menu)
+
+        try:
+            self._watch_menu_job = self.root.after(delay, _hide)
+        except Exception:
+            self._watch_menu_job = None
+
+    def _hide_watch_menu(self, menu):
+        self._watch_menu_cancel_hide()
+        try:
+            menu.unpost()
+        except Exception:
+            pass
+        try:
+            menu.grab_release()
+        except Exception:
+            pass
+
+    def _watch_menu_action(self, fn, menu):
+        self._hide_watch_menu(menu)
+        try:
+            fn()
+        except Exception:
+            log.exception("自选池右键操作失败(忽略)")
+
     def _watch_context_menu(self, event):
         """自选池右键：上移 / 下移 / 置顶（已置顶则取消置顶）。"""
         try:
@@ -25192,16 +25233,28 @@ class App:
         m = tk.Menu(self.root, tearoff=0, bg=PANEL_BG, fg=FG_MAIN,
                     activebackground=BTN_HOVER, activeforeground=FG_MAIN,
                     font=("Microsoft YaHei", 9))
-        m.add_command(label="上移", command=lambda: self._watch_move(-1),
-                      state=("normal" if idx > lo else "disabled"))
-        m.add_command(label="下移", command=lambda: self._watch_move(1),
-                      state=("normal" if idx < hi else "disabled"))
+        m.add_command(
+            label="上移",
+            command=lambda: self._watch_menu_action(
+                lambda: self._watch_move(-1), m),
+            state=("normal" if idx > lo else "disabled"))
+        m.add_command(
+            label="下移",
+            command=lambda: self._watch_menu_action(
+                lambda: self._watch_move(1), m),
+            state=("normal" if idx < hi else "disabled"))
         m.add_separator()
-        m.add_command(label=("取消置顶" if pinned else "置顶"),
-                      command=self._watch_toggle_pin)
+        m.add_command(
+            label=("取消置顶" if pinned else "置顶"),
+            command=lambda: self._watch_menu_action(
+                self._watch_toggle_pin, m))
+        # 自动隐藏：鼠标移出菜单后 400ms 收起，移回立即取消
+        m.bind("<Enter>", lambda e: self._watch_menu_cancel_hide())
+        m.bind("<Leave>", lambda e: self._watch_menu_schedule_hide(m))
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
+            self._watch_menu_cancel_hide()
             try:
                 m.grab_release()
             except Exception:

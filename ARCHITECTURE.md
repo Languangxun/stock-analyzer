@@ -128,7 +128,8 @@
 普通组内交换（不跨分组边界），置顶项移到最前并显示「★」，再次选择
 「取消置顶」后落到剩余置顶项之后；`_watch_pins[市场]` 与 `codes_<市场>`
 顺序同步持久化到 ini `pinned_<市场>`；`_normalize_watch_order()` 负责去重与
-置顶项前置。
+置顶项前置。**自动隐藏（v7.4.8）**：菜单 `<Leave>` 后 400ms `unpost`，
+`<Enter>` 取消定时；命令项先收起再执行，避免菜单长期悬浮。
 
 **左侧「今日行业」面板（v7.0.9）**：随市场模式换内容——A股 显示行业涨跌前三
 （`fetch_top_sectors`，东财 clist 板块 `fs=m:90+t:2` 三页 + 腾讯/akshare 兜底、10 分钟缓存）
@@ -1330,6 +1331,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.4.8**<br>（2026-11-21） | **自选股右键菜单自动隐藏**：菜单 `<Leave>` 400ms 后 `unpost`，`<Enter>` 取消定时；命令项先收起再执行；新增 `_watch_menu_schedule_hide/_hide_watch_menu`；2.1 节与 README/CHANGELOG 同步 |
 | **v7.4.7**<br>（2026-11-21） | **自选股右键上移/下移/置顶**：`<Button-3>` 菜单，置顶项置前并显示「★」，已置顶时菜单变「取消置顶」；上移/下移限制在置顶组/普通组内；`pinned_<市场>` 与 `codes_<市场>` 同步存 ini；`_normalize_watch_order` 去重+置顶前置；2.1 节与 README/CHANGELOG 同步 |
 | **v7.4.6**<br>（2026-11-21） | **AI画线兼容 K3.1pro + AI读取用户画线 + 纯脚本自动画线**：①`parse_ai_lines` 支持任意围栏/裸 JSON/嵌套/宽松日期数字/中英文 kind，system 加硬性画线要求，新增 `draw_lines` 工具；②`res["user_lines"]` + 首轮摘要 + `get_user_drawings` 工具，让 AI 读取手工直线/方框；③新增 `auto_lines.py`（多尺度枢轴、水平位/趋势线/通道/箱体、多轮精修与轮次日志、趋势/通道每侧1条+水平位最小间距+箱体合并去重），GUI「自动画线」+ orange「自动线」图层，CLI 可独立运行；`auto_lines.py` 入客户端包；3.9/3.17 节与 README/CHANGELOG 同步 |
 | **v7.4.5**<br>（2026-11-21） | **右侧栏「画线指导」**：下拉开源新增面板，内置桌面《金融市场技术分析.pdf》31页文字整理版（`DRAWING_GUIDE_TEXT`，缩进/短标题映射 h1/h2/h3/b1~b4，只读滚动）；`_find_drawing_guide_pdf()` 依次查 `~/桌面`/`~/Desktop`/程序目录，命中则显示「打开原版PDF」（`webbrowser file://`）看图表，缺失不影响文字版；侧栏宽度自适应；3.13 节与 README/CHANGELOG 同步 |
