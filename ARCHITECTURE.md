@@ -737,12 +737,16 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
     实时复算（CRLF 模型可加载、缺库自动降级）。研究批量消融由父进程一次性
     构建 `sm701_score_matrix` 并注入各 worker，worker 只按代码×日期取值，
     避免每只股重复扫描 70MB+ 预测文件；
-  - **quant 每日消融（v7.4.2）**：`ablation_quant.py` 下载 quant 下载中心的
-    `public/ablation/latest.csv`（三档策略 + 验证指标）→ 反查 algo →
-    `research/ablation_gui_cache.json`；GUI 启动自动同步（12h 新鲜度）+
-    数据工具手动同步/批量应用推荐档。`_ensure_strategy()` 在导入批次比旧策略
-    新时直接保存推荐档并重分析（`source=quant` 的 abl 训练指标为空，
-    三档窗显示 "-"），与 `[predict] local_ablation=0` 配套实现本地不跑消融；
+  - **quant 每日消融（v7.4.2；v7.4.9 quant-only）**：`ablation_quant.py`
+    下载 quant 下载中心的 `public/ablation/latest.csv`（三档策略 + 验证指标）
+    → 反查 algo → `research/ablation_gui_cache.json`；GUI 启动自动同步
+    （12h 新鲜度）+ 数据工具手动同步/批量应用推荐档。`load_research_ablation()`
+    对 `source=quant` 用「批次 ts 与文件 mtime 较新者」+30 天有效期（周更批次
+    不再被 5 天本地 TTL 误杀）；`_ensure_strategy()` 在 `local_ablation=0` 时
+    旧策略过期即使 quant ts 更早也强制保存推荐档并重分析；缓存缺失/过期
+    `_ensure_quant_cache_for()` 自动下载；未覆盖 ETF/指数明确提示，不回退本地。
+    本机 ini `[predict] local_ablation=0` + `ablation_sync=1` 即「quant 算消融、
+    本地只消费」；`source=quant` 的 abl 训练指标为空，三档窗显示 "-"；
 - **L2（v6.1.3 新增）**：每个行业构造「行业指数」——**优先同名行业ETF**收盘序列，无匹配则同行业个股等权收益累乘；
   行业指数 > MA20 且 5 日动量 > 0 → BUY，反向 SELL（时序行业趋势，与板块轮动的横截面强弱互补）；
 - **防过拟合**：前 ~75% 训练集选型，后 ~25% 验证集只报告；训练集上把 **Calmar/PF/胜率/年化**
@@ -1331,6 +1335,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.4.9**<br>（2026-11-21） | **本机消融固定走 quant**：本机 ini `local_ablation=0`+`ablation_sync=1`；`load_research_ablation()` 对 quant 批次按 ts/文件 mtime 取新+30天有效期（修复周更批次被 5 天 TTL 整批误杀）；`local_ablation=0` 旧策略过期强制换 quant 推荐档；缓存缺失/过期自动下载，未覆盖 ETF/指数明确提示；3.8 节与 README/CHANGELOG 同步 |
 | **v7.4.8**<br>（2026-11-21） | **自选股右键菜单自动隐藏**：菜单 `<Leave>` 400ms 后 `unpost`，`<Enter>` 取消定时；命令项先收起再执行；新增 `_watch_menu_schedule_hide/_hide_watch_menu`；2.1 节与 README/CHANGELOG 同步 |
 | **v7.4.7**<br>（2026-11-21） | **自选股右键上移/下移/置顶**：`<Button-3>` 菜单，置顶项置前并显示「★」，已置顶时菜单变「取消置顶」；上移/下移限制在置顶组/普通组内；`pinned_<市场>` 与 `codes_<市场>` 同步存 ini；`_normalize_watch_order` 去重+置顶前置；2.1 节与 README/CHANGELOG 同步 |
 | **v7.4.6**<br>（2026-11-21） | **AI画线兼容 K3.1pro + AI读取用户画线 + 纯脚本自动画线**：①`parse_ai_lines` 支持任意围栏/裸 JSON/嵌套/宽松日期数字/中英文 kind，system 加硬性画线要求，新增 `draw_lines` 工具；②`res["user_lines"]` + 首轮摘要 + `get_user_drawings` 工具，让 AI 读取手工直线/方框；③新增 `auto_lines.py`（多尺度枢轴、水平位/趋势线/通道/箱体、多轮精修与轮次日志、趋势/通道每侧1条+水平位最小间距+箱体合并去重），GUI「自动画线」+ orange「自动线」图层，CLI 可独立运行；`auto_lines.py` 入客户端包；3.9/3.17 节与 README/CHANGELOG 同步 |

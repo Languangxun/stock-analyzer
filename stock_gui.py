@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.8"
+APP_VERSION = "7.4.9"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -8900,7 +8900,7 @@ def save_strategy(full, strat):
 
 # v6.2.2：研究消融批量结果（tier_picks_from_ablation.py 产物），
 # GUI 消融弹窗优先读它（三档全量），读不到才本地重跑（近1000日，3~5分钟/只）。
-_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "codes": {}}
+_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "source": "", "codes": {}}
 
 
 def load_research_ablation(full):
@@ -8915,8 +8915,17 @@ def load_research_ablation(full):
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
             _RESEARCH_ABL.update(mtime=mt, ts=float(d.get("ts") or 0.0),
+                                 source=str(d.get("source") or ""),
                                  codes=d.get("codes") or {})
-        if time.time() - _RESEARCH_ABL["ts"] > STRAT_TTL:
+        # quant 每日/每周批次：内部 ts 是批次发布日，可能比下载时间早几天；
+        # 不能沿用本地研究缓存的 5 日 TTL（周更批次会整批被判过期）。
+        # 对 quant 以「批次 ts 与文件 mtime 较新者」为准，给 30 天有效期。
+        is_quant = str(_RESEARCH_ABL.get("source") or "") == "quant"
+        ttl = 30 * 86400 if is_quant else STRAT_TTL
+        fresh_ts = max(float(_RESEARCH_ABL["ts"] or 0.0),
+                       float(_RESEARCH_ABL["mtime"] or 0.0)) \
+            if is_quant else float(_RESEARCH_ABL["ts"] or 0.0)
+        if time.time() - fresh_ts > ttl:
             return None
         c = _RESEARCH_ABL["codes"].get(full)
         if not c:
@@ -18177,6 +18186,8 @@ class App:
         self._ai_sessions = {}      # (code,model) -> {hash, msgs} 会话缓存
         self._last_ablation = None      # 最近一次消融结果（含全部候选）
         self._last_ablation_for = ""    # 上面对应的股票代码（防跨股串用）
+        self._quant_retry_job = None    # quant 缓存缺失/同步中时的重试任务
+        self._quant_auto_sync_for = ""  # 已为哪只股票触发过自动同步
         # v7.4.2：启动 4s 后后台同步 quant 每日消融（缓存 12h 内则跳过）
         try:
             self.root.after(4000, self._quant_ablation_autosync)
@@ -21313,12 +21324,20 @@ class App:
                         > float(st.get("ts") or 0))
                 except (TypeError, ValueError):
                     newer = False
-                if newer and self._apply_imported_strategy(res, abl):
+                # local_ablation=0 → quant 批次是唯一消融源：即使批次 ts 早于
+                # 本地策略保存时间，也强制换用 quant 推荐档（避免下载了新
+                # 批次却因“本地 ts 更新”而继续沿用旧策略）。
+                prefer_quant = (bool(abl) and abl.get("source") == "quant"
+                                and not getattr(CFG, "LOCAL_ABLATION", True))
+                if abl and (prefer_quant or newer) \
+                        and self._apply_imported_strategy(res, abl):
                     return
                 if not getattr(CFG, "LOCAL_ABLATION", True):
+                    if self._ensure_quant_cache_for(res, full0):
+                        return
                     self.progress_var.set(
                         f"策略缓存已过期，继续沿用旧策略 {st.get('label', '?')}"
-                        "（本地消融已关闭，等待导入研究消融结果）")
+                        "（本地消融已关闭，等待 quant 消融结果）")
                     return
                 self.progress_var.set(
                     f"策略缓存已过期，沿用旧策略 {st.get('label', '?')}；"
@@ -21339,9 +21358,12 @@ class App:
             self._show_strategy_result(res, abl)
             return
         if not getattr(CFG, "LOCAL_ABLATION", True):
+            # quant-only 模式：缓存缺失/过期先自动从 quant 拉取，拉完仍无
+            # 该标的（ETF/指数等）再提示。
+            if self._ensure_quant_cache_for(res, full0):
+                return
             self.progress_var.set(
-                "未找到策略且本地消融已关闭：请从 quant 导入研究消融结果"
-                "（research/ablation_gui_cache.json）后重新分析")
+                "quant 消融缓存未覆盖该标的（ETF/指数等），本地消融已关闭")
             return
         self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
                               "MA/筹码峰/板块轮动/多维×4风险档, 近1000交易日)...")
@@ -21388,6 +21410,43 @@ class App:
 
     # ---------- quant 每日消融数据同步（v7.4.2） ----------
 
+    def _ensure_quant_cache_for(self, res, full0):
+        """local_ablation=0 时：缓存缺失/超过 30 天 → 自动从 quant 拉取。
+        返回 True 表示已触发同步或已安排重试，调用方先返回即可。"""
+        if self._quant_ablation_fresh(30 * 86400):
+            return False
+        if getattr(self, "_ablation_sync_busy", False):
+            self.progress_var.set("quant 消融同步中，稍后自动重试…")
+            if getattr(self, "_quant_retry_job", None) is None:
+                def _retry():
+                    self._quant_retry_job = None
+                    if self.res is res:
+                        self._ensure_strategy(res)
+                try:
+                    self._quant_retry_job = self.root.after(2500, _retry)
+                except Exception:
+                    self._quant_retry_job = None
+            return True
+        if getattr(self, "_quant_auto_sync_for", "") != full0:
+            self._quant_auto_sync_for = full0
+            self.progress_var.set("未找到 quant 消融缓存，正在从 quant 下载…")
+
+            def _synced(ok):
+                self._quant_auto_sync_for = ""
+                if self.res is not res:
+                    return
+                if not ok:
+                    self.progress_var.set(
+                        "quant 消融同步失败，本地消融已关闭；"
+                        "请检查网络或工具→数据工具手动同步")
+                    return
+                self._safe_after(0, lambda: self._ensure_strategy(res))
+
+            self._sync_quant_ablation_bg(
+                manual=False, silent=True, on_done=_synced)
+            return True
+        return False
+
     def _quant_ablation_fresh(self, max_age=12 * 3600):
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "research", "ablation_gui_cache.json")
@@ -21396,13 +21455,21 @@ class App:
         except OSError:
             return False
 
-    def _sync_quant_ablation_bg(self, manual=False, silent=False):
+    def _sync_quant_ablation_bg(self, manual=False, silent=False,
+                                on_done=None):
         """后台下载 quant latest.csv → research/ablation_gui_cache.json。"""
         if getattr(self, "_ablation_sync_busy", False):
             return
         self._ablation_sync_busy = True
         if manual:
             self.progress_var.set("正在从 quant 下载最新消融数据 ...")
+
+        def _notify(ok):
+            if callable(on_done):
+                try:
+                    on_done(bool(ok))
+                except Exception:
+                    log.exception("quant 消融同步回调失败(忽略)")
 
         def work():
             import ablation_quant
@@ -21422,9 +21489,10 @@ class App:
                     messagebox.showwarning("消融数据同步", msg, parent=self.root)
                 elif not silent:
                     self.progress_var.set(msg)
+                _notify(False)
                 return
             # 让 load_research_ablation 下一轮按 mtime 重新加载
-            _RESEARCH_ABL.update(mtime=0.0, ts=0.0, codes={})
+            _RESEARCH_ABL.update(mtime=0.0, ts=0.0, source="", codes={})
             txt = (f"quant 消融数据已更新：{r.get('codes', 0)} 只 / "
                    f"批次 {time.strftime('%m-%d %H:%M', time.localtime(r.get('ts') or 0))}")
             log.info(txt)
@@ -21436,6 +21504,7 @@ class App:
                     "分析股票时自动使用 quant 三档结果；旧策略缓存过期后"
                     "会自动换用推荐档（不跑本地消融）。",
                     parent=self.root)
+            _notify(True)
 
         self._run_bg(work, done)
 

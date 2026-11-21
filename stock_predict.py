@@ -131,7 +131,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.4.8"
+APP_VERSION = "7.4.9"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -8919,7 +8919,7 @@ def save_strategy(full, strat):
 
 # v6.2.2：研究消融批量结果（tier_picks_from_ablation.py 产物），
 # GUI 消融弹窗优先读它（三档全量），读不到才本地重跑（近1000日，3~5分钟/只）。
-_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "codes": {}}
+_RESEARCH_ABL = {"mtime": 0.0, "ts": 0.0, "source": "", "codes": {}}
 
 
 def load_research_ablation(full):
@@ -8934,8 +8934,17 @@ def load_research_ablation(full):
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
             _RESEARCH_ABL.update(mtime=mt, ts=float(d.get("ts") or 0.0),
+                                 source=str(d.get("source") or ""),
                                  codes=d.get("codes") or {})
-        if time.time() - _RESEARCH_ABL["ts"] > STRAT_TTL:
+        # quant 每日/每周批次：内部 ts 是批次发布日，可能比下载时间早几天；
+        # 不能沿用本地研究缓存的 5 日 TTL（周更批次会整批被判过期）。
+        # 对 quant 以「批次 ts 与文件 mtime 较新者」为准，给 30 天有效期。
+        is_quant = str(_RESEARCH_ABL.get("source") or "") == "quant"
+        ttl = 30 * 86400 if is_quant else STRAT_TTL
+        fresh_ts = max(float(_RESEARCH_ABL["ts"] or 0.0),
+                       float(_RESEARCH_ABL["mtime"] or 0.0)) \
+            if is_quant else float(_RESEARCH_ABL["ts"] or 0.0)
+        if time.time() - fresh_ts > ttl:
             return None
         c = _RESEARCH_ABL["codes"].get(full)
         if not c:

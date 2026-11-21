@@ -5,6 +5,17 @@
 
 ## 版本历史
 
+> **v7.4.9：本机消融固定走 quant 机（2026-11-21）**：
+> ①本机 `stock_gui.ini [predict] local_ablation=0` + `ablation_sync=1`：
+> 不再本地跑 `run_ablation`，统一消费 quant 每日/每周消融批次；
+> ②修复 quant 缓存被误判过期：`load_research_ablation()` 对 `source=quant`
+> 按「批次 ts 与缓存文件 mtime 较新者」计算，有效期 30 天（周更批次不再因
+> 批次发布日超过 5 天而整批失效）；③`local_ablation=0` 时旧策略过期即使
+> quant 批次 ts 早于本地策略保存时间，也强制换用 quant 推荐档并重分析；
+> ④quant 缓存缺失/超过 30 天自动下载，缓存未覆盖的 ETF/指数明确提示，
+> 绝不回退本地消融；`APP_VERSION=7.4.9`，`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 同步。
+
 > **v7.4.8：自选股右键菜单自动隐藏（2026-11-21）**：
 > 自选池右键菜单增加自动收起——鼠标移出菜单 **400ms** 后自动隐藏，移回菜单
 > 立即取消；选择任意菜单项后先收起再执行上移/下移/置顶；新增

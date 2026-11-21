@@ -1,4 +1,4 @@
-# stock-analyzer · v7.4.8
+# stock-analyzer · v7.4.9
 
 **多市场统计研究工具（A股 / 港股 / 美股 / 期货 / 加密）**：历史形态相似度匹配 +
 sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本地桌面 GUI 与命令行两种
@@ -101,15 +101,18 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   `SM70_DIR/DB/MODEL/PRED`（兼容 `SM701_*`）。
   **注意**：sm701 是「次日开盘买→收盘卖」的日内口径，A 股 T+1 不可当日卖出，
  与本仓库 T 收盘口径回测错位（详见「三档策略」末 sm701 对照节），仅作研究观察；
-- **quant 每日消融数据接入（v7.4.2）**：工具→数据工具「quant 消融数据接入」→
-  「立即同步最新消融」，或启动时自动后台同步
-  `https://quant.tail6a6cc8.ts.net/downloads` 的
+- **quant 每日消融数据接入（v7.4.2；v7.4.9 quant-only）**：
+  工具→数据工具「quant 消融数据接入」→「立即同步最新消融」，或启动时自动
+  后台同步 `https://quant.tail6a6cc8.ts.net/downloads` 的
   `public/ablation/latest.csv`（5460 只 × 保守/稳健/激进三档策略 + 验证指标）；
   转换后写 `research/ablation_gui_cache.json`，三档窗/全部组合直接可用，
-  还可「应用推荐档到全部策略缓存」；`ini [predict] ablation_sync=0` 关自动同步、
-  `ablation_url` 换源；也可单独运行 `python ablation_quant.py`（`--offline`
-  用已下载文件、`--file` 指定本地 CSV）。原始数据存 `research/ablation_quant/`，
-  不入库。配合 `local_ablation=0` 即「quant 算消融、本地只消费」。
+  还可「应用推荐档到全部策略缓存」；quant 批次可能周更，缓存按批次 ts 与
+  文件 mtime 取新、有效期 30 天。本机设置
+  `[predict] local_ablation=0` + `ablation_sync=1`：**不再本地跑消融**，
+  旧策略过期强制换 quant 推荐档；缓存缺失自动下载，ETF/指数等未覆盖标的
+  明确提示。`ini [predict] ablation_sync=0` 关自动同步、`ablation_url` 换源；
+  也可单独运行 `python ablation_quant.py`（`--offline` 用已下载文件、`--file`
+  指定本地 CSV）。原始数据存 `research/ablation_quant/`，不入库。
 - **auto 风险偏好（v7.3.1，`ini [predict] risk_mode=auto`）**：大盘 BOLL
   三等分自动切换——上证收盘在 BOLL(20,2) 带内位置下 1/3→保守（贴下轨）、
   中 1/3→稳健（中轨附近）、上 1/3→激进（贴上轨），单股交易层参数与信号
