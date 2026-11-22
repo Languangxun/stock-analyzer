@@ -1,4 +1,4 @@
-# stock-analyzer · v7.5.10
+# stock-analyzer · v7.5.11
 
 **多市场统计研究工具（A股 / 港股 / 美股 / 期货 / 加密）**：历史形态相似度匹配 +
 sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本地桌面 GUI 与命令行两种
@@ -131,6 +131,12 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   `prod_crypto_hourly_k24` 小时模型（每 UTC 日最后一小时概率），日线
   h1/h5/h10 作兜底；模型/小时库/生成脚本均在仓库外，git 不分发、不上传；
   本机可用 `~/桌面/sm701/sync_quant_crypto.sh` 从 quant 机拉取并重算；
+  **sm702 止损否决（v7.5.11，默认关）**：设置→外部策略 勾选后只读
+  `~/桌面/sm702/outputs_crypto/` 的 walk-forward 预测与最新信号；crypto
+  BUY 连续 N 日处于止损概率 top-q 时否决（图上空心「B否」），仓位倍数按
+  sm702 胜率缩放（可调 q / persist / mult_scale / mult_max / min_rate）。
+  sm701 的买卖阈值与开关也移到该页（内调参）；模型/数据仍在仓库外、不上传；
+
   策略工坊绑定优先。**v7.5.9**：crypto 默认启用 `[trade] trend_crypto=1`
   ——收盘跌破 MA60 的 BUY 不生成（不逆势抄底），SELL 保留用于离场；
   回测层开空同样要求收盘跌破 MA60，平仓不受限。本机 `crypto_hourly.db`

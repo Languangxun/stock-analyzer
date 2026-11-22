@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.10"
+APP_VERSION = "7.5.11"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -345,6 +345,16 @@ class CFG:
     #                  其他算法消融，sm701 仅多市场直出/独立调用）。
     SM701_EXT_ON = True
     SM701_JOIN_ABLATION = True
+    # v7.5.11：sm701 信号滞回阈值（内调参；默认 0.55/0.50）
+    SM701_SIG_BUY = 0.55
+    SM701_SIG_SELL = 0.50
+    # v7.5.11：sm702 加密止损/否决模型（只读 sm702 outputs_crypto）
+    SM702_ON = False
+    SM702_Q = 0.30          # 止损概率 top-q 视为高风险
+    SM702_PERSIST = 1       # 连续 N 日 top-q 才否决
+    SM702_MULT_SCALE = 10.0 # 胜率每超 0.5 一个百分点对应倍数
+    SM702_MULT_MAX = 3.0
+    SM702_MIN_RATE = 0.55
     # ---- 分市场交易/融资配置（v7.5.7，ini [trade]）----
     # 回测与交易记录共用：finance=允许融资/杠杆做多，short=允许做空，
     # leverage=杠杆倍数（finance=0 时回测强制 1 倍）。默认全部关闭，
@@ -563,6 +573,20 @@ def _load_predict_cfg():
         CFG.SM701_JOIN_ABLATION = bool(gi("sm701_ablation",
                                           1 if CFG.SM701_JOIN_ABLATION
                                           else 0, 0, 1))
+        CFG.SM701_SIG_BUY = gf("sm701_buy", CFG.SM701_SIG_BUY, 0.50, 0.99)
+        CFG.SM701_SIG_SELL = gf("sm701_sell", CFG.SM701_SIG_SELL, 0.01, 0.50)
+        if CFG.SM701_SIG_SELL >= CFG.SM701_SIG_BUY:
+            CFG.SM701_SIG_SELL = max(0.01, CFG.SM701_SIG_BUY - 0.01)
+        # v7.5.11：sm702 止损/否决模型（默认关；外部策略页可开/调参）
+        CFG.SM702_ON = bool(gi("sm702_ext", 0, 0, 1))
+        CFG.SM702_Q = gf("sm702_q", CFG.SM702_Q, 0.01, 0.99)
+        CFG.SM702_PERSIST = gi("sm702_persist", CFG.SM702_PERSIST, 1, 10)
+        CFG.SM702_MULT_SCALE = gf("sm702_mult_scale",
+                                  CFG.SM702_MULT_SCALE, 0.0, 100.0)
+        CFG.SM702_MULT_MAX = gf("sm702_mult_max",
+                                CFG.SM702_MULT_MAX, 0.0, 20.0)
+        CFG.SM702_MIN_RATE = gf("sm702_min_rate",
+                                CFG.SM702_MIN_RATE, 0.50, 0.99)
         # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
         CFG.LOCAL_ABLATION = bool(gi("local_ablation",
                                      1 if CFG.LOCAL_ABLATION else 0, 0, 1))
@@ -7535,6 +7559,55 @@ def _entry_lev(cfg, typ, txt):
 
 
 _TREND_BLOCK = "【MA60闸门】"
+_SM702_BLOCK = "【sm702否决】"
+_BLOCK_MARKS = (_TREND_BLOCK, _SM702_BLOCK)
+
+
+def _sm702_mult_at(full, typ, date):
+    """sm702 仓位倍数（无模型/未开启/无该日预测 = 1.0；0 = 否决）。"""
+    if not CFG.SM702_ON or not date:
+        return 1.0
+    try:
+        rec = sm702_pred_map(full).get(str(date)[:10])
+        if not rec:
+            return 1.0
+        return float(sm702_mult(rec, typ, CFG.SM702_MULT_SCALE,
+                                CFG.SM702_MULT_MAX, CFG.SM702_MIN_RATE))
+    except Exception:
+        return 1.0
+
+
+def _sm702_filter(signals, rows, full):
+    """crypto BUY 的 sm702 否决层（v7.5.11）：top-q 止损概率/胜率不足时标记。
+
+    与 MA60 闸门一样保留信号并打标（图上空心 B），回测层跳过开仓；
+    SELL 保留用于离场（空头开仓倍数由 sm702_mults 控制）。
+    """
+    if not signals or not rows or not CFG.SM702_ON:
+        return signals
+    if _market_of(full) != "crypto":
+        return signals
+    try:
+        mp = sm702_pred_map(full)
+    except Exception:
+        return signals
+    if not mp:
+        return signals
+    out = []
+    for s in signals:
+        s2 = s
+        if s[2] == "BUY" and s[0] < len(rows):
+            rec = mp.get(rows[s[0]].get("date"))
+            veto = sm702_veto(rows, s[0], full, CFG.SM702_Q,
+                              CFG.SM702_PERSIST)
+            mul = 1.0 if not rec else sm702_mult(
+                rec, "BUY", CFG.SM702_MULT_SCALE, CFG.SM702_MULT_MAX,
+                CFG.SM702_MIN_RATE)
+            if veto or mul <= 0:
+                s2 = (s[0], s[1], s[2],
+                      _SM702_BLOCK + (s[3] if len(s) > 3 else ""))
+        out.append(s2)
+    return out
 
 
 def _crypto_trend_filter(signals, rows, full):
@@ -7562,14 +7635,23 @@ def _crypto_trend_filter(signals, rows, full):
     return out
 
 
-def _sig_lev_text(full, typ, txt):
+def _sig_lev_text(full, typ, txt, date=None):
     """K线买卖点悬停说明：实际杠杆（quant 置信度公式）与调仓成数。"""
     cfg = _trade_cfg(full)
     if (txt or "").startswith(_TREND_BLOCK):
         return "MA60 下方·趋势闸门拦截（不交易）"
+    if (txt or "").startswith(_SM702_BLOCK):
+        return "sm702 止损概率高·否决买入（不交易）"
     if typ == "SELL" and not cfg.get("short"):
         return "平多（未开启做空）"
     lev, conf = _entry_lev(cfg, typ, txt)
+    _smul = _sm702_mult_at(full, typ, date) if date else 1.0
+    _sm_txt = ""
+    if _smul <= 0:
+        return "sm702 胜率不足·否决（不交易）"
+    if abs(_smul - 1.0) > 1e-9:
+        lev = max(1.0, min(cfg.get("leverage", lev), lev * _smul))
+        _sm_txt = f"×sm702 {_smul:.1f}"
     side = "多" if typ == "BUY" else "空"
     if not cfg.get("finance"):
         _bp = float(cfg.get("base_pct") or 10.0) / 10.0
@@ -7577,13 +7659,13 @@ def _sig_lev_text(full, typ, txt):
     cs = (f"，置信{conf:.2f}" if conf is not None
           else "，无概率→1x")
     base = float(cfg.get("base_pct") or 10.0)
-    return (f"{side} {lev:.1f}x（上限{cfg.get('leverage', 1):g}x{cs}）"
+    return (f"{side} {lev:.1f}x（上限{cfg.get('leverage', 1):g}x{cs}{_sm_txt}）"
             f" · 调仓至{base / 10.0:.1f}成（名义{base * lev / 10.0:.1f}成）")
 
 
 def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                  market="", adaptive=False, conf_lo=0.55, conf_hi=0.60,
-                 trend=False, breakeven=True):
+                 trend=False, breakeven=True, sm702_mults=None):
     """单段事件回测：支持多头/空头/双向（v7.5.7；v7.5.9 逐笔杠杆/重置）。
 
     mode:
@@ -7665,15 +7747,22 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
     bankrupt = False
 
     def _eff_lev(i, typ):
-        """开仓实际杠杆：quant 置信度公式，融资关闭/无概率=1×。"""
-        if not adaptive:
-            return lev, _signal_conf(sig_txt.get(i, ""), typ)
+        """开仓实际杠杆：quant 置信度公式 × sm702 倍数；0=否决。"""
         conf = _signal_conf(sig_txt.get(i, ""), typ)
-        if conf is None:
-            return 1.0, None
-        x = (conf - conf_lo) / max(conf_hi - conf_lo, 1e-9)
-        x = max(0.0, min(1.0, x))
-        return max(1.0, min(20.0, 1.0 + (lev - 1.0) * x)), conf
+        if adaptive and conf is not None:
+            x = (conf - conf_lo) / max(conf_hi - conf_lo, 1e-9)
+            x = max(0.0, min(1.0, x))
+            lv = 1.0 + (lev - 1.0) * x
+        elif adaptive:
+            lv = 1.0
+        else:
+            lv = lev
+        _m = float((sm702_mults or {}).get(
+            rows[i].get("date") if i < len(rows) else "", 1.0) or 0.0)
+        if _m <= 0:
+            return 0.0, conf
+        lv = min(lev, max(1.0, lv * _m))
+        return max(1.0, min(20.0, lv)), conf
 
     def _liq_price(px, side, lv):
         """强平价：多 = entry*(1-1/lev+mmr)，空 = entry*(1+1/lev-mmr)。"""
@@ -7835,10 +7924,14 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                 _close(i, px_fill, "信号平空")
             _trend_ok = (not trend or ma60[i] is None
                          or c >= ma60[i])
-            if pos == 0 and mode in ("long", "both") and c and _trend_ok:
+            _blk = any((sig_txt.get(i) or "").startswith(_m)
+                       for _m in _BLOCK_MARKS)
+            if pos == 0 and mode in ("long", "both") and c and _trend_ok \
+                    and not _blk:
                 trade_lev, trade_conf = _eff_lev(i, "BUY")
-                liq_px = _liq_price(px_fill, 1, trade_lev)
-                pos, entry, entry_i, extreme = 1, px_fill, i, px_fill
+                if trade_lev > 0:
+                    liq_px = _liq_price(px_fill, 1, trade_lev)
+                    pos, entry, entry_i, extreme = 1, px_fill, i, px_fill
         elif typ == "SELL":
             if pos == 1:
                 _close(i, px_fill, "信号卖出")
@@ -7846,8 +7939,9 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                          or c < ma60[i])
             if pos == 0 and mode in ("short", "both") and c and _trend_ok:
                 trade_lev, trade_conf = _eff_lev(i, "SELL")
-                liq_px = _liq_price(px_fill, -1, trade_lev)
-                pos, entry, entry_i, extreme = -1, px_fill, i, px_fill
+                if trade_lev > 0:
+                    liq_px = _liq_price(px_fill, -1, trade_lev)
+                    pos, entry, entry_i, extreme = -1, px_fill, i, px_fill
 
         # 开盘成交时同日盘中仍可能强平（收盘成交时 low/high 在成交前，跳过）
         if exec_open and pos != 0 and liq_px is not None and (
@@ -8015,11 +8109,12 @@ def _signal_forward_stats(rows, signals, horizons=(1, 5)):
 
 def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
                   adaptive=False, conf_lo=0.55, conf_hi=0.60, trend=False,
-                  breakeven=True):
+                  breakeven=True, sm702_mults=None):
     """单方向回测 + 训练/验证/IC 打包（v7.5.7；v7.5.9 逐笔杠杆/重置）。"""
     out = _bt_simulate(rows, signals, rp, mode=mode, leverage=leverage,
                        market=market, adaptive=adaptive, conf_lo=conf_lo,
-                       conf_hi=conf_hi, trend=trend, breakeven=breakeven)
+                       conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                       sm702_mults=sm702_mults)
     n = len(rows)
     split = max(30, int(n * 0.75))
     out["split_i"] = split if 0 < split < n else None
@@ -8032,12 +8127,14 @@ def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
             out["train"] = _bt_simulate(
                 rows[:split], tr_sigs, rp, mode=mode, leverage=leverage,
                 market=market, adaptive=adaptive, conf_lo=conf_lo,
-                conf_hi=conf_hi, trend=trend, breakeven=breakeven)
+                conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                sm702_mults=sm702_mults)
         if va_sigs:
             out["val"] = _bt_simulate(
                 rows[split:], va_sigs, rp, mode=mode, leverage=leverage,
                 market=market, adaptive=adaptive, conf_lo=conf_lo,
-                conf_hi=conf_hi, trend=trend, breakeven=breakeven)
+                conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                sm702_mults=sm702_mults)
     inv = mode == "short"
     out["ic1"] = _signal_ic(rows, signals, 1, invert=inv)
     out["ic5"] = _signal_ic(rows, signals, 5, invert=inv)
@@ -8076,16 +8173,33 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         trd = bool(cfg.get("trend"))
         bev = bool(cfg.get("breakeven", True))
         mkt = cfg.get("market") or ""
+        smm = {}
+        if CFG.SM702_ON and mkt == "crypto":
+            try:
+                _mp = sm702_pred_map(full)
+                for _s in signals:
+                    if _s[0] + 1 >= len(rows):
+                        continue
+                    _rec = _mp.get(rows[_s[0]].get("date"))
+                    if _rec:
+                        smm[rows[_s[0] + 1].get("date")] = sm702_mult(
+                            _rec, _s[2], CFG.SM702_MULT_SCALE,
+                            CFG.SM702_MULT_MAX, CFG.SM702_MIN_RATE)
+            except Exception:
+                log.exception("sm702 倍数映射失败(忽略)")
         long_bt = _bt_pack_side(rows, signals, rp, "long", lev,
                                 market=mkt, adaptive=adp, conf_lo=clo,
-                                conf_hi=chi, trend=trd, breakeven=bev)
+                                conf_hi=chi, trend=trd, breakeven=bev,
+                                sm702_mults=smm)
         short_bt = (_bt_pack_side(rows, signals, rp, "short", lev,
                                   market=mkt, adaptive=adp, conf_lo=clo,
-                                  conf_hi=chi, trend=trd, breakeven=bev)
+                                  conf_hi=chi, trend=trd, breakeven=bev,
+                                sm702_mults=smm)
                     if short_ok else None)
         total_bt = (_bt_pack_side(rows, signals, rp, "both", lev,
                                   market=mkt, adaptive=adp, conf_lo=clo,
-                                  conf_hi=chi, trend=trd, breakeven=bev)
+                                  conf_hi=chi, trend=trd, breakeven=bev,
+                                sm702_mults=smm)
                     if short_ok else long_bt)
         out = dict(total_bt)
         out["long"] = long_bt
@@ -8098,6 +8212,7 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         out["conf_hi"] = chi
         out["trend"] = trd
         out["breakeven"] = bev
+        out["sm702"] = bool(CFG.SM702_ON and mkt == "crypto")
         out["leverage"] = lev
         out["market"] = mkt
         return out
@@ -8123,7 +8238,9 @@ def strategy_signals_full(rows, strat, industry="", full=""):
         if algo == "sector_rot":
             return _sig_sector_rot(rows, industry=industry)
         if algo == "sm701":
-            return _crypto_trend_filter(_sig_sm701(rows, full), rows, full)
+            return _sm702_filter(
+                _crypto_trend_filter(_sig_sm701(rows, full), rows, full),
+                rows, full)
         if algo == "analog":
             return _sig_analog(rows, full or None)
         if algo == "studio":
@@ -13323,7 +13440,8 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
                           f"（{analog.get('n', 0)}例），维持原策略")
 
     # v7.5.10：压缩后再做 crypto MA60 闸门（避免连续 SELL 被 dedup 吞掉）
-    signals = _crypto_trend_filter(signals, disp_rows, full)
+    signals = _sm702_filter(
+        _crypto_trend_filter(signals, disp_rows, full), disp_rows, full)
 
     vols = [r["vol"] for r in disp_rows]
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
@@ -13605,7 +13723,8 @@ def analyze_finish_signals(res, progress=None):
             res["band_algo"] = res.get("band_algo", "") + \
                 f"（{_why} → 兜底改用多维评分·{sel_mode}）"
             _fb_applied = True
-    signals = _crypto_trend_filter(signals, disp_rows, full)
+    signals = _sm702_filter(
+        _crypto_trend_filter(signals, disp_rows, full), disp_rows, full)
     res["signals"] = signals
     bt_stats = None
     if len(signals) >= 2:
@@ -15411,7 +15530,7 @@ from external.sm701_ext import (  # noqa: E402,F401
     _sm701_predict_feats, _sm701_live_one, _sm701_live_predict,
     _sm701_read_bars, _sm701_stock_info, sm701_has_model, sm701_market_pool,
     sm701_paths, sm701_prob_map, sm701_score_matrix, sm701_status,
-    sm70x_series)
+    sm702_dir, sm702_mult, sm702_pred_map, sm702_veto, sm70x_series)
 from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
@@ -25797,12 +25916,16 @@ class App:
                 continue
             x = xs(i)
             if typ == "BUY":
-                _blk = (txt or "").startswith(_TREND_BLOCK)
+                _blk_m = next(((m, ("B否" if m == _SM702_BLOCK else "B闸"))
+                               for m in _BLOCK_MARKS
+                               if (txt or "").startswith(m)), None)
+                _blk = _blk_m is not None
+                _blab = _blk_m[1] if _blk else "B"
                 y = ymap(bars[i]["low"]) + 5
                 cv.create_polygon(x, y, x - 5, y + 9, x + 5, y + 9,
                                   fill=(BG if _blk else UP),
                                   outline=(AXIS_TXT if _blk else ""))
-                cv.create_text(x, y + 15, text=("B闸" if _blk else "B"),
+                cv.create_text(x, y + 15, text=_blab,
                                fill=(AXIS_TXT if _blk else UP),
                                font=("Arial", 8, "bold"))
                 if _short_on:
@@ -26511,7 +26634,8 @@ class App:
         for s_i, _day, s_t, s_txt in self.view["signals"]:
             if s_i == idx:
                 _lev_txt = _sig_lev_text(
-                    (self.res or {}).get("full_code") or "", s_t, s_txt)
+                    (self.res or {}).get("full_code") or "", s_t, s_txt,
+                    date=_day)
                 sig_txt = (f"  ◆[{'买' if s_t == 'BUY' else '卖'}] {s_txt}"
                            f" | {_lev_txt}")
                 _sig_hit = (s_t, s_txt, _lev_txt)
@@ -29793,19 +29917,6 @@ class App:
             row=13 + len(prows), column=0, columnspan=3, sticky="w",
             pady=(8, 0))
 
-        # sm701 外接算法开关（v7.3.5）：总开关 + A股消融候选开关。
-        # 模型/特征/数据均在仓库外，本程序只读接入，私有因子不入包。
-        sm701_ext_var = tk.BooleanVar(value=bool(CFG.SM701_EXT_ON))
-        ttk.Checkbutton(frm, text="sm701 外接算法（多市场直出 + A股消融接入；"
-                                  "关闭=断开）",
-                        variable=sm701_ext_var).grid(
-            row=14 + len(prows), column=0, columnspan=3, sticky="w",
-            pady=(6, 0))
-        sm701_abl_var = tk.BooleanVar(value=bool(CFG.SM701_JOIN_ABLATION))
-        ttk.Checkbutton(frm, text="sm701 参加 A股单股消融候选"
-                                  "（关闭=仅多市场直出）",
-                        variable=sm701_abl_var).grid(
-            row=15 + len(prows), column=0, columnspan=3, sticky="w")
 
         # ---- 使用注意（基于n=4500+回测的诚实边界）----
         notes = (
@@ -29990,6 +30101,70 @@ class App:
                   foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
                   justify="left").grid(row=9, column=0, columnspan=3,
                                        sticky="w", pady=(8, 0))
+
+        # ---- sm70x 外接算法（v7.5.11：从预测参数页移到外部策略页）----
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=10, column=0, columnspan=3, sticky="we", pady=(14, 6))
+        ttk.Label(frm, text="— sm70x 外接算法（sm701 信号 / sm702 止损否决）—"
+                  ).grid(row=11, column=0, columnspan=3, sticky="w",
+                         pady=(0, 4))
+        sm701_ext_var = tk.BooleanVar(value=bool(CFG.SM701_EXT_ON))
+        ttk.Checkbutton(frm, text="sm701 外接算法（多市场直出 + A股消融接入；"
+                                  "关闭=断开）",
+                        variable=sm701_ext_var).grid(
+            row=12, column=0, columnspan=3, sticky="w")
+        sm701_abl_var = tk.BooleanVar(value=bool(CFG.SM701_JOIN_ABLATION))
+        ttk.Checkbutton(frm, text="sm701 参加 A股单股消融候选"
+                                  "（关闭=仅多市场直出）",
+                        variable=sm701_abl_var).grid(
+            row=13, column=0, columnspan=3, sticky="w")
+        sm701_buy_var = tk.StringVar(value=f"{CFG.SM701_SIG_BUY:g}")
+        sm701_sell_var = tk.StringVar(value=f"{CFG.SM701_SIG_SELL:g}")
+        _r = 14
+        for _lab, _var, _hint in (
+                ("sm701 买阈", sm701_buy_var, "概率≥此值出 BUY（0.50~0.99）"),
+                ("sm701 卖阈", sm701_sell_var, "概率<此值出 SELL（0.01~0.50）")):
+            ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
+                                           pady=2)
+            ttk.Entry(frm, textvariable=_var, width=8).grid(
+                row=_r, column=1, sticky="w", pady=2)
+            ttk.Label(frm, text=_hint, foreground=AXIS_TXT).grid(
+                row=_r, column=2, sticky="w")
+            _r += 1
+        sm702_var = tk.BooleanVar(value=bool(CFG.SM702_ON))
+        ttk.Checkbutton(frm, text="sm702 加密止损/否决（BUY 遇 top-q 止损"
+                                  "概率则否决；无模型时自动跳过）",
+                        variable=sm702_var).grid(
+            row=_r, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        _r += 1
+        sm702_vars = {
+            "q": tk.StringVar(value=f"{CFG.SM702_Q:g}"),
+            "persist": tk.StringVar(value=str(CFG.SM702_PERSIST)),
+            "scale": tk.StringVar(value=f"{CFG.SM702_MULT_SCALE:g}"),
+            "max": tk.StringVar(value=f"{CFG.SM702_MULT_MAX:g}"),
+            "min_rate": tk.StringVar(value=f"{CFG.SM702_MIN_RATE:g}"),
+        }
+        for _key, _lab, _hint in (
+                ("q", "top-q", "止损概率最高的 q 比例视为高风险（0.01~0.99）"),
+                ("persist", "连续日", "连续 N 日 top-q 才否决（1~10）"),
+                ("scale", "倍数斜率", "胜率每超 0.5 一个百分点的倍数"),
+                ("max", "倍数上限", "sm702 仓位倍数上限（0~20）"),
+                ("min_rate", "最低胜率", "低于此胜率直接否决（0.50~0.99）")):
+            ttk.Label(frm, text=f"sm702 {_lab}").grid(
+                row=_r, column=0, sticky="w", pady=2)
+            ttk.Entry(frm, textvariable=sm702_vars[_key], width=10).grid(
+                row=_r, column=1, sticky="w", pady=2)
+            ttk.Label(frm, text=_hint, foreground=AXIS_TXT).grid(
+                row=_r, column=2, sticky="w")
+            _r += 1
+        _sm702_d = sm702_dir() if CFG.SM702_ON else ""
+        ttk.Label(
+            frm,
+            text=("sm702 目录: " + (_sm702_d or "未检测到（~/桌面/sm702）")
+                  + "\n模型/数据在仓库外，只读接入；参数保存后立即生效。"),
+            foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
+            justify="left", wraplength=620).grid(
+                row=_r, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         def _studio_sel():
             cur = studio_lb.curselection()
@@ -30556,6 +30731,45 @@ class App:
                 pnotes.append(
                     "sm701消融候选="
                     f"{'开' if CFG.SM701_JOIN_ABLATION else '关'}")
+                def _pf(var, lo, hi, dflt):
+                    try:
+                        return max(lo, min(hi, float(var.get())))
+                    except (TypeError, ValueError):
+                        return dflt
+
+                CFG.SM701_SIG_BUY = _pf(sm701_buy_var, 0.50, 0.99,
+                                        CFG.SM701_SIG_BUY)
+                CFG.SM701_SIG_SELL = _pf(sm701_sell_var, 0.01, 0.50,
+                                         CFG.SM701_SIG_SELL)
+                if CFG.SM701_SIG_SELL >= CFG.SM701_SIG_BUY:
+                    CFG.SM701_SIG_SELL = max(0.01, CFG.SM701_SIG_BUY - 0.01)
+                cp.set("predict", "sm701_buy", f"{CFG.SM701_SIG_BUY:g}")
+                cp.set("predict", "sm701_sell", f"{CFG.SM701_SIG_SELL:g}")
+                pnotes.append(f"sm701阈值 {CFG.SM701_SIG_BUY:g}/"
+                              f"{CFG.SM701_SIG_SELL:g}")
+                CFG.SM702_ON = bool(sm702_var.get())
+                CFG.SM702_Q = _pf(sm702_vars["q"], 0.01, 0.99, CFG.SM702_Q)
+                CFG.SM702_PERSIST = int(_pf(sm702_vars["persist"], 1, 10,
+                                            CFG.SM702_PERSIST))
+                CFG.SM702_MULT_SCALE = _pf(sm702_vars["scale"], 0.0, 100.0,
+                                           CFG.SM702_MULT_SCALE)
+                CFG.SM702_MULT_MAX = _pf(sm702_vars["max"], 0.0, 20.0,
+                                         CFG.SM702_MULT_MAX)
+                CFG.SM702_MIN_RATE = _pf(sm702_vars["min_rate"], 0.50, 0.99,
+                                         CFG.SM702_MIN_RATE)
+                cp.set("predict", "sm702_ext",
+                       "1" if CFG.SM702_ON else "0")
+                cp.set("predict", "sm702_q", f"{CFG.SM702_Q:g}")
+                cp.set("predict", "sm702_persist", str(CFG.SM702_PERSIST))
+                cp.set("predict", "sm702_mult_scale",
+                       f"{CFG.SM702_MULT_SCALE:g}")
+                cp.set("predict", "sm702_mult_max",
+                       f"{CFG.SM702_MULT_MAX:g}")
+                cp.set("predict", "sm702_min_rate",
+                       f"{CFG.SM702_MIN_RATE:g}")
+                pnotes.append(
+                    f"sm702={'开' if CFG.SM702_ON else '关'}"
+                    f"(q={CFG.SM702_Q:g},N={CFG.SM702_PERSIST})")
                 _av = ("all" if ablview_var.get() == "全部组合"
                        else "three")
                 CFG.ABLATION_VIEW = _av

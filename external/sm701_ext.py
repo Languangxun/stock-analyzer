@@ -41,7 +41,9 @@ DB_PATH / _market_of / tier_load_panel 以名称惰性解析传入；本模块**
 import stock_gui**，避免双向依赖。build_cli 生成的 CLI 同样可用
 （需 external/ 与主文件同目录）。
 """
+import csv
 import glob
+import gzip
 import logging
 import os
 import sqlite3
@@ -1228,13 +1230,22 @@ def sm701_prob_map(full, dates=None):
     return out
 
 
-def _sig_sm701_from_probs(rows, probs, tag="sm701"):
+def _sig_sm701_from_probs(rows, probs, tag="sm701",
+                          buy_th=None, sell_th=None):
     """sm701 概率序列 → 买卖点（probs 可为 {date: prob} 或按行对齐的序列）。
 
     与 `_sig_sm701` 同一滞回口径，供研究消融在父进程一次性预载概率后
-    直接生成信号，避免每个 worker 重复扫描 70MB+ 预测文件。"""
+    直接生成信号，避免每个 worker 重复扫描 70MB+ 预测文件。
+    v7.5.11：buy_th/sell_th 可由设置内调（默认 0.55/0.50）。"""
     if not rows or probs is None:
         return []
+    try:
+        buy_th = _SM701_SIG_BUY if buy_th is None else float(buy_th)
+        sell_th = _SM701_SIG_SELL if sell_th is None else float(sell_th)
+    except (TypeError, ValueError):
+        buy_th, sell_th = _SM701_SIG_BUY, _SM701_SIG_SELL
+    if sell_th >= buy_th:
+        sell_th = max(0.01, buy_th - 0.01)
     seq = isinstance(probs, dict)
     out = []
     state = 0
@@ -1243,13 +1254,13 @@ def _sig_sm701_from_probs(rows, probs, tag="sm701"):
             probs[i] if i < len(probs) else None)
         if p is None:
             continue
-        if state <= 0 and p >= _SM701_SIG_BUY:
+        if state <= 0 and p >= buy_th:
             out.append((i, r["date"], "BUY",
-                        f"{tag}概率{p:.2f}≥{_SM701_SIG_BUY:.2f}"))
+                        f"{tag}概率{p:.2f}≥{buy_th:.2f}"))
             state = 1
-        elif state >= 1 and p < _SM701_SIG_SELL:
+        elif state >= 1 and p < sell_th:
             out.append((i, r["date"], "SELL",
-                        f"{tag}概率{p:.2f}<{_SM701_SIG_SELL:.2f}"))
+                        f"{tag}概率{p:.2f}<{sell_th:.2f}"))
             state = 0
     return out
 
@@ -1270,7 +1281,140 @@ def _sig_sm701(rows, full, **_kw):
         return []
     mk = _market_of(full)
     tag = "sm701小时" if mk == "crypto" else "sm701"
-    return _sig_sm701_from_probs(rows, probs, tag=tag)
+    cfg = (_HOST or {}).get("CFG")
+    buy_th = getattr(cfg, "SM701_SIG_BUY", _SM701_SIG_BUY)
+    sell_th = getattr(cfg, "SM701_SIG_SELL", _SM701_SIG_SELL)
+    return _sig_sm701_from_probs(rows, probs, tag=tag,
+                                 buy_th=buy_th, sell_th=sell_th)
+
+
+# ---- sm702 加密止损/否决模型（v7.5.11）----
+# 只读 sm702 的输出：outputs_crypto/predictions_wf.csv.gz（历史 walk-forward）
+# 与 latest_signals.csv（最新一日）。用作 crypto BUY 的否决层与仓位倍数，
+# 模型/数据仍在仓库外，不上传。
+_SM702_CACHE = {}
+_SM702_LOCK = threading.RLock()
+
+
+def sm702_dir():
+    """sm702 根目录（SM702_DIR 优先；桌面副本/原目录兜底）。"""
+    cands = [(os.environ.get("SM702_DIR") or "").strip(),
+             os.path.join(os.path.expanduser("~"), "桌面", "sm702"),
+             os.path.join(os.path.expanduser("~"), "sm702")]
+    for p in cands:
+        if p and os.path.isdir(p):
+            return p
+    return ""
+
+
+def _sm702_read(path, code):
+    op = gzip.open if path.endswith(".gz") else open
+    out = {}
+    try:
+        with op(path, "rt", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("code") or "") != code:
+                    continue
+                d = str(row.get("date") or "")[:10]
+                if not d:
+                    continue
+                try:
+                    prob = float(row.get("prob"))
+                except (TypeError, ValueError):
+                    continue
+                rank = row.get("prob_rank")
+                try:
+                    rank = float(rank) if rank not in (None, "") else None
+                except (TypeError, ValueError):
+                    rank = None
+                try:
+                    th = float(row.get("threshold"))
+                except (TypeError, ValueError):
+                    th = None
+                sig = str(row.get("signal") or "").strip()
+                out[d] = {"prob": prob, "rank": rank, "threshold": th,
+                          "signal": sig in ("1", "1.0", "True", "true")}
+    except Exception:
+        log.debug("sm702 读取失败 %s", path, exc_info=True)
+    return out
+
+
+def sm702_pred_map(full):
+    """crypto 代码 → {date: {prob, rank, threshold, signal}}；无模型返回 {}。"""
+    if not full or _market_of(full) != "crypto":
+        return {}
+    base = sm702_dir()
+    if not base:
+        return {}
+    code = _sm701_code(full)
+    p1 = os.path.join(base, "outputs_crypto", "predictions_wf.csv.gz")
+    p2 = os.path.join(base, "outputs_crypto", "latest_signals.csv")
+    key = (code, os.path.getmtime(p1) if os.path.exists(p1) else 0,
+           os.path.getmtime(p2) if os.path.exists(p2) else 0)
+    with _SM702_LOCK:
+        hit = _SM702_CACHE.get("map")
+        if hit and hit[0] == key:
+            return dict(hit[1])
+        out = {}
+        for p in (p1, p2):
+            if not os.path.exists(p):
+                continue
+            got = _sm702_read(p, code)
+            for d, rec in got.items():
+                out.setdefault(d, rec)     # 历史优先；latest 只补缺日
+        _SM702_CACHE["map"] = (key, dict(out))
+        return out
+
+
+def sm702_mult(rec, typ="BUY", mult_scale=10.0, mult_max=3.0,
+               min_rate=0.55):
+    """sm702 概率 → 仓位倍数（quant crypto_position_adapter 口径）。
+
+    多头胜率=1-prob、空头胜率=prob；胜率低于 min_rate 返回 0（否决）。"""
+    if not rec:
+        return 1.0
+    try:
+        p = float(rec.get("prob"))
+    except (TypeError, ValueError):
+        return 1.0
+    win = (1.0 - p) if typ != "SELL" else p
+    try:
+        min_rate = float(min_rate)
+        if win < min_rate:
+            return 0.0
+        m = (win - 0.5) * float(mult_scale)
+        return max(0.0, min(float(mult_max), m))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def sm702_veto(rows, i, full, q=0.30, persist=1):
+    """crypto BUY 是否被 sm702 否决（连续 persist 日处于止损概率 top-q）。"""
+    mp = sm702_pred_map(full)
+    if not mp or not rows or i < 0:
+        return False
+    try:
+        q = max(0.0, min(1.0, float(q)))
+        persist = max(1, int(persist))
+    except (TypeError, ValueError):
+        q, persist = 0.30, 1
+    for k in range(persist):
+        j = i - k
+        if j < 0:
+            return False
+        rec = mp.get(rows[j].get("date"))
+        if not rec:
+            return False
+        rank = rec.get("rank")
+        if rank is not None:
+            top = rank >= 1.0 - q
+        else:
+            th = rec.get("threshold")
+            top = bool(rec.get("signal")) or (
+                th is not None and rec.get("prob", 0.0) >= th)
+        if not top:
+            return False
+    return True
 
 
 # ---- 外接算法开关辅助（该市场是否有 sm701 生产模型集）----

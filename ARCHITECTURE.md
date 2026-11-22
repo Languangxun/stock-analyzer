@@ -620,6 +620,17 @@ SELL 平多开空，单账户）。
 停止后续开仓；爆仓重置时峰值重置为 1。开关 ini `[trade] breakeven`
 （设置→交易/融资，默认开）。
 
+**sm702 止损否决（v7.5.11）**：`external/sm701_ext.py` 只读
+`~/桌面/sm702/outputs_crypto/` 的 walk-forward 预测与最新信号，
+`sm702_pred_map()` 按代码/日期缓存；`sm702_veto()` 判断 crypto BUY 是否
+连续 N 日处于止损概率 top-q，`sm702_mult()` 按胜率给仓位倍数
+（`(胜率-0.5)×mult_scale`，上限 `mult_max`，胜率 < `min_rate` 否决）。
+`_sm702_filter()` 在 `_dedup_signals`/MA60 之后给 BUY 打
+「【sm702否决】」（图空心 B否），`_bt_simulate` 跳过；有效信号的实际
+杠杆乘以 sm702 倍数并受设置杠杆上限约束；SELL 平仓不受影响。
+设置→外部策略页含 sm702 开关与 q/persist/mult_scale/mult_max/min_rate，
+sm701 总开关/消融开关/买阈/卖阈也移到该页（ini `[predict]`）。
+
 **crypto 趋势闸门**：`_crypto_trend_filter` 在 `_dedup_signals` **之后**
 给收盘跌破 MA60 的 BUY 打 `【MA60闸门】` 标记（图上空心「B闸」），
 避免先丢 BUY 导致连续 SELL 被压缩、近期买卖点消失；回测层
@@ -1446,6 +1457,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.11**<br>（2026-11-22） | **sm702 止损否决 + sm 设置外部策略页**：`external/sm701_ext.py` 只读 `~/桌面/sm702/outputs_crypto/predictions_wf.csv.gz`/`latest_signals.csv`，新增 `sm702_pred_map/sm702_mult/sm702_veto`；crypto BUY 连续 N 日 top-q 止损概率或胜率不足时标「【sm702否决】」（图空心 B否、回测跳过），有效信号按 sm702 胜率乘仓位倍数；设置→外部策略页新增 sm702 开关与 q/persist/mult_scale/mult_max/min_rate，sm701 开关与买/卖阈同页（ini `[predict] sm702_*`/`sm701_buy|sell`）；`APP_VERSION=7.5.11`，`stock_predict.py` 重新生成 |
 | **v7.5.10**<br>（2026-11-22） | **净值保本强平**：`_bt_simulate(breakeven=True)` 跟踪权益峰值，曾 >1 后回落到 1.0 时按净值=1 的价格强平并停止后续开仓（`be_count/be_halt`，明细「保本强平（净值1.0）」）；排在普通止损前，爆仓重置时峰值重置；设置→交易/融资新增开关（ini `[trade] breakeven`，默认开）；`APP_VERSION=7.5.10`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.9**<br>（2026-11-22） | **爆仓净值重置 + quant 置信度杠杆 + 买卖点悬停**：`_bt_simulate` 爆仓后 `ret_lev=-100%`、`reset=True`，净值重置为 1 继续回测；曲线标「爆仓重置」、明细标「爆仓（净值重置）」。自适应杠杆改用 quant `trading/leverage.py` 口径 `1+(上限-1)×clip((概率-conf_lo)/(conf_hi-conf_lo))`，空头用 1-概率，设置倍数为上限；设置→交易/融资「单笔风险%」改为「置信低/高」（`conf_lo_市场/conf_hi_市场`），crypto 默认 0.55→0.60。K线 B/S/多/空悬停显示实际杠杆与「调仓至 B 成（名义 E 成）」（`_sig_lev_text`）；MA60 闸门在 `_dedup_signals` 之后标记（空心 B闸），修复连续 SELL 被压缩导致近期无买卖点；保存设置后重载 `[trade]`。本机 `crypto_hourly.db` 从 quant 快照拷贝/校验并重算日聚合概率（1,223,156 行，至 2026-11-22 06:00 UTC）。`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.8**<br>（2026-11-22） | **回测逐笔杠杆 + 爆仓 + 加密趋势闸门**：`_bt_simulate` 每笔按实际杠杆记录 `ret_lev`，按 0.5% 维持保证金用日内 low/high 检查强平；设置→交易/融资新增「自适应」与「加密 MA60 趋势闸门」；crypto 默认自适应、BUY 需站上 MA60、开空需跌破 MA60（平仓不受限）；信号胜率明细表新增「杠杆/价格收益/杠杆收益」列与爆仓计数；`APP_VERSION=7.5.8`，`stock_predict.py` 重新生成 |
