@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.2"
+APP_VERSION = "7.5.7"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -345,6 +345,16 @@ class CFG:
     #                  其他算法消融，sm701 仅多市场直出/独立调用）。
     SM701_EXT_ON = True
     SM701_JOIN_ABLATION = True
+    # ---- 分市场交易/融资配置（v7.5.7，ini [trade]）----
+    # 回测与交易记录共用：finance=允许融资/杠杆做多，short=允许做空，
+    # leverage=杠杆倍数（finance=0 时回测强制 1 倍）。默认全部关闭，
+    # 保持旧口径；在 设置→交易/融资 按市场勾选。
+    TRADE_FINANCE = {"cn": False, "hk": False, "us": False,
+                     "futures": False, "crypto": False}
+    TRADE_SHORT = {"cn": False, "hk": False, "us": False,
+                   "futures": False, "crypto": False}
+    TRADE_LEVERAGE = {"cn": 1.0, "hk": 1.0, "us": 1.0,
+                      "futures": 1.0, "crypto": 1.0}
     # ---- 本地策略消融开关（v7.4.1，ini [predict] local_ablation）----
     # 0 = GUI 不再在本地跑 run_ablation（缓存过期/无缓存/「全部组合」重算
     #     都不跑）——只沿用旧策略或读取导入的研究消融结果
@@ -596,6 +606,49 @@ def _load_studio_cfg():
 
 
 
+def _load_trade_cfg():
+    """从 ini [trade] 读取分市场融资/做空/杠杆（v7.5.7）。"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("trade"):
+            cp.add_section("trade")
+
+        def gb(key, dflt):
+            raw = (cp.get("trade", key, fallback="1" if dflt else "0")
+                   or "").strip().lower()
+            return raw in ("1", "true", "yes", "on", "是")
+
+        def gf(key, dflt):
+            try:
+                return max(1.0, min(20.0, float(cp.get(
+                    "trade", key, fallback=dflt))))
+            except (TypeError, ValueError):
+                return dflt
+
+        for mk in ("cn", "hk", "us", "futures", "crypto"):
+            CFG.TRADE_FINANCE[mk] = gb(
+                f"finance_{mk}", CFG.TRADE_FINANCE.get(mk, False))
+            CFG.TRADE_SHORT[mk] = gb(
+                f"short_{mk}", CFG.TRADE_SHORT.get(mk, False))
+            CFG.TRADE_LEVERAGE[mk] = gf(
+                f"leverage_{mk}", CFG.TRADE_LEVERAGE.get(mk, 1.0))
+    except Exception:
+        log.exception("读取分市场交易配置失败(使用默认)")
+
+
+def _trade_cfg(full):
+    """当前代码所属市场的有效交易配置（融资/做空/杠杆）。"""
+    mk = _market_of(full)
+    fin = bool(CFG.TRADE_FINANCE.get(mk, False))
+    short = bool(CFG.TRADE_SHORT.get(mk, False))
+    lev = float(CFG.TRADE_LEVERAGE.get(mk, 1.0) or 1.0)
+    if not fin:
+        lev = 1.0
+    return {"market": mk, "finance": fin, "short": short,
+            "leverage": max(1.0, min(20.0, lev))}
+
+
 # ---- 指标参数分市场（v7.0.1）：ini [inds] 为A股，[inds_市场] 为覆盖；
 # calc_* 经 INDP() 读取：优先当前线程上下文市场（analyze/消融入口设置），
 # 无上下文用 A股。实现线程本地，避免并发分析互相串参数。
@@ -738,6 +791,7 @@ def set_ind_param(attr, value):
 _load_predict_cfg()
 _load_ind_cfg()
 _load_studio_cfg()
+_load_trade_cfg()
 
 
 W_WINDOW: int = CFG.W_WINDOW
@@ -5890,10 +5944,11 @@ def _quote_cache_set(full, data):
         log.debug("quote_cache 写入失败 %s", full, exc_info=True)
 
 
-def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
+def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL, persist=True):
     """带缓存的行情快照：内存 → 数据库 → 网络；无网络时优雅降级到缓存。
 
     所有行情快照调用应优先走本函数，避免盘中每次刷新都联网。
+    persist=False 时只更新内存缓存（3 秒级 tick 用），避免高频写 SQLite。
     """
     now = time.time()
     hit = None
@@ -5920,19 +5975,61 @@ def fetch_quote_cached(full: str, ttl=_IDX_QUOTE_TTL):
         raise
     with _STATE_LOCK:
         _IDX_QUOTE_CACHE[full] = (now, q)
-    _quote_cache_set(full, q)
+    if persist:
+        _quote_cache_set(full, q)
     return q
 
 
-# ================= 分时线（v6.6.5：缓存周期=一个交易日） =================
-# 数据源：腾讯 minute/query（今日/最近交易日 1 分钟：HHMM 价格 累计量 累计额）。
-# 缓存：内存（盘中 60s TTL，收盘后当日定型）+ SQLite minute_cache（每代码
-# 只保留最新一个交易日，离线可显示）。均价线 = 分钟增量 VWAP（Σprice×Δvol /
-# ΣΔvol，与量纲无关、必然落在当日价格区间内）。
+def _tick_quote_ttl(full):
+    """当前股票的行情快照 TTL（v7.5.3）。
 
-_MINUTE_MEM = {}                # code -> data dict（含 ts）
+    A 股交易时段用 2.5 秒，配合 TICK_MS=3s 做到准实时；休市、周末与
+    港股/美股/期货/加密保持 60 秒，避免无意义的高频请求。行情源单次
+    实测 ~0.2s（腾讯/新浪/同花顺同量级），3 秒轮询压力可控。
+    """
+    if _market_of(full) != "cn":
+        return _IDX_QUOTE_TTL
+    hm = time.strftime("%H%M")
+    if "0910" <= hm <= "1505" and _today_is_session() is not False:
+        return 2.5
+    return _IDX_QUOTE_TTL
+
+
+# ================= 分时线（A股一个交易日；加密跨日滚动，v7.5.4） =================
+# 数据源：腾讯 minute/query（今日/最近交易日 1 分钟：HHMM 价格 累计量 累计额）；
+# 加密优先 Kraken 公共 OHLC（跨日滚动），港美期走 Yahoo 对应周期（v7.5.4）。
+# 缓存：内存（盘中 60s TTL，收盘后当日定型）+ SQLite minute_cache（每代码
+# 每个周期保留最近一次结果，离线可显示）。均价线 = 周期增量 VWAP
+# （Σprice×Δvol / ΣΔvol，与量纲无关、必然落在当日价格区间内）。
+
+_MINUTE_MEM = {}                # code[@interval] -> data dict（含 ts）
 _MINUTE_TTL_LIVE = 60.0         # 盘中重拉间隔（秒）
 _MINUTE_LOCK = threading.Lock()
+
+# 分时周期（v7.5.4）：内部 interval -> (界面标签, 分钟数)。
+_MINUTE_INTERVALS = {"1m": ("1分", 1), "5m": ("5分", 5),
+                     "15m": ("15分", 15), "30m": ("30分", 30),
+                     "60m": ("60分", 60)}
+MINUTE_VIEWS = ("日K", "分时", "1分", "5分", "15分", "30分", "60分")
+_MINUTE_VIEW_MAP = {"日K": (None, False), "分时": ("1m", False),
+                    "1分": ("1m", True),
+                    "5分": ("5m", True), "15分": ("15m", True),
+                    "30分": ("30m", True), "60分": ("60m", True)}
+
+
+def _minute_interval(interval):
+    return interval if interval in _MINUTE_INTERVALS else "1m"
+
+
+def _minute_view_parts(label):
+    """界面选项 -> (interval, 是否蜡烛K)。"""
+    return _MINUTE_VIEW_MAP.get(label or "分时", ("1m", False))
+
+
+def _minute_cache_key(full, interval):
+    """1 分钟沿用旧 key（兼容既有库），其它周期追加 @interval。"""
+    interval = _minute_interval(interval)
+    return full if interval == "1m" else f"{full}@{interval}"
 
 
 def _minute_active():
@@ -5969,7 +6066,68 @@ def _fetch_minute_tx(full):
     if not rows or len(day) != 8:
         raise RuntimeError("分时数据为空")
     return {"day": f"{day[:4]}-{day[4:6]}-{day[6:8]}", "rows": rows,
-            "prev_close": prev}
+            "prev_close": prev, "src": "tencent"}
+
+
+def _fetch_minute_em(full):
+    """东财分时 1 分钟（腾讯失败时接管）：OHLC/成交量更完整。
+
+    返回与腾讯同构 rows[(hhmm, close, cum_vol, cum_amt)] + bars(OHLC)；
+    v7.5.5 作为 A股分时第二源，复用熔断/代理/限流。
+    """
+    secid = _code_to_em(full)
+    if not secid:
+        raise RuntimeError("东财分时不支持该代码")
+    if not _cb_ok("东财分时"):
+        raise RuntimeError("东财分时熔断中")
+    path = ("/api/qt/stock/trends2/get"
+            f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8"
+            "&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1")
+    hosts = ("push2his.eastmoney.com", "92.push2his.eastmoney.com")
+    txt = None
+    last = None
+    for host in hosts:
+        try:
+            txt = _http_get(f"https://{host}{path}", retries=1, timeout=4,
+                            headers={"Accept": "application/json"},
+                            src_name="东财分时")
+            break
+        except Exception as e:
+            last = e
+    if txt is None:
+        raise RuntimeError(f"东财分时请求失败: {last}")
+    j = json.loads(txt)
+    data = j.get("data") or {}
+    trends = data.get("trends") or []
+    rows, bars, cum, cum_amt = [], [], 0.0, 0.0
+    day = ""
+    for seg in trends:
+        p = str(seg).split(",")
+        if len(p) < 7 or len(p[0]) < 16:
+            continue
+        try:
+            day = p[0][:10]
+            hhmm = p[0][11:13] + p[0][14:16]
+            o, c, h, l = (float(p[1]), float(p[2]),
+                          float(p[3]), float(p[4]))
+            vol, amt = float(p[5]), float(p[6])
+        except (ValueError, IndexError):
+            continue
+        if c <= 0:
+            continue
+        cum += vol
+        cum_amt += amt
+        rows.append((hhmm, c, cum, cum_amt))
+        bars.append({"t": hhmm, "open": o, "high": h, "low": l,
+                     "close": c, "vol": vol})
+    if len(rows) < 2 or len(day) != 10:
+        raise RuntimeError("东财分时数据为空")
+    try:
+        prev = float(data.get("preClose"))
+    except (TypeError, ValueError):
+        prev = None
+    return {"day": day, "rows": rows, "bars": bars, "prev_close": prev,
+            "interval": "1m", "src": "eastmoney"}
 
 
 def _minute_derive(rows):
@@ -5987,89 +6145,172 @@ def _minute_derive(rows):
     return vols, avg
 
 
-def fetch_minute_lines(full):
-    """分时线（带缓存，**缓存周期=一个交易日**）。返回 dict：
-    {"day","rows","prev_close","vols","avg","ts"}；全部不可得时抛异常。
+def _minute_bars_from_rows(rows, vols=None):
+    """无 OHLC 源时用分钟收盘价构造近似K（A股分时/旧缓存降级）。"""
+    bars = []
+    prev = None
+    for i, row in enumerate(rows):
+        try:
+            t, price = str(row[0]), float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        o = prev if prev is not None else price
+        bars.append({"t": t, "open": o, "high": max(o, price),
+                     "low": min(o, price), "close": price,
+                     "vol": float(vols[i]) if vols and i < len(vols) else 0.0})
+        prev = price
+    return bars
 
-    - 盘中：内存缓存 60s，过期重拉（拉取失败回退缓存，显示最近可得分时）；
-    - 收盘/休市：当日数据已定型，直接用缓存（库内/内存），不联网；
-    - SQLite minute_cache 每代码只保留最新一个交易日（写入即清旧行），
-      跨重启、离线均可显示最近交易日的分时。
-    v6.6.5：hk/us/fu/crypto 走 Yahoo 1m（分时缓存口径相同）。"""
-    if _market_of(full) != "cn":
-        active = True            # 港美期加交易时段各异，统一 60s TTL 重拉
-        now = time.time()
-        with _MINUTE_LOCK:
-            hit = _MINUTE_MEM.get(full)
-            if hit and now - hit.get("ts", 0) < _MINUTE_TTL_LIVE:
-                return hit
-        try:
-            data = _fetch_minute_market(full)
-        except Exception:
-            if hit:
-                return hit
-            raise
-        data["vols"], data["avg"] = _minute_derive(data["rows"])
-        data["ts"] = now
-        with _MINUTE_LOCK:
-            _MINUTE_MEM[full] = data
-        try:
-            blob = json.dumps({k: data[k] for k in
-                               ("day", "rows", "prev_close", "vols", "avg")},
-                              ensure_ascii=False, separators=(",", ":"))
-            with db_conn(commit=True) as conn:
-                conn.execute("DELETE FROM minute_cache WHERE code=?", (full,))
-                conn.execute(
-                    "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
-                    (full, data["day"], blob, now))
-        except Exception:
-            log.debug("分时缓存写库失败", exc_info=True)
+
+def _cn_minute_bucket(t, step):
+    """A股分钟时间串 -> 忽略午休的连续分钟序号 // step。"""
+    try:
+        hh, mm = int(str(t)[:2]), int(str(t)[2:4])
+    except (TypeError, ValueError):
+        return 0
+    mins = hh * 60 + mm
+    if 570 <= mins <= 690:              # 09:30~11:30
+        pos = min(119, mins - 570)      # 11:30 归入 11:26~11:30 桶
+    elif 780 <= mins <= 900:            # 13:00~15:00
+        pos = 120 + min(119, mins - 780)  # 15:00 归入 14:56~15:00 桶
+    else:
+        pos = max(0, mins - 570)
+    return pos // max(1, int(step))
+
+
+def _aggregate_cn_minute(data, interval):
+    """腾讯只有 1 分钟：按周期聚合成 OHLC，累计量保留给 _minute_derive。"""
+    step = _MINUTE_INTERVALS[_minute_interval(interval)][1]
+    if step <= 1:
         return data
-    now = time.time()
-    active = _minute_active()
-    with _MINUTE_LOCK:
-        hit = _MINUTE_MEM.get(full)
-        if hit and (not active or now - hit.get("ts", 0) < _MINUTE_TTL_LIVE):
-            return hit
-    cached = None
+    out, bars = [], []
+    cur = None
+
+    def _flush():
+        if cur is None:
+            return
+        out.append((cur["t"], cur["close"], cur["cum"], cur["amt"]))
+        bars.append({k: cur[k] for k in
+                     ("t", "open", "high", "low", "close")})
+        bars[-1]["vol"] = 0.0
+
+    src_bars = data.get("bars") or []
+    use_bars = len(src_bars) == len(data["rows"])
+    for idx, (t, p, cum, amt) in enumerate(data["rows"]):
+        o = h = l = p
+        if use_bars:
+            try:
+                b = src_bars[idx]
+                o, h, l = (float(b["open"]), float(b["high"]),
+                           float(b["low"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        bucket = _cn_minute_bucket(t, step)
+        if cur is None or bucket != cur["bucket"]:
+            _flush()
+            cur = {"bucket": bucket, "t": str(t), "open": o, "high": h,
+                   "low": l, "close": p, "cum": cum, "amt": amt}
+        else:
+            cur["high"] = max(cur["high"], h)
+            cur["low"] = min(cur["low"], l)
+            cur["close"] = p
+            cur["cum"] = cum
+            cur["amt"] = amt
+    _flush()
+    if not out:
+        return data
+    return {"day": data.get("day"), "rows": out, "bars": bars,
+            "prev_close": data.get("prev_close"),
+            "interval": _minute_interval(interval),
+            "src": data.get("src") or "tencent"}
+
+
+def _minute_cache_read(key):
     try:
         with db_conn() as conn:
             row = conn.execute(
                 "SELECT data FROM minute_cache WHERE code=?",
-                (full,)).fetchone()
-        if row:
-            cached = json.loads(row[0])
+                (key,)).fetchone()
+        return json.loads(row[0]) if row else None
     except Exception:
-        cached = None
+        return None
+
+
+def _minute_cache_write(key, data, now):
+    try:
+        blob = json.dumps({k: data[k] for k in
+                           ("day", "rows", "bars", "stamps", "prev_close",
+                            "vols", "avg", "interval", "market", "src",
+                            "avg5_vol") if k in data},
+                          ensure_ascii=False, separators=(",", ":"))
+        with db_conn(commit=True) as conn:
+            conn.execute("DELETE FROM minute_cache WHERE code=?", (key,))
+            conn.execute(
+                "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
+                (key, data["day"], blob, now))
+    except Exception:
+        log.debug("分时缓存写库失败", exc_info=True)
+
+
+def fetch_minute_lines(full, interval="1m", ttl=None):
+    """分时/分钟K线（A股一个交易日；加密跨日滚动）。返回 dict：
+    {"day","rows","bars","prev_close","vols","avg","ts","interval","market"}。
+
+    interval：1m/5m/15m/30m/60m（v7.5.4）；A股由腾讯 1 分钟聚合，加密优先
+    Kraken 公共 OHLC（跨日滚动 720 根，失败回落 Yahoo），港美期走 Yahoo
+    对应 interval。内存 TTL 默认 60s，可传 ttl 覆盖（分时视图按周期
+    10~60s 自适应）；收盘/休市读 SQLite 定型缓存；
+    minute_cache 以 code[@interval] 为键，各周期互不覆盖。
+    """
+    interval = _minute_interval(interval)
+    key = _minute_cache_key(full, interval)
+    now = time.time()
+    market = _market_of(full)
+    active = True if market != "cn" else _minute_active()
+    ttl = _MINUTE_TTL_LIVE if ttl is None else max(0.0, float(ttl))
+    with _MINUTE_LOCK:
+        hit = _MINUTE_MEM.get(key)
+        if hit and (not active or now - hit.get("ts", 0) < ttl):
+            return hit
+    cached = _minute_cache_read(key)
     if cached and not active:
-        data = dict(cached, ts=now)
+        data = dict(cached, ts=now, interval=interval, market=market)
+        if not data.get("bars"):
+            data["bars"] = _minute_bars_from_rows(
+                data.get("rows") or [], data.get("vols"))
         with _MINUTE_LOCK:
-            _MINUTE_MEM[full] = data
+            _MINUTE_MEM[key] = data
         return data
     try:
-        data = _fetch_minute_tx(full)
+        if market == "cn":
+            try:
+                data = _fetch_minute_tx(full)
+            except Exception as e:
+                flog.info("腾讯分时失败，东财分时接管 %s: %s", full, e)
+                data = _fetch_minute_em(full)
+            if interval != "1m":
+                data = _aggregate_cn_minute(data, interval)
+        else:
+            data = _fetch_minute_market(full, interval)
     except Exception:
         if hit:
             return hit
         if cached:
-            return dict(cached, ts=now)
+            data = dict(cached, ts=now, interval=interval, market=market)
+            if not data.get("bars"):
+                data["bars"] = _minute_bars_from_rows(
+                    data.get("rows") or [], data.get("vols"))
+            return data
         raise
     data["vols"], data["avg"] = _minute_derive(data["rows"])
+    data["interval"] = interval
+    data["market"] = market
+    if not data.get("bars"):
+        data["bars"] = _minute_bars_from_rows(data["rows"], data["vols"])
     data["ts"] = now
     with _MINUTE_LOCK:
-        _MINUTE_MEM[full] = data
-    try:
-        blob = json.dumps({k: data[k] for k in
-                           ("day", "rows", "prev_close", "vols", "avg")},
-                          ensure_ascii=False,
-                          separators=(",", ":"))
-        with db_conn(commit=True) as conn:
-            conn.execute("DELETE FROM minute_cache WHERE code=?", (full,))
-            conn.execute(
-                "INSERT OR REPLACE INTO minute_cache VALUES(?,?,?,?)",
-                (full, data["day"], blob, now))
-    except Exception:
-        log.debug("分时缓存写库失败", exc_info=True)
+        _MINUTE_MEM[key] = data
+    _minute_cache_write(key, data, now)
     return data
 
 
@@ -6370,10 +6611,88 @@ def _yf_rows(j, interval):
     return out
 
 
-# ---------------- Twelve Data：美股可选源（免费层邮箱注册即可，无需实名） -------------
-# 免费层 Basic：800 次/天、8 次/分钟，含美股实时行情与日K；未配置 key 时
-# 一切照旧走 Yahoo（零影响）。key 来源：环境变量 TWELVE_DATA_API_KEY 优先，
-# 其次 stock_gui.ini [data] twelvedata_key。
+# ---------------- Kraken：加密分时/K线首选源（v7.5.4） ----------------
+# Yahoo 加密分钟线的成交量存在大量 0 值与跨日跳变（60m 首根偶发数十倍），
+# 分时量/量比失真；Kraken 公共 OHLC 返回连续 OHLCV，且天然是跨日滚动窗口。
+# 仅用于 crypto，失败/未上市自动回落 Yahoo。
+_KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
+_KRAKEN_INTERVALS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
+_KRAKEN_ALIAS = {"BTC": "XBT", "DOGE": "XDG"}
+_KRAKEN_AVG_CACHE = {}          # full -> (ts, 5日均量)
+_KRAKEN_AVG_LOCK = threading.Lock()
+
+
+def _kraken_pair(full):
+    """cryptobtcusdt -> XBTUSD；cryptoethusdt -> ETHUSD。"""
+    body = (full or "")[6:].upper()
+    quote = next((q for q in ("USDT", "USDC", "USD")
+                  if body.endswith(q)), "")
+    if not body or not quote:
+        raise ValueError(f"无法映射 Kraken 交易对: {full}")
+    base = body[:-len(quote)]
+    return _KRAKEN_ALIAS.get(base, base) + "USD"
+
+
+def _kraken_ohlc(full, kraken_iv, limit=720):
+    """Kraken 公共 OHLC → [{date,open,high,low,close,vol}]（升序）。"""
+    if not _cb_ok("kraken"):
+        raise RuntimeError("kraken 熔断中")
+    pair = _kraken_pair(full)
+    url = (f"{_KRAKEN_OHLC}?pair={urllib.parse.quote(pair)}"
+           f"&interval={int(kraken_iv)}")
+    txt = _http_get(url, retries=1, timeout=12,
+                    headers={"Accept": "application/json"},
+                    src_name="kraken")
+    j = json.loads(txt)
+    errs = j.get("error") or []
+    if errs:
+        raise RuntimeError(f"kraken: {errs}")
+    res = j.get("result") or {}
+    key = next((k for k in res if k != "last"), None)
+    rows = res.get(key) or []
+    out = []
+    for r in rows:
+        try:
+            ts = int(float(r[0]))
+            o, h, l, c = (float(r[1]), float(r[2]),
+                          float(r[3]), float(r[4]))
+            v = float(r[6])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if c <= 0:
+            continue
+        out.append({
+            "date": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)),
+            "open": o, "high": h, "low": l, "close": c, "vol": v})
+    out.sort(key=lambda r: r["date"])
+    return out[-limit:] if limit and len(out) > limit else out
+
+
+def _kraken_avg_daily_vol(full):
+    """Kraken 近 5 个完整 UTC 日成交量均值（与分钟量同量纲，1h 缓存）。"""
+    now = time.time()
+    with _KRAKEN_AVG_LOCK:
+        hit = _KRAKEN_AVG_CACHE.get(full)
+        if hit and now - hit[0] < 3600:
+            return hit[1]
+    avg = None
+    try:
+        rows = _kraken_ohlc(full, 1440, limit=7)
+        vols = [float(r["vol"]) for r in rows
+                if r.get("vol") and r["vol"] > 0]
+        if len(vols) >= 6:
+            vols = vols[-6:-1]      # 去掉当日未完成 bar
+        vols = vols[-5:]
+        if vols:
+            avg = sum(vols) / len(vols)
+    except Exception as e:
+        flog.info("kraken 日均量失败 %s: %s", full, e)
+    with _KRAKEN_AVG_LOCK:
+        _KRAKEN_AVG_CACHE[full] = (now, avg)
+    return avg
+
+
+# ---------------- Twelve Data：美股可选源（免费层邮箱注册即可，无需实名） ----------------
 _TD_BASE = "https://api.twelvedata.com"
 _TD_MIN_INTERVAL = 7.6        # 免费层 8 次/分钟，留一点余量
 _TD_DAY_CAP = 700             # 免费层 800 次/天，余下的留给手动调试
@@ -6657,20 +6976,29 @@ def _get_daily_market(full, tail=None):
     return _display_rows(full, rows, tail)
 
 
-def _fetch_minute_market(full):
-    """多市场分时：Yahoo 1m period=1d（crypto 按 UTC 日）→ 与腾讯分时同构
-    rows[(hhmm, price, cum_vol, 0)]；prev_close 取库内前一交易日收盘。"""
-    yf = _market_yf_symbol(full)
-    j = _yf_chart(yf, interval="1m", period="1d")
-    bars = _yf_rows(j, "1m")
-    if len(bars) < 10:
-        raise RuntimeError("yahoo 分时数据过短")
-    rows, cum = [], 0.0
-    for b in bars:
-        hhmm = b["date"][11:13] + b["date"][14:16]
-        cum += b["vol"]
+def _minute_data_from_bars(full, raw, interval="1m", src=""):
+    """Bars（[{date,open,high,low,close,vol}] 升序）→ 分时同构数据。
+
+    rows 保留 HHMM 兼容旧绘制；stamps 为 "MM-DD HH:MM"（跨日横轴/光标用）。
+    """
+    if len(raw) < 2:
+        raise RuntimeError("分时数据过短")
+    rows, bars, stamps, cum = [], [], [], 0.0
+    for b in raw:
+        d = str(b.get("date") or "")
+        if len(d) < 16:
+            continue
+        hhmm = d[11:13] + d[14:16]
+        stamp = d[5:10] + " " + d[11:16]
+        cum += float(b.get("vol") or 0.0)
         rows.append((hhmm, b["close"], cum, 0.0))
-    day = bars[-1]["date"][:10]
+        bars.append({"t": hhmm, "stamp": stamp, "open": b["open"],
+                     "high": b["high"], "low": b["low"],
+                     "close": b["close"], "vol": float(b.get("vol") or 0)})
+        stamps.append(stamp)
+    if len(rows) < 2:
+        raise RuntimeError("分时数据过短")
+    day = str(raw[-1].get("date") or "")[:10]
     prev = None
     try:
         with db_conn() as conn:
@@ -6681,7 +7009,39 @@ def _fetch_minute_market(full):
         prev = float(r[0]) if r else None
     except Exception:
         prev = None
-    return {"day": day, "rows": rows, "prev_close": prev}
+    return {"day": day, "rows": rows, "bars": bars, "stamps": stamps,
+            "prev_close": prev, "interval": interval, "src": src}
+
+
+def _fetch_minute_market(full, interval="1m"):
+    """多市场分时/分钟K（v7.5.4）。
+
+    - crypto：Kraken 公共 OHLC 优先（连续 OHLCV、跨日滚动 720 根），失败
+      回落 Yahoo；Yahoo 加密按 interval 取 2~5 天并只保留最近 720 根，
+      不再按 UTC 自然日截断；
+    - hk/us/futures：Yahoo 对应 interval，period=1d。
+    prev_close 取库内前一交易日收盘。
+    """
+    interval = _minute_interval(interval)
+    crypto = _market_of(full) == "crypto"
+    if crypto:
+        try:
+            raw = _kraken_ohlc(full, _KRAKEN_INTERVALS[interval], limit=720)
+            data = _minute_data_from_bars(full, raw, interval, src="kraken")
+            data["avg5_vol"] = _kraken_avg_daily_vol(full)
+            return data
+        except Exception as e:
+            flog.info("kraken 分时回落 yahoo %s %s: %s", full, interval, e)
+    yf = _market_yf_symbol(full)
+    period = "1d"
+    if crypto:
+        period = {"1m": "2d", "5m": "5d", "15m": "5d",
+                  "30m": "5d", "60m": "5d"}.get(interval, "5d")
+    j = _yf_chart(yf, interval=interval, period=period)
+    raw = _yf_rows(j, interval)
+    if crypto:
+        raw = raw[-720:]
+    return _minute_data_from_bars(full, raw, interval, src="yahoo")
 
 
 def set_market_pool(market):
@@ -7072,18 +7432,24 @@ def _exec_mode():
     return os.environ.get("EXEC_PX", "close").lower()
 
 
-def _bt_simulate(rows, signals, rp):
-    """单段事件回测：BUY开仓/SELL平仓 + 动态止损/移动止盈。
+def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0):
+    """单段事件回测：支持多头/空头/双向（v7.5.7）。
 
-    早盘信号：信号在 T 日收盘生成，T+1 日收盘成交；止损单用 T-1 日 ATR
-    设定（见 CFG.RISK_PARAMS，各档 ATR 止损/移动止盈参数），
-    T 日盘中止损触发才是可执行的挂单（防前视）。
-    rp["use_atr_stop"]=False（外部策略，v6.6.0）时不叠加 ATR/移动止盈，
-    改用 stop_loss_pct/take_profit_pct/max_hold_days 显式参数。
-    返回指标 dict（含净值曲线 curve 与逐笔收益 trades_list）。"""
+    mode:
+      - long  ：BUY 开多 / SELL 平多（原口径）
+      - short ：SELL 开空 / BUY 平空；空头收益 = entry/exit - 1
+      - both  ：BUY 平空并开多、SELL 平多并开空（反转系统，单账户）
+    leverage：融资/杠杆倍数（仅作用于权益曲线，逐笔 trades 仍为价格收益）。
+    早盘信号：T 日收盘生成、T+1 日收盘成交；止损单用 T-1 日 ATR 设定。
+    rp["use_atr_stop"]=False 时用 stop_loss_pct/take_profit_pct/max_hold_days。
+    返回指标 dict（curve/trades_list/detail 等）。"""
     n = len(rows)
+    mode = mode if mode in ("long", "short", "both") else "long"
+    try:
+        lev = max(1.0, float(leverage or 1.0))
+    except (TypeError, ValueError):
+        lev = 1.0
     sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < n}
-    # 计算ATR(14)用于止损
     atrs = [0.0] * n
     for i in range(14, n):
         atrs[i] = sum(max(rows[j]["high"] - rows[j]["low"],
@@ -7091,127 +7457,168 @@ def _bt_simulate(rows, signals, rp):
                           abs(rows[j]["low"] - rows[j-1]["close"]))
                       for j in range(i - 13, i + 1)) / 14
     exec_open = _exec_mode() == "open"
-    # 外部策略（v6.6.0）：use_atr_stop=False 时用显式百分比止损/止盈/最长持有，
-    # 不再叠加 ATR 止损与移动止盈（0=不启用）。
     pct_exit = rp.get("use_atr_stop") is False
     stop_pct = max(0.0, _st_num(rp.get("stop_loss_pct"), 0.0) or 0.0)
     take_pct = max(0.0, _st_num(rp.get("take_profit_pct"), 0.0) or 0.0)
     max_hold = max(0, int(_st_num(rp.get("max_hold_days"), 0) or 0))
+    atr_mult = rp["atr_mult"]
+    trail_ratio = rp["trail_ratio"]
+    trail_trig = rp["trail_trigger"]
     eq = 1.0
+    pos = 0                 # 0=空仓，1=多，-1=空
     entry = None
     entry_i = None
-    highest = None  # 持仓期间最高价
+    extreme = None          # 多头最高价 / 空头最低价
     trades = []
+    details = []
     curve = []
+
+    def _close(i, px, reason):
+        nonlocal eq, pos, entry, entry_i, extreme
+        if pos == 0 or entry is None or not px:
+            return
+        side = "多" if pos == 1 else "空"
+        ret = (px / entry - 1.0) if pos == 1 else (entry / px - 1.0)
+        trades.append(ret)
+        eq *= max(0.0, 1.0 + lev * ret)
+        details.append({
+            "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+            "entry_px": entry, "exit_i": i, "exit_date": rows[i]["date"],
+            "exit_px": px, "ret": ret, "side": side, "reason": reason})
+        pos = 0
+        entry = entry_i = extreme = None
+
+    def _long_exit(i, c, h, l, o, prev_ext):
+        if pct_exit:
+            stop_px = entry * (1.0 - stop_pct / 100.0) \
+                if stop_pct > 0 else None
+            take_px = entry * (1.0 + take_pct / 100.0) \
+                if take_pct > 0 else None
+            if stop_px is not None and l <= stop_px:
+                return (o if (o and o <= stop_px) else stop_px), \
+                    f"止损 {stop_pct:g}%"
+            if take_px is not None and h >= take_px:
+                return (o if (o and o >= take_px) else take_px), \
+                    f"止盈 {take_pct:g}%"
+            if max_hold > 0 and entry_i is not None \
+                    and (i - entry_i) >= max_hold:
+                return c, f"最长持有 {max_hold} 天"
+            return None, ""
+        atr_prev = atrs[i - 1] if i > 0 else 0.0
+        atr_stop = (entry - atr_mult * atr_prev) if atr_prev > 0 \
+            else entry * 0.95
+        trailing = prev_ext > entry * trail_trig
+        trail_stop = prev_ext * trail_ratio if trailing else atr_stop
+        if l <= trail_stop:
+            return (o if (o and o <= trail_stop) else trail_stop), \
+                ("移动止盈" if trailing else "ATR止损")
+        return None, ""
+
+    def _short_exit(i, c, h, l, o, prev_ext):
+        if pct_exit:
+            stop_px = entry * (1.0 + stop_pct / 100.0) \
+                if stop_pct > 0 else None
+            take_px = entry * (1.0 - take_pct / 100.0) \
+                if take_pct > 0 else None
+            if stop_px is not None and h >= stop_px:
+                return (o if (o and o >= stop_px) else stop_px), \
+                    f"止损 {stop_pct:g}%"
+            if take_px is not None and l <= take_px:
+                return (o if (o and o <= take_px) else take_px), \
+                    f"止盈 {take_pct:g}%"
+            if max_hold > 0 and entry_i is not None \
+                    and (i - entry_i) >= max_hold:
+                return c, f"最长持有 {max_hold} 天"
+            return None, ""
+        atr_prev = atrs[i - 1] if i > 0 else 0.0
+        atr_stop = (entry + atr_mult * atr_prev) if atr_prev > 0 \
+            else entry * 1.05
+        trailing = prev_ext < entry * (2.0 - trail_trig)
+        trail_stop = (prev_ext * (2.0 - trail_ratio)) \
+            if trailing else atr_stop
+        if h >= trail_stop:
+            return (o if (o and o >= trail_stop) else trail_stop), \
+                ("移动止盈" if trailing else "ATR止损")
+        return None, ""
 
     for i, r in enumerate(rows):
         c = r["close"]
         h = r["high"]
         l = r["low"]
+        o = r.get("open") or c
         typ = sig_map.get(i)
+        px_fill = o if exec_open else c
 
-        if entry is not None:
-            prev_high = highest
-            highest = max(highest, h) if highest else h
-            if pct_exit:
-                stop_px = entry * (1.0 - stop_pct / 100.0) \
-                    if stop_pct > 0 else None
-                take_px = entry * (1.0 + take_pct / 100.0) \
-                    if take_pct > 0 else None
-                exit_price = None
-                if stop_px is not None and l <= stop_px:
-                    exit_price = r["open"] if r["open"] <= stop_px \
-                        else stop_px
-                elif take_px is not None and h >= take_px:
-                    exit_price = r["open"] if r["open"] >= take_px \
-                        else take_px
-                elif max_hold > 0 and entry_i is not None \
-                        and (i - entry_i) >= max_hold:
-                    exit_price = c
-                if exit_price is not None:
-                    trades.append(exit_price / entry - 1)
-                    eq *= exit_price / entry
-                    entry = None
-                    entry_i = None
-                    highest = None
-                    curve.append(eq)
-                    continue
+        if pos != 0:
+            prev_ext = extreme if extreme is not None else entry
+            if pos == 1:
+                extreme = max(prev_ext, h)
+                exit_px, reason = _long_exit(i, c, h, l, o, prev_ext)
             else:
-                # 止损单在前一日收盘后用 T-1 的 ATR 设定，T 日盘中触发合法
-                atr_prev = atrs[i - 1] if i > 0 else 0.0
-                atr_stop = entry - rp["atr_mult"] * atr_prev \
-                    if atr_prev > 0 else entry * 0.95
-                trail_stop = prev_high * rp["trail_ratio"] \
-                    if prev_high > entry * rp["trail_trigger"] else atr_stop
+                extreme = min(prev_ext, l)
+                exit_px, reason = _short_exit(i, c, h, l, o, prev_ext)
+            if exit_px is not None:
+                _close(i, exit_px, reason)
+                curve.append(eq)
+                continue
 
-                # 止损触发（日内最低触及止损价）
-                if l <= trail_stop:
-                    exit_price = r["open"] if r["open"] <= trail_stop \
-                        else trail_stop
-                    trades.append(exit_price / entry - 1)
-                    eq *= exit_price / entry
-                    entry = None
-                    entry_i = None
-                    highest = None
-                    curve.append(eq)
-                    continue
+        if typ == "BUY":
+            if pos == -1:
+                _close(i, px_fill, "信号平空")
+            if pos == 0 and mode in ("long", "both") and c:
+                pos, entry, entry_i, extreme = 1, px_fill, i, px_fill
+        elif typ == "SELL":
+            if pos == 1:
+                _close(i, px_fill, "信号卖出")
+            if pos == 0 and mode in ("short", "both") and c:
+                pos, entry, entry_i, extreme = -1, px_fill, i, px_fill
 
-        if typ == "BUY" and entry is None and c:
-            px_fill = ((r.get("open") or c) if exec_open else c)
-            entry = px_fill
-            entry_i = i
-            highest = px_fill     # 成交时点之前的盘中高点不计入
-        elif typ == "SELL" and entry:
-            px_fill = ((r.get("open") or c) if exec_open else c)
-            trades.append(px_fill / entry - 1)
-            eq *= px_fill / entry
-            entry = None
-            entry_i = None
-            highest = None
-        curve.append(eq * (c / entry) if entry else eq)
+        if pos == 1:
+            curve.append(eq * max(0.0, 1.0 + lev * (c / entry - 1.0)))
+        elif pos == -1:
+            curve.append(eq * max(0.0, 1.0 + lev * (1.0 - c / entry)))
+        else:
+            curve.append(eq)
 
-    # 未平仓按最后收盘价计算
-    floating = rows[-1]["close"] / entry - 1 if entry else None
+    floating = None
+    if pos == 1:
+        floating = rows[-1]["close"] / entry - 1.0
+    elif pos == -1:
+        floating = entry / rows[-1]["close"] - 1.0
+    if floating is not None and entry_i is not None:
+        last_c = rows[-1]["close"]
+        details.append({
+            "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
+            "entry_px": entry, "exit_i": None, "exit_date": None,
+            "exit_px": last_c, "ret": floating,
+            "side": "多" if pos == 1 else "空", "reason": "持仓中"})
+
     wins = len([t for t in trades if t > 0])
     losses = len([t for t in trades if t <= 0])
-
     import datetime
-    # v6.1.8 P0：年化口径与 _bt_events 对齐——用区间起点（rows[0].date）
-    # 计算 years，而非首个信号日（signals[0][0]）。
-    # 原口径在「首信号远晚于区间起点」时会把分母压小、年化虚高；
-    # _bt_events 已统一用 [i0, i1) 区间，years 下限 0.25。
     d0 = datetime.date.fromisoformat(rows[0]["date"])
     d1 = datetime.date.fromisoformat(rows[-1]["date"])
     years = max((d1 - d0).days / 365.25, 0.25)
     total = curve[-1] if curve else 1.0
     ann = total ** (1 / years) - 1 if total > 0 else -1.0
-
     peak = 0.0
     mdd = 0.0
     for v in curve:
         peak = max(peak, v)
         if peak > 0:
             mdd = min(mdd, v / peak - 1)
-
     avg_win = sum(t for t in trades if t > 0) / wins if wins else 0
     avg_loss = sum(t for t in trades if t <= 0) / losses if losses else 0
     return {
         "trades": len(trades) + (1 if floating is not None else 0),
-        "closed": len(trades),
-        "wins": wins,
-        "losses": losses,
+        "closed": len(trades), "wins": wins, "losses": losses,
         "winrate": wins / len(trades) if trades else None,
-        "total": total - 1,
-        "ann": ann,
-        "mdd": mdd,
-        "floating": floating,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
+        "total": total - 1, "ann": ann, "mdd": mdd,
+        "floating": floating, "avg_win": avg_win, "avg_loss": avg_loss,
         "profit_loss": avg_win / abs(avg_loss) if avg_loss != 0 else float('inf'),
-        "curve": curve,
-        "trades_list": trades,
+        "curve": curve, "trades_list": trades, "detail": details,
+        "mode": mode, "leverage": lev,
     }
-
 
 def _bt_exit_note(rp):
     """回测退出规则说明（外部策略用显式百分比参数，v6.6.0）。"""
@@ -7245,7 +7652,7 @@ def _rank_avg(vals):
     return r
 
 
-def _signal_ic(rows, signals, horizon=5):
+def _signal_ic(rows, signals, horizon=5, invert=False):
     """信号方向(+1买/-1卖) 与未来 horizon 日收益的 Spearman IC。
 
     返回 (ic, n)：ic 为 None 表示样本不足/无区分度。"""
@@ -7258,7 +7665,10 @@ def _signal_ic(rows, signals, horizon=5):
         c0, c1 = rows[i].get("close"), rows[i + horizon].get("close")
         if not c0 or not c1 or c0 <= 0:
             continue
-        pairs.append((1.0 if s[2] == "BUY" else -1.0, c1 / c0 - 1.0))
+        sgn = 1.0 if s[2] == "BUY" else -1.0
+        if invert:
+            sgn = -sgn
+        pairs.append((sgn, c1 / c0 - 1.0))
     n = len(pairs)
     if n < 5:
         return None, n
@@ -7294,38 +7704,69 @@ def _signal_forward_stats(rows, signals, horizons=(1, 5)):
     return out
 
 
-def backtest_signals(rows, signals, rp=None):
-    """按买卖点信号模拟交易（早盘信号：信号在 T 日收盘生成，T+1 日收盘成交）。
-    BUY开仓/SELL平仓，带ATR动态止损+移动止盈；止损单用 T-1 日 ATR 设定，
-    T 日盘中止损触发才是可执行的挂单，避免用当日收盘信息判当日盘中。
-    rp["use_atr_stop"]=False（外部策略）时改用显式止损%/止盈%/最长持有。
-    返回全期指标 + 训练集(前75%)/验证集(后25%)分段指标 + 信号IC
-    + 信号后1/5日收益，供 GUI 展开显示。"""
+def _bt_pack_side(rows, signals, rp, mode, leverage):
+    """单方向回测 + 训练/验证/IC 打包（v7.5.7）。"""
+    out = _bt_simulate(rows, signals, rp, mode=mode, leverage=leverage)
+    n = len(rows)
+    split = max(30, int(n * 0.75))
+    out["split_i"] = split if 0 < split < n else None
+    out["train"] = out["val"] = None
+    if 0 < split < n:
+        tr_sigs = [s for s in signals if s[0] < split]
+        va_sigs = [(s[0] - split,) + tuple(s[1:])
+                   for s in signals if split <= s[0] < n]
+        if tr_sigs:
+            out["train"] = _bt_simulate(
+                rows[:split], tr_sigs, rp, mode=mode, leverage=leverage)
+        if va_sigs:
+            out["val"] = _bt_simulate(
+                rows[split:], va_sigs, rp, mode=mode, leverage=leverage)
+    inv = mode == "short"
+    out["ic1"] = _signal_ic(rows, signals, 1, invert=inv)
+    out["ic5"] = _signal_ic(rows, signals, 5, invert=inv)
+    out["fwd"] = _signal_forward_stats(rows, signals)
+    return out
+
+
+def backtest_signals(rows, signals, rp=None, full="", leverage=None,
+                     allow_short=None):
+    """按买卖点信号模拟交易（早盘信号：T 日收盘生成，T+1 日成交）。
+
+    v7.5.7：同时返回多头/空头/总共三套结果（顶栏字段=总共，兼容旧调用）：
+      out["long"]  BUY 开多/SELL 平多
+      out["short"] SELL 开空/BUY 平空（市场允许做空时才有）
+      out["total"] 反转系统：BUY 平空开多、SELL 平多开空；无做空权限时=多头
+    `full` 用于读取分市场 设置→交易/融资（做空/杠杆）；leverage/allow_short
+    可显式覆盖（研究脚本）。杠杆只作用于权益曲线，trades 仍为价格收益。
+    """
     try:
         if not signals or len(rows) < 30:
             return None
         rp = rp or CFG.risk_params()
-        out = _bt_simulate(rows, signals, rp)
-        n = len(rows)
-        split = max(30, int(n * 0.75))
-        out["split_i"] = split if 0 < split < n else None
-        out["train"] = out["val"] = None
-        if 0 < split < n:
-            tr_sigs = [s for s in signals if s[0] < split]
-            va_sigs = [(s[0] - split,) + tuple(s[1:])
-                       for s in signals if split <= s[0] < n]
-            if tr_sigs:
-                out["train"] = _bt_simulate(rows[:split], tr_sigs, rp)
-            if va_sigs:
-                out["val"] = _bt_simulate(rows[split:], va_sigs, rp)
-        out["ic1"] = _signal_ic(rows, signals, 1)
-        out["ic5"] = _signal_ic(rows, signals, 5)
-        out["fwd"] = _signal_forward_stats(rows, signals)
+        cfg = _trade_cfg(full) if full else {
+            "market": "cn", "finance": False, "short": False,
+            "leverage": 1.0}
+        lev = cfg["leverage"] if leverage is None else max(
+            1.0, min(20.0, float(leverage or 1.0)))
+        short_ok = (bool(cfg.get("short")) if allow_short is None
+                    else bool(allow_short))
+        long_bt = _bt_pack_side(rows, signals, rp, "long", lev)
+        short_bt = (_bt_pack_side(rows, signals, rp, "short", lev)
+                    if short_ok else None)
+        total_bt = (_bt_pack_side(rows, signals, rp, "both", lev)
+                    if short_ok else long_bt)
+        out = dict(total_bt)
+        out["long"] = long_bt
+        out["short"] = short_bt
+        out["combined"] = total_bt
+        out["allow_short"] = short_ok
+        out["finance"] = bool(cfg.get("finance"))
+        out["leverage"] = lev
+        out["market"] = cfg.get("market")
         return out
     except Exception:
         log.exception("backtest_signals 回测失败")
         return None
-
 
 def strategy_signals_full(rows, strat, industry="", full=""):
     """按所选策略在传入 rows 上重算信号（工具→信号胜率回测用）。
@@ -12342,9 +12783,19 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
             strat = bound
         elif (CFG.SM701_EXT_ON and mk in _SM701_MK
               and sm701_has_model(mk)):
+            _label = f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"
+            if mk == "crypto":
+                try:
+                    _hp = os.path.join(
+                        sm701_paths(market="crypto").get("dir") or "",
+                        "output", "crypto_hourly_daily_probs.csv.gz")
+                    if os.path.isfile(_hp):
+                        _label = "sm70x外接算法·加密小时（直出，不消融）"
+                except Exception:
+                    pass
             strat = {"algo": "sm701", "mode": "sm701",
                      "params": dict(_SM701_EXT_RISK),
-                     "label": f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"}
+                     "label": _label}
         # 未接入外接算法：strat 保持 None → 只看行情不出买卖点
     if not strat:
         strat = studio_active_strategy()
@@ -12685,7 +13136,7 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
     bt_stats = None
     if signals and len(signals) >= 2:
         try:
-            bt_stats = backtest_signals(disp_rows, signals, rp=rp)
+            bt_stats = backtest_signals(disp_rows, signals, rp=rp, full=full)
         except Exception:
             log.exception("回测统计失败(bt_stats=None)")
 
@@ -12818,7 +13269,8 @@ def analyze_finish_signals(res, progress=None):
     bt_stats = None
     if len(signals) >= 2:
         try:
-            bt_stats = backtest_signals(disp_rows, signals, rp=rp)
+            bt_stats = backtest_signals(disp_rows, signals, rp=rp,
+                                         full=res.get("full_code") or "")
         except Exception:
             log.exception("后台回测统计失败(bt_stats=None)")
     res["bt_stats"] = bt_stats
@@ -18032,12 +18484,15 @@ def _ai_tool_chips(ctx, args):
             f"{d}[{t}]{x}" for _, d, t, x in sigs[-12:]))
     bt = res.get("bt_stats") or {}
     if bt:
-        clean = {k: v for k, v in bt.items()
-                 if k not in ("curve", "trades_list", "train", "val")}
-        for seg in ("train", "val"):
-            if isinstance(bt.get(seg), dict):
-                clean[seg] = {k: v for k, v in bt[seg].items()
-                              if k not in ("curve", "trades_list")}
+        _drop = ("curve", "trades_list", "detail", "train", "val",
+                 "long", "short", "combined")
+        clean = {k: v for k, v in bt.items() if k not in _drop}
+        for _side in ("long", "short", "combined"):
+            _m = bt.get(_side)
+            if isinstance(_m, dict):
+                clean[_side] = {k: v for k, v in _m.items()
+                                if k not in ("curve", "trades_list",
+                                             "detail", "train", "val")}
         out.append("回测统计：" + _ai_tool_json(clean))
     if res.get("band_note"):
         out.append("波段：" + str(res.get("band_note")))
@@ -18074,17 +18529,19 @@ def _ai_tool_intraday(ctx, args):
             return f"代码格式不对: {code}"
     else:
         code = (ctx.get("res") or {}).get("full_code") or ""
+    interval = _minute_interval(str(args.get("interval") or "1m").strip())
+    label = _MINUTE_INTERVALS[interval][0]
     try:
-        data = fetch_minute_lines(code)
+        data = fetch_minute_lines(code, interval)
     except Exception as e:
         return f"分时获取失败 {code}: {e}"
     rows = data.get("rows") or []
     vols = data.get("vols") or []
     avg = data.get("avg") or []
     points = _ai_tool_int(args.get("points"), 60, 10, 240)
-    out = [f"分时 {code} {data.get('day') or '-'} 昨收 "
+    out = [f"{label}K {code} {data.get('day') or '-'} 昨收 "
            f"{_ai_tool_f(data.get('prev_close'))}"
-           "（时间,价格,均价,分钟量）"]
+           "（时间,价格,均价,周期量）"]
     for i in range(max(0, len(rows) - points), len(rows)):
         row = rows[i]
         if isinstance(row, (list, tuple)) and len(row) >= 2:
@@ -18444,11 +18901,16 @@ def ai_tool_specs():
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {
             "name": "get_intraday",
-            "description": "获取当日/最近交易日分时（价格/均价/分钟量），"
+            "description": "获取当日/最近交易日分时或分钟K（价格/均价/周期量），"
                            "可用 code 指定成分股等其它代码；用于盘中判断。",
             "parameters": {"type": "object", "properties": {
-                "points": {"type": "integer", "description": "最近多少分钟，10-240",
+                "points": {"type": "integer", "description": "最近多少根，10-240",
                            "default": 60},
+                "interval": {"type": "string",
+                             "enum": ["1m", "5m", "15m", "30m", "60m"],
+                             "description": "K线周期，默认 1m；加密等市场支持"
+                                            " 5m/15m/30m/60m",
+                             "default": "1m"},
                 "code": {"type": "string",
                          "description": "可选代码，如成分股 600519"}}}}},
         {"type": "function", "function": {
@@ -18689,7 +19151,9 @@ def _load_sm_brand_logo(master, width=560):
 class App:
     PANEL_H = {"main": 400, "vol": 110, "ind": 160}
     REFRESH_MS = 15 * 60 * 1000     # 完整重分析间隔
-    TICK_MS = 60 * 1000             # 行情快照刷新（1分钟）
+    # 行情快照刷新：盘中 3 秒（配合 _tick_quote_ttl 的短缓存），
+    # 休市/非交易日自动回退到 60 秒 TTL，不会额外压上游。
+    TICK_MS = 3 * 1000
     PREFETCH_MS = 60 * 60 * 1000    # 后台主动预取周期（未分析股K线）
     PREFETCH_START_MS = 60 * 1000   # 启动后首轮延迟（先让当前分析跑完）
     PREFETCH_CHUNK = 20             # 每批预取代码数（批间 sleep 限速）
@@ -18790,9 +19254,14 @@ class App:
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
         self.show_boll = tk.BooleanVar(value=True)    # BOLL 独立打勾（与 MA 同位）
         self.minute_mode = tk.BooleanVar(value=False)  # 分时视图（v6.6.5）
+        self.minute_view = tk.StringVar(value="日K")  # 日K/分时/1分K...（v7.5.5）
+        self._minute_n = None         # 分时可视根数（None=全部）
+        self._minute_pan = 0          # 分时平移：0=最新，正=往左看更早
+        self._minute_code = ""        # 分时缩放状态所属代码
         self._minute_data = None      # 当前分时缓存（fetch_minute_lines 结果）
         self._minute_busy = False
         self._minute_ts = 0.0
+        self._minute_gen = 0          # 周期切换时丢弃过期回调
         self.show_ai_lines = tk.BooleanVar(value=True)  # AI画线显隐（v6.5.2）
         self.show_auto_lines = tk.BooleanVar(value=True)  # 脚本自动画线显隐
         self._auto_lines = {}          # {full_code: auto_lines dict} 会话内缓存
@@ -19040,10 +19509,17 @@ class App:
                        lambda e: self._switch_market(e.widget.get()))
             self._mkt_boxes = getattr(self, "_mkt_boxes", []) + [cmb_m]
             ttk.Label(top2, text="周期:").pack(side="left")
+            self.cmb_minute_tf = ttk.Combobox(
+                top2, textvariable=self.minute_view, width=4,
+                state="readonly", values=list(MINUTE_VIEWS))
+            self.cmb_minute_tf.pack(side="left", padx=2)
+            self.cmb_minute_tf.bind("<<ComboboxSelected>>",
+                                    lambda e: self._minute_tf_changed())
+            ttk.Label(top2, text="根数:").pack(side="left")
             cb = ttk.Combobox(top2, textvariable=self.show_n, width=4,
                               state="readonly", values=[15, 30, 45, 60])
             cb.pack(side="left", padx=2)
-            cb.bind("<<ComboboxSelected>>", lambda e: self._rerender())
+            cb.bind("<<ComboboxSelected>>", lambda e: self._n_changed())
             ttk.Label(top2, text="副图:").pack(side="left")
             ci = ttk.Combobox(top2, textvariable=self.ind_name, width=6,
                               state="readonly", values=["MACD", "KDJ", "RSI", "ADX", "量比"])
@@ -19056,10 +19532,6 @@ class App:
                             command=self._rerender).pack(side="left", padx=2)
             ttk.Checkbutton(top2, text="折叠", width=4, variable=self.fold_sub,
                             command=self._toggle_sub).pack(side="left", padx=2)
-            ttk.Checkbutton(top2, text="分时", width=4,
-                            variable=self.minute_mode,
-                            command=self._toggle_minute).pack(side="left",
-                                                              padx=2)
             # 小屏：荐股/报告/样本/缓存/指数 全部收进【工具】菜单
             ttk.Button(top2, text="工具", width=4,
                        command=lambda: self._tools_menu(top2)
@@ -19076,10 +19548,17 @@ class App:
                        lambda e: self._switch_market(e.widget.get()))
             self._mkt_boxes = getattr(self, "_mkt_boxes", []) + [cmb_m]
             ttk.Label(top, text="周期:").pack(side="left")
+            self.cmb_minute_tf = ttk.Combobox(
+                top, textvariable=self.minute_view, width=5,
+                state="readonly", values=list(MINUTE_VIEWS))
+            self.cmb_minute_tf.pack(side="left", padx=3)
+            self.cmb_minute_tf.bind("<<ComboboxSelected>>",
+                                    lambda e: self._minute_tf_changed())
+            ttk.Label(top, text="根数:").pack(side="left")
             cb = ttk.Combobox(top, textvariable=self.show_n, width=5,
                               state="readonly", values=[30, 60, 90, 120])
             cb.pack(side="left", padx=3)
-            cb.bind("<<ComboboxSelected>>", lambda e: self._rerender())
+            cb.bind("<<ComboboxSelected>>", lambda e: self._n_changed())
             ttk.Label(top, text="副图指标:").pack(side="left")
             ci = ttk.Combobox(top, textvariable=self.ind_name, width=6,
                               state="readonly",
@@ -19113,11 +19592,6 @@ class App:
                       font=("Consolas", 8), bg=DARK_BG, fg=C_ORANGE,
                       activebackground=BTN_HOVER, activeforeground=C_ORANGE,
                       bd=0, padx=4).pack(side="left")
-            tk.Checkbutton(top, text="分时", variable=self.minute_mode,
-                           command=self._toggle_minute, font=("Consolas", 8),
-                           bg=DARK_BG, fg=FG_MAIN, activebackground=DARK_BG,
-                           activeforeground=FG_MAIN,
-                           selectcolor=FIELD_BG).pack(side="left")
 
         if self.compact:
             pass
@@ -20720,9 +21194,13 @@ class App:
 
     def _ai_data_load_minute(self, res, gen, force=False):
         code = res.get("full_code") or ""
+        interval = self._minute_interval_value() or "1m"
+        label = self.minute_view.get()
+        if label == "日K":
+            label = "分时"
         if force:
             try:
-                _MINUTE_MEM.pop(code, None)
+                _MINUTE_MEM.pop(_minute_cache_key(code, interval), None)
             except Exception:
                 pass
 
@@ -20747,9 +21225,10 @@ class App:
             self._ai_minute_data = data
             self._ai_draw_mini()
             self._ai_data_info_var.set(
-                f"分时 {data.get('day') or ''} 已加载")
+                f"{label} {data.get('day') or ''} 已加载")
 
-        self._ai_data_bg(lambda: fetch_minute_lines(code), done)
+        self._ai_data_bg(
+            lambda: fetch_minute_lines(code, interval), done)
 
     def _ai_data_load_etf(self, res, gen, force=False):
         code = res.get("full_code") or ""
@@ -22946,12 +23425,16 @@ class App:
         res = self.res
         if err or not q or not res:
             return
-        old_snap = (res["quote"].get("time") or "")[:8]
+        old_q = res.get("quote") or {}
+        old_snap = (old_q.get("time") or "")[:8]
         new_snap = (q.get("time") or "")[:8]
         # 残缺快照（旧批量缓存/网络降级）先与旧快照合并并补齐 OHLC，
         # 否则下游报告/AI 提示词取 q["open"] 会 KeyError。
-        q = _quote_ensure({**(res.get("quote") or {}), **(q or {})},
-                          (res.get("quote") or {}).get("price") or 0.0)
+        q = _quote_ensure({**old_q, **(q or {})},
+                          old_q.get("price") or 0.0)
+        changed = (q.get("price"), q.get("high"), q.get("low"), q.get("time")) != \
+                  (old_q.get("price"), old_q.get("high"), old_q.get("low"),
+                   old_q.get("time"))
         res["quote"] = q
         if new_snap != old_snap and old_snap:
             # 跨快照日（如开盘后出现今日bar/新交易日）→ 触发完整重分析
@@ -22962,7 +23445,7 @@ class App:
             except ValueError:
                 pass
             return
-        if res.get("has_live"):
+        if res.get("has_live") and changed:
             live = res["disp_rows"][-1]
             live["close"] = q["price"]
             live["high"] = max(live["high"], q["price"])
@@ -22977,11 +23460,14 @@ class App:
             if tb:                               # T日预测叠加层同步外扩
                 tb["high"] = max(tb["high"], live["high"])
                 tb["low"] = min(tb["low"], live["low"])
-        res["phase"] = market_phase_text(
+        phase = market_phase_text(
             q.get("time"), q.get("market") or _market_of(
                 res.get("full_code") or ""))
+        phase_changed = res.get("phase") != phase
+        res["phase"] = phase
         self._set_info(q)
-        self._rerender()
+        if changed or phase_changed:
+            self._rerender()
         self._notify_plugins("on_tick", q)
 
     # ---------- 多市场切换（v6.6.5：A股/港股/美股/期货/加密） ----------
@@ -23395,10 +23881,13 @@ class App:
         except ValueError:
             return
         self._tick_busy = True
-        self._run_bg(lambda: fetch_quote_cached(full), self._tick_done)
+        ttl = _tick_quote_ttl(full)
+        self._run_bg(
+            lambda: fetch_quote_cached(full, ttl=ttl, persist=ttl >= 30),
+            self._tick_done)
         # 分时模式：盘中每 60s 重拉一次（收盘/休市走定型缓存，不联网）
         if self.minute_mode.get() and not self._minute_busy \
-                and time.time() - self._minute_ts > 60:
+                and time.time() - self._minute_ts > self._minute_refresh_sec():
             self._load_minute()
 
     def _fail(self, msg):
@@ -23473,31 +23962,102 @@ class App:
                 + ("  [含盘中实时bar]" if res["has_live"] else "") + tail)
 
     # ---------- 分时视图（v6.6.5：主图切分时线，缓存周期=一个交易日） ----------
-    def _toggle_minute(self):
-        if not self.minute_mode.get():
+    def _minute_interval_value(self):
+        return _minute_view_parts(self.minute_view.get())[0]
+
+    def _minute_is_k(self):
+        return _minute_view_parts(self.minute_view.get())[1]
+
+    def _minute_tf_changed(self):
+        """周期下拉：日K ↔ 分时/1分K…；分时周期切换重置缩放。"""
+        label = self.minute_view.get()
+        if label == "日K":
+            self._minute_gen += 1       # 丢弃在途回调
+            self._minute_busy = False
+            for attr in ("_wheel_job", "_drag_job"):
+                job = getattr(self, attr, None)
+                if job:
+                    try:
+                        self.root.after_cancel(job)
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
             self._minute_data = None
+            self._minute_n = None
+            self._minute_pan = 0
+            self.minute_mode.set(False)
             self._rerender()
             return
-        # 分时视图自动切右侧栏到「盘口」：集合竞价 + 五档挂单随手可见
-        if "盘口" in getattr(self, "_rt_panels", {}):
-            self._switch_rt("盘口")
-        self._refresh_order_book()
+        if not self.minute_mode.get():
+            self.minute_mode.set(True)
+            # 分时视图自动切右侧栏到「盘口」：集合竞价 + 五档挂单随手可见
+            if "盘口" in getattr(self, "_rt_panels", {}):
+                self._switch_rt("盘口")
+            self._refresh_order_book()
+        self._minute_gen += 1       # 任何选择变化都作废在途回调
+        self._minute_busy = False
+        for attr in ("_wheel_job", "_drag_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._minute_n = None
+        self._minute_pan = 0
+        d = self._minute_data
+        if d and d.get("interval") == self._minute_interval_value():
+            self._minute_ts = time.time()
+            self._draw_minute_view()
+            self.progress_var.set(self._minute_status(d))
+            return
         self._load_minute()
 
+    def _minute_status(self, data):
+        label = self.minute_view.get()
+        market = data.get("market") or ""
+        span = data.get("day") or ""
+        stamps = data.get("stamps") or []
+        if stamps and stamps[0][:5] != stamps[-1][:5]:
+            span = f"{stamps[0][:5]}~{stamps[-1][:5]}"
+        live = market != "cn" or _minute_active()
+        return (f"{label} {span}（{len(data['rows'])}根，"
+                f"{'盘中%ds刷新' % self._minute_refresh_sec() if live else '盘后定型缓存'}）")
+
+    def _minute_refresh_sec(self):
+        """分时刷新间隔：短周期更快，长周期保持 60s（v7.5.5）。"""
+        iv = self._minute_interval_value() or "1m"
+        return {"1m": 10, "5m": 20, "15m": 30,
+                "30m": 60, "60m": 60}.get(iv, 60)
+
     def _load_minute(self):
-        """后台拉当前股票分时（_minute_busy 防重入；离线走交易日缓存）。"""
-        if self._minute_busy:
-            return
+        """后台拉当前股票分时/分钟K（切周期时旧回调由 generation 丢弃）。"""
         full = (self.res or {}).get("full_code") or self.code_var.get()
         try:
             full = normalize_code(full)
         except ValueError:
             return
+        interval = self._minute_interval_value()
+        if not interval:
+            return
+        label = self.minute_view.get()
+        if full != self._minute_code:
+            self._minute_code = full
+            self._minute_n = None
+            self._minute_pan = 0
+        self._minute_gen += 1
+        gen = self._minute_gen
         self._minute_busy = True
-        self.progress_var.set("分时加载中...")
-        self._run_bg(lambda: fetch_minute_lines(full), self._minute_done)
+        self.progress_var.set(f"{label}加载中...")
+        ttl = self._minute_refresh_sec()
+        self._run_bg(
+            lambda: fetch_minute_lines(full, interval, ttl=ttl),
+            lambda data, err: self._minute_done(data, err, gen))
 
-    def _minute_done(self, data, err):
+    def _minute_done(self, data, err, gen=None):
+        if gen is not None and gen != self._minute_gen:
+            return
         self._minute_busy = False
         if not self.minute_mode.get():
             return
@@ -23508,34 +24068,92 @@ class App:
         self._minute_data = data
         self._minute_ts = time.time()
         self._draw_minute_view()
-        self.progress_var.set(
-            f"分时 {data['day']}（{len(data['rows'])} 分钟，"
-            f"{'盘后定型缓存' if not _minute_active() else '盘中60s刷新'}）")
+        self.progress_var.set(self._minute_status(data))
+
+    def _minute_window(self, total):
+        """当前可视窗口 [start,end)；滚轮缩放/拖拽共用。"""
+        if total <= 0:
+            return 0, 0
+        n = total if not self._minute_n else int(self._minute_n)
+        n = max(2, min(total, n))
+        pan = max(0, min(int(self._minute_pan or 0), total - n))
+        end = total - pan
+        return max(0, end - n), end
 
     def _draw_minute_view(self):
-        """主图分时：价格线+均价线(VWAP)+昨收基准，右侧涨跌幅轴；
-        副图分钟量 + 分时MACD/量比（自动切换），并带同步十字光标。"""
+        """主图分时/分钟K：价格线或蜡烛 + VWAP + 昨收基准，右侧涨跌幅轴；
+        副图周期量 + MACD/量比（自动切换），并带同步十字光标。"""
         cv = self.cv_main
         cv.delete("all")
-        d = self._minute_data
-        if not d:
+        d0 = self._minute_data
+        if not d0:
             return
-        rows = d["rows"]
+        rows0 = d0["rows"]
+        n0 = len(rows0)
+        if n0 < 2:
+            return
+        prices0 = [r[1] for r in rows0]
+        avgs0 = d0.get("avg") or []
+        vols0 = d0.get("vols") or []
+        times0 = [str(r[0]) for r in rows0]
+        stamps0 = d0.get("stamps") or []
+        bars0 = d0.get("bars") or []
+        if len(bars0) != n0:
+            bars0 = _minute_bars_from_rows(rows0, vols0)
+        # 指标在完整窗口上算完再切片：滚轮缩放不会引入 warm-up 偏差
+        dif0, dea0, mhist0 = calc_macd(prices0)
+        vr0 = self._minute_vr(times0, rows0, self._minute_avg5(d0), d0)
+        start, end = self._minute_window(n0)
+        rows = rows0[start:end]
         n = len(rows)
         if n < 2:
             return
-        prices = [r[1] for r in rows]
-        avgs = d.get("avg") or []
-        prev = d.get("prev_close") or prices[0]
-        mx = max(max(prices), max(avgs) if avgs else prices[0], prev)
-        mn = min(min(prices), min(avgs) if avgs else prices[0], prev)
-        half = max(mx - prev, prev - mn, prev * 0.004)
-        hi, lo = prev + half * 1.08, prev - half * 1.08
+        prices = prices0[start:end]
+        avgs = avgs0[start:end] if avgs0 else []
+        vols = vols0[start:end] if vols0 else []
+        times = times0[start:end]
+        stamps = stamps0[start:end]
+        bars = bars0[start:end]
+        dif = dif0[start:end]
+        dea = dea0[start:end]
+        mhist = mhist0[start:end]
+        vr_series = vr0[start:end]
+        d = dict(d0, rows=rows, bars=bars, vols=vols, avg=avgs,
+                 stamps=stamps)
+        prev = d0.get("prev_close") or prices0[0]
+        market = d.get("market") or _market_of(
+            (self.res or {}).get("full_code") or "")
+        view_label = self.minute_view.get()
+        is_k = self._minute_is_k()
+        multi_day = bool(stamps) and stamps[0][:5] != stamps[-1][:5]
+        axis_times = stamps if multi_day else times
+        span = d.get("day") or ""
+        if multi_day:
+            span = f"{stamps[0][:5]}~{stamps[-1][:5]}"
+        if len(bars) < 2:
+            is_k = False
+        high_vals = [float(b["high"]) for b in bars
+                     if b.get("high") is not None] if is_k else []
+        low_vals = [float(b["low"]) for b in bars
+                    if b.get("low") is not None] if is_k else []
+        p_mx = max([max(prices)] + ([max(avgs)] if avgs else [])
+                   + high_vals)
+        p_mn = min([min(prices)] + ([min(avgs)] if avgs else [])
+                   + low_vals)
+        # 多日窗口/平移后昨收可能远离当前可视价格：此时按可视高低点缩放，
+        # 避免为了容纳昨收把蜡烛压成一条线。
+        centered = (not multi_day and p_mn and
+                    p_mn * 0.98 <= prev <= p_mx * 1.02)
+        if centered:
+            half = max(p_mx - prev, prev - p_mn, prev * 0.004)
+            hi, lo = prev + half * 1.08, prev - half * 1.08
+        else:
+            pad = max((p_mx - p_mn) * 0.06, p_mx * 0.002)
+            hi, lo = p_mx + pad, p_mn - pad
         w = max(cv.winfo_width(), 420)
         h = max(cv.winfo_height(), 300)
         L, R, T, B = 62, 52, 26, 28
         ph = h - T - B
-        times = [str(r[0]) for r in rows]
 
         def xm(i):
             return L + i / max(1, n - 1) * (w - L - R)
@@ -23554,15 +24172,39 @@ class App:
             cv.create_text(w - R + 4, yy, anchor="w",
                            text=f"{pct:+.2f}%", fill=color,
                            font=("Consolas", 8))
-        cv.create_line(L, ym(prev), w - R, ym(prev),
-                       fill=GUIDE_C, dash=(4, 3))
-        pts = []
-        for i, p in enumerate(prices):
-            pts.extend((xm(i), ym(p)))
-        if len(pts) >= 4:
-            # 分时价格线用白色（亮色主题自动转黑），与黄色虚线均价线区分
-            cv.create_line(*pts, fill=TPRED_C, width=1,
-                           joinstyle="round")
+        if lo <= prev <= hi:
+            cv.create_line(L, ym(prev), w - R, ym(prev),
+                           fill=GUIDE_C, dash=(4, 3))
+        if is_k:
+            slot = (w - L - R) / max(1, n)
+            bw = max(1.0, min(18.0, slot * 0.64))
+            for i, b in enumerate(bars):
+                try:
+                    o = float(b["open"])
+                    c = float(b["close"])
+                    hh = float(b["high"])
+                    ll = float(b["low"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                color = UP if c >= o else DOWN
+                x = xm(i)
+                cv.create_line(x, ym(hh), x, ym(ll), fill=color)
+                y1, y2 = ym(o), ym(c)
+                if abs(y1 - y2) < 1.0:
+                    cv.create_line(x - bw / 2, y1, x + bw / 2, y1,
+                                   fill=color)
+                else:
+                    cv.create_rectangle(x - bw / 2, min(y1, y2),
+                                        x + bw / 2, max(y1, y2),
+                                        fill=color, outline=color)
+        else:
+            pts = []
+            for i, p in enumerate(prices):
+                pts.extend((xm(i), ym(p)))
+            if len(pts) >= 4:
+                # 分时价格线用白色（亮色主题自动转黑），与黄色虚线均价线区分
+                cv.create_line(*pts, fill=TPRED_C, width=1,
+                               joinstyle="round")
         if avgs:
             pts = []
             for i, p in enumerate(avgs):
@@ -23574,24 +24216,29 @@ class App:
             ob_txt = f"  集合竞价 {ob['price']:.2f}"
         elif ob.get("open"):
             ob_txt = f"  开盘竞价 {ob['open']:.2f}"
+        head = "分时" if not is_k else f"{view_label}K"
+        suffix = " UTC" if market == "crypto" else ""
+        last_px = prices0[-1]
+        last_avg = avgs0[-1] if avgs0 else None
+        win_txt = (f"  窗口 {start + 1}-{end}/{n0}"
+                   if (start > 0 or end < n0) else "")
         cv.create_text(L, T - 10, anchor="w",
-                       text=(f"分时 {d['day']}  昨收 {prev:.2f}  "
-                             f"现价 {prices[-1]:.2f} "
-                             f"({(prices[-1] / prev - 1) * 100:+.2f}%)"
-                             + (f"  均价 {avgs[-1]:.2f}" if avgs else "")
+                       text=(f"{head} {span}{suffix}{win_txt}  昨收 {prev:.2f}  "
+                             f"现价 {last_px:.2f} "
+                             f"({(last_px / prev - 1) * 100:+.2f}%)"
+                             + (f"  均价 {last_avg:.2f}" if last_avg else "")
                              + ob_txt),
                        fill=TITLE_TXT, font=("Microsoft YaHei", 9, "bold"))
-        for i, lab in self._minute_marks(times):
+        for i, lab in self._minute_marks(axis_times, d):
             cv.create_text(xm(i), h - B + 12, text=lab,
                            fill=AXIS_TXT, font=("Consolas", 7))
         g = {"w": w, "h": h, "L": L, "R": R, "T": T, "B": B,
              "n": n, "ph": ph, "bw": (w - L - R) / max(1, n - 1),
              "minute": True}
-        self._finish_panel(cv, g, "main", lo, hi, times,
+        self._finish_panel(cv, g, "main", lo, hi, axis_times,
                            fmt=lambda v: f"{v:.2f}")
 
         # 副图1：分钟量
-        vols = d.get("vols") or []
         cv2 = self.cv_vol
         if cv2 is not None and vols:
             cv2.delete("all")
@@ -23609,30 +24256,42 @@ class App:
                 return T2 + (vmax - v) / max(1e-9, vmax) * ph2
 
             bw = max(1.0, (w2 - L - R) / n - 0.5)
+            if is_k:
+                updown = []
+                for i, b in enumerate(bars):
+                    try:
+                        updown.append(float(b["close"]) >= float(b["open"]))
+                    except (KeyError, TypeError, ValueError):
+                        updown.append(prices[i] >= prev)
+            else:
+                updown = [p >= prev for p in prices]
             for i, v in enumerate(vols):
                 if v <= 0:
                     continue
-                color = UP if prices[i] >= prev else DOWN
+                color = UP if (updown[i] if i < len(updown)
+                               else prices[i] >= prev) else DOWN
                 cv2.create_rectangle(xm2(i) - bw / 2, yv(v),
                                      xm2(i) + bw / 2, yv(0),
                                      fill=color, outline="")
-            cv2.create_text(L2 + 2, 2, text="分时量（手）", anchor="nw",
+            vol_head = f"{view_label}成交量" if is_k else "分时量"
+            if market == "cn":
+                vol_head += "（手）"
+            cv2.create_text(L2 + 2, 2, text=vol_head, anchor="nw",
                             font=("Microsoft YaHei", 8), fill=TITLE_TXT)
-            for i, lab in self._minute_marks(times):
+            for i, lab in self._minute_marks(axis_times, d):
                 cv2.create_text(xm2(i), h2 - B2 + 10, text=lab,
                                 fill=AXIS_TXT, font=("Consolas", 7))
             g2 = {"w": w2, "h": h2, "L": L2, "R": R2, "T": T2, "B": B2,
                   "n": n, "ph": ph2, "bw": (w2 - L - R) / max(1, n - 1),
                   "minute": True}
-            self._finish_panel(cv2, g2, "vol", 0.0, vmax, times,
-                               fmt=lambda v: fmt_vol_cn(v) + "手")
+            vfmt = ((lambda v: fmt_vol_cn(v) + "手") if market == "cn"
+                    else fmt_vol_cn)
+            self._finish_panel(cv2, g2, "vol", 0.0, vmax, axis_times, fmt=vfmt)
         elif cv2 is not None:
             cv2.delete("all")
 
         # 副图2：分时 MACD + 量比（自动，不跟随日线指标下拉）
         cv3 = self.cv_ind
-        dif = dea = mhist = []
-        vr_series = []
         if cv3 is not None:
             cv3.delete("all")
             w3 = max(cv3.winfo_width(), 420)
@@ -23643,7 +24302,6 @@ class App:
             macd_h = int(ph3 * 0.64)
             vr_top = T3 + macd_h + 6
             vr_h = max(18, ph3 - macd_h - 6)
-            dif, dea, mhist = calc_macd(prices)
             vals = [x for x in dif + dea + mhist if x is not None]
             mlo = min(vals + [0.0])
             mhi = max(vals + [0.0])
@@ -23673,8 +24331,6 @@ class App:
             cv3.create_text(L3 - 4, zero, text="0", anchor="e",
                             font=("Consolas", 7), fill=AXIS_TXT)
 
-            avg5 = self._minute_avg5(d)
-            vr_series = self._minute_vr(times, rows, avg5)
             vr_vals = [x for x in vr_series if x is not None]
             vmax = max([2.0] + vr_vals) * 1.1
 
@@ -23699,11 +24355,12 @@ class App:
                 info += f"  量比:{lv[-1]:.2f}"
             # 标题按可用宽度逐级降级，窄窗口下也不会横向截断
             avail = max(80, w3 - (L3 + 2) - R3 - 6)
+            macd_head = "分时" if not is_k else f"{view_label}K"
             title = "MACD / 量比"
-            for cand in (f"分时MACD / 量比（自动）  {info}",
-                         f"分时MACD / 量比  {info}",
+            for cand in (f"{macd_head}MACD / 量比（自动）  {info}",
+                         f"{macd_head}MACD / 量比  {info}",
                          f"MACD / 量比  {info}",
-                         "分时MACD / 量比（自动）"):
+                         f"{macd_head}MACD / 量比（自动）"):
                 if self._text_px(cv3, cand, size=8,
                                  family="Microsoft YaHei") <= avail:
                     title = cand
@@ -23718,18 +24375,70 @@ class App:
                   "macd_lo": mlo, "macd_hi": mhi,
                   "vr_top": vr_top, "vr_bottom": vr_top + vr_h,
                   "vr_max": vmax}
-            self._finish_panel(cv3, g3, "ind", 0.0, 1.0, times,
+            self._finish_panel(cv3, g3, "ind", 0.0, 1.0, axis_times,
                                fmt=lambda v: f"{v:.2f}")
         self._minute_series = {
-            "prices": prices, "avgs": avgs, "vols": vols, "times": times,
+            "prices": prices, "avgs": avgs, "vols": vols, "times": axis_times,
             "prev": prev, "dif": dif, "dea": dea, "mhist": mhist,
             "vr": vr_series,
         }
 
-    def _minute_marks(self, times):
-        want = {"0930": "09:30", "1030": "10:30", "1300": "13:00",
-                "1400": "14:00", "1500": "15:00"}
-        return [(i, want[t]) for i, t in enumerate(times) if t in want]
+    def _minute_marks(self, times, d=None):
+        """时间刻度：多日显示日期（加密跨日滚动）；A股固定时点；加密单日
+        每 4 小时（UTC）；其它市场首/中/末自适应。"""
+        if not times:
+            return []
+        if any("-" in str(t) for t in times):
+            day_starts = []
+            prev = None
+            for i, t in enumerate(times):
+                day = str(t)[:5]
+                if day != prev:
+                    day_starts.append((i, day))
+                    prev = day
+            # 12~24 小时窗口跨日：除日期分界外再标 4 小时整点，
+            # 避免 1 分钟图只剩两个日期刻度。
+            if len(day_starts) <= 2:
+                hm = []
+                for i, t in enumerate(times):
+                    s = str(t)
+                    if len(s) >= 11 and s[6:11].endswith(":00"):
+                        try:
+                            hh = int(s[6:8])
+                        except ValueError:
+                            continue
+                        if hh % 4 == 0:
+                            hm.append((i, s[:5] if hh == 0 else s[6:11]))
+                if 2 <= len(hm) <= 8:
+                    return hm
+            if len(day_starts) > 7:
+                step = (len(day_starts) - 1) / 6
+                day_starts = [day_starts[int(round(k * step))]
+                              for k in range(7)]
+            return day_starts
+        market = (d or {}).get("market") or _market_of(
+            (self.res or {}).get("full_code") or "")
+        if market == "cn":
+            want = {"0930": "09:30", "1030": "10:30", "1300": "13:00",
+                    "1400": "14:00", "1500": "15:00"}
+            hits = [(i, want[t]) for i, t in enumerate(times)
+                    if t in want]
+            if hits:
+                return hits
+        elif market == "crypto":
+            want = {"0000": "00:00", "0400": "04:00", "0800": "08:00",
+                    "1200": "12:00", "1600": "16:00", "2000": "20:00"}
+            hits = [(i, want[t]) for i, t in enumerate(times)
+                    if t in want]
+            if hits:
+                return hits
+        n = len(times)
+        out = []
+        for i in sorted({0, n // 4, n // 2, 3 * n // 4, n - 1}):
+            t = str(times[i])
+            if len(t) >= 4:
+                out.append((i, f"{t[:2]}:{t[2:4]}"))
+        return out
 
     def _minute_elapsed(self, t):
         try:
@@ -23744,6 +24453,15 @@ class App:
         return 120
 
     def _minute_avg5(self, d):
+        # 加密走 Kraken 时，日均量与分钟量同量纲（币），不能用主库 Yahoo
+        # 的全局美元成交量，否则量比会差几个数量级。
+        if d.get("avg5_vol"):
+            try:
+                return float(d["avg5_vol"])
+            except (TypeError, ValueError):
+                pass
+        if d.get("src") == "kraken":
+            return None       # 量纲拿不到时宁可不画，避免与 Yahoo 美元量混算
         day = d.get("day") or ""
         bars = (self.res or {}).get("disp_rows") or []
         vols = [float(b["vol"]) for b in bars
@@ -23753,19 +24471,26 @@ class App:
         vols = vols[-5:]
         return sum(vols) / len(vols) if vols else None
 
-    def _minute_vr(self, times, rows, avg5):
+    def _minute_vr(self, times, rows, avg5, d=None):
+        """累计量比：5 日均量 × 已走周期占比（按市场日长度归一）。"""
+        if not avg5:
+            return [None] * len(rows)
+        market = (d or {}).get("market") or _market_of(
+            (self.res or {}).get("full_code") or "")
+        session = {"cn": 240, "hk": 330, "us": 390}.get(market, 1440)
+        step = _MINUTE_INTERVALS[_minute_interval(
+            (d or {}).get("interval") or "1m")][1]
         out = []
-        for r, t in zip(rows, times):
+        for i, r in enumerate(rows):
             try:
                 cum = float(r[2])
             except (TypeError, ValueError, IndexError):
                 out.append(None)
                 continue
-            if not avg5:
-                out.append(None)
-                continue
-            el = max(5, self._minute_elapsed(t))
-            exp = avg5 * el / 240.0
+            el = max(5, (i + 1) * step)
+            if market in ("cn", "hk", "us"):
+                el = min(session, el)   # 有固定交易时段，不能超过一日
+            exp = avg5 * el / float(session)
             out.append(cum / exp if exp > 0 else None)
         return out
 
@@ -23797,7 +24522,8 @@ class App:
                         * (n - 1)))
         idx = max(0, min(n - 1, idx))
         t = sg["dates"][idx] if idx < len(sg["dates"]) else ""
-        dl = f"{t[:2]}:{t[2:4]}" if len(t) >= 4 else t
+        dl = t if (len(t) > 5 and "-" in t) else (
+            f"{t[:2]}:{t[2:4]}" if len(t) >= 4 else t)
         cv.coords(sg["did"], xv, sg["h"] - sg["B"] // 2 + 2)
         cv.itemconfigure(sg["did"], text=dl)
         wbg = len(dl) * 7 + 10
@@ -23931,6 +24657,10 @@ class App:
             return                      # 画线拖拽中不缩放
         if not self.res:
             return
+        if self.minute_mode.get():
+            if self._minute_data:
+                self._minute_wheel(event)
+            return
         if event.state & 0x1:  # Shift held → pan
             step = 5 if (event.delta > 0 or getattr(event, "num", None) == 4) else -5
             self.view_pan = max(0, min(self.view_pan + step,
@@ -23953,6 +24683,51 @@ class App:
         if getattr(self, "_wheel_job", None):
             self.root.after_cancel(self._wheel_job)
         self._wheel_job = self.root.after(60, self._rerender)
+
+    def _minute_wheel(self, event):
+        """分时/分钟K滚轮缩放；Shift+滚轮左右平移。"""
+        total = len((self._minute_data or {}).get("rows") or [])
+        if total < 2:
+            return
+        up = (getattr(event, "num", None) == 4
+              or getattr(event, "delta", 0) > 0)
+        cur_n = total if not self._minute_n else int(self._minute_n)
+        cur_n = max(2, min(total, cur_n))
+        if getattr(event, "state", 0) & 0x1:      # Shift → pan
+            step = 10 if up else -10
+            max_pan = max(0, total - cur_n)
+            self._minute_pan = max(0, min(self._minute_pan + step, max_pan))
+            first = max(1, total - self._minute_pan - cur_n + 1)
+            self.progress_var.set(
+                f"分时平移: 第{first}-{total - self._minute_pan} 根 / 共{total}")
+        else:
+            step = max(5, int(cur_n * 0.15))
+            new_n = cur_n - step if up else cur_n + step
+            new_n = max(20, min(total, new_n))
+            self._minute_n = None if new_n >= total else new_n
+            self._minute_pan = min(self._minute_pan, max(0, total - new_n))
+            self.progress_var.set(
+                f"分时缩放: 显示 {new_n}/{total} 根"
+                "（滚轮缩放 / Shift+滚轮平移）")
+        if getattr(self, "_wheel_job", None):
+            self.root.after_cancel(self._wheel_job)
+        self._wheel_job = self.root.after(60, self._draw_minute_view)
+
+    def _n_changed(self):
+        """「根数」下拉：日K改显示根数；分时/分钟K改可视窗口根数。"""
+        if self.minute_mode.get():
+            try:
+                self._minute_n = max(2, int(self.show_n.get()))
+            except Exception:
+                self._minute_n = None
+            self._minute_pan = 0
+            self._draw_minute_view()
+            total = len((self._minute_data or {}).get("rows") or [])
+            if total:
+                self.progress_var.set(
+                    f"分时显示 {min(total, self._minute_n or total)}/{total} 根")
+            return
+        self._rerender()
 
     def _on_resize(self, _event):
         if getattr(self, "_resize_job", None):
@@ -24011,7 +24786,8 @@ class App:
         if getattr(self, "_udraw", None):
             return
         self._drag_x = event.x
-        self._drag_pan = self.view_pan
+        self._drag_pan = (self._minute_pan if self.minute_mode.get()
+                          else self.view_pan)
         self._drag_moved = False
 
     def _drag_move(self, event):
@@ -24029,6 +24805,18 @@ class App:
         if not g or g.get("bw", 0) <= 0:
             return
         bars_moved = int(dx / g["bw"])
+        if self.minute_mode.get():
+            total = len((self._minute_data or {}).get("rows") or [])
+            vis = total if not self._minute_n else int(self._minute_n)
+            vis = max(2, min(total, vis))
+            new_pan = max(0, min(self._drag_pan + bars_moved,
+                                 max(0, total - vis)))
+            if new_pan != self._minute_pan:
+                self._minute_pan = new_pan
+                if not getattr(self, "_drag_job", None):
+                    self._drag_job = self.root.after(
+                        60, self._draw_minute_view)
+            return
         new_pan = max(0, min(self._drag_pan + bars_moved,
                              len(self.res["disp_rows"]) - 20))
         if new_pan != self.view_pan:
@@ -24047,11 +24835,21 @@ class App:
         if getattr(self, "_drag_job", None):
             self.root.after_cancel(self._drag_job)
             self._drag_job = None
-            self._rerender()
+            if self.minute_mode.get():
+                self._draw_minute_view()
+            else:
+                self._rerender()
 
     def _drag_reset(self, event):
         """双击图表：回到最新K线（清除平移）。"""
         if getattr(self, "_udraw", None) or (getattr(event, "state", 0) & 0x4):
+            return
+        if self.minute_mode.get():
+            if self._minute_n is not None or self._minute_pan:
+                self._minute_n = None
+                self._minute_pan = 0
+                self.progress_var.set("分时已回到最新")
+                self._draw_minute_view()
             return
         if self.view_pan:
             self.view_pan = 0
@@ -24651,6 +25449,8 @@ class App:
                            fill=TPRED_C, anchor="sw",
                            font=("Microsoft YaHei", 7, "bold"))
 
+        _tcfg = _trade_cfg((self.res or {}).get("full_code") or "")
+        _short_on = bool(_tcfg.get("short"))
         for i, day, typ, txt in v["signals"]:
             if i >= len(bars) - 1:
                 continue
@@ -24661,12 +25461,22 @@ class App:
                                   fill=UP, outline="")
                 cv.create_text(x, y + 15, text="B", fill=UP,
                                font=("Arial", 8, "bold"))
+                if _short_on:
+                    # 空头平仓（多）：同一 BUY 信号的反向含义
+                    yc_ = ymap(bars[i]["high"]) - 5
+                    cv.create_text(x, yc_ - 10, text="多", fill=UP,
+                                   font=("Microsoft YaHei", 8, "bold"))
             else:
                 y = ymap(bars[i]["high"]) - 5
                 cv.create_polygon(x, y, x - 5, y - 9, x + 5, y - 9,
                                   fill=DOWN, outline="")
                 cv.create_text(x, y - 15, text="S", fill=DOWN,
                                font=("Arial", 8, "bold"))
+                if _short_on:
+                    # 空头开仓：SELL 信号在空头侧显示「空」
+                    yc_ = ymap(bars[i]["low"]) + 5
+                    cv.create_text(x, yc_ + 10, text="空", fill=DOWN,
+                                   font=("Microsoft YaHei", 8, "bold"))
 
         if not bars:
             return
@@ -26549,7 +27359,8 @@ class App:
             "（指标序列，可传 code）、get_prediction（预测分位/多日）、"
             "get_similar_samples（相似样本）、get_market（大盘/闸门）、"
             "get_chips_action（筹码/评分/信号/回测）、get_fundamentals（财报）、"
-            "get_intraday（当日/最近交易日分时，可传 code）、get_strategy"
+            "get_intraday（当日/最近交易日分时或分钟K，可传 code/interval"
+            "=1m/5m/15m/30m/60m）、get_strategy"
             "（策略参数）、search_news（个股资讯）、get_etf_constituents"
             "（ETF成分股+权重/涨跌/量比，分析ETF优先调用）、get_external_env"
             "（外部宏观/地缘/黄金原油/美股港股/特朗普/关税等，多引擎联网"
@@ -26793,6 +27604,21 @@ class App:
         f_det = ttk.Frame(bt_nb, padding=6)
         bt_nb.add(f_det, text=" 交易明细 ")
 
+        bt_dir_bar = ttk.Frame(f_sum)
+        bt_dir_bar.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Label(bt_dir_bar, text="方向").pack(side="left")
+        bt_dir = ttk.Combobox(bt_dir_bar, state="readonly", width=8,
+                              values=("总共", "多头", "空头"))
+        bt_dir.current(0)
+        bt_dir.pack(side="left", padx=(4, 12))
+        ttk.Label(bt_dir_bar,
+                  text="方向下拉切换图表/明细；汇总看上方三向  ·  "
+                       "融资/杠杆在 设置→交易/融资",
+                  foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8)).pack(side="left")
+        bt_dir.bind("<<ComboboxSelected>>",
+                    lambda e: _render_bt_views())
+
         bt_canvas = tk.Canvas(f_sum, height=340, bg=BG, highlightthickness=1,
                               highlightbackground=BORDER, bd=0)
         bt_canvas.pack(side="top", fill="x", pady=(0, 8))
@@ -26819,12 +27645,13 @@ class App:
                              text="先点【计算胜率/收益曲线】生成交易明细")
         det_stat.pack(side="left")
 
-        det_cols = ("seg", "n", "ed", "ep", "xd", "xp", "ret", "reason")
-        det_heads = ("段", "#", "买入日", "买入价", "卖出日", "卖出价",
+        det_cols = ("side", "seg", "n", "ed", "ep", "xd", "xp",
+                    "ret", "reason")
+        det_heads = ("向", "段", "#", "买入日", "买入价", "卖出日", "卖出价",
                      "收益", "原因")
-        det_wids = (56, 40, 92, 72, 92, 72, 74, 110)
-        det_anch = ("center", "center", "center", "e", "center", "e",
-                    "e", "w")
+        det_wids = (32, 56, 40, 92, 72, 92, 72, 74, 110)
+        det_anch = ("center", "center", "center", "center", "e", "center",
+                    "e", "e", "w")
         det_tv = ttk.Treeview(f_det, columns=det_cols, show="headings",
                               height=14)
         det_vs = ttk.Scrollbar(f_det, orient="vertical",
@@ -26862,8 +27689,8 @@ class App:
             det_tv.delete(*det_tv.get_children())
             for r in rows:
                 det_tv.insert("", "end", values=(
-                    r["seg"], r["n"], r["ed"], _fmt_px(r["ep"]),
-                    r["xd"] or "—", _fmt_px(r["xp"]),
+                    r.get("side", ""), r["seg"], r["n"], r["ed"],
+                    _fmt_px(r["ep"]), r["xd"] or "—", _fmt_px(r["xp"]),
                     "-" if r["ret"] is None else f"{r['ret'] * 100:+.2f}%",
                     r["reason"]), tags=(r["tag"],))
             n_win = len([r for r in rows if (r["ret"] or 0) > 0])
@@ -26883,15 +27710,23 @@ class App:
             det_tv.heading(_c, command=lambda cc=_c: _det_sort_by(cc))
         det_seg.bind("<<ComboboxSelected>>", lambda e: _render_detail())
 
-        def _fill_detail(bt):
+        def _side_bt(bt, side="总共"):
+            key = {"总共": "combined", "多头": "long",
+                   "空头": "short"}.get(side, "combined")
+            return (bt or {}).get(key) or (bt if side == "总共" else None)
+
+        def _fill_detail(bt, side="总共"):
             _det_rows[:] = []
-            for seg, m in (("全期", bt), ("训练集", (bt or {}).get("train")),
-                           ("验证集", (bt or {}).get("val"))):
+            m0 = _side_bt(bt, side)
+            for seg, m in (("全期", m0),
+                           ("训练集", (m0 or {}).get("train")),
+                           ("验证集", (m0 or {}).get("val"))):
                 for i, d in enumerate(((m or {}).get("detail") or []), 1):
                     tag = ("open" if d.get("reason") == "持仓中"
                            else ("win" if (d.get("ret") or 0) > 0
                                  else "loss"))
                     _det_rows.append({
+                        "side": d.get("side") or "",
                         "seg": seg, "n": i,
                         "ed": d.get("entry_date") or "-",
                         "ep": d.get("entry_px"), "xd": d.get("exit_date"),
@@ -26904,14 +27739,18 @@ class App:
                 return "-"
             return f"{v * 100:+.1f}%" if sign else f"{v * 100:.1f}%"
 
-        def _draw_curve(bt):
-            """收益曲线：净值/回撤只画训练集（验证集不显示净值，仅底色+分界）。"""
+        def _draw_curve(bt, side="总共"):
+            """收益曲线：按方向画多头/空头/总共（验证集不显净值，仅底色+分界）。"""
             cv = bt_canvas
             cv.configure(bg=BG)      # 跟随当前主题（切换主题后重绘不再黑底白块）
             cv.delete("all")
-            if not bt or not bt.get("curve"):
-                cv.create_text(12, 16, anchor="w", text="信号不足，无收益曲线",
-                               fill=AXIS_TXT, font=("Microsoft YaHei", 9))
+            m = _side_bt(bt, side)
+            if not m or not m.get("curve"):
+                cv.create_text(
+                    12, 16, anchor="w",
+                    text=("该市场未开启做空，无空头曲线"
+                          if side == "空头" else "信号不足，无收益曲线"),
+                    fill=AXIS_TXT, font=("Microsoft YaHei", 9))
                 return
             W = max(cv.winfo_width(), 480)
             H = int(cv["height"])
@@ -26919,9 +27758,9 @@ class App:
             h_eq = int((H - T - B) * 0.68)
             h_dd = (H - T - B) - h_eq - 14
             y0_dd = T + h_eq + 14
-            curve = bt["curve"]
+            curve = m["curve"]
             n = len(curve)
-            si = bt.get("split_i") or n          # 只画到训练集结束
+            si = m.get("split_i") or n           # 只画到训练集结束
             show = curve[:si]
             lo = min(min(show), 1.0)
             hi = max(max(show), 1.0)
@@ -26934,11 +27773,13 @@ class App:
             def ym(v):
                 return T + (hi - v) / (hi - lo) * h_eq
 
-            # 验证集区域：主题色点纹底色 + 分界（不画净值，仅文字指标展示在下方）
+            # 验证集区域：浅一档纯色底 + 分界（不画净值，仅文字指标展示在下方）
             if si < n:
                 xs_ = xm(si)
-                cv.create_rectangle(xs_, T, W - R, H - B, fill=AXIS_TXT,
-                                    stipple="gray12", outline="")
+                # 验证集区域用浅一档的纯色底（v7.5.4：gray12 点纹在大画布上
+                # 像一片噪点，被误认为数据异常）
+                cv.create_rectangle(xs_, T, W - R, H - B, fill=PANEL_BG,
+                                    outline="")
                 cv.create_line(xs_, T, xs_, H - B, fill=C_GOLD, dash=(4, 3))
                 cv.create_text(L + 6, T + 10, anchor="w",
                                text=f"训练集 {int(si * 100 / n)}%（显示净值）",
@@ -26994,17 +27835,27 @@ class App:
                 peak_t = max(peak_t, v)
                 if peak_t > 0:
                     mdd_t = min(mdd_t, v / peak_t - 1)
+            _sh = "" if side == "总共" else side
             cv.create_text(L, T - 8, anchor="w",
-                           text=f"训练集净值（起始=1.0） 期末 {show[-1]:.3f} "
+                           text=f"{_sh}训练集净值（起始=1.0） 期末 {show[-1]:.3f} "
                                 f"({(show[-1] - 1) * 100:+.1f}%)  "
-                                f"训练最大回撤 {mdd_t * 100:.1f}%",
+                                f"{_sh}训练最大回撤 {mdd_t * 100:.1f}%",
                            fill=TITLE_TXT, font=("Microsoft YaHei", 9, "bold"))
-            cv.create_text(L, y0_dd - 9, anchor="w", text="训练集回撤",
+            cv.create_text(L, y0_dd - 9, anchor="w",
+                           text=f"{_sh}训练集回撤",
                            fill=DOWN, font=("Microsoft YaHei", 8, "bold"))
             cv.create_text(W - R, T - 8, anchor="e",
                            text=f"区间 {(bt.get('_rows') or self.res['disp_rows'])[0]['date']} ~ "
                                 f"{(bt.get('_rows') or self.res['disp_rows'])[-1]['date']}",
                            fill=AXIS_TXT, font=("Microsoft YaHei", 8))
+
+        def _render_bt_views():
+            bt = _bt_last[0]
+            if not bt:
+                return
+            side = bt_dir.get()
+            _fill_detail(bt, side)
+            _draw_curve(bt, side)
 
         def run_bt():
             # v6.6.5：计算段后台化——本函数在工具窗打开 80ms 后自动执行，
@@ -27052,23 +27903,11 @@ class App:
                                                 full=res["full_code"])
                 if not sig_use:
                     sig_use = fallback_sigs
-                bt = backtest_signals(rows_bt, sig_use, rp=rp)
+                bt = backtest_signals(rows_bt, sig_use, rp=rp,
+                                      full=res["full_code"])
                 if bt:
-                    # v6.1.6：训练/验证/全期改用消融同引擎（_bt_events）与
-                    # 同切分（val=max(200,n/4)），保证与「策略消融」弹窗
-                    # 逐项一致。
-                    ev_full, ev_tr, ev_va, split = _bt_segments(
-                        rows_bt, sig_use, rp, detail=True)
-                    if ev_full:
-                        for _k in ("trades", "closed", "wins", "losses",
-                                   "winrate", "total", "ann", "mdd",
-                                   "floating", "avg_win", "avg_loss",
-                                   "profit_loss", "curve", "detail"):
-                            bt[_k] = ev_full.get(_k)
-                        bt["train"] = ev_tr
-                        bt["val"] = ev_va
-                        bt["split_i"] = (split
-                                         if 0 < split < len(rows_bt) else None)
+                    # v7.5.7：多头/空头/总共三套结果由 backtest_signals
+                    # 一次算好；顶栏=总共，方向下拉只切图表/明细。
                     bt["_signals"] = sig_use
                     bt["_rows"] = rows_bt
                 return bt
@@ -27089,9 +27928,16 @@ class App:
                 if not (win.winfo_exists() and self.res is res):
                     return          # 窗口已关/已切换股票，丢弃过期结果
                 _bt_last[0] = bt
-                sig_use = bt.get("_signals") or []
                 bt_result.config(state="normal")
                 bt_result.delete("1.0", "end")
+                if not bt:
+                    bt_result.insert(
+                        "end",
+                        "该策略在近1000根窗口内没有可回测交易（信号不足）")
+                    bt_result.config(state="disabled")
+                    _render_bt_views()
+                    return
+                sig_use = bt.get("_signals") or []
 
                 def _seg(title, m, extra="", n_sig=None):
                     if not m:
@@ -27116,7 +27962,24 @@ class App:
                         f"均盈 {_fmt_pct(m.get('avg_win'), True)}  "
                         f"均亏 {_fmt_pct(m.get('avg_loss'), True)}\n")
 
-                if not bt or bt.get("winrate") is None:
+                def _side_line(name, x):
+                    if not x:
+                        return f"  {name}: 未开启（设置→交易/融资 可开）"
+                    return (f"  {name}: 全期 {_fmt_pct(x.get('total'), True)}  "
+                            f"年化 {_fmt_pct(x.get('ann'), True)}  "
+                            f"胜率 {_fmt_pct(x.get('winrate'))}"
+                            f"（{x.get('wins', 0)}/{x.get('closed', 0)}）"
+                            f"  交易 {x.get('trades', 0)}")
+
+                bt_result.insert(
+                    "end",
+                    "方向汇总（融资 %s，杠杆 %gx）：\n%s\n%s\n%s\n" % (
+                        "开" if bt.get("finance") else "关",
+                        float(bt.get("leverage") or 1.0),
+                        _side_line("多头", bt.get("long")),
+                        _side_line("空头", bt.get("short")),
+                        _side_line("总共", bt.get("combined") or bt)))
+                if bt.get("winrate") is None:
                     bt_result.insert(
                         "end",
                         "该策略在近1000根窗口内没有可回测交易（信号不足）")
@@ -27162,17 +28025,17 @@ class App:
                         bt_result.insert(
                             "end", f"  {name}: " + "  ".join(parts) + "\n")
                     bt_result.insert("end",
-                        f"\n  提示：回测与消融**同窗（近1000根）同引擎**"
-                        f"（_bt_events），\n"
-                        f"  交易/胜率/年化/回撤与「策略消融」弹窗逐项一致；\n"
+                        f"\n  提示：多头/空头/总共同信号、同风险参数；"
+                        f"总=反转系统（多空不叠加），\n"
+                        f"  多头=BUY开/SELL平，空头=SELL开/BUY平；"
+                        f"融资关闭时杠杆按 1 倍；\n"
                         f"  用所选策略信号，T日收盘信号/T+1成交，"
                         f"退出规则: {_bt_exit_note(rp)}；\n"
                         f"  训练/验证按 val=max(200,n/4) 切分，"
                         f"验证集不参与选型。\n")
                 bt_result.config(state="disabled")
-                _fill_detail(bt)            # 交易明细子页同步刷新
+                _render_bt_views()           # 方向下拉：图表/明细同步
                 bt_result.yview_moveto(0)   # 回到顶部，先看全期/训练/验证
-                _draw_curve(bt)
 
             self._run_bg(worker, done)
 
@@ -27187,7 +28050,7 @@ class App:
                 except Exception:
                     pass
             _curve_job[0] = self.root.after(
-                120, lambda: (_draw_curve(_bt_last[0])
+                120, lambda: (_draw_curve(_bt_last[0], bt_dir.get())
                               if bt_canvas.winfo_exists() else None))
         bt_canvas.bind("<Configure>", _curve_resize)
 
@@ -27230,7 +28093,13 @@ class App:
                 "exec": ("open" if _exec_mode() == "open" else "close"),
                 "full": {k: v for k, v in bt.items()
                          if k not in ("curve", "trades_list", "train", "val",
-                                      "_signals", "_rows", "detail")},
+                                      "_signals", "_rows", "detail",
+                                      "long", "short", "combined")},
+                "sides": {
+                    _s: {k: v for k, v in (bt.get(_s) or {}).items()
+                         if k not in ("curve", "trades_list", "train", "val",
+                                      "detail")}
+                    for _s in ("long", "short", "combined")},
                 "train": bt.get("train"),
                 "val": bt.get("val"),
                 "trades_detail": {
@@ -28012,9 +28881,10 @@ class App:
                                 style="SettingsNav.Treeview")
         nav_tree.pack(fill="both", expand=True, padx=(4, 0), pady=8)
         sections = (("ui", "外观"), ("pred", "预测参数"),
-                    ("studio", "外部策略"), ("ind", "指标参数"),
-                    ("pick", "荐股"), ("ai", "AI 接口"),
-                    ("data", "数据源"), ("about", "关于"))
+                    ("trade", "交易/融资"), ("studio", "外部策略"),
+                    ("ind", "指标参数"), ("pick", "荐股"),
+                    ("ai", "AI 接口"), ("data", "数据源"),
+                    ("about", "关于"))
         for _key, _lab in sections:
             nav_tree.insert("", "end", iid=_key, text="  " + _lab)
 
@@ -28033,10 +28903,11 @@ class App:
             _f.grid(row=0, column=0, sticky="nsew")
             _f.grid_remove()
             secs[_key] = _f
-        sec_ui, sec_pred, sec_studio, sec_ind, sec_pick, sec_ai, \
-            sec_data, sec_about = (
-                secs["ui"], secs["pred"], secs["studio"], secs["ind"],
-                secs["pick"], secs["ai"], secs["data"], secs["about"])
+        sec_ui, sec_pred, sec_trade, sec_studio, sec_ind, sec_pick, \
+            sec_ai, sec_data, sec_about = (
+                secs["ui"], secs["pred"], secs["trade"], secs["studio"],
+                secs["ind"], secs["pick"], secs["ai"], secs["data"],
+                secs["about"])
         frm = sec_ui                 # 下方既有构建代码按区切换父容器
 
         try:
@@ -28535,6 +29406,49 @@ class App:
         # ---- 外部策略：股票策略工坊导入（v6.6.0，存 ini [studio]）----
         # 选中导入策略后：单股买卖点按工坊规则生成，不参与消融、
         # 不使用风险偏好；交易层改用显式止损/止盈/最长持有。
+        # ---- 交易/融资（v7.5.7：分市场融资、做空、杠杆；[trade]）----
+        frm = sec_trade
+        ttk.Label(frm, text="— 分市场交易/融资（回测与交易记录共用）—").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(frm, text="市场").grid(row=1, column=0, sticky="w")
+        ttk.Label(frm, text="允许融资/杠杆").grid(row=1, column=1,
+                                                   sticky="w", padx=8)
+        ttk.Label(frm, text="允许做空").grid(row=1, column=2,
+                                             sticky="w", padx=8)
+        ttk.Label(frm, text="杠杆倍数").grid(row=1, column=3,
+                                             sticky="w", padx=8)
+        trade_fin_vars = {}
+        trade_short_vars = {}
+        trade_lev_vars = {}
+        _trade_mks = (("cn", "A股"), ("hk", "港股"), ("us", "美股"),
+                      ("futures", "期货"), ("crypto", "加密"))
+        for _r, (_mk, _lab) in enumerate(_trade_mks, start=2):
+            trade_fin_vars[_mk] = tk.BooleanVar(
+                value=bool(CFG.TRADE_FINANCE.get(_mk, False)))
+            trade_short_vars[_mk] = tk.BooleanVar(
+                value=bool(CFG.TRADE_SHORT.get(_mk, False)))
+            trade_lev_vars[_mk] = tk.StringVar(
+                value=f"{float(CFG.TRADE_LEVERAGE.get(_mk, 1.0)):g}")
+            ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
+                                            pady=2)
+            ttk.Checkbutton(frm, text="允许",
+                            variable=trade_fin_vars[_mk]).grid(
+                                row=_r, column=1, sticky="w", padx=8)
+            ttk.Checkbutton(frm, text="允许",
+                            variable=trade_short_vars[_mk]).grid(
+                                row=_r, column=2, sticky="w", padx=8)
+            ttk.Entry(frm, textvariable=trade_lev_vars[_mk],
+                      width=8).grid(row=_r, column=3, sticky="w", padx=8)
+        ttk.Label(
+            frm,
+            text="说明：融资关闭时杠杆按 1 倍；做空开启后 K 线显示 空/多，"
+                 "回测分别给出多头/空头/总共；A股融券需账户权限。\n"
+                 "杠杆仅放大权益曲线（逐笔明细仍为价格收益，未计融资利息/融券费），"
+                 "上限 20 倍。",
+            foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
+            justify="left").grid(row=8, column=0, columnspan=4,
+                                 sticky="w", pady=(8, 0))
+
         frm = sec_studio
         ttk.Label(frm, text="— 股票策略工坊外部策略（stock_strategy_studio）—"
                   ).grid(row=0, column=0, columnspan=3, sticky="w",
@@ -29189,6 +30103,30 @@ class App:
                     CFG.RISK_MODE = risk_var.get()
                     cp.set("predict", "risk_mode", CFG.RISK_MODE)
                     pnotes.append(f"风险={CFG.RISK_MODE}")
+                # 交易/融资分市场（存 [trade]；v7.5.7）
+                if not cp.has_section("trade"):
+                    cp.add_section("trade")
+                _tn = 0
+                for _mk in ("cn", "hk", "us", "futures", "crypto"):
+                    _fin = bool(trade_fin_vars[_mk].get())
+                    _short = bool(trade_short_vars[_mk].get())
+                    try:
+                        _lev = max(1.0, min(20.0, float(
+                            trade_lev_vars[_mk].get())))
+                    except (ValueError, TypeError):
+                        _lev = float(CFG.TRADE_LEVERAGE.get(_mk, 1.0))
+                    CFG.TRADE_FINANCE[_mk] = _fin
+                    CFG.TRADE_SHORT[_mk] = _short
+                    CFG.TRADE_LEVERAGE[_mk] = _lev
+                    cp.set("trade", f"finance_{_mk}", "1" if _fin else "0")
+                    cp.set("trade", f"short_{_mk}", "1" if _short else "0")
+                    cp.set("trade", f"leverage_{_mk}", f"{_lev:g}")
+                    _tn += 1
+                pnotes.append(f"交易/融资x{_tn}"
+                              + ("（含做空）"
+                                 if any(v.get() for v in
+                                        trade_short_vars.values())
+                                 else ""))
                 # 外部策略（存 [studio]；v6.6.0）
                 if not cp.has_section("studio"):
                     cp.add_section("studio")

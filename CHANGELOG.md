@@ -5,6 +5,81 @@
 
 ## 版本历史
 
+> **v7.5.7：分市场融资/杠杆 + 多空回测/K线（2026-11-22）**：
+> ①**设置→交易/融资**：A股/港股/美股/期货/加密分别配置「允许融资」、
+> 「允许做空」、杠杆倍数（1~20），ini `[trade]`；默认全部关闭/1倍，
+> 保持旧多头口径；交易记录插件同步读取（融资关闭=1倍，开启后按倍数）；
+> ②**K线**：多头 BUY/SELL 仍显示 B/S；开启做空后同一信号在空头侧显示
+> BUY=「多」（平空）、SELL=「空」（开空）；
+> ③**回测**：`backtest_signals` 同时返回 `long`/`short`/`combined`（顶栏 `total` 仍是数值）——多头=
+> BUY开/SELL平，空头=SELL开/BUY平，总=反转系统（多空不叠加）；融资杠杆
+> 只放大权益曲线，逐笔收益仍为价格收益；工具→信号胜率新增「方向」下拉
+> （总共/多头/空头），明细表加「向」列，顶部并排显示三向全期汇总；
+> ④`analyze`/工具/AI 调用传 `full` 读取市场配置；AI 回测统计只输出
+> 三向摘要，不含曲线/明细；`APP_VERSION=7.5.7`，`stock_predict.py`
+> 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.5.6：加密买点修复 + quant 小时模型本机接入（2026-11-22）**：
+> ①**为什么没买点**：本地加密信号原先只走 sm701 日线 h1/h5/h10，且
+> `production/valid_predictions_crypto.csv.gz` 缺失；`sm701_prob_map` 只
+> 实时复算最近 250 日，状态机在窗口最左沿触发一次 BUY 后概率一直未跌破
+> 0.50，主图可见的近 250/130 根内没有新的 BUY；
+> ②**接入 quant 机加密模型（仅本机）**：从 quant 机拉取
+> `prod_crypto_hourly_k24.txt`、`features_hourly_k24.json`、`crypto_hourly.db`
+> 到 `~/桌面/sm701`（仓库外，git 不分发、不上传）；本机
+> `gen_crypto_hourly_daily.py` 用小时模型生成
+> `output/crypto_hourly_daily_probs.csv.gz`（每个 UTC 日最后一小时概率）；
+> ③`external/sm701_ext.py` 的 crypto `sm701_prob_map` 优先读该本地文件，
+> 缺失/无该币/新日期才回落日线实时复算；信号说明显示「sm701小时概率」；
+> BTC 实测 1101 天 79 个信号，最近 2026-11-06 BUY、11-14 SELL、11-15 BUY，
+> ETH/SOL 同样恢复买点；
+> ④本机刷新脚本 `~/桌面/sm701/sync_quant_crypto.sh` 只拉取+本地生成，
+> 不推送；未改 git/cron；`APP_VERSION=7.5.6`，`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 同步。
+
+> **v7.5.5：分时并入周期 + 滚轮缩放（2026-11-22）**：
+> ①周期下拉统一为 **日K / 分时 / 1分 / 5分 / 15分 / 30分 / 60分**，
+> 「分时」不再作为独立勾选叠加在日K上层，而是与其它周期同级；原数字
+> 「周期」改名「根数」（日K显示根数；分时/分钟K时改可视窗口根数）；
+> ②分时/分钟K支持 **滚轮缩放、Shift+滚轮平移、左键拖拽平移、
+> 双击回到最新**；缩放只切可视窗口，不重复联网，窗口标题显示
+> `窗口 a-b/总数`；
+> ③MACD/量比在完整窗口上计算后再切片，缩放不产生 warm-up 偏差；
+> 分时线/蜡烛K、成交量、右侧涨跌幅轴、时间刻度均随窗口同步；
+> ④多源轮换：加密 Kraken 公共 OHLC 优先、Yahoo 回流；A股分时腾讯优先，
+> 失败由东财分时接管（再次失败走缓存），5分及以上仍由 1 分钟聚合；
+> 1分K/5分K 等周期可直接切换，切周期重置缩放；
+> ⑤刷新频率按周期自适应：1分 10s、5分 20s、15分 30s、30/60分 60s
+> （`fetch_minute_lines(..., ttl=)`），1分K 更接近主流软件的盘中更新节奏；
+> `APP_VERSION=7.5.5`，`stock_predict.py` 重新生成；README/ARCHITECTURE 同步。
+
+> **v7.5.4：分时周期可选 1/5/15/30/60 分钟（2026-11-22）**：
+> ①主工具栏「分时」旁新增周期下拉（分时/1分/5分/15分/30分/60分），默认
+> 「分时」保持原 1 分钟价格线；选择 1 分及以上切换为蜡烛K + VWAP，副图
+> 标题/时间轴/量比随周期与市场（A股/港股/美股/加密 UTC）适配；
+> ②数据层 `fetch_minute_lines(full, interval)`：加密优先 Kraken 公共 OHLC
+> （1m/5m/15m/30m/60m，跨日滚动最近 720 根，OHLCV 连续；失败回落 Yahoo），
+> 港美期走 Yahoo 对应 interval；A股仍取腾讯 1 分钟并按
+> 09:30~11:30 / 13:00~15:00 聚合 OHLC；`minute_cache` 以
+> `code[@interval]` 为键，各周期独立落库/离线可读，旧 `code` 键继续兼容
+> 1 分钟；③加密不再按 UTC 自然日截断（60m 不会只剩当日 3 根），多日横轴
+> 按日期标注、主图按窗口高低点缩放，成交量改用 Kraken 同源量，
+> `avg5_vol` 同量纲算量比；④信号胜率窗口验证集底色由 gray12 点纹改为
+> 纯色，避免大画布上被误看成数据噪点；⑤`get_intraday` AI 工具新增
+> `interval` 参数，侧栏分时 Mini 图跟随当前周期；周期切换用 generation
+> 丢弃过期回调；`APP_VERSION=7.5.4`，`stock_predict.py` 重新生成；
+> README/ARCHITECTURE 同步。
+
+> **v7.5.3：盘中行情快照 3 秒刷新（2026-11-22）**：
+> ①`App.TICK_MS` 60s→3s，`_tick` 按 `_tick_quote_ttl()` 取 TTL——A股
+> 09:10~15:05 且 `_today_is_session() is not False` 时 2.5s，休市/周末与
+> 港股/美股/期货/加密仍 60s；②`fetch_quote_cached(..., persist=False)`
+> 高频 tick 只更新内存缓存、不写 SQLite，避免 3 秒一次落库；③`_tick_done`
+> 仅在 price/high/low/time 或交易阶段变化时更新实时 bar/预测区间并
+> `_rerender()`，价格未变不重绘；④实测单次行情源约 0.2s（腾讯/新浪/同花顺
+> 同量级），3s 轮询约 20 次/分，与盘口 3s 同频；`APP_VERSION=7.5.3`，
+> `stock_predict.py` 重新生成；2.1 节与 ARCHITECTURE 同步。
+
 > **v7.5.2：加密盘中 UTC 口径 + 关于页外接品牌 + 开源模型隔离（2026-11-21）**：
 > ①**加密 7×24 按 UTC 切日**：`_market_last_expected()` 对 crypto 返回
 > **UTC 昨日**（当日 UTC 日K要到次日 00:00 UTC 才完成），

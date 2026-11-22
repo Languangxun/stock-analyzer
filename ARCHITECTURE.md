@@ -106,11 +106,16 @@
   `_get_daily_market` 用 Yahoo 补齐缺失/最新段（重叠日仍以 sm70x 同源为准），
   避免 crypto 副本停在旧日期时反复判过期或半根K不更新；
   **美股另可选 Twelve Data（v7.1.0）**：配 key 后快照与日K优先走 TD，Yahoo 退为兜底；
+  **加密分钟K（v7.5.4）**：`_fetch_minute_market` 优先 Kraken
+  `/0/public/OHLC`（1m/5m/15m/30m/60m，跨日滚动 720 根，连续 OHLCV；
+  `_kraken_avg_daily_vol` 取同源 5 日均量算量比），失败/未上市回落 Yahoo
+  （按 interval 取 2~5 天，不再按 UTC 自然日截断）；
 - **策略链（非 cn）**：策略工坊绑定（ini `[studio] bind_市场`，工具→策略工坊窗）
   > **sm70x 直出**（`sm701_paths(market)` 生产集
   `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
   `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
-  （杠杆 `leverage_市场`，T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
+  （`[trade] finance_市场 / short_市场 / leverage_市场`，v7.5.7 设置→交易/融资；
+  T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
   （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
 - 涨跌停：`_limit_pct` 非 cn 返回 None（钳制/异常校验自动放行）。
 
@@ -130,6 +135,11 @@
 网络源为 **腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`（带 Referer、GBK）→ 东财 `ulist.np`**，
 任一成功即返回并回写缓存；无网络时降级返回库内旧缓存，避免界面空白。自选池名称/
 现价/涨幅与五大指数走 `fetch_batch_quotes`（同样缓存优先，仅缺失/过期代码才联网）。
+**盘中 tick 刷新（v7.5.3）**：`App.TICK_MS=3s`，`_tick_quote_ttl()` 在 A 股
+09:10~15:05 且今日为交易日时返回 2.5s，其余（休市/周末/港美期加密）60s；
+高频 tick 用 `fetch_quote_cached(persist=False)` 只写内存、不写 `quote_cache`；
+`_tick_done` 仅在 price/high/low/time 或交易阶段变化时更新实时 bar/预测区间
+并重绘，价格未变不触发 `_rerender()`。
 **左侧自选池（v7.0.6）**：`Watch.Treeview` 紧凑单列显示「代码 名称 涨跌幅」，
 涨幅 ≥0 红、<0 绿（UP/DOWN），`_index_loop` 每 30s 调 `_refresh_names()`；
 重绘保留选中项与滚动位置，双击行切换股票。**宽度自适应（v7.0.7）**：
@@ -557,11 +567,13 @@ T 日收盘信号 → **T+1 收盘成交**；**ATR(14) 止损** + **移动止盈
 
 **GUI 单股回测面板（工具→信号胜率，2026-09-26 升级；v6.1.6 与消融统一）**：
 `backtest_signals` 内部为 `_bt_simulate`（单段）+ 组合全期/分段，用于 IC/信号后收益等
-信号质量统计；面板的**全期/训练/验证指标自 v6.1.6 起改用消融同引擎 `_bt_events`
-与同切分**（`val=max(200, n/4)`、预计算 ATR、盘中假K不计入，统一封装为 `_bt_segments`，
+信号质量统计；面板的**全期/训练/验证指标**在 v6.1.6~v7.5.6 使用消融同引擎
+`_bt_events`/`_bt_segments`（`val=max(200, n/4)`、预计算 ATR、盘中假K不计入，
 GUI 面板与 `stock_backtest_export.py` 共用），
 保证与「策略消融」弹窗及每只股导出逐项一致（此前两个引擎：trades 含浮仓、
 固定前 75/25、分段 ATR 重算，sz002241 验证集 10 笔/-7.0% vs 弹窗 9 笔/-6.8%）；
+v7.5.7 多空拆分/杠杆改用 `_bt_simulate(mode=long/short/both)`（见下条），
+信号与风险参数仍同源；
 `_bt_events` 同步补齐 `closed/floating/avg_win/avg_loss/profit_loss/trades_list`
 （向后兼容，trades 只计已平仓）。另算 **IC(T+1)/IC(T+5)**（信号方向 +1买/-1卖 vs
 未来收益的 Spearman 秩相关）与 **信号后 1/5 日收益/上涨占比**。面板回测**与消融同窗**
@@ -574,6 +586,18 @@ GUI 面板与 `stock_backtest_export.py` 共用），
 不重建窗口也不会"黑底白块"），验证集底纹改 `AXIS_TXT` + `stipple="gray12"`（浅色/深色/
 高对比通用）；`run_bt` 结束 `yview_moveto(0)`，结果文本回到顶部直接展示全期/训练/验证；
 主图 MA 图例按 `cv.bbox` 实际字宽推进（HiDPI 不再重叠）。
+
+**多空拆分 / 杠杆（v7.5.7）**：设置→交易/融资 按市场配置
+`finance_市场`（允许融资/杠杆做多）、`short_市场`（允许做空）、
+`leverage_市场`（1~20），ini `[trade]`；默认全关/1 倍保持旧口径。
+`_bt_simulate(mode=long|short|both, leverage=)`：多头 BUY 开/SELL 平；
+空头 SELL 开/BUY 平（收益 entry/exit−1，止损/移动止盈镜像）；both 为
+反转系统（BUY 平空开多、SELL 平多开空，单账户）；杠杆只放大权益曲线，
+`trades/detail` 仍为价格收益。`backtest_signals(..., full=)` 返回
+`long/short/combined` 三套（顶栏 `total` 仍是数值，兼容旧报告），训练/验证/IC 分方向
+打包；工具→信号胜率新增「方向」下拉（总共/多头/空头），明细表增加「向」列，
+顶部并排显示三向全期收益/胜率/交易数。A股默认不融资不做空；
+交易记录插件 `_acc_leverage` 同步读取 `[trade]`（finance=0 强制 1 倍）。
 
 **交易明细子页（v6.3.3）**：`_bt_events` 新增可选 `detail_out`——逐笔记录
 `{entry_i/entry_date/entry_px, exit_i/exit_date/exit_px, ret, reason}`，
@@ -702,6 +726,12 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
     （`date,code,prob_h1,prob_h5,prob_h10,prob`；`prob`=三模型等权平均）；
     文件缺失时历史段留空、只做实时复算（A 股单股复用 `sm701_score_matrix`
     的一次全市场矩阵，避免逐股重算；非 cn 单股最多复算最近 250 个交易日）；
+    **v7.5.6 加密小时模型（仅本机）**：crypto 优先读
+    `~/桌面/sm701/output/crypto_hourly_daily_probs.csv.gz`（quant 机
+    `prod_crypto_hourly_k24` + `crypto_hourly.db` 本地生成，date/code/
+    prob_hourly，每 UTC 日最后一小时），`sm701_prob_map` 的 crypto 分支
+    用它覆盖日线 h1/h5/h10 概率；缺失/无该币/新日期才回落日线实时复算；
+    模型、小时库与生成脚本均在仓库外，git 不分发、不上传；
   - **数据读取**：`_sm701_conn()` 只读 URI 打开行情库，`_sm701_stock_info()`
     补股票名/行业/PE/换手率；多市场行情直读 sm701 原生
     `hk_daily/us_daily/fut_daily/crypto_daily`，或 `global_daily.db` 的
@@ -864,7 +894,7 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   成分股批量取行情 + 日K计算当日/5日/20日/量比并加权汇总；
   `get_etf_constituents` 工具输出统计表；`get_kline`/`get_indicators`/
   `get_intraday` 增加可选 `code`，可查成分股等其它标的（`get_intraday` 即
-  当日/最近交易日分时）。
+  当日/最近交易日分时，v7.5.4 另支持 `interval=1m/5m/15m/30m/60m`）。
 - **外部环境搜索（2026-11-05；v7.5.0 多引擎）**：`get_external_env` 在
   DeepSeek 官方接口下仍调用 `/v1/tools/search`；非官方网关改走
   `ai_foreign_search()`——移植 quant（`ai-quant/scripts/foreign_search.py`）
@@ -1067,12 +1097,27 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   程序目录同名 PDF，找到时面板右上角显示「打开原版PDF」（`webbrowser` 打开
   `file://`），便于查看原稿图表；找不到 PDF 仅隐藏按钮，文字版仍可用。
 
-- **分时视图（2026-11-05；v7.0.5 价格线白色）**：分时主图价格线（`TPRED_C`，
+- **分时视图（2026-11-05；v7.0.5 价格线白色；v7.5.4 周期可选）**：分时主图价格线（`TPRED_C`，
   暗色纯白/亮色黑，与黄色虚线 VWAP 区分）/VWAP/昨收基准 + 右侧涨跌幅轴；
   `cv_vol` 分钟量；`cv_ind` 自动切换为分时 MACD（DIF/DEA/柱）+ 累计量比
   （5 日均量 × 已交易分钟/240，阈值 0.8/1.0/1.2）；`_minute_motion` 同步
   三图垂直光标 + 悬停图水平光标，读数含时间/价/涨幅/均价/分钟量/量比/MACD；
-  时间刻度 09:30/10:30/13:00/14:00/15:00；不跟随日线指标下拉。
+  A股时间刻度 09:30/10:30/13:00/14:00/15:00；不跟随日线指标下拉。
+  **周期与缩放（v7.5.4 / v7.5.5）**：主工具栏周期下拉可选
+  日K/分时/1分/5分/15分/30分/60分（「分时」与K周期同级，不再是独立勾选
+  叠加层；原数字周期改名「根数」，日K时控制显示根数、分时/分钟K时控制
+  可视窗口根数）；分时 `_minute_window()` 支持滚轮缩放、
+  Shift+滚轮平移、左键拖拽平移、双击回到最新，MACD/量比在完整窗口计算后
+  再切片，缩放不重复联网；
+  `fetch_minute_lines(full, interval)` 加密优先 Kraken 公共 OHLC（跨日滚动
+  最近 720 根，OHLCV 连续；失败回落 Yahoo），港美期走 Yahoo 原生 interval，
+  A股取腾讯 1 分钟（失败由东财分时 `_fetch_minute_em` 接管），由
+  `_aggregate_cn_minute` 按 09:30~11:30 / 13:00~15:00 聚合 OHLC；1分及以上 `_draw_minute_view` 画蜡烛K + VWAP，
+  `minute_cache` 以 `code[@interval]` 分周期落库（旧 `code` 键兼容 1 分钟）；
+  加密多日横轴按日期标注、主图按窗口高低点缩放，Kraken 分钟量与
+  `avg5_vol` 同量纲算量比；分时刷新按周期自适应（1m 10s / 5m 20s /
+  15m 30s / 30m/60m 60s），`fetch_minute_lines(ttl=)` 控制内存 TTL；
+  信号胜率窗验证集底色改为纯色（原 gray12 点纹）。
   **盘口/集合竞价（v7.0.2）**：右侧栏新增「盘口」面板，`fetch_order_book()`
   走腾讯五档（`qt.gtimg.cn` 字段 9~28）+ 新浪兜底，3s 缓存；按行情时间判定
   集合竞价/竞价撮合/连续竞价/收盘竞价，显示竞价参考价、匹配量、今开、买卖
@@ -1369,6 +1414,11 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.7**<br>（2026-11-22） | **分市场融资/杠杆 + 多空回测/K线**：设置→交易/融资 按 A股/港股/美股/期货/加密配置 `finance_市场`/`short_市场`/`leverage_市场`（ini `[trade]`，默认关/1倍）；K线多头 B/S，开启做空后 BUY=多（平空）、SELL=空（开空）；`_bt_simulate(mode=long/short/both, leverage=)`，`backtest_signals` 返回 `long/short/combined`（总=反转系统、多空不叠加；顶栏 `total` 仍是数值），工具→信号胜率新增方向下拉与「向」列；交易记录插件同步 `[trade]`；`APP_VERSION=7.5.7`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
+| **v7.5.6**<br>（2026-11-22） | **加密买点修复 + quant 小时模型本机接入**：定位「无买点」根因——本地 crypto 仅日线 h1/h5/h10 实时复算最近 250 日，状态机在最左沿 BUY 后长期持有；从 quant 机拉取 `prod_crypto_hourly_k24`/`crypto_hourly.db` 到 `~/桌面/sm701`（仓库外、不上传），本机生成 `output/crypto_hourly_daily_probs.csv.gz`；`external/sm701_ext.py` 的 crypto `sm701_prob_map` 优先读该文件，信号 tag 改「sm701小时概率」；BTC 最近 11-06 BUY / 11-14 SELL / 11-15 BUY；`APP_VERSION=7.5.6`，`stock_predict.py` 重新生成；3.4 节与 README/CHANGELOG 同步 |
+| **v7.5.5**<br>（2026-11-22） | **分时并入周期 + 滚轮缩放**：周期下拉统一为 日K/分时/1分/5分/15分/30分/60分，「分时」不再是独立勾选叠加层；数字周期改名「根数」（日K根数/分时窗口根数）；分时 `_minute_window()` 支持滚轮缩放/Shift+滚轮平移/左键拖拽/双击回最新，MACD 与量比在完整窗口计算后切片，缩放不重复联网；A股分时腾讯→东财兜底；`APP_VERSION=7.5.5`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
+| **v7.5.4**<br>（2026-11-22） | **分时周期可选 1/5/15/30/60 分钟**：主工具栏「分时」旁新增下拉（分时/1分/5分/15分/30分/60分），1分及以上画蜡烛K + VWAP；`fetch_minute_lines(full, interval)` 支持 1m/5m/15m/30m/60m，加密优先 Kraken 公共 OHLC（跨日滚动 720 根、OHLCV 连续，失败回落 Yahoo），港美期走 Yahoo，A股腾讯 1 分钟经 `_aggregate_cn_minute` 聚合 OHLC；`minute_cache` 改 `code[@interval]` 分周期缓存；加密不再按 UTC 自然日截断，多日横轴按日期标注、窗口高低点缩放，成交量与 `avg5_vol` 同源同量纲；信号胜率窗验证集底色改纯色；`get_intraday` 新增 `interval` 参数；`APP_VERSION=7.5.4`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
+| **v7.5.3**<br>（2026-11-22） | **盘中行情 3 秒刷新**：`App.TICK_MS` 60s→3s；新增 `_tick_quote_ttl()`（A股 09:10~15:05 且交易日→2.5s，其余 60s）；`fetch_quote_cached(..., persist=False)` 高频 tick 只写内存不落库；`_tick_done` 仅在价格/时间/阶段变化时更新实时 bar 与重绘；单次行情源实测约 0.2s，3s 轮询与盘口同频；`APP_VERSION=7.5.3`，`stock_predict.py` 重新生成；2.1 节与 README/CHANGELOG 同步 |
 | **v7.5.2**<br>（2026-11-21） | **加密盘中 UTC + 关于页外接品牌 + 开源模型隔离**：①crypto 日K/实时 bar/缓存桶全部按 UTC 切日——`_market_last_expected` 返回 UTC 昨日，`_get_daily_market` 只缓存已完成 UTC 日并清理旧半根，盘中实时 bar 由 UTC 快照 7×24 合成，`market_phase_text` 显示 UTC 盘中；②`_sm701_cache_epoch(src_max, market)` 对 crypto 用 UTC 30 分钟桶，`_main_latest_market` 按市场前缀取主库最新日；③sm70x 副本库落后时 Yahoo 补齐最新已完成段（重叠日同源优先）；④`sm70x_series()` + 关于页「已连接 / Powered by」品牌图（`assets/smlogo.png`，仅外接模型存在时）；⑤`.gitignore`/`build_client_zip.py` 扩到 sm70x 全系列，新增 `check_open_source.py`（模型内容/密钥自检）；`APP_VERSION=7.5.2`，`stock_predict.py` 重新生成；2.0/3.7 节与 README/CHANGELOG 同步 |
 | **v7.5.1**<br>（2026-11-21） | **多日幽灵K线影线修正**：`_multi_day_prediction()` 的累计高/低由「每日 `hi[75]`/`lo[25]` 连乘」改为「逐样本路径累计最高/最低后取 P75/P25」——对每个历史样本乘出 1..d 日收盘路径，逐日记录路径最高/最低（含起点，单日先按当前标的涨跌停钳制），再跨样本取分位；`cum_cl_raw` 也改用路径累计 P50。日线 `cl/hi/lo` 分位保留原口径；T+5/T+10 幽灵K与报告表影线明显收敛；3.2 节与 README/CHANGELOG 同步 |
 | **v7.5.0**<br>（2026-11-21） | **AI Agent 接入 quant 多引擎搜索**：移植 `ai-quant/scripts/foreign_search.py` 检索栈到 `stock_gui.py`——`ai_foreign_search()` 并行抓取必应 / Google News / DuckDuckGo（宏观另加 WSJ/Investing RSS），Bing/DDG 跳转还原、DDG lite 降级、按检索词覆盖率+日期排序、URL 去重；RSS 按 `days` 过滤且最多补充约 1/4；非 DeepSeek 官方网关的 `deepseek_search()` 由「Google News RSS 单源」改走该多引擎（免 Key）；`ai_stock_news`/`search_news`/`get_external_env` 接 `days`/`engines`，`after:` 自动转 `when:Nd`/`df=`；会话「联网」开关显式传入 `ai_stock_news`；DeepSeek 官方仍走 `/v1/tools/search`；3.9 节与 README/CHANGELOG 同步 |

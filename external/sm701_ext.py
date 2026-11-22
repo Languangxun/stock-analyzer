@@ -104,6 +104,7 @@ def tier_load_panel():
 # （设置 SM701_MODEL 时强制单模型口径，跳过 production/）。
 _SM701_CACHE = {}
 _SM701_LOCK = threading.RLock()
+_SM701_CRYPTO_HOURLY = "crypto_hourly_daily_probs.csv.gz"
 _SM701_WARMUP_BARS = 180
 
 
@@ -1080,6 +1081,57 @@ def _sm701_cn_matrix_probs(full):
             if np.isfinite(F[i, j])}
 
 
+def _sm701_crypto_hourly_map(paths, sm_code):
+    """本机 quant 加密小时模型日聚合概率 {date: prob_hourly}（v7.5.6）。
+
+    文件由本机 `sm701/output/crypto_hourly_daily_probs.csv.gz` 提供（quant
+    机模型 + crypto_hourly.db 离线生成，仅本机使用，不入库/不上传）。缺失
+    或代码不在文件中时返回 {}，调用方回落日线模型。
+    """
+    base = (paths or {}).get("dir")
+    if not base:
+        return {}
+    path = os.path.join(base, "output", _SM701_CRYPTO_HOURLY)
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    key = (path, mt)
+    cache = _SM701_CACHE.setdefault("crypto_hourly_map", {})
+    hit = cache.get(sm_code)
+    if hit and hit[0] == key:
+        return dict(hit[1])
+    out = {}
+    try:
+        import csv
+        import gzip
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+            rd = csv.reader(f)
+            head = next(rd, [])
+            try:
+                di = head.index("date")
+                ci = head.index("code")
+                pi = next(head.index(c) for c in
+                          ("prob_hourly", "prob", "prob_avg")
+                          if c in head)
+            except (StopIteration, ValueError):
+                di = ci = pi = -1
+            if pi >= 0:
+                need = max(di, ci, pi)
+                for row in rd:
+                    if len(row) <= need or row[ci] != sm_code:
+                        continue
+                    try:
+                        out[row[di]] = float(row[pi])
+                    except ValueError:
+                        continue
+    except Exception:
+        log.debug("读取 crypto_hourly_daily_probs 失败(忽略)", exc_info=True)
+        return {}
+    cache[sm_code] = (key, dict(out))
+    return out
+
+
 def sm701_prob_map(full, dates=None):
     """单股 sm701 概率序列 {date: prob}：历史落盘 + 新交易日实时复算。
 
@@ -1102,10 +1154,17 @@ def sm701_prob_map(full, dates=None):
         pred_mt = os.path.getmtime(paths["pred"])
     except OSError:
         pred_mt = 0.0
+    hourly_mt = 0.0
+    if mk == "crypto":
+        try:
+            hourly_mt = os.path.getmtime(os.path.join(
+                paths.get("dir") or "", "output", _SM701_CRYPTO_HOURLY))
+        except OSError:
+            pass
     src_max = max((_sm701_market_latest(paths.get("db"), mk)
                    if paths.get("db") else ""), _main_latest_market(mk))
     key = (pred_mt, _sm701_model_mtimes(paths), src_max,
-           _sm701_cache_epoch(src_max, mk))
+           _sm701_cache_epoch(src_max, mk), hourly_mt)
     cache = _SM701_CACHE.setdefault("probmap", {})
     hit = cache.get(full)
     if hit and hit[0] == key:
@@ -1122,7 +1181,7 @@ def sm701_prob_map(full, dates=None):
                 try:
                     ci, di = head.index("code"), head.index("date")
                     pi = next(head.index(c) for c in
-                              ("prob", "prob_lgbm", "prob_fuse")
+                              ("prob", "prob_lgbm", "prob_fuse", "prob_avg")
                               if c in head)
                 except (StopIteration, ValueError):
                     ci = di = pi = -1
@@ -1135,6 +1194,10 @@ def sm701_prob_map(full, dates=None):
                             out[row[di]] = float(row[pi])
                         except ValueError:
                             continue
+        if mk == "crypto":
+            hourly = _sm701_crypto_hourly_map(paths, sm_code)
+            if hourly:
+                out = dict(hourly)
         cache[full] = (key, dict(out))
     if dates:
         uniq = list(dict.fromkeys(d for d in dates if d))
@@ -1165,7 +1228,7 @@ def sm701_prob_map(full, dates=None):
     return out
 
 
-def _sig_sm701_from_probs(rows, probs):
+def _sig_sm701_from_probs(rows, probs, tag="sm701"):
     """sm701 概率序列 → 买卖点（probs 可为 {date: prob} 或按行对齐的序列）。
 
     与 `_sig_sm701` 同一滞回口径，供研究消融在父进程一次性预载概率后
@@ -1182,11 +1245,11 @@ def _sig_sm701_from_probs(rows, probs):
             continue
         if state <= 0 and p >= _SM701_SIG_BUY:
             out.append((i, r["date"], "BUY",
-                        f"sm701概率{p:.2f}≥{_SM701_SIG_BUY:.2f}"))
+                        f"{tag}概率{p:.2f}≥{_SM701_SIG_BUY:.2f}"))
             state = 1
         elif state >= 1 and p < _SM701_SIG_SELL:
             out.append((i, r["date"], "SELL",
-                        f"sm701概率{p:.2f}<{_SM701_SIG_SELL:.2f}"))
+                        f"{tag}概率{p:.2f}<{_SM701_SIG_SELL:.2f}"))
             state = 0
     return out
 
@@ -1201,7 +1264,8 @@ def _sig_sm701(rows, full, **_kw):
     except Exception:
         log.exception("sm701 单股概率读取失败")
         return []
-    return _sig_sm701_from_probs(rows, probs)
+    tag = "sm701小时" if _market_of(full) == "crypto" else "sm701"
+    return _sig_sm701_from_probs(rows, probs, tag=tag)
 
 
 # ---- 外接算法开关辅助（该市场是否有 sm701 生产模型集）----

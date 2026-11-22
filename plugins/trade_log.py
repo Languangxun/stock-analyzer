@@ -145,9 +145,28 @@ class TradeLogPlugin(StockPlugin):
         return (acc or "").split(":")[0] or "cn"
 
     def _acc_leverage(self, acc):
-        """该账本市场杠杆（购买力倍数；1=无杠杆）。默认：期货10/加密5/其他1。"""
+        """该账本市场杠杆（购买力倍数；1=无杠杆）。
+
+        v7.5.7：优先读主程序 ini [trade] finance_/leverage_（设置→交易/融资）；
+        finance=0 时强制 1 倍。缺省回落插件自身设置 / 市场默认。
+        """
         mk = self._acc_market(acc)
         dflt = 10.0 if mk == "futures" else (5.0 if mk == "crypto" else 1.0)
+        try:
+            import configparser
+            from stock_gui import INI_PATH
+            cp = configparser.ConfigParser()
+            cp.read(INI_PATH, encoding="utf-8")
+            fin = (cp.get("trade", f"finance_{mk}", fallback="")
+                   or "").strip().lower()
+            if fin in ("0", "false", "no", "off", "否"):
+                return 1.0
+            raw = (cp.get("trade", f"leverage_{mk}", fallback="")
+                   or "").strip()
+            if raw:
+                return max(1.0, min(20.0, float(raw)))
+        except Exception:
+            pass
         try:
             return max(1.0, float(self._settings.get(
                 f"leverage_{mk}", dflt) or dflt))
