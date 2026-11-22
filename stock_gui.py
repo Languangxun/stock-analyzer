@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.8"
+APP_VERSION = "7.5.9"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -355,14 +355,22 @@ class CFG:
                    "futures": False, "crypto": False}
     TRADE_LEVERAGE = {"cn": 1.0, "hk": 1.0, "us": 1.0,
                       "futures": 1.0, "crypto": 1.0}
-    # v7.5.8：波动率自适应杠杆 + 单笔风险预算（ini [trade] adaptive_/riskpct_）。
-    # 加密 7×24 无涨跌停、日内振幅大，固定高杠杆会在极端行情直接爆仓；
-    # 开启后实际杠杆 = min(配置杠杆, 单笔风险% / ATR止损距离%)，
-    # 波动越大杠杆越低，保证止损先于强平触发。默认仅加密开启。
+    # v7.5.8：置信度自适应杠杆（参数取自 quant ai-quant：trading/leverage.py
+    # 与 config/markets.yaml 的 crypto 段，2026-11-22）：
+    #   lev = 1 + (上限杠杆-1) × clip((置信度-conf_lo)/(conf_hi-conf_lo), 0, 1)
+    # 置信度=sm701 概率（空头用 1-概率）；低于 conf_lo 不融资（1×），
+    # 高于 conf_hi 用满设置杠杆。crypto 默认 conf 0.55→0.60（quant 口径）。
     TRADE_ADAPTIVE = {"cn": False, "hk": False, "us": False,
                       "futures": False, "crypto": True}
-    TRADE_RISK_PCT = {"cn": 10.0, "hk": 10.0, "us": 10.0,
-                      "futures": 10.0, "crypto": 10.0}
+    TRADE_CONF_LOW = {"cn": 0.55, "hk": 0.55, "us": 0.55,
+                      "futures": 0.55, "crypto": 0.55}
+    TRADE_CONF_HIGH = {"cn": 0.60, "hk": 0.60, "us": 0.60,
+                       "futures": 0.60, "crypto": 0.60}
+    # v7.5.9：quant 单票基准仓位（占总资产%）。取自 ai-quant：
+    # A股 10仓×10%→10%；港美期 5仓×20%→min(20,96/5)=19.2%；
+    # 加密 3仓×40%→min(40,96/3)=32%。名义敞口=基准×杠杆。
+    TRADE_BASE_PCT = {"cn": 10.0, "hk": 19.2, "us": 19.2,
+                      "futures": 19.2, "crypto": 32.0}
     # v7.5.8：加密 MA60 趋势闸门（ini [trade] trend_crypto）。
     # BUY 需收盘站上 MA60；反向系统开空需收盘跌破 MA60（平仓不受限）。
     # 加密无涨跌停，跌破 MA60 后常出现连续急跌，逆势抄底/追空是主要
@@ -640,10 +648,10 @@ def _load_trade_cfg():
             except (TypeError, ValueError):
                 return dflt
 
-        def gp(key, dflt):
-            """单笔风险预算%，1~50；0 视为关闭。"""
+        def gcf(key, dflt):
+            """置信度阈值，0.05~0.95。"""
             try:
-                return max(1.0, min(50.0, float(cp.get(
+                return max(0.05, min(0.95, float(cp.get(
                     "trade", key, fallback=dflt))))
             except (TypeError, ValueError):
                 return dflt
@@ -657,10 +665,19 @@ def _load_trade_cfg():
                 f"leverage_{mk}", CFG.TRADE_LEVERAGE.get(mk, 1.0))
             CFG.TRADE_ADAPTIVE[mk] = gb(
                 f"adaptive_{mk}", CFG.TRADE_ADAPTIVE.get(mk, False))
-            CFG.TRADE_RISK_PCT[mk] = gp(
-                f"riskpct_{mk}", CFG.TRADE_RISK_PCT.get(mk, 10.0))
+            _lo = gcf(f"conf_lo_{mk}", CFG.TRADE_CONF_LOW.get(mk, 0.55))
+            _hi = gcf(f"conf_hi_{mk}", CFG.TRADE_CONF_HIGH.get(mk, 0.60))
+            CFG.TRADE_CONF_LOW[mk] = _lo
+            CFG.TRADE_CONF_HIGH[mk] = max(
+                _lo + 0.01, _hi)
             CFG.TRADE_TREND[mk] = gb(
                 f"trend_{mk}", CFG.TRADE_TREND.get(mk, False))
+            try:
+                CFG.TRADE_BASE_PCT[mk] = max(0.5, min(100.0, float(cp.get(
+                    "trade", f"basepct_{mk}",
+                    fallback=CFG.TRADE_BASE_PCT.get(mk, 10.0)))))
+            except (TypeError, ValueError):
+                pass
     except Exception:
         log.exception("读取分市场交易配置失败(使用默认)")
 
@@ -675,8 +692,10 @@ def _trade_cfg(full):
         lev = 1.0
     return {"market": mk, "finance": fin, "short": short,
             "adaptive": bool(CFG.TRADE_ADAPTIVE.get(mk, False)),
-            "risk_pct": float(CFG.TRADE_RISK_PCT.get(mk, 10.0) or 0.0),
+            "conf_lo": float(CFG.TRADE_CONF_LOW.get(mk, 0.55)),
+            "conf_hi": float(CFG.TRADE_CONF_HIGH.get(mk, 0.60)),
             "trend": bool(CFG.TRADE_TREND.get(mk, False)),
+            "base_pct": float(CFG.TRADE_BASE_PCT.get(mk, 10.0)),
             "leverage": max(1.0, min(20.0, lev))}
 
 
@@ -7463,21 +7482,85 @@ def _exec_mode():
     return os.environ.get("EXEC_PX", "close").lower()
 
 
+_SIG_CONF_RE = re.compile(r"概率\s*([0-9]*\.?[0-9]+)")
+
+
+def _signal_conf(txt, typ="BUY"):
+    """从 sm701 信号说明解析置信度（概率）；空头用 1-概率（quant 口径）。
+
+    非 sm701 信号没有概率 → None（自适应杠杆时不加杠杆，按 1×）。"""
+    m = _SIG_CONF_RE.search(txt or "")
+    if not m:
+        return None
+    try:
+        p = max(0.0, min(1.0, float(m.group(1))))
+    except ValueError:
+        return None
+    return p if typ != "SELL" else 1.0 - p
+
+
+def _conf_leverage(conf, max_lev, lo=0.55, hi=0.60):
+    """quant 置信度杠杆：lev=1+(max-1)*clip((conf-lo)/(hi-lo),0,1)。"""
+    try:
+        max_lev = max(1.0, min(20.0, float(max_lev or 1.0)))
+        lo = float(lo)
+        hi = max(lo + 1e-9, float(hi))
+        if conf is None:
+            return 1.0
+        x = (float(conf) - lo) / (hi - lo)
+        x = max(0.0, min(1.0, x))
+        return max(1.0, min(20.0, 1.0 + (max_lev - 1.0) * x))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _entry_lev(cfg, typ, txt):
+    """按市场配置 + 信号置信度算实际杠杆；融资关闭/无置信度=1×。"""
+    max_lev = float((cfg or {}).get("leverage") or 1.0)
+    if not (cfg or {}).get("finance"):
+        return 1.0, None
+    if not (cfg or {}).get("adaptive"):
+        return max_lev, _signal_conf(txt, typ)
+    conf = _signal_conf(txt, typ)
+    return _conf_leverage(conf, max_lev,
+                          (cfg or {}).get("conf_lo", 0.55),
+                          (cfg or {}).get("conf_hi", 0.60)), conf
+
+
+def _sig_lev_text(full, typ, txt):
+    """K线买卖点悬停说明：实际杠杆（quant 置信度公式）与调仓成数。"""
+    cfg = _trade_cfg(full)
+    if typ == "SELL" and not cfg.get("short"):
+        return "平多（未开启做空）"
+    lev, conf = _entry_lev(cfg, typ, txt)
+    side = "多" if typ == "BUY" else "空"
+    if not cfg.get("finance"):
+        _bp = float(cfg.get("base_pct") or 10.0) / 10.0
+        return f"{side} 1.0x（未融资）· 调仓至{_bp:.1f}成（名义{_bp:.1f}成）"
+    cs = (f"，置信{conf:.2f}" if conf is not None
+          else "，无概率→1x")
+    base = float(cfg.get("base_pct") or 10.0)
+    return (f"{side} {lev:.1f}x（上限{cfg.get('leverage', 1):g}x{cs}）"
+            f" · 调仓至{base / 10.0:.1f}成（名义{base * lev / 10.0:.1f}成）")
+
+
 def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
-                 market="", adaptive=False, risk_pct=10.0, trend=False):
-    """单段事件回测：支持多头/空头/双向（v7.5.7；v7.5.8 逐笔杠杆）。
+                 market="", adaptive=False, conf_lo=0.55, conf_hi=0.60,
+                 trend=False):
+    """单段事件回测：支持多头/空头/双向（v7.5.7；v7.5.9 逐笔杠杆/重置）。
 
     mode:
       - long  ：BUY 开多 / SELL 平多（原口径）
       - short ：SELL 开空 / BUY 平空；空头收益 = entry/exit - 1
       - both  ：BUY 平空并开多、SELL 平多并开空（反转系统，单账户）
     leverage：配置杠杆上限（融资/杠杆倍数）。
-    adaptive/risk_pct（v7.5.8）：波动率自适应——每笔开仓按 ATR 止损距离
-      反推实际杠杆 = min(leverage, risk_pct% / 止损距离%)，保证止损先于
-      强平；risk_pct 为单笔最大权益损失预算（%，1~50）。
-    爆仓（v7.5.8）：逐笔按实际杠杆含维持保证金 0.5% 计算强平价，持仓
-      期间用 low/high 检查；触发即按强平价平仓、ret_lev=-100%、权益归零
-      并停止后续交易。
+    adaptive/conf_lo/conf_hi（v7.5.9）：置信度自适应——每笔开仓从信号
+      说明解析 sm701 概率，按 quant 口径
+      `lev = 1+(leverage-1)×clip((conf-conf_lo)/(conf_hi-conf_lo),0,1)`
+      计算实际杠杆；空头置信度=1-概率；无概率/融资关闭时 1×。
+    爆仓（v7.5.9）：逐笔按实际杠杆含维持保证金 0.5% 计算强平价，持仓
+      期间用 low/high 检查；触发即按强平价平仓、ret_lev=-100%，随后
+      **净值重置为 1.0** 继续回测（detail.reset=True，curves 标注断点）。
     逐笔：detail 同时给出价格收益 ret 与杠杆后收益 ret_lev；
       trades_list 仍为价格收益（兼容），trades_lev 为杠杆后收益。
     早盘信号：T 日收盘生成、T+1 日收盘成交；止损单用 T-1 日 ATR 设定。
@@ -7490,12 +7573,13 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
     except (TypeError, ValueError):
         lev = 1.0
     try:
-        risk_pct = max(0.0, min(50.0, float(risk_pct or 0.0)))
+        conf_lo = max(0.0, min(0.99, float(conf_lo)))
+        conf_hi = max(conf_lo + 1e-9, min(1.0, float(conf_hi)))
     except (TypeError, ValueError):
-        risk_pct = 0.0
-    adaptive = bool(adaptive and risk_pct > 0)
+        conf_lo, conf_hi = 0.55, 0.60
+    adaptive = bool(adaptive)
     mmr = 0.005             # 维持保证金率：强平价 = 1/lev - mmr
-    # v7.5.8：MA60 趋势闸门（加密默认开；平仓不受限）
+    # v7.5.9：MA60 趋势闸门（加密默认开；平仓不受限）
     ma60 = [None] * n
     if trend:
         run = 0.0
@@ -7506,6 +7590,8 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             if i >= 59:
                 ma60[i] = run / 60.0
     sig_map = {s[0] + 1: s[2] for s in signals if s[0] + 1 < n}
+    sig_txt = {s[0] + 1: (s[3] if len(s) > 3 else "")
+               for s in signals if s[0] + 1 < n}
     atrs = [0.0] * n
     for i in range(14, n):
         atrs[i] = sum(max(rows[j]["high"] - rows[j]["low"],
@@ -7526,27 +7612,26 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
     entry_i = None
     extreme = None          # 多头最高价 / 空头最低价
     trade_lev = lev         # 当前持仓实际杠杆（自适应后）
+    trade_conf = None       # 当前持仓信号置信度
     liq_px = None           # 当前持仓强平价
     trades = []             # 价格收益（兼容）
     trades_lev = []         # 杠杆后收益
     details = []
     curve = []
     liq_count = 0
+    reset_count = 0
     bankrupt = False
 
-    def _eff_lev(i, px):
-        """开仓时的实际杠杆：配置上限 ∩ 单笔风险预算/止损距离。"""
-        lv = lev
-        if adaptive and px:
-            if pct_exit:
-                # 外部策略用显式百分比止损；无止损则不缩放（风险不可估）
-                stop_dist = stop_pct / 100.0 if stop_pct > 0 else 0.0
-            else:
-                atr_prev = atrs[i - 1] if i > 0 else 0.0
-                stop_dist = atr_mult * atr_prev / px
-            if stop_dist > 1e-9:
-                lv = min(lv, risk_pct / 100.0 / stop_dist)
-        return max(1.0, min(20.0, lv))
+    def _eff_lev(i, typ):
+        """开仓实际杠杆：quant 置信度公式，融资关闭/无概率=1×。"""
+        if not adaptive:
+            return lev, _signal_conf(sig_txt.get(i, ""), typ)
+        conf = _signal_conf(sig_txt.get(i, ""), typ)
+        if conf is None:
+            return 1.0, None
+        x = (conf - conf_lo) / max(conf_hi - conf_lo, 1e-9)
+        x = max(0.0, min(1.0, x))
+        return max(1.0, min(20.0, 1.0 + (lev - 1.0) * x)), conf
 
     def _liq_price(px, side, lv):
         """强平价：多 = entry*(1-1/lev+mmr)，空 = entry*(1+1/lev-mmr)。"""
@@ -7555,7 +7640,7 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
         return px * (1.0 + 1.0 / lv - mmr)
 
     def _close(i, px, reason, forced=False):
-        nonlocal eq, pos, entry, entry_i, extreme, trade_lev, liq_px
+        nonlocal eq, pos, entry, entry_i, extreme, trade_lev, liq_px, trade_conf
         if pos == 0 or entry is None or not px:
             return
         side = "多" if pos == 1 else "空"
@@ -7568,11 +7653,13 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             "entry_i": entry_i, "entry_date": rows[entry_i]["date"],
             "entry_px": entry, "exit_i": i, "exit_date": rows[i]["date"],
             "exit_px": px, "ret": ret, "ret_lev": ret_lev,
-            "lev": trade_lev, "liq_px": liq_px, "liq_hit": bool(forced),
+            "lev": trade_lev, "conf": trade_conf,
+            "liq_px": liq_px, "liq_hit": bool(forced), "reset": bool(forced),
             "side": side, "reason": reason})
         pos = 0
         entry = entry_i = extreme = None
         trade_lev = lev
+        trade_conf = None
         liq_px = None
 
     def _long_exit(i, c, h, l, o, prev_ext):
@@ -7629,9 +7716,6 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
         return None, ""
 
     for i, r in enumerate(rows):
-        if bankrupt:
-            curve.append(0.0)
-            continue
         c = r["close"]
         h = r["high"]
         l = r["low"]
@@ -7646,10 +7730,12 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                     (pos == -1 and h >= liq_px)):
                 # 跳空穿过强平价时按开盘价成交（现实更差，亏幅仍封顶 -100%）
                 fill = (min(o, liq_px) if pos == 1 else max(o, liq_px))
-                _close(i, fill, "爆仓", forced=True)
+                _close(i, fill, "爆仓（净值重置）", forced=True)
                 liq_count += 1
-                bankrupt = eq <= 0
-                curve.append(eq)
+                reset_count += 1
+                bankrupt = True
+                curve.append(0.0)
+                eq = 1.0            # 爆仓后净值归 1，继续观察后续信号
                 continue
             # ② 再查策略止损/止盈
             prev_ext = extreme if extreme is not None else entry
@@ -7670,7 +7756,7 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             _trend_ok = (not trend or ma60[i] is None
                          or c >= ma60[i])
             if pos == 0 and mode in ("long", "both") and c and _trend_ok:
-                trade_lev = _eff_lev(i, px_fill)
+                trade_lev, trade_conf = _eff_lev(i, "BUY")
                 liq_px = _liq_price(px_fill, 1, trade_lev)
                 pos, entry, entry_i, extreme = 1, px_fill, i, px_fill
         elif typ == "SELL":
@@ -7679,7 +7765,7 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             _trend_ok = (not trend or ma60[i] is None
                          or c < ma60[i])
             if pos == 0 and mode in ("short", "both") and c and _trend_ok:
-                trade_lev = _eff_lev(i, px_fill)
+                trade_lev, trade_conf = _eff_lev(i, "SELL")
                 liq_px = _liq_price(px_fill, -1, trade_lev)
                 pos, entry, entry_i, extreme = -1, px_fill, i, px_fill
 
@@ -7688,10 +7774,12 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                 (pos == 1 and l <= liq_px) or
                 (pos == -1 and h >= liq_px)):
             fill = (min(o, liq_px) if pos == 1 else max(o, liq_px))
-            _close(i, fill, "爆仓", forced=True)
+            _close(i, fill, "爆仓（净值重置）", forced=True)
             liq_count += 1
-            bankrupt = eq <= 0
-            curve.append(eq)
+            reset_count += 1
+            bankrupt = True
+            curve.append(0.0)
+            eq = 1.0
             continue
 
         if pos == 1:
@@ -7713,7 +7801,8 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             "entry_px": entry, "exit_i": None, "exit_date": None,
             "exit_px": last_c, "ret": floating,
             "ret_lev": trade_lev * floating, "lev": trade_lev,
-            "liq_px": liq_px, "liq_hit": False,
+            "conf": trade_conf, "liq_px": liq_px, "liq_hit": False,
+            "reset": False,
             "side": "多" if pos == 1 else "空", "reason": "持仓中"})
 
     wins = len([t for t in trades if t > 0])
@@ -7748,10 +7837,12 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
         "avg_win_lev": avg_win_lev, "avg_loss_lev": avg_loss_lev,
         "profit_loss_lev": (avg_win_lev / abs(avg_loss_lev)
                             if avg_loss_lev != 0 else float('inf')),
-        "liq_count": liq_count, "bankrupt": bool(bankrupt),
+        "liq_count": liq_count, "reset_count": reset_count,
+        "bankrupt": bool(bankrupt),
         "avg_lev": (sum(eff) / len(eff)) if eff else lev,
         "max_lev": max(eff) if eff else lev,
-        "adaptive": adaptive, "risk_pct": risk_pct, "trend": bool(trend),
+        "adaptive": adaptive, "conf_lo": conf_lo, "conf_hi": conf_hi,
+        "trend": bool(trend),
         "curve": curve, "trades_list": trades, "trades_lev": trades_lev,
         "detail": details, "mode": mode, "market": market,
         "leverage": lev,
@@ -7842,11 +7933,11 @@ def _signal_forward_stats(rows, signals, horizons=(1, 5)):
 
 
 def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
-                  adaptive=False, risk_pct=10.0, trend=False):
-    """单方向回测 + 训练/验证/IC 打包（v7.5.7；v7.5.8 逐笔杠杆）。"""
+                  adaptive=False, conf_lo=0.55, conf_hi=0.60, trend=False):
+    """单方向回测 + 训练/验证/IC 打包（v7.5.7；v7.5.9 逐笔杠杆/重置）。"""
     out = _bt_simulate(rows, signals, rp, mode=mode, leverage=leverage,
-                       market=market, adaptive=adaptive, risk_pct=risk_pct,
-                       trend=trend)
+                       market=market, adaptive=adaptive, conf_lo=conf_lo,
+                       conf_hi=conf_hi, trend=trend)
     n = len(rows)
     split = max(30, int(n * 0.75))
     out["split_i"] = split if 0 < split < n else None
@@ -7858,13 +7949,13 @@ def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
         if tr_sigs:
             out["train"] = _bt_simulate(
                 rows[:split], tr_sigs, rp, mode=mode, leverage=leverage,
-                market=market, adaptive=adaptive, risk_pct=risk_pct,
-                trend=trend)
+                market=market, adaptive=adaptive, conf_lo=conf_lo,
+                conf_hi=conf_hi, trend=trend)
         if va_sigs:
             out["val"] = _bt_simulate(
                 rows[split:], va_sigs, rp, mode=mode, leverage=leverage,
-                market=market, adaptive=adaptive, risk_pct=risk_pct,
-                trend=trend)
+                market=market, adaptive=adaptive, conf_lo=conf_lo,
+                conf_hi=conf_hi, trend=trend)
     inv = mode == "short"
     out["ic1"] = _signal_ic(rows, signals, 1, invert=inv)
     out["ic5"] = _signal_ic(rows, signals, 5, invert=inv)
@@ -7881,8 +7972,8 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
       out["short"] SELL 开空/BUY 平空（市场允许做空时才有）
       out["total"] 反转系统：BUY 平空开多、SELL 平多开空；无做空权限时=多头
     `full` 用于读取分市场 设置→交易/融资（做空/杠杆/自适应）；leverage/
-    allow_short 可显式覆盖（研究脚本）。v7.5.8：逐笔明细含杠杆后收益
-    ret_lev 与强平价；自适应开启时按单笔风险预算压低高波动标的杠杆。
+    allow_short 可显式覆盖（研究脚本）。v7.5.9：逐笔明细含杠杆后收益
+    ret_lev 与强平价；自适应开启时按 quant 置信度公式压低/放大杠杆。
     """
     try:
         if not signals or len(rows) < 30:
@@ -7890,25 +7981,27 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         rp = rp or CFG.risk_params()
         cfg = _trade_cfg(full) if full else {
             "market": "cn", "finance": False, "short": False,
-            "leverage": 1.0, "adaptive": False, "risk_pct": 0.0}
+            "leverage": 1.0, "adaptive": False,
+            "conf_lo": 0.55, "conf_hi": 0.60, "trend": False}
         lev = cfg["leverage"] if leverage is None else max(
             1.0, min(20.0, float(leverage or 1.0)))
         short_ok = (bool(cfg.get("short")) if allow_short is None
                     else bool(allow_short))
         adp = bool(cfg.get("adaptive"))
-        rpct = float(cfg.get("risk_pct") or 0.0)
+        clo = float(cfg.get("conf_lo") or 0.55)
+        chi = float(cfg.get("conf_hi") or 0.60)
         trd = bool(cfg.get("trend"))
         mkt = cfg.get("market") or ""
         long_bt = _bt_pack_side(rows, signals, rp, "long", lev,
-                                market=mkt, adaptive=adp, risk_pct=rpct,
-                                trend=trd)
+                                market=mkt, adaptive=adp, conf_lo=clo,
+                                conf_hi=chi, trend=trd)
         short_bt = (_bt_pack_side(rows, signals, rp, "short", lev,
-                                  market=mkt, adaptive=adp, risk_pct=rpct,
-                                  trend=trd)
+                                  market=mkt, adaptive=adp, conf_lo=clo,
+                                  conf_hi=chi, trend=trd)
                     if short_ok else None)
         total_bt = (_bt_pack_side(rows, signals, rp, "both", lev,
-                                  market=mkt, adaptive=adp, risk_pct=rpct,
-                                  trend=trd)
+                                  market=mkt, adaptive=adp, conf_lo=clo,
+                                  conf_hi=chi, trend=trd)
                     if short_ok else long_bt)
         out = dict(total_bt)
         out["long"] = long_bt
@@ -7917,7 +8010,8 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         out["allow_short"] = short_ok
         out["finance"] = bool(cfg.get("finance"))
         out["adaptive"] = adp
-        out["risk_pct"] = rpct
+        out["conf_lo"] = clo
+        out["conf_hi"] = chi
         out["trend"] = trd
         out["leverage"] = lev
         out["market"] = mkt
@@ -26320,9 +26414,17 @@ class App:
                 f"低{b['low']:.2f} 收{b['close']:.2f}")
             return
         sig_txt = ""
+        _sig_hit = None
         for s_i, _day, s_t, s_txt in self.view["signals"]:
             if s_i == idx:
-                sig_txt = f"  ◆[{'买' if s_t == 'BUY' else '卖'}] {s_txt}"
+                _lev_txt = _sig_lev_text(
+                    (self.res or {}).get("full_code") or "", s_t, s_txt)
+                sig_txt = (f"  ◆[{'买' if s_t == 'BUY' else '卖'}] {s_txt}"
+                           f" | {_lev_txt}")
+                _sig_hit = (s_t, s_txt, _lev_txt)
+        # 悬停买卖点：主图顶部浮动提示（状态栏同时显示）
+        if key == "main":
+            self._draw_sig_tip(cv, sg, idx, _sig_hit)
         pc = bars[idx - 1]["close"] if idx > 0 else (
             self.res["disp_rows"][self.view["off"] - 1]["close"]
             if self.view["off"] > 0 else self.res["prev_close"])
@@ -26333,6 +26435,29 @@ class App:
             f"低{b['low']:.2f} 收{b['close']:.2f} ({chg:+.2f}%) "
             f"量{vol_s}{ind_txt}{sig_txt}")
 
+    def _draw_sig_tip(self, cv, sg, idx, hit):
+        """主图买卖点悬停浮层：实际杠杆 + 调仓成数（v7.5.8）。"""
+        cv.delete("sigtip")
+        if not hit:
+            return
+        s_t, _s_txt, lev_txt = hit
+        txt = f"{'买' if s_t == 'BUY' else '卖'} · {lev_txt}"
+        try:
+            f = tkfont.Font(root=cv, family="Microsoft YaHei", size=9)
+            tw = f.measure(txt)
+        except Exception:
+            tw = len(txt) * 9
+        x = sg["L"] + sg["bw"] * (idx + 0.5)
+        x0 = min(max(x - tw / 2 - 7, sg["L"] + 2), sg["w"] - tw - 16)
+        y0 = sg["T"] + 6
+        cv.create_rectangle(x0, y0, x0 + tw + 14, y0 + 22,
+                            fill=PANEL_BG, outline=C_GOLD,
+                            tags=("sigtip",))
+        cv.create_text(x0 + 7, y0 + 11, text=txt, anchor="w",
+                       fill=FG_MAIN, font=("Microsoft YaHei", 9),
+                       tags=("sigtip",))
+        cv.tag_raise("sigtip")
+
     def _on_leave(self, _event, _key=None):
         self.hover_var.set("")
         self._mtn = None
@@ -26342,6 +26467,7 @@ class App:
                 continue
             c2 = {"main": self.cv_main, "vol": self.cv_vol,
                   "ind": self.cv_ind}[k2]
+            c2.delete("sigtip")
             for it in ("vid", "hid", "pid", "pbg", "did", "dbgd"):
                 c2.itemconfigure(sg2[it], state="hidden")
             sg2["_shown"] = False
@@ -27965,6 +28091,19 @@ class App:
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=C_GOLD, width=2,
                                joinstyle="round", capstyle="round")
+            # 爆仓重置标注（v7.5.8）：净值归 1 的断点，竖虚线 + 文案
+            for _d in (m.get("detail") or []):
+                if not _d.get("reset"):
+                    continue
+                _xi = _d.get("exit_i")
+                if _xi is None or not (0 <= _xi < si):
+                    continue
+                _xr = xm(_xi)
+                cv.create_line(_xr, T + 2, _xr, T + h_eq,
+                               fill=DOWN, dash=(3, 3))
+                cv.create_text(_xr + 3, T + h_eq - 4, text="爆仓重置",
+                               anchor="sw", fill=DOWN,
+                               font=("Microsoft YaHei", 8, "bold"))
             # 交易点：只画训练段 B/S（信号过多时省略点，避免糊成一片）
             sig_pts = [s for s in (bt.get("_signals") or [])
                        if 0 <= s[0] < si]
@@ -28128,9 +28267,8 @@ class App:
                         f"均亏 {_fmt_pct(m.get('avg_loss_lev'), True)}  "
                         f"实际杠杆 均{m.get('avg_lev', 1):.1f}x/"
                         f"高{m.get('max_lev', 1):.1f}x"
-                        + (f"  爆仓 {m.get('liq_count', 0)} 笔"
-                           if m.get("liq_count") else "")
-                        + ("  ⚠已爆仓" if m.get("bankrupt") else "") + "\n")
+                        + (f"  爆仓 {m.get('liq_count', 0)} 笔（净值已重置）"
+                           if m.get("liq_count") else "") + "\n")
 
                 def _side_line(name, x):
                     if not x:
@@ -28141,7 +28279,7 @@ class App:
                             f"（{x.get('wins', 0)}/{x.get('closed', 0)}）"
                             f"  交易 {x.get('trades', 0)}"
                             f"  实际杠杆 {x.get('avg_lev', 1):.1f}x"
-                            + (f"  爆仓 {x.get('liq_count')} 笔"
+                            + (f"  爆仓 {x.get('liq_count')} 笔（已重置）"
                                if x.get("liq_count") else ""))
 
                 _adp = bt.get("adaptive")
@@ -28151,7 +28289,8 @@ class App:
                     "方向汇总（融资 %s，杠杆 %gx%s%s）：\n%s\n%s\n%s\n" % (
                         "开" if bt.get("finance") else "关",
                         float(bt.get("leverage") or 1.0),
-                        (f"，自适应单笔风险 {bt.get('risk_pct', 0):g}%%"
+                        (f"，置信杠杆 {bt.get('conf_lo', 0.55):g}→"
+                         f"{bt.get('conf_hi', 0.60):g}"
                          if _adp else ""),
                         ("，加密 MA60 闸门" if _trd else ""),
                         _side_line("多头", bt.get("long")),
@@ -28209,8 +28348,11 @@ class App:
                         f"总=反转系统（多空不叠加），\n"
                         f"  多头=BUY开/SELL平，空头=SELL开/BUY平；"
                         f"融资关闭时杠杆按 1 倍；\n"
-                        f"  v7.5.8 逐笔=价格收益×实际杠杆，含 0.5% 维持保证金爆仓；"
-                        f"自适应=单笔风险预算/ATR止损距离；\n"
+                        f"  v7.5.8 逐笔=价格收益×实际杠杆，含 0.5% 维持保证金爆仓"
+                        f"（净值重置为1并标注）；\n"
+                        f"  自适应=quant 置信度杠杆 1+(上限-1)×((概率-低)/(高-低))；\n"
+                        f"  回测按满仓权益计算；K线悬停的「调仓至X成」是 quant 单票基准建议；\n"
+                        f"  爆仓后净值重置，区间收益=最近一段、最大回撤含重置前；\n"
                         f"  用所选策略信号，T日收盘信号/T+1成交，"
                         f"退出规则: {_bt_exit_note(rp)}；\n"
                         f"  训练/验证按 val=max(200,n/4) 切分，"
@@ -29589,10 +29731,10 @@ class App:
         # 选中导入策略后：单股买卖点按工坊规则生成，不参与消融、
         # 不使用风险偏好；交易层改用显式止损/止盈/最长持有。
         # ---- 交易/融资（v7.5.7：分市场融资、做空、杠杆；[trade]）
-        # ---- v7.5.8：加密波动率自适应杠杆 + 单笔风险预算 ----
+        # ---- v7.5.8：置信度自适应杠杆（quant 口径）----
         frm = sec_trade
         ttk.Label(frm, text="— 分市场交易/融资（回测与交易记录共用）—").grid(
-            row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
+            row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
         ttk.Label(frm, text="市场").grid(row=1, column=0, sticky="w")
         ttk.Label(frm, text="允许融资/杠杆").grid(row=1, column=1,
                                                    sticky="w", padx=8)
@@ -29602,13 +29744,16 @@ class App:
                                              sticky="w", padx=8)
         ttk.Label(frm, text="自适应").grid(row=1, column=4,
                                            sticky="w", padx=8)
-        ttk.Label(frm, text="单笔风险%").grid(row=1, column=5,
-                                              sticky="w", padx=8)
+        ttk.Label(frm, text="置信低").grid(row=1, column=5,
+                                           sticky="w", padx=8)
+        ttk.Label(frm, text="置信高").grid(row=1, column=6,
+                                           sticky="w", padx=8)
         trade_fin_vars = {}
         trade_short_vars = {}
         trade_lev_vars = {}
         trade_adp_vars = {}
-        trade_risk_vars = {}
+        trade_clo_vars = {}
+        trade_chi_vars = {}
         _trade_mks = (("cn", "A股"), ("hk", "港股"), ("us", "美股"),
                       ("futures", "期货"), ("crypto", "加密"))
         for _r, (_mk, _lab) in enumerate(_trade_mks, start=2):
@@ -29620,8 +29765,10 @@ class App:
                 value=f"{float(CFG.TRADE_LEVERAGE.get(_mk, 1.0)):g}")
             trade_adp_vars[_mk] = tk.BooleanVar(
                 value=bool(CFG.TRADE_ADAPTIVE.get(_mk, False)))
-            trade_risk_vars[_mk] = tk.StringVar(
-                value=f"{float(CFG.TRADE_RISK_PCT.get(_mk, 10.0)):g}")
+            trade_clo_vars[_mk] = tk.StringVar(
+                value=f"{float(CFG.TRADE_CONF_LOW.get(_mk, 0.55)):g}")
+            trade_chi_vars[_mk] = tk.StringVar(
+                value=f"{float(CFG.TRADE_CONF_HIGH.get(_mk, 0.60)):g}")
             ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
                                             pady=2)
             ttk.Checkbutton(frm, text="允许",
@@ -29632,29 +29779,34 @@ class App:
                                 row=_r, column=2, sticky="w", padx=8)
             ttk.Entry(frm, textvariable=trade_lev_vars[_mk],
                       width=8).grid(row=_r, column=3, sticky="w", padx=8)
-            ttk.Checkbutton(frm, text="波动率",
+            ttk.Checkbutton(frm, text="置信",
                             variable=trade_adp_vars[_mk]).grid(
                                 row=_r, column=4, sticky="w", padx=8)
-            ttk.Entry(frm, textvariable=trade_risk_vars[_mk],
-                      width=8).grid(row=_r, column=5, sticky="w", padx=8)
+            ttk.Entry(frm, textvariable=trade_clo_vars[_mk],
+                      width=5).grid(row=_r, column=5, sticky="w", padx=8)
+            ttk.Entry(frm, textvariable=trade_chi_vars[_mk],
+                      width=5).grid(row=_r, column=6, sticky="w", padx=8)
         trade_trend_var = tk.BooleanVar(
             value=bool(CFG.TRADE_TREND.get("crypto", True)))
         ttk.Checkbutton(
             frm, text="加密信号启用 MA60 趋势闸门（BUY 需站上 MA60；"
                       "开空需跌破 MA60；平仓不受限）",
             variable=trade_trend_var).grid(
-                row=9, column=0, columnspan=6, sticky="w", pady=(6, 0))
+                row=9, column=0, columnspan=7, sticky="w", pady=(6, 0))
         ttk.Label(
             frm,
             text="说明：融资关闭时杠杆按 1 倍；做空开启后 K 线显示 空/多，"
                  "回测分别给出多头/空头/总共；A股融券需账户权限。\n"
                  "v7.5.8：回测逐笔=价格收益×实际杠杆，并按 0.5% 维持保证金"
-                 "模拟爆仓（触发后权益归零、停止开仓）；\n"
-                 "「波动率」开启时实际杠杆=min(配置杠杆, 单笔风险%/ATR止损距离%)，"
-                 "波动越大杠杆越低，保证止损先于强平（加密默认开，10%）。\n"
+                 "模拟爆仓（触发后净值重置为 1、继续回测并标注）；\n"
+                 "「置信」开启时实际杠杆=1+(设置杠杆-1)×clip((概率-置信低)/"
+                 "(置信高-置信低))，空头用 1-概率；无概率时 1×。"
+                 "加密默认开、0.55→0.60（quant 口径）。\n"
+                 "单票基准：A股1成、港美期1.92成、加密3.2成"
+                 "（quant 10/5/3 仓口径）；名义敞口=基准×杠杆。\n"
                  "未计融资利息/融券费、跳空穿价与资金费率；杠杆上限 20 倍。",
             foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
-            justify="left").grid(row=10, column=0, columnspan=6,
+            justify="left").grid(row=10, column=0, columnspan=7,
                                  sticky="w", pady=(8, 0))
 
         frm = sec_studio
@@ -30325,20 +30477,28 @@ class App:
                         _lev = float(CFG.TRADE_LEVERAGE.get(_mk, 1.0))
                     _adp = bool(trade_adp_vars[_mk].get())
                     try:
-                        _rpct = max(1.0, min(50.0, float(
-                            trade_risk_vars[_mk].get())))
+                        _clo = max(0.05, min(0.95, float(
+                            trade_clo_vars[_mk].get())))
                     except (ValueError, TypeError):
-                        _rpct = float(CFG.TRADE_RISK_PCT.get(_mk, 10.0))
+                        _clo = float(CFG.TRADE_CONF_LOW.get(_mk, 0.55))
+                    try:
+                        _chi = max(0.05, min(0.95, float(
+                            trade_chi_vars[_mk].get())))
+                    except (ValueError, TypeError):
+                        _chi = float(CFG.TRADE_CONF_HIGH.get(_mk, 0.60))
+                    _chi = max(_clo + 0.01, _chi)
                     CFG.TRADE_FINANCE[_mk] = _fin
                     CFG.TRADE_SHORT[_mk] = _short
                     CFG.TRADE_LEVERAGE[_mk] = _lev
                     CFG.TRADE_ADAPTIVE[_mk] = _adp
-                    CFG.TRADE_RISK_PCT[_mk] = _rpct
+                    CFG.TRADE_CONF_LOW[_mk] = _clo
+                    CFG.TRADE_CONF_HIGH[_mk] = _chi
                     cp.set("trade", f"finance_{_mk}", "1" if _fin else "0")
                     cp.set("trade", f"short_{_mk}", "1" if _short else "0")
                     cp.set("trade", f"leverage_{_mk}", f"{_lev:g}")
                     cp.set("trade", f"adaptive_{_mk}", "1" if _adp else "0")
-                    cp.set("trade", f"riskpct_{_mk}", f"{_rpct:g}")
+                    cp.set("trade", f"conf_lo_{_mk}", f"{_clo:g}")
+                    cp.set("trade", f"conf_hi_{_mk}", f"{_chi:g}")
                     _tn += 1
                 pnotes.append(f"交易/融资x{_tn}"
                               + ("（含做空）"

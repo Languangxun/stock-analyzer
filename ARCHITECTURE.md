@@ -115,7 +115,9 @@
   `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
   `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
   （`[trade] finance_市场 / short_市场 / leverage_市场 / adaptive_市场 /
-  riskpct_市场 / trend_crypto`，v7.5.7 设置→交易/融资；v7.5.8 自适应与趋势闸门；
+  conf_lo_市场 / conf_hi_市场 / basepct_市场 / trend_crypto`，
+  v7.5.7 设置→交易/融资；
+  v7.5.9 置信度杠杆与趋势闸门；
   T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
   （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
 - 涨跌停：`_limit_pct` 非 cn 返回 None（钳制/异常校验自动放行）。
@@ -588,21 +590,30 @@ v7.5.7 多空拆分/杠杆改用 `_bt_simulate(mode=long/short/both)`（见下�
 高对比通用）；`run_bt` 结束 `yview_moveto(0)`，结果文本回到顶部直接展示全期/训练/验证；
 主图 MA 图例按 `cv.bbox` 实际字宽推进（HiDPI 不再重叠）。
 
-**多空拆分 / 杠杆（v7.5.7；v7.5.8 爆仓与自适应）**：设置→交易/融资 按市场配置
+**多空拆分 / 杠杆（v7.5.7；v7.5.9 爆仓重置与置信度杠杆）**：设置→交易/融资 按市场配置
 `finance_市场`（允许融资/杠杆做多）、`short_市场`（允许做空）、
-`leverage_市场`（1~20）、`adaptive_市场`（波动率自适应）、
-`riskpct_市场`（单笔风险预算%）、`trend_crypto`（MA60 趋势闸门），ini `[trade]`；
-默认全关/1 倍保持旧口径，仅 crypto 默认 adaptive=1、riskpct=10、trend=1。
-`_bt_simulate(mode=long|short|both, leverage=, market=, adaptive=, risk_pct=,
-trend=)`：多头 BUY 开/SELL 平；空头 SELL 开/BUY 平（收益 entry/exit−1，
-止损/移动止盈镜像）；both 为反转系统（BUY 平空开多、SELL 平多开空，单账户）。
-**v7.5.8 逐笔杠杆/爆仓**：每笔开仓实际杠杆 `lev_eff=min(配置杠杆,
-风险%/ATR止损距离%)`（外部策略用显式止损%）；强平价
-`entry×(1∓1/lev_eff+0.5%)`，持仓期用 low/high 先于止损检查，触发按
-（跳空时取开盘价）强平价平仓、`ret_lev=-100%`、权益归零并停止后续开仓；
-`detail` 新增 `ret_lev/lev/liq_px/liq_hit`，`trades_lev` 为杠杆后序列
-（`trades_list` 仍为价格收益，兼容研究脚本），指标新增
-`avg_win_lev/avg_loss_lev/profit_loss_lev/liq_count/bankrupt/avg_lev/max_lev`。
+`leverage_市场`（1~20，**上限**）、`adaptive_市场`（置信度自适应）、
+`conf_lo_市场/conf_hi_市场`（置信区间）、`basepct_市场`（单票基准%，
+A股10/港美期19.2/加密32）、`trend_crypto`（MA60 趋势闸门），
+ini `[trade]`；默认全关/1 倍保持旧口径，仅 crypto 默认 adaptive=1、
+conf 0.55→0.60、trend=1。
+`_bt_simulate(mode=long|short|both, leverage=, market=, adaptive=,
+conf_lo=, conf_hi=, trend=)`：多头 BUY 开/SELL 平；空头 SELL 开/BUY 平
+（收益 entry/exit−1，止损/移动止盈镜像）；both 为反转系统（BUY 平空开多、
+SELL 平多开空，单账户）。
+**v7.5.9 逐笔杠杆/爆仓/重置**：每笔开仓从信号说明解析 sm701 概率，
+按 quant `ai-quant/trading/leverage.py` 口径
+`lev=1+(配置杠杆-1)×clip((置信度-conf_lo)/(conf_hi-conf_lo),0,1)`
+（空头置信度=1-概率；融资关闭/无概率=1×）；强平价
+`entry×(1∓1/lev+0.5%)`，持仓期用 low/high 先于止损检查，触发按
+（跳空时取开盘价）强平价平仓、`ret_lev=-100%`，随后**净值重置为 1.0**
+继续回测（`detail.reset=True`，曲线画「爆仓重置」竖虚线）；
+`detail` 新增 `ret_lev/lev/conf/liq_px/liq_hit/reset`，`trades_lev` 为
+杠杆后序列（`trades_list` 仍为价格收益，兼容研究脚本），指标新增
+`avg_win_lev/avg_loss_lev/profit_loss_lev/liq_count/reset_count/avg_lev/max_lev`。
+**K线买卖点悬停**：`_sig_lev_text` 用同一公式算实际杠杆，状态栏与主图
+浮层显示 `多/空 X.Xx（上限 Nx，置信 c）· 调仓至 B 成（名义 E 成）`；
+未融资 1.0x；未开做空的 SELL 显示「平多」。
 **crypto 趋势闸门**：`sm701_ext._sig_sm701` 丢弃收盘跌破 MA60 的 BUY
 （SELL 保留离场），回测层开空同样要求收盘跌破 MA60（平仓不受限）。
 `backtest_signals(..., full=)` 返回 `long/short/combined` 三套（顶栏 `total`
@@ -1426,7 +1437,8 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
-| **v7.5.8**<br>（2026-11-22） | **回测逐笔杠杆 + 爆仓 + 加密自适应/趋势闸门**：`_bt_simulate` 每笔按 `lev_eff=min(配置杠杆, risk_pct%/ATR止损距离%)` 计算实际杠杆，`detail` 增加 `ret_lev/lev/liq_px/liq_hit`、`trades_lev` 与杠杆后盈亏比；按 0.5% 维持保证金用日内 low/high 检查强平，爆仓按（跳空）强平价成交、权益归零并停止开仓；设置→交易/融资新增「自适应/单笔风险%」（ini `adaptive_市场`/`riskpct_市场`）与「加密 MA60 趋势闸门」（`trend_crypto`）；crypto 默认自适应 10%、BUY 需站上 MA60、开空需跌破 MA60（平仓不受限）；信号胜率明细表新增「杠杆/价格收益/杠杆收益」列与爆仓计数；`APP_VERSION=7.5.8`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
+| **v7.5.9**<br>（2026-11-22） | **爆仓净值重置 + quant 置信度杠杆 + 买卖点悬停**：`_bt_simulate` 爆仓后 `ret_lev=-100%`、`reset=True`，净值重置为 1 继续回测；曲线标「爆仓重置」、明细标「爆仓（净值重置）」。自适应杠杆改用 quant `trading/leverage.py` 口径 `1+(上限-1)×clip((概率-conf_lo)/(conf_hi-conf_lo))`，空头用 1-概率，设置倍数为上限；设置→交易/融资「单笔风险%」改为「置信低/高」（`conf_lo_市场/conf_hi_市场`），crypto 默认 0.55→0.60。K线 B/S/多/空悬停显示实际杠杆与「调仓至 B 成（名义 E 成）」（`_sig_lev_text`）。本机 `crypto_hourly.db` 从 quant 快照拷贝/校验并重算日聚合概率（1,223,156 行，至 2026-11-22 06:00 UTC）。`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
+| **v7.5.8**<br>（2026-11-22） | **回测逐笔杠杆 + 爆仓 + 加密趋势闸门**：`_bt_simulate` 每笔按实际杠杆记录 `ret_lev`，按 0.5% 维持保证金用日内 low/high 检查强平；设置→交易/融资新增「自适应」与「加密 MA60 趋势闸门」；crypto 默认自适应、BUY 需站上 MA60、开空需跌破 MA60（平仓不受限）；信号胜率明细表新增「杠杆/价格收益/杠杆收益」列与爆仓计数；`APP_VERSION=7.5.8`，`stock_predict.py` 重新生成 |
 | **v7.5.7**<br>（2026-11-22） | **分市场融资/杠杆 + 多空回测/K线**：设置→交易/融资 按 A股/港股/美股/期货/加密配置 `finance_市场`/`short_市场`/`leverage_市场`（ini `[trade]`，默认关/1倍）；K线多头 B/S，开启做空后 BUY=多（平空）、SELL=空（开空）；`_bt_simulate(mode=long/short/both, leverage=)`，`backtest_signals` 返回 `long/short/combined`（总=反转系统、多空不叠加；顶栏 `total` 仍是数值），工具→信号胜率新增方向下拉与「向」列；交易记录插件同步 `[trade]`；`APP_VERSION=7.5.7`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.6**<br>（2026-11-22） | **加密买点修复 + quant 小时模型本机接入**：定位「无买点」根因——本地 crypto 仅日线 h1/h5/h10 实时复算最近 250 日，状态机在最左沿 BUY 后长期持有；从 quant 机拉取 `prod_crypto_hourly_k24`/`crypto_hourly.db` 到 `~/桌面/sm701`（仓库外、不上传），本机生成 `output/crypto_hourly_daily_probs.csv.gz`；`external/sm701_ext.py` 的 crypto `sm701_prob_map` 优先读该文件，信号 tag 改「sm701小时概率」；BTC 最近 11-06 BUY / 11-14 SELL / 11-15 BUY；`APP_VERSION=7.5.6`，`stock_predict.py` 重新生成；3.4 节与 README/CHANGELOG 同步 |
 | **v7.5.5**<br>（2026-11-22） | **分时并入周期 + 滚轮缩放**：周期下拉统一为 日K/分时/1分/5分/15分/30分/60分，「分时」不再是独立勾选叠加层；数字周期改名「根数」（日K根数/分时窗口根数）；分时 `_minute_window()` 支持滚轮缩放/Shift+滚轮平移/左键拖拽/双击回最新，MACD 与量比在完整窗口计算后切片，缩放不重复联网；A股分时腾讯→东财兜底；`APP_VERSION=7.5.5`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |
