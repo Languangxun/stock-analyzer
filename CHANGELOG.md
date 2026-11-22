@@ -26,7 +26,12 @@
 > 1,223,156 行，2017-08-17 ~ 2026-11-22 06:00 UTC，20 币），
 > 并重算 `output/crypto_hourly_daily_probs.csv.gz`
 > （2023-11-18 ~ 2026-11-22）；库/模型仍在仓库外、不上传；
-> ⑤`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；README/ARCHITECTURE
+> ⑤**修订（同日）**：MA60 闸门改为在 `_dedup_signals` **之后**执行——
+> 若先丢 BUY，连续 SELL 会被压缩成一条 6 月的旧信号，图上近期买卖点
+> 全部消失；现保留被拦截的 BUY 并画空心「B闸」，悬停显示
+> 「MA60 下方·趋势闸门拦截（不交易）」，SELL 正常显示；保存设置后
+> 从 ini 重载 `[trade]`，杠杆/置信参数立即生效；
+> ⑥`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；README/ARCHITECTURE
 > 同步。
 
 > **v7.5.8：回测逐笔杠杆/爆仓 + 加密自适应杠杆与 MA60 闸门（2026-11-22）**：

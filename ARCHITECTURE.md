@@ -614,8 +614,11 @@ SELL 平多开空，单账户）。
 **K线买卖点悬停**：`_sig_lev_text` 用同一公式算实际杠杆，状态栏与主图
 浮层显示 `多/空 X.Xx（上限 Nx，置信 c）· 调仓至 B 成（名义 E 成）`；
 未融资 1.0x；未开做空的 SELL 显示「平多」。
-**crypto 趋势闸门**：`sm701_ext._sig_sm701` 丢弃收盘跌破 MA60 的 BUY
-（SELL 保留离场），回测层开空同样要求收盘跌破 MA60（平仓不受限）。
+**crypto 趋势闸门**：`_crypto_trend_filter` 在 `_dedup_signals` **之后**
+给收盘跌破 MA60 的 BUY 打 `【MA60闸门】` 标记（图上空心「B闸」），
+避免先丢 BUY 导致连续 SELL 被压缩、近期买卖点消失；回测层
+`_bt_simulate(trend=True)` 跳过被拦截 BUY，开空同样要求跌破 MA60
+（平仓不受限）。
 `backtest_signals(..., full=)` 返回 `long/short/combined` 三套（顶栏 `total`
 仍是数值，兼容旧报告），训练/验证/IC 分方向打包；工具→信号胜率新增「方向」
 下拉（总共/多头/空头）、明细表「向/杠杆/价格收益/杠杆收益」列，顶部并排
@@ -1437,7 +1440,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
-| **v7.5.9**<br>（2026-11-22） | **爆仓净值重置 + quant 置信度杠杆 + 买卖点悬停**：`_bt_simulate` 爆仓后 `ret_lev=-100%`、`reset=True`，净值重置为 1 继续回测；曲线标「爆仓重置」、明细标「爆仓（净值重置）」。自适应杠杆改用 quant `trading/leverage.py` 口径 `1+(上限-1)×clip((概率-conf_lo)/(conf_hi-conf_lo))`，空头用 1-概率，设置倍数为上限；设置→交易/融资「单笔风险%」改为「置信低/高」（`conf_lo_市场/conf_hi_市场`），crypto 默认 0.55→0.60。K线 B/S/多/空悬停显示实际杠杆与「调仓至 B 成（名义 E 成）」（`_sig_lev_text`）。本机 `crypto_hourly.db` 从 quant 快照拷贝/校验并重算日聚合概率（1,223,156 行，至 2026-11-22 06:00 UTC）。`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
+| **v7.5.9**<br>（2026-11-22） | **爆仓净值重置 + quant 置信度杠杆 + 买卖点悬停**：`_bt_simulate` 爆仓后 `ret_lev=-100%`、`reset=True`，净值重置为 1 继续回测；曲线标「爆仓重置」、明细标「爆仓（净值重置）」。自适应杠杆改用 quant `trading/leverage.py` 口径 `1+(上限-1)×clip((概率-conf_lo)/(conf_hi-conf_lo))`，空头用 1-概率，设置倍数为上限；设置→交易/融资「单笔风险%」改为「置信低/高」（`conf_lo_市场/conf_hi_市场`），crypto 默认 0.55→0.60。K线 B/S/多/空悬停显示实际杠杆与「调仓至 B 成（名义 E 成）」（`_sig_lev_text`）；MA60 闸门在 `_dedup_signals` 之后标记（空心 B闸），修复连续 SELL 被压缩导致近期无买卖点；保存设置后重载 `[trade]`。本机 `crypto_hourly.db` 从 quant 快照拷贝/校验并重算日聚合概率（1,223,156 行，至 2026-11-22 06:00 UTC）。`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.8**<br>（2026-11-22） | **回测逐笔杠杆 + 爆仓 + 加密趋势闸门**：`_bt_simulate` 每笔按实际杠杆记录 `ret_lev`，按 0.5% 维持保证金用日内 low/high 检查强平；设置→交易/融资新增「自适应」与「加密 MA60 趋势闸门」；crypto 默认自适应、BUY 需站上 MA60、开空需跌破 MA60（平仓不受限）；信号胜率明细表新增「杠杆/价格收益/杠杆收益」列与爆仓计数；`APP_VERSION=7.5.8`，`stock_predict.py` 重新生成 |
 | **v7.5.7**<br>（2026-11-22） | **分市场融资/杠杆 + 多空回测/K线**：设置→交易/融资 按 A股/港股/美股/期货/加密配置 `finance_市场`/`short_市场`/`leverage_市场`（ini `[trade]`，默认关/1倍）；K线多头 B/S，开启做空后 BUY=多（平空）、SELL=空（开空）；`_bt_simulate(mode=long/short/both, leverage=)`，`backtest_signals` 返回 `long/short/combined`（总=反转系统、多空不叠加；顶栏 `total` 仍是数值），工具→信号胜率新增方向下拉与「向」列；交易记录插件同步 `[trade]`；`APP_VERSION=7.5.7`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.6**<br>（2026-11-22） | **加密买点修复 + quant 小时模型本机接入**：定位「无买点」根因——本地 crypto 仅日线 h1/h5/h10 实时复算最近 250 日，状态机在最左沿 BUY 后长期持有；从 quant 机拉取 `prod_crypto_hourly_k24`/`crypto_hourly.db` 到 `~/桌面/sm701`（仓库外、不上传），本机生成 `output/crypto_hourly_daily_probs.csv.gz`；`external/sm701_ext.py` 的 crypto `sm701_prob_map` 优先读该文件，信号 tag 改「sm701小时概率」；BTC 最近 11-06 BUY / 11-14 SELL / 11-15 BUY；`APP_VERSION=7.5.6`，`stock_predict.py` 重新生成；3.4 节与 README/CHANGELOG 同步 |

@@ -7527,9 +7527,39 @@ def _entry_lev(cfg, typ, txt):
                           (cfg or {}).get("conf_hi", 0.60)), conf
 
 
+_TREND_BLOCK = "【MA60闸门】"
+
+
+def _crypto_trend_filter(signals, rows, full):
+    """crypto MA60 趋势闸门（v7.5.10）：压缩后给跌破 MA60 的 BUY 打标记。
+
+    必须在 `_dedup_signals` 之后执行：先丢 BUY 会让连续 SELL 被压缩成一条，
+    图上近期买卖点消失。这里保留 BUY（图上画空心 B + 标注），由
+    `_bt_simulate(trend=True)` 跳过开仓；SELL 保留用于离场。"""
+    if not signals or not rows:
+        return signals
+    if _market_of(full) != "crypto" or not CFG.TRADE_TREND.get("crypto"):
+        return signals
+    out = []
+    for s in signals:
+        s2 = s
+        if s[2] == "BUY" and s[0] < len(rows):
+            i = s[0]
+            if i >= 59:
+                m60 = sum(r.get("close") or 0.0
+                          for r in rows[i - 59:i + 1]) / 60.0
+                if (rows[i].get("close") or 0.0) < m60:
+                    s2 = (s[0], s[1], s[2],
+                          _TREND_BLOCK + (s[3] if len(s) > 3 else ""))
+        out.append(s2)
+    return out
+
+
 def _sig_lev_text(full, typ, txt):
     """K线买卖点悬停说明：实际杠杆（quant 置信度公式）与调仓成数。"""
     cfg = _trade_cfg(full)
+    if (txt or "").startswith(_TREND_BLOCK):
+        return "MA60 下方·趋势闸门拦截（不交易）"
     if typ == "SELL" and not cfg.get("short"):
         return "平多（未开启做空）"
     lev, conf = _entry_lev(cfg, typ, txt)
@@ -8038,7 +8068,7 @@ def strategy_signals_full(rows, strat, industry="", full=""):
         if algo == "sector_rot":
             return _sig_sector_rot(rows, industry=industry)
         if algo == "sm701":
-            return _sig_sm701(rows, full)
+            return _crypto_trend_filter(_sig_sm701(rows, full), rows, full)
         if algo == "analog":
             return _sig_analog(rows, full or None)
         if algo == "studio":
@@ -13237,6 +13267,9 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
             band_note += (f" | 异动触发但相似样本分歧"
                           f"（{analog.get('n', 0)}例），维持原策略")
 
+    # v7.5.10：压缩后再做 crypto MA60 闸门（避免连续 SELL 被 dedup 吞掉）
+    signals = _crypto_trend_filter(signals, disp_rows, full)
+
     vols = [r["vol"] for r in disp_rows]
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
     chips = None
@@ -13517,6 +13550,7 @@ def analyze_finish_signals(res, progress=None):
             res["band_algo"] = res.get("band_algo", "") + \
                 f"（{_why} → 兜底改用多维评分·{sel_mode}）"
             _fb_applied = True
+    signals = _crypto_trend_filter(signals, disp_rows, full)
     res["signals"] = signals
     bt_stats = None
     if len(signals) >= 2:
@@ -25708,15 +25742,19 @@ class App:
                 continue
             x = xs(i)
             if typ == "BUY":
+                _blk = (txt or "").startswith(_TREND_BLOCK)
                 y = ymap(bars[i]["low"]) + 5
                 cv.create_polygon(x, y, x - 5, y + 9, x + 5, y + 9,
-                                  fill=UP, outline="")
-                cv.create_text(x, y + 15, text="B", fill=UP,
+                                  fill=(BG if _blk else UP),
+                                  outline=(AXIS_TXT if _blk else ""))
+                cv.create_text(x, y + 15, text=("B闸" if _blk else "B"),
+                               fill=(AXIS_TXT if _blk else UP),
                                font=("Arial", 8, "bold"))
                 if _short_on:
                     # 空头平仓（多）：同一 BUY 信号的反向含义
                     yc_ = ymap(bars[i]["high"]) - 5
-                    cv.create_text(x, yc_ - 10, text="多", fill=UP,
+                    cv.create_text(x, yc_ - 10, text="多",
+                                   fill=(AXIS_TXT if _blk else UP),
                                    font=("Microsoft YaHei", 8, "bold"))
             else:
                 y = ymap(bars[i]["high"]) - 5
@@ -29771,14 +29809,20 @@ class App:
                 value=f"{float(CFG.TRADE_CONF_HIGH.get(_mk, 0.60)):g}")
             ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
                                             pady=2)
-            ttk.Checkbutton(frm, text="允许",
-                            variable=trade_fin_vars[_mk]).grid(
-                                row=_r, column=1, sticky="w", padx=8)
+            _fin_cb = ttk.Checkbutton(frm, text="允许",
+                                      variable=trade_fin_vars[_mk])
+            _fin_cb.grid(row=_r, column=1, sticky="w", padx=8)
             ttk.Checkbutton(frm, text="允许",
                             variable=trade_short_vars[_mk]).grid(
                                 row=_r, column=2, sticky="w", padx=8)
-            ttk.Entry(frm, textvariable=trade_lev_vars[_mk],
-                      width=8).grid(row=_r, column=3, sticky="w", padx=8)
+            _lev_ent = ttk.Entry(frm, textvariable=trade_lev_vars[_mk],
+                                 width=8)
+            _lev_ent.grid(row=_r, column=3, sticky="w", padx=8)
+            if not trade_fin_vars[_mk].get():
+                _lev_ent.state(["disabled"])
+            _fin_cb.configure(command=(
+                lambda e=_lev_ent, v=trade_fin_vars[_mk]:
+                e.state(["!disabled"] if v.get() else ["disabled"])))
             ttk.Checkbutton(frm, text="置信",
                             variable=trade_adp_vars[_mk]).grid(
                                 row=_r, column=4, sticky="w", padx=8)
@@ -30603,6 +30647,7 @@ class App:
                 globals()["TOPK"] = CFG.TOPK
                 with open(INI_PATH, "w", encoding="utf-8") as f:
                     cp.write(f)
+                _load_trade_cfg()    # 从 ini 重载杠杆/融资/置信参数
             except Exception:
                 log.exception("保存预测参数失败(忽略)")
             self._rebuild_ui()
