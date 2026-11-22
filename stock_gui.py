@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.11"
+APP_VERSION = "7.5.12"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -381,9 +381,10 @@ class CFG:
     # 加密 3仓×40%→min(40,96/3)=32%。名义敞口=基准×杠杆。
     TRADE_BASE_PCT = {"cn": 10.0, "hk": 19.2, "us": 19.2,
                       "futures": 19.2, "crypto": 32.0}
-    # v7.5.10：净值保本强平。净值曾 >1 后回落到 1.0 时，按净值=1 的价格
-    # 强平并停止后续开仓，避免把已有利润回吐成爆仓；ini [trade] breakeven。
-    TRADE_BREAKEVEN = True
+    # v7.5.12：加密最大回撤平仓（仅 crypto）。权益从峰值回撤达到设定%
+    # 时平仓，平仓后权益为新峰值、可继续开仓；0=关闭。
+    # ini [trade] maxdd_crypto。
+    TRADE_MAXDD_CRYPTO = 50.0
     # v7.5.8：加密 MA60 趋势闸门（ini [trade] trend_crypto）。
     # BUY 需收盘站上 MA60；反向系统开空需收盘跌破 MA60（平仓不受限）。
     # 加密无涨跌停，跌破 MA60 后常出现连续急跌，逆势抄底/追空是主要
@@ -699,9 +700,13 @@ def _load_trade_cfg():
                 _lo + 0.01, _hi)
             CFG.TRADE_TREND[mk] = gb(
                 f"trend_{mk}", CFG.TRADE_TREND.get(mk, False))
-            if mk == "cn":
-                CFG.TRADE_BREAKEVEN = gb(
-                    "breakeven", CFG.TRADE_BREAKEVEN)
+            if mk == "crypto":
+                try:
+                    CFG.TRADE_MAXDD_CRYPTO = max(0.0, min(
+                        95.0, float(cp.get("trade", "maxdd_crypto",
+                                           fallback=CFG.TRADE_MAXDD_CRYPTO))))
+                except (TypeError, ValueError):
+                    pass
             try:
                 CFG.TRADE_BASE_PCT[mk] = max(0.5, min(100.0, float(cp.get(
                     "trade", f"basepct_{mk}",
@@ -725,7 +730,8 @@ def _trade_cfg(full):
             "conf_lo": float(CFG.TRADE_CONF_LOW.get(mk, 0.55)),
             "conf_hi": float(CFG.TRADE_CONF_HIGH.get(mk, 0.60)),
             "trend": bool(CFG.TRADE_TREND.get(mk, False)),
-            "breakeven": bool(CFG.TRADE_BREAKEVEN),
+            "maxdd": (float(CFG.TRADE_MAXDD_CRYPTO)
+                      if mk == "crypto" else 0.0),
             "base_pct": float(CFG.TRADE_BASE_PCT.get(mk, 10.0)),
             "leverage": max(1.0, min(20.0, lev))}
 
@@ -7665,7 +7671,7 @@ def _sig_lev_text(full, typ, txt, date=None):
 
 def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                  market="", adaptive=False, conf_lo=0.55, conf_hi=0.60,
-                 trend=False, breakeven=True, sm702_mults=None):
+                 trend=False, maxdd=0.0, sm702_mults=None):
     """单段事件回测：支持多头/空头/双向（v7.5.7；v7.5.9 逐笔杠杆/重置）。
 
     mode:
@@ -7673,8 +7679,8 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
       - short ：SELL 开空 / BUY 平空；空头收益 = entry/exit - 1
       - both  ：BUY 平空并开多、SELL 平多并开空（反转系统，单账户）
     leverage：配置杠杆上限（融资/杠杆倍数）。
-    breakeven（v7.5.10）：净值曾 >1 后回落到 1.0 时按净值=1 强平并停止
-      后续开仓（保本线），避免利润回吐后继续走到爆仓。
+    maxdd（v7.5.12）：**仅 crypto** 生效。权益从峰值回撤达到 maxdd%（默认
+      50）时，按回撤阈值对应的价格平仓并停止后续开仓；0=关闭。
     adaptive/conf_lo/conf_hi（v7.5.9）：置信度自适应——每笔开仓从信号
       说明解析 sm701 概率，按 quant 口径
       `lev = 1+(leverage-1)×clip((conf-conf_lo)/(conf_hi-conf_lo),0,1)`
@@ -7741,8 +7747,8 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
     curve = []
     liq_count = 0
     reset_count = 0
-    be_count = 0
-    be_halt = False
+    dd_count = 0
+    dd_hit = False
     peak_eq = 1.0
     bankrupt = False
 
@@ -7786,7 +7792,7 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             "exit_px": px, "ret": ret, "ret_lev": ret_lev,
             "lev": trade_lev, "conf": trade_conf,
             "liq_px": liq_px, "liq_hit": bool(forced), "reset": bool(forced),
-            "breakeven": ("保本" in (reason or "")),
+            "maxdd": ("回撤" in (reason or "")),
             "side": side, "reason": reason})
         pos = 0
         entry = entry_i = extreme = None
@@ -7848,9 +7854,6 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
         return None, ""
 
     for i, r in enumerate(rows):
-        if be_halt:
-            curve.append(eq)
-            continue
         c = r["close"]
         h = r["high"]
         l = r["low"]
@@ -7875,9 +7878,8 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                 eq = 1.0            # 爆仓后净值归 1，继续观察后续信号
                 peak_eq = 1.0
                 continue
-            # ② 净值保本强平：峰值曾 >1，回落到 1.0 时按净值=1 平仓
-            if breakeven:
-                # 峰值按收盘权益确认（避免同一根K线先冲高后回落就误触发）
+            # ② 加密最大回撤平仓：仅 crypto；峰值按收盘权益确认
+            if market == "crypto" and maxdd > 0:
                 if pos == 1:
                     peak_eq = max(peak_eq,
                                   eq * (1.0 + trade_lev * (c / entry - 1.0)))
@@ -7886,24 +7888,26 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
                     peak_eq = max(peak_eq,
                                   eq * (1.0 + trade_lev * (1.0 - c / entry)))
                     bad_eq = eq * (1.0 + trade_lev * (1.0 - h / entry))
-                if peak_eq > 1.0 + 1e-9 and bad_eq <= 1.0 and eq > 0:
+                stop_eq = peak_eq * (1.0 - maxdd / 100.0)
+                if peak_eq > 0 and bad_eq <= stop_eq and eq > 0:
                     if pos == 1:
-                        be_px = entry * (1.0 + (1.0 / eq - 1.0) / trade_lev)
+                        dd_px = entry * (1.0 + (stop_eq / eq - 1.0)
+                                          / trade_lev)
                     else:
-                        be_px = entry / (1.0 + (1.0 / eq - 1.0) / trade_lev)
+                        dd_px = entry / (1.0 + (stop_eq / eq - 1.0)
+                                          / trade_lev)
                     eq0 = eq
-                    _close(i, be_px, "保本强平（净值1.0）")
-                    # 规则口径：净值封顶为 1.0（跳空穿价也按 1.0 记）
-                    tgt = (1.0 / eq0 - 1.0) if eq0 > 0 else -1.0
-                    tgt = max(-1.0, min(1.0, tgt))
+                    _close(i, dd_px, f"回撤{maxdd:g}%平仓")
+                    tgt = (stop_eq / eq0 - 1.0) if eq0 > 0 else -1.0
+                    tgt = max(-1.0, min(0.0, tgt))
                     if trades_lev:
                         trades_lev[-1] = tgt
                     if details:
                         details[-1]["ret_lev"] = tgt
-                    eq = 1.0
-                    be_count += 1
-                    be_halt = True
-                    peak_eq = 1.0
+                    eq = max(0.0, stop_eq)
+                    dd_count += 1
+                    dd_hit = True
+                    peak_eq = eq      # 以平仓后权益为新峰值，可继续开仓
                     curve.append(eq)
                     continue
             # ③ 再查策略止损/止盈
@@ -7976,7 +7980,7 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
             "exit_px": last_c, "ret": floating,
             "ret_lev": trade_lev * floating, "lev": trade_lev,
             "conf": trade_conf, "liq_px": liq_px, "liq_hit": False,
-            "reset": False, "breakeven": False,
+            "reset": False, "maxdd": False,
             "side": "多" if pos == 1 else "空", "reason": "持仓中"})
 
     wins = len([t for t in trades if t > 0])
@@ -8012,12 +8016,12 @@ def _bt_simulate(rows, signals, rp, mode="long", leverage=1.0,
         "profit_loss_lev": (avg_win_lev / abs(avg_loss_lev)
                             if avg_loss_lev != 0 else float('inf')),
         "liq_count": liq_count, "reset_count": reset_count,
-        "be_count": be_count, "be_halt": bool(be_halt),
+        "dd_count": dd_count, "dd_hit": bool(dd_hit),
         "bankrupt": bool(bankrupt),
         "avg_lev": (sum(eff) / len(eff)) if eff else lev,
         "max_lev": max(eff) if eff else lev,
         "adaptive": adaptive, "conf_lo": conf_lo, "conf_hi": conf_hi,
-        "trend": bool(trend), "breakeven": bool(breakeven),
+        "trend": bool(trend), "maxdd": float(maxdd),
         "curve": curve, "trades_list": trades, "trades_lev": trades_lev,
         "detail": details, "mode": mode, "market": market,
         "leverage": lev,
@@ -8109,11 +8113,11 @@ def _signal_forward_stats(rows, signals, horizons=(1, 5)):
 
 def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
                   adaptive=False, conf_lo=0.55, conf_hi=0.60, trend=False,
-                  breakeven=True, sm702_mults=None):
+                  maxdd=0.0, sm702_mults=None):
     """单方向回测 + 训练/验证/IC 打包（v7.5.7；v7.5.9 逐笔杠杆/重置）。"""
     out = _bt_simulate(rows, signals, rp, mode=mode, leverage=leverage,
                        market=market, adaptive=adaptive, conf_lo=conf_lo,
-                       conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                       conf_hi=conf_hi, trend=trend, maxdd=maxdd,
                        sm702_mults=sm702_mults)
     n = len(rows)
     split = max(30, int(n * 0.75))
@@ -8127,13 +8131,13 @@ def _bt_pack_side(rows, signals, rp, mode, leverage, market="",
             out["train"] = _bt_simulate(
                 rows[:split], tr_sigs, rp, mode=mode, leverage=leverage,
                 market=market, adaptive=adaptive, conf_lo=conf_lo,
-                conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                conf_hi=conf_hi, trend=trend, maxdd=maxdd,
                 sm702_mults=sm702_mults)
         if va_sigs:
             out["val"] = _bt_simulate(
                 rows[split:], va_sigs, rp, mode=mode, leverage=leverage,
                 market=market, adaptive=adaptive, conf_lo=conf_lo,
-                conf_hi=conf_hi, trend=trend, breakeven=breakeven,
+                conf_hi=conf_hi, trend=trend, maxdd=maxdd,
                 sm702_mults=sm702_mults)
     inv = mode == "short"
     out["ic1"] = _signal_ic(rows, signals, 1, invert=inv)
@@ -8162,7 +8166,7 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
             "market": "cn", "finance": False, "short": False,
             "leverage": 1.0, "adaptive": False,
             "conf_lo": 0.55, "conf_hi": 0.60, "trend": False,
-            "breakeven": True}
+            "maxdd": 0.0}
         lev = cfg["leverage"] if leverage is None else max(
             1.0, min(20.0, float(leverage or 1.0)))
         short_ok = (bool(cfg.get("short")) if allow_short is None
@@ -8171,7 +8175,7 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         clo = float(cfg.get("conf_lo") or 0.55)
         chi = float(cfg.get("conf_hi") or 0.60)
         trd = bool(cfg.get("trend"))
-        bev = bool(cfg.get("breakeven", True))
+        dd = float(cfg.get("maxdd") or 0.0)
         mkt = cfg.get("market") or ""
         smm = {}
         if CFG.SM702_ON and mkt == "crypto":
@@ -8189,16 +8193,16 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
                 log.exception("sm702 倍数映射失败(忽略)")
         long_bt = _bt_pack_side(rows, signals, rp, "long", lev,
                                 market=mkt, adaptive=adp, conf_lo=clo,
-                                conf_hi=chi, trend=trd, breakeven=bev,
+                                conf_hi=chi, trend=trd, maxdd=dd,
                                 sm702_mults=smm)
         short_bt = (_bt_pack_side(rows, signals, rp, "short", lev,
                                   market=mkt, adaptive=adp, conf_lo=clo,
-                                  conf_hi=chi, trend=trd, breakeven=bev,
+                                  conf_hi=chi, trend=trd, maxdd=dd,
                                 sm702_mults=smm)
                     if short_ok else None)
         total_bt = (_bt_pack_side(rows, signals, rp, "both", lev,
                                   market=mkt, adaptive=adp, conf_lo=clo,
-                                  conf_hi=chi, trend=trd, breakeven=bev,
+                                  conf_hi=chi, trend=trd, maxdd=dd,
                                 sm702_mults=smm)
                     if short_ok else long_bt)
         out = dict(total_bt)
@@ -8211,7 +8215,7 @@ def backtest_signals(rows, signals, rp=None, full="", leverage=None,
         out["conf_lo"] = clo
         out["conf_hi"] = chi
         out["trend"] = trd
-        out["breakeven"] = bev
+        out["maxdd"] = dd
         out["sm702"] = bool(CFG.SM702_ON and mkt == "crypto")
         out["leverage"] = lev
         out["market"] = mkt
@@ -28394,17 +28398,15 @@ class App:
             # 而消融选型用的是近1000根；若拿全历史(可达2400根)切分，
             # 训练段会落在策略数据起点之前（如 L2 行业ETF 2024 才有数据）
             # → 训练集恒空、曲线一条水平线（688012/002491 实测）。
-            rows_bt = res["disp_rows"]
-            if res.get("has_live"):
-                rows_bt = rows_bt[:-1]   # 与消融一致：盘中假K不计入回测
-            if len(rows_bt) > ABL_BARS:
-                rows_bt = rows_bt[-ABL_BARS:]
+            # v7.5.12：回测窗口现生成——不复用 analyze 的 disp_rows/signals
+            # 缓存；后台线程重新取最新日K并重算信号（get_daily 会按新鲜度
+            # 决定是否补拉，窗口始终按当前数据生成）。
+            rows_bt = list(res["disp_rows"])   # 兜底（取数失败时）
             try:
                 info = get_stock_info(res["full_code"]) or {}
                 industry = info.get("industry") or ""
             except Exception:
                 industry = ""
-            fallback_sigs = res.get("signals") or []
             win._bt_busy = True
             try:
                 btn_bt.config(state="disabled")
@@ -28417,10 +28419,19 @@ class App:
                              "复算，约1~3分钟，期间界面可正常使用）\n")
 
             def worker():
+                nonlocal rows_bt
+                try:
+                    fresh = get_daily(res["full_code"])
+                    if fresh and len(fresh) >= 30:
+                        rows_bt = fresh
+                except Exception:
+                    log.exception("回测现取日K失败(用分析快照兜底)")
+                if res.get("has_live") and rows_bt:
+                    rows_bt = rows_bt[:-1]   # 盘中假K不计入回测
+                if len(rows_bt) > ABL_BARS:
+                    rows_bt = rows_bt[-ABL_BARS:]
                 sig_use = strategy_signals_full(rows_bt, strat, industry,
                                                 full=res["full_code"])
-                if not sig_use:
-                    sig_use = fallback_sigs
                 bt = backtest_signals(rows_bt, sig_use, rp=rp,
                                       full=res["full_code"])
                 if bt:
@@ -28428,6 +28439,7 @@ class App:
                     # 一次算好；顶栏=总共，方向下拉只切图表/明细。
                     bt["_signals"] = sig_use
                     bt["_rows"] = rows_bt
+                    bt["_fresh"] = True
                 return bt
 
             def done(bt, err):
@@ -28469,7 +28481,8 @@ class App:
                             f"\n  ── {title} ──{extra}\n  {why}\n")
                         return
                     bt_result.insert("end",
-                        f"\n  ── {title} ──{extra}\n"
+                        f"\n  ── {title} ──{extra}"
+                        f"{'  （现生成）' if m.get('_fresh') or bt.get('_fresh') else ''}\n"
                         f"  交易 {m['trades']} 次（已平仓 {m['closed']}）  "
                         f"胜率 {_fmt_pct(m.get('winrate'))}"
                         f"（{m['wins']}/{m['closed']}）\n"
@@ -28486,8 +28499,9 @@ class App:
                         f"高{m.get('max_lev', 1):.1f}x"
                         + (f"  爆仓 {m.get('liq_count', 0)} 笔（净值已重置）"
                            if m.get("liq_count") else "")
-                        + (f"  保本强平 {m.get('be_count')} 笔（停止开仓）"
-                           if m.get("be_count") else "") + "\n")
+                        + (f"  回撤{m.get('maxdd', 0):g}%平仓 "
+                           f"{m.get('dd_count')} 笔"
+                           if m.get("dd_count") else "") + "\n")
 
                 def _side_line(name, x):
                     if not x:
@@ -28500,8 +28514,9 @@ class App:
                             f"  实际杠杆 {x.get('avg_lev', 1):.1f}x"
                             + (f"  爆仓 {x.get('liq_count')} 笔（已重置）"
                                if x.get("liq_count") else "")
-                            + (f"  保本强平 {x.get('be_count')} 笔"
-                               if x.get("be_count") else ""))
+                            + (f"  回撤{x.get('maxdd', 0):g}%平仓 "
+                               f"{x.get('dd_count')} 笔"
+                               if x.get("dd_count") else ""))
 
                 _adp = bt.get("adaptive")
                 _trd = bt.get("trend")
@@ -28574,7 +28589,8 @@ class App:
                         f"  自适应=quant 置信度杠杆 1+(上限-1)×((概率-低)/(高-低))；\n"
                         f"  回测按满仓权益计算；K线悬停的「调仓至X成」是 quant 单票基准建议；\n"
                         f"  爆仓后净值重置，区间收益=最近一段、最大回撤含重置前；\n"
-                        f"  保本强平：净值曾>1 后回落到 1.0 时按净值=1 平仓并停止开仓；\n"
+                        f"  回撤平仓：仅 crypto，权益从峰值回撤达到设置%时"
+                        f"平仓（可继续开仓）；\n"
                         f"  用所选策略信号，T日收盘信号/T+1成交，"
                         f"退出规则: {_bt_exit_note(rp)}；\n"
                         f"  训练/验证按 val=max(200,n/4) 切分，"
@@ -30008,11 +30024,16 @@ class App:
                       "开空需跌破 MA60；平仓不受限）",
             variable=trade_trend_var).grid(
                 row=9, column=0, columnspan=7, sticky="w", pady=(6, 0))
-        trade_be_var = tk.BooleanVar(value=bool(CFG.TRADE_BREAKEVEN))
-        ttk.Checkbutton(
-            frm, text="净值曾>1 后回落到 1.0 时保本强平，并停止后续开仓",
-            variable=trade_be_var).grid(
-                row=10, column=0, columnspan=7, sticky="w")
+        trade_dd_var = tk.StringVar(value=f"{CFG.TRADE_MAXDD_CRYPTO:g}")
+        ttk.Label(frm, text="加密回撤平仓%").grid(
+            row=10, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=trade_dd_var, width=8).grid(
+            row=10, column=1, sticky="w", padx=8, pady=(6, 0))
+        ttk.Label(frm, text="0=关闭；仅 crypto；权益从峰值回撤达到此值"
+                            "平仓并停止开仓（默认50）",
+                  foreground=AXIS_TXT).grid(
+                      row=10, column=2, columnspan=5, sticky="w",
+                      pady=(6, 0))
         ttk.Label(
             frm,
             text="说明：融资关闭时杠杆按 1 倍；做空开启后 K 线显示 空/多，"
@@ -30024,7 +30045,8 @@ class App:
                  "加密默认开、0.55→0.60（quant 口径）。\n"
                  "单票基准：A股1成、港美期1.92成、加密3.2成"
                  "（quant 10/5/3 仓口径）；名义敞口=基准×杠杆。\n"
-                 "保本强平：净值曾>1 后回落到 1.0 时按净值=1 平仓并停止开仓。\n"
+                 "回撤平仓：仅加密，权益从峰值回撤达到设定%时平仓并停止开仓"
+                 "（0=关闭，默认50）。\n"
                  "未计融资利息/融券费、跳空穿价与资金费率；杠杆上限 20 倍。",
             foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
             justify="left").grid(row=11, column=0, columnspan=7,
@@ -30832,9 +30854,13 @@ class App:
                 CFG.TRADE_TREND["crypto"] = bool(trade_trend_var.get())
                 cp.set("trade", "trend_crypto",
                        "1" if CFG.TRADE_TREND["crypto"] else "0")
-                CFG.TRADE_BREAKEVEN = bool(trade_be_var.get())
-                cp.set("trade", "breakeven",
-                       "1" if CFG.TRADE_BREAKEVEN else "0")
+                try:
+                    CFG.TRADE_MAXDD_CRYPTO = max(0.0, min(
+                        95.0, float(trade_dd_var.get())))
+                except (ValueError, TypeError):
+                    CFG.TRADE_MAXDD_CRYPTO = 50.0
+                cp.set("trade", "maxdd_crypto",
+                       f"{CFG.TRADE_MAXDD_CRYPTO:g}")
                 # 外部策略（存 [studio]；v6.6.0）
                 if not cp.has_section("studio"):
                     cp.add_section("studio")

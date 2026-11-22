@@ -115,7 +115,7 @@
   `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
   `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
   （`[trade] finance_市场 / short_市场 / leverage_市场 / adaptive_市场 /
-  conf_lo_市场 / conf_hi_市场 / basepct_市场 / breakeven /
+  conf_lo_市场 / conf_hi_市场 / basepct_市场 / maxdd_crypto /
   trend_crypto`，v7.5.7 设置→交易/融资；
   v7.5.9 置信度杠杆与趋势闸门；
   T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
@@ -614,11 +614,11 @@ SELL 平多开空，单账户）。
 **K线买卖点悬停**：`_sig_lev_text` 用同一公式算实际杠杆，状态栏与主图
 浮层显示 `多/空 X.Xx（上限 Nx，置信 c）· 调仓至 B 成（名义 E 成）`；
 未融资 1.0x；未开做空的 SELL 显示「平多」。
-**净值保本强平（v7.5.10）**：`_bt_simulate(breakeven=True)` 跟踪收盘权益
-峰值；峰值 >1 后回落到 1.0 时，按 `1+(1/eq−1)/lev`（空头取倒数）算
-净值=1 的价格强平，记录「保本强平（净值1.0）」并 `be_halt=True`
-停止后续开仓；爆仓重置时峰值重置为 1。开关 ini `[trade] breakeven`
-（设置→交易/融资，默认开）。
+**加密回撤平仓（v7.5.12）**：`_bt_simulate(maxdd=)` **仅 `market=="crypto"`**
+生效（A股/港美期传 0）；跟踪收盘权益峰值，权益回撤达到 maxdd%（默认 50）
+时按阈值权益对应的价格平仓，记录「回撤N%平仓」（`dd_count/dd_hit`），
+以平仓后权益为新峰值、**可继续开仓**；爆仓重置时峰值重置为 1。
+ini `[trade] maxdd_crypto`（设置→交易/融资，0=关闭）。
 
 **sm702 止损否决（v7.5.11）**：`external/sm701_ext.py` 只读
 `~/桌面/sm702/outputs_crypto/` 的 walk-forward 预测与最新信号，
@@ -1457,6 +1457,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.12**<br>（2026-11-22） | **加密回撤平仓 + 回测现生成**：删除 v7.5.10 净值保本强平（会过早停手导致曲线平），改为仅 crypto 的最大回撤平仓——权益从峰值回撤达到 maxdd%（默认 50，ini `[trade] maxdd_crypto`）时平仓，`dd_count/dd_hit`，以平仓后权益为新峰值可继续开仓；A股/港美期不生效；工具→信号胜率回测改为后台 `get_daily` 现取日K、现算信号，不复用 `analyze` 的 `disp_rows/signals` 缓存（结果标「现生成」）；`APP_VERSION=7.5.12`，`stock_predict.py` 重新生成 |
 | **v7.5.11**<br>（2026-11-22） | **sm702 止损否决 + sm 设置外部策略页**：`external/sm701_ext.py` 只读 `~/桌面/sm702/outputs_crypto/predictions_wf.csv.gz`/`latest_signals.csv`，新增 `sm702_pred_map/sm702_mult/sm702_veto`；crypto BUY 连续 N 日 top-q 止损概率或胜率不足时标「【sm702否决】」（图空心 B否、回测跳过），有效信号按 sm702 胜率乘仓位倍数；设置→外部策略页新增 sm702 开关与 q/persist/mult_scale/mult_max/min_rate，sm701 开关与买/卖阈同页（ini `[predict] sm702_*`/`sm701_buy|sell`）；`APP_VERSION=7.5.11`，`stock_predict.py` 重新生成 |
 | **v7.5.10**<br>（2026-11-22） | **净值保本强平**：`_bt_simulate(breakeven=True)` 跟踪权益峰值，曾 >1 后回落到 1.0 时按净值=1 的价格强平并停止后续开仓（`be_count/be_halt`，明细「保本强平（净值1.0）」）；排在普通止损前，爆仓重置时峰值重置；设置→交易/融资新增开关（ini `[trade] breakeven`，默认开）；`APP_VERSION=7.5.10`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.9**<br>（2026-11-22） | **爆仓净值重置 + quant 置信度杠杆 + 买卖点悬停**：`_bt_simulate` 爆仓后 `ret_lev=-100%`、`reset=True`，净值重置为 1 继续回测；曲线标「爆仓重置」、明细标「爆仓（净值重置）」。自适应杠杆改用 quant `trading/leverage.py` 口径 `1+(上限-1)×clip((概率-conf_lo)/(conf_hi-conf_lo))`，空头用 1-概率，设置倍数为上限；设置→交易/融资「单笔风险%」改为「置信低/高」（`conf_lo_市场/conf_hi_市场`），crypto 默认 0.55→0.60。K线 B/S/多/空悬停显示实际杠杆与「调仓至 B 成（名义 E 成）」（`_sig_lev_text`）；MA60 闸门在 `_dedup_signals` 之后标记（空心 B闸），修复连续 SELL 被压缩导致近期无买卖点；保存设置后重载 `[trade]`。本机 `crypto_hourly.db` 从 quant 快照拷贝/校验并重算日聚合概率（1,223,156 行，至 2026-11-22 06:00 UTC）。`APP_VERSION=7.5.9`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
