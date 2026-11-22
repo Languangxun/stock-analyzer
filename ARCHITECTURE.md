@@ -114,7 +114,8 @@
   > **sm70x 直出**（`sm701_paths(market)` 生产集
   `prod_{cn|hk|us|fut|crypto}_h{1,5,10}_tech.txt` + 各市场样本外预测文件；
   `_sm701_live_one` 同源行情实时复算）> 多维评分（无模型/无数据时回退并标注）；- **分市场配置**：自选池 `[watchlist] codes_市场`；交易账本 `{市场}:{实盘|模拟}`
-  （`[trade] finance_市场 / short_市场 / leverage_市场`，v7.5.7 设置→交易/融资；
+  （`[trade] finance_市场 / short_市场 / leverage_市场 / adaptive_市场 /
+  riskpct_市场 / trend_crypto`，v7.5.7 设置→交易/融资；v7.5.8 自适应与趋势闸门；
   T+1/整手仅 A股）；指标参数 `[inds_市场]` 覆盖
   （`INDP()` 线程本地上下文，analyze/run_ablation 入口设置）；
 - 涨跌停：`_limit_pct` 非 cn 返回 None（钳制/异常校验自动放行）。
@@ -587,16 +588,27 @@ v7.5.7 多空拆分/杠杆改用 `_bt_simulate(mode=long/short/both)`（见下�
 高对比通用）；`run_bt` 结束 `yview_moveto(0)`，结果文本回到顶部直接展示全期/训练/验证；
 主图 MA 图例按 `cv.bbox` 实际字宽推进（HiDPI 不再重叠）。
 
-**多空拆分 / 杠杆（v7.5.7）**：设置→交易/融资 按市场配置
+**多空拆分 / 杠杆（v7.5.7；v7.5.8 爆仓与自适应）**：设置→交易/融资 按市场配置
 `finance_市场`（允许融资/杠杆做多）、`short_市场`（允许做空）、
-`leverage_市场`（1~20），ini `[trade]`；默认全关/1 倍保持旧口径。
-`_bt_simulate(mode=long|short|both, leverage=)`：多头 BUY 开/SELL 平；
-空头 SELL 开/BUY 平（收益 entry/exit−1，止损/移动止盈镜像）；both 为
-反转系统（BUY 平空开多、SELL 平多开空，单账户）；杠杆只放大权益曲线，
-`trades/detail` 仍为价格收益。`backtest_signals(..., full=)` 返回
-`long/short/combined` 三套（顶栏 `total` 仍是数值，兼容旧报告），训练/验证/IC 分方向
-打包；工具→信号胜率新增「方向」下拉（总共/多头/空头），明细表增加「向」列，
-顶部并排显示三向全期收益/胜率/交易数。A股默认不融资不做空；
+`leverage_市场`（1~20）、`adaptive_市场`（波动率自适应）、
+`riskpct_市场`（单笔风险预算%）、`trend_crypto`（MA60 趋势闸门），ini `[trade]`；
+默认全关/1 倍保持旧口径，仅 crypto 默认 adaptive=1、riskpct=10、trend=1。
+`_bt_simulate(mode=long|short|both, leverage=, market=, adaptive=, risk_pct=,
+trend=)`：多头 BUY 开/SELL 平；空头 SELL 开/BUY 平（收益 entry/exit−1，
+止损/移动止盈镜像）；both 为反转系统（BUY 平空开多、SELL 平多开空，单账户）。
+**v7.5.8 逐笔杠杆/爆仓**：每笔开仓实际杠杆 `lev_eff=min(配置杠杆,
+风险%/ATR止损距离%)`（外部策略用显式止损%）；强平价
+`entry×(1∓1/lev_eff+0.5%)`，持仓期用 low/high 先于止损检查，触发按
+（跳空时取开盘价）强平价平仓、`ret_lev=-100%`、权益归零并停止后续开仓；
+`detail` 新增 `ret_lev/lev/liq_px/liq_hit`，`trades_lev` 为杠杆后序列
+（`trades_list` 仍为价格收益，兼容研究脚本），指标新增
+`avg_win_lev/avg_loss_lev/profit_loss_lev/liq_count/bankrupt/avg_lev/max_lev`。
+**crypto 趋势闸门**：`sm701_ext._sig_sm701` 丢弃收盘跌破 MA60 的 BUY
+（SELL 保留离场），回测层开空同样要求收盘跌破 MA60（平仓不受限）。
+`backtest_signals(..., full=)` 返回 `long/short/combined` 三套（顶栏 `total`
+仍是数值，兼容旧报告），训练/验证/IC 分方向打包；工具→信号胜率新增「方向」
+下拉（总共/多头/空头）、明细表「向/杠杆/价格收益/杠杆收益」列，顶部并排
+显示三向全期收益/胜率/交易数与爆仓次数。A股默认不融资不做空；
 交易记录插件 `_acc_leverage` 同步读取 `[trade]`（finance=0 强制 1 倍）。
 
 **交易明细子页（v6.3.3）**：`_bt_events` 新增可选 `detail_out`——逐笔记录
@@ -1414,6 +1426,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.8**<br>（2026-11-22） | **回测逐笔杠杆 + 爆仓 + 加密自适应/趋势闸门**：`_bt_simulate` 每笔按 `lev_eff=min(配置杠杆, risk_pct%/ATR止损距离%)` 计算实际杠杆，`detail` 增加 `ret_lev/lev/liq_px/liq_hit`、`trades_lev` 与杠杆后盈亏比；按 0.5% 维持保证金用日内 low/high 检查强平，爆仓按（跳空）强平价成交、权益归零并停止开仓；设置→交易/融资新增「自适应/单笔风险%」（ini `adaptive_市场`/`riskpct_市场`）与「加密 MA60 趋势闸门」（`trend_crypto`）；crypto 默认自适应 10%、BUY 需站上 MA60、开空需跌破 MA60（平仓不受限）；信号胜率明细表新增「杠杆/价格收益/杠杆收益」列与爆仓计数；`APP_VERSION=7.5.8`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.7**<br>（2026-11-22） | **分市场融资/杠杆 + 多空回测/K线**：设置→交易/融资 按 A股/港股/美股/期货/加密配置 `finance_市场`/`short_市场`/`leverage_市场`（ini `[trade]`，默认关/1倍）；K线多头 B/S，开启做空后 BUY=多（平空）、SELL=空（开空）；`_bt_simulate(mode=long/short/both, leverage=)`，`backtest_signals` 返回 `long/short/combined`（总=反转系统、多空不叠加；顶栏 `total` 仍是数值），工具→信号胜率新增方向下拉与「向」列；交易记录插件同步 `[trade]`；`APP_VERSION=7.5.7`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.6**<br>（2026-11-22） | **加密买点修复 + quant 小时模型本机接入**：定位「无买点」根因——本地 crypto 仅日线 h1/h5/h10 实时复算最近 250 日，状态机在最左沿 BUY 后长期持有；从 quant 机拉取 `prod_crypto_hourly_k24`/`crypto_hourly.db` 到 `~/桌面/sm701`（仓库外、不上传），本机生成 `output/crypto_hourly_daily_probs.csv.gz`；`external/sm701_ext.py` 的 crypto `sm701_prob_map` 优先读该文件，信号 tag 改「sm701小时概率」；BTC 最近 11-06 BUY / 11-14 SELL / 11-15 BUY；`APP_VERSION=7.5.6`，`stock_predict.py` 重新生成；3.4 节与 README/CHANGELOG 同步 |
 | **v7.5.5**<br>（2026-11-22） | **分时并入周期 + 滚轮缩放**：周期下拉统一为 日K/分时/1分/5分/15分/30分/60分，「分时」不再是独立勾选叠加层；数字周期改名「根数」（日K根数/分时窗口根数）；分时 `_minute_window()` 支持滚轮缩放/Shift+滚轮平移/左键拖拽/双击回最新，MACD 与量比在完整窗口计算后切片，缩放不重复联网；A股分时腾讯→东财兜底；`APP_VERSION=7.5.5`，`stock_predict.py` 重新生成；3.13 节与 README/CHANGELOG 同步 |

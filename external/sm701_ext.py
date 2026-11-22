@@ -1254,9 +1254,27 @@ def _sig_sm701_from_probs(rows, probs, tag="sm701"):
     return out
 
 
+def _crypto_trend_gate_on():
+    """加密 MA60 趋势闸门开关（v7.5.8；读宿主 CFG，缺省开）。"""
+    cfg = (_HOST or {}).get("CFG")
+    try:
+        return bool((getattr(cfg, "TRADE_TREND", None) or {}).get(
+            "crypto", True))
+    except Exception:
+        return True
+
+
+def _ma_at(rows, i, n):
+    if i + 1 < n:
+        return None
+    return sum(r.get("close") or 0.0 for r in rows[i - n + 1:i + 1]) / n
+
+
 def _sig_sm701(rows, full, **_kw):
     """sm701 概率信号（外接算法直出，A股消融候选亦用此口径）：
-    概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。"""
+    概率 ≥0.55 触发 BUY、<0.50 触发 SELL（滞回），同一方向不重复。
+    v7.5.8：crypto 开启趋势闸门时，收盘跌破 MA60 的 BUY 丢弃（不抄底），
+    SELL 保留（平仓/离场不受限；开空闸门在回测层同口径判断）。"""
     if not rows or not full:
         return []
     try:
@@ -1264,8 +1282,19 @@ def _sig_sm701(rows, full, **_kw):
     except Exception:
         log.exception("sm701 单股概率读取失败")
         return []
-    tag = "sm701小时" if _market_of(full) == "crypto" else "sm701"
-    return _sig_sm701_from_probs(rows, probs, tag=tag)
+    mk = _market_of(full)
+    tag = "sm701小时" if mk == "crypto" else "sm701"
+    sigs = _sig_sm701_from_probs(rows, probs, tag=tag)
+    if mk == "crypto" and _crypto_trend_gate_on():
+        kept = []
+        for s in sigs:
+            if s[2] == "BUY":
+                m60 = _ma_at(rows, s[0], 60)
+                if m60 and (rows[s[0]].get("close") or 0.0) < m60:
+                    continue
+            kept.append(s)
+        sigs = kept
+    return sigs
 
 
 # ---- 外接算法开关辅助（该市场是否有 sm701 生产模型集）----
