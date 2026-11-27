@@ -871,6 +871,11 @@ class TradeLogPlugin(StockPlugin):
                 self._save_data()
                 self._refresh_list()
                 win.destroy()
+                # v7.5.16：新记录的成本点立即标上主图
+                try:
+                    self.api.rerender()
+                except Exception:
+                    pass
             except ValueError:
                 messagebox.showwarning("提示", "请输入有效的价格和数量",
                                        parent=win)
@@ -911,6 +916,11 @@ class TradeLogPlugin(StockPlugin):
                     break
         self._save_data()
         self._refresh_list()
+        # v7.5.16：删除记录后同步移除主图成本点
+        try:
+            self.api.rerender()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 设置

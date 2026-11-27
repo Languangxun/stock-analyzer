@@ -48,6 +48,10 @@ class PluginAPI:
         """在状态栏显示一条文本。"""
         self.on_ui_thread(lambda: self._app.progress_var.set(text))
 
+    def rerender(self):
+        """主图重绘（v7.5.16）：插件改数据后刷新K线（如成本点标记）。"""
+        self.on_ui_thread(self._app._rerender)
+
     # ------------------------------------------------------------------
     # 主题
     # ------------------------------------------------------------------

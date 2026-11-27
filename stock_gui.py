@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.15"
+APP_VERSION = "7.5.16"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -25831,6 +25831,29 @@ class App:
         cv.tag_raise(g["pid"])
         g["_shown"] = False
 
+    def _trade_marks(self, code):
+        """交易记录标记数据（v7.5.16）：从交易记录插件取该代码全部记录
+        （实盘+模拟合并，按 日期/方向/价格/数量 去重），供主图灰色
+        B/S 成本点标注。无插件/无记录返回 []。"""
+        code = (code or "").strip().lower()
+        if not code:
+            return []
+        out, seen = [], set()
+        for p in getattr(self, "_plugins", []) or []:
+            recs = getattr(p, "_records", None)
+            if not isinstance(recs, list):
+                continue
+            for r in recs:
+                if (r.get("code") or "").strip().lower() != code:
+                    continue
+                key = (r.get("date"), r.get("type"), r.get("price"),
+                       r.get("volume"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(r)
+        return out
+
     def _draw_main(self):
         cv, v = self.cv_main, self.view
         cv.delete("all")
@@ -26047,6 +26070,28 @@ class App:
                     yc_ = ymap(bars[i]["low"]) + 5
                     cv.create_text(x, yc_ + 10, text="空", fill=DOWN,
                                    font=("Microsoft YaHei", 8, "bold"))
+
+        # 交易记录成本点（v7.5.16）：灰色 B/S 标在记录日 K 线的成交价上
+        # （哪一日买的/卖的、成本多少一眼可见；灰色小圈+字母，
+        # 与红绿信号三角区分；价格超出视野不画）
+        _marks = self._trade_marks((self.res or {}).get("full_code") or "")
+        if _marks:
+            _didx = {b.get("date"): i for i, b in enumerate(bars)}
+            for r in _marks:
+                i = _didx.get(str(r.get("date") or ""))
+                try:
+                    px = float(r.get("price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if i is None or px <= 0 or not (lo <= px <= hi):
+                    continue
+                x = xs(i)
+                py = ymap(px)
+                lab = "B" if r.get("type") == "BUY" else "S"
+                cv.create_oval(x - 2, py - 2, x + 2, py + 2,
+                               fill="", outline=AXIS_TXT)
+                cv.create_text(x + 6, py, text=lab, fill=AXIS_TXT,
+                               anchor="w", font=("Arial", 8, "bold"))
 
         if not bars:
             return
