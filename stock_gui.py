@@ -114,7 +114,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.12"
+APP_VERSION = "7.5.14"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -23188,7 +23188,8 @@ class App:
                 "每档策略由 quant 侧全市场消融选型；CSV 只发布验证集指标，"
                 "训练期显示为 “-”\n"
                 "推荐档=当前风险偏好匹配档（无匹配取验证年化最高）；"
-                "以下胜率/年化/回撤均为【验证集】样本外数据。")
+                "以下胜率/年化/回撤均为【验证集】样本外数据。\n"
+                "本机正在后台重算该股完整消融，完成后自动用本地结果刷新本窗。")
         else:
             _head = (
                 f"基于近{abl['bars']}个交易日回测选策略 "
@@ -23331,6 +23332,57 @@ class App:
             win.focus_force()
         except Exception:
             log.exception("策略弹窗布局失败")
+
+        # v7.4.3：quant 批次只带验证集指标（训练期显示“-”）——弹窗打开后
+        # 本机再算一遍完整消融（近1000日，与「重选策略」同引擎），完成后
+        # 若用户仍开着该弹窗，用本地结果重开补齐训练期/牛熊评分。
+        if ((abl or {}).get("source") == "quant"
+                and getattr(CFG, "LOCAL_ABLATION", True)
+                and not studio_active_strategy()):
+            ttk.Label(btns, text="本机消融计算中，完成后自动刷新…",
+                      foreground=AXIS_TXT).pack(side="left", padx=6)
+            self._popup_local_recompute(res, win)
+
+    def _popup_local_recompute(self, res, win):
+        """quant 批次弹窗的本机补算（v7.4.3）：后台跑单股 run_ablation，
+        完成后若用户仍开着该弹窗且未切换股票，销毁旧弹窗并用本地结果
+        重开（本地结果含训练期指标与牛熊评分，recommend 为本地训练集
+        Calmar 最优档）。local_ablation=0 / 外部策略启用时不补算。"""
+        full = res["full_code"]
+        if getattr(self, "_popup_recompute_for", "") == full:
+            return
+        self._popup_recompute_for = full
+
+        def work():
+            try:
+                idx_rows = get_daily("sh000001")
+            except Exception:
+                idx_rows = None
+            bars = res["disp_rows"][:-1] if res.get("has_live") \
+                else res["disp_rows"]
+            return run_ablation(full, bars, idx_rows=idx_rows,
+                                progress=self._progress)
+
+        def done(r, e):
+            self._popup_recompute_for = ""
+            cur = self.res
+            if e or not r:
+                if e:
+                    self.progress_var.set(f"本机消融补算失败: {e}")
+                return
+            if not cur or cur.get("full_code") != full:
+                return                  # 已切换股票：结果照常落缓存
+            try:
+                if not win.winfo_exists():
+                    return              # 用户已关弹窗/已应用，不打扰
+            except Exception:
+                return
+            self._last_ablation = r
+            self._last_ablation_for = full
+            self.progress_var.set("本机消融完成，已用本地结果刷新弹窗")
+            self._show_strategy_popup(cur, r)
+
+        self._run_bg(work, done)
 
     def _rerun_strategy(self):
         """手动重选：打开「全部组合」策略窗口（v6.3.3）。

@@ -9,6 +9,9 @@
 - 真实费用：佣金（含最低 5 元）+ 印花税（仅卖出）+ 过户费（仅沪市）
   + 可选滑点（计入费用）
 - 持仓实时显示现价/市值/浮动盈亏/今仓（T+1）标记
+- 卖出单已实现盈亏（相对当时持仓成本）入列着色：A股红盈绿亏，
+  港美期密按国际习惯绿盈红亏；汇总行含已实现盈亏合计
+- 分市场融资杠杆（每个市场各自倍数，宿主 ini [trade] 优先）
 - 联动开关：可选是否把账户资金提供给荐股/信号联动（联动固定使用实盘）
 - 账户净值收益曲线（逐交易日：现金 + 持仓按当日收盘市值）
 - AI 分析（基于当前账本持仓与记录）
@@ -25,6 +28,8 @@ from .base import StockPlugin
 
 ACCOUNTS = (("live", "实盘"), ("sim", "模拟"))
 DEFAULT_CAPITAL_SIM = 1000000.0     # 模拟盘默认本金 100 万
+MARKET_NAMES = {"cn": "A股", "hk": "港股", "us": "美股",
+                "futures": "期货", "crypto": "加密"}
 
 
 def _code_market(code):
@@ -144,6 +149,13 @@ class TradeLogPlugin(StockPlugin):
     def _acc_market(self, acc):
         return (acc or "").split(":")[0] or "cn"
 
+    def _acc_name(self, acc):
+        """账本显示名（v7.5.14）：如「A股实盘」「加密模拟」。"""
+        mk = self._acc_market(acc)
+        mode = (acc or "").split(":")[-1]
+        return (f"{MARKET_NAMES.get(mk, mk)}"
+                f"{dict(ACCOUNTS).get(mode, '')}")
+
     def _acc_leverage(self, acc):
         """该账本市场杠杆（购买力倍数；1=无杠杆）。
 
@@ -193,6 +205,31 @@ class TradeLogPlugin(StockPlugin):
         recs = [r for r in self._records
                 if r.get("account", "live") == acc]
         return sorted(recs, key=lambda r: (r.get("date", ""), r.get("code", "")))
+
+    def _realized_pnls(self, acc):
+        """按日期重放算每笔卖出的已实现盈亏（v7.5.14）。
+
+        相对**当时**持仓平均成本（成本含买入费用），卖出费用计入；
+        返回 {id(rec): pnl}；无持仓对应的孤儿卖出不含。"""
+        out = {}
+        hold = {}               # code -> {"vol": 持仓, "cost": 总成本}
+        for rec in self._recs(acc):
+            code = rec.get("code", "")
+            vol = int(rec.get("volume", 0) or 0)
+            price = float(rec.get("price", 0) or 0)
+            fee = float(rec.get("fee", 0) or 0)
+            h = hold.get(code)
+            if rec.get("type") == "SELL":
+                if h and h["vol"] > 0:
+                    avg = h["cost"] / h["vol"]
+                    out[id(rec)] = (price - avg) * vol - fee
+                    h["vol"] -= vol
+                    h["cost"] -= avg * vol
+            else:
+                h = hold.setdefault(code, {"vol": 0, "cost": 0.0})
+                h["vol"] += vol
+                h["cost"] += price * vol + fee
+        return out
 
     def _calc_fee(self, price, volume, is_sell=False, code=""):
         """真实费用：佣金(含最低) + 滑点；印花税/过户费仅 A股（沪市过户）。
@@ -409,7 +446,7 @@ class TradeLogPlugin(StockPlugin):
         acc_frame = tk.Frame(self._frame, bg=c["DARK_BG"])
         acc_frame.pack(fill="x", padx=6, pady=(0, 2))
         self._wl_market_lab = tk.Label(
-            acc_frame, text=f"账本（{_code_market('cn')}）:",
+            acc_frame, text="账本：",
             bg=c["DARK_BG"], fg=c["AXIS_TXT"],
             font=("Microsoft YaHei", 9))
         self._wl_market_lab.pack(side="left")
@@ -446,7 +483,8 @@ class TradeLogPlugin(StockPlugin):
         list_frame = tk.Frame(self._frame, bg=c["DARK_BG"])
         list_frame.pack(fill="both", expand=True, padx=6, pady=2)
 
-        columns = ("date", "code", "name", "type", "price", "volume", "fee")
+        columns = ("date", "code", "name", "type", "price", "volume", "fee",
+                   "pnl")
         self._tree = ttk.Treeview(
             list_frame, columns=columns, show="headings", height=8)
 
@@ -457,6 +495,7 @@ class TradeLogPlugin(StockPlugin):
         self._tree.heading("price", text="价格")
         self._tree.heading("volume", text="数量")
         self._tree.heading("fee", text="费用")
+        self._tree.heading("pnl", text="盈亏")
 
         self._tree.column("date", width=70)
         self._tree.column("code", width=65)
@@ -465,6 +504,7 @@ class TradeLogPlugin(StockPlugin):
         self._tree.column("price", width=50)
         self._tree.column("volume", width=45)
         self._tree.column("fee", width=45)
+        self._tree.column("pnl", width=62)
 
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical",
                                   command=self._tree.yview)
@@ -490,13 +530,36 @@ class TradeLogPlugin(StockPlugin):
         self._refresh_list()
 
     def _refresh_list(self):
-        """刷新交易记录列表。"""
+        """刷新交易记录列表（v7.5.14 分市场着色）：
+        卖出单按**当时**持仓成本算已实现盈亏并着色——A股沿用国内习惯
+        （盈利红字/亏损绿字），港股/美股/期货/加密按国际习惯反过来
+        （盈利绿字/亏损红字）；买入单与打平单用默认色。"""
         for item in self._tree.get_children():
             self._tree.delete(item)
 
         acc = self._view_acc()
+        mk = self._acc_market(acc)
+        c = self.api.colors()
+        win_c, loss_c = ((c["UP"], c["DOWN"]) if mk == "cn"
+                         else (c["DOWN"], c["UP"]))
+        self._tree.tag_configure("win", foreground=win_c)
+        self._tree.tag_configure("loss", foreground=loss_c)
+        try:
+            self._wl_market_lab.config(
+                text=f"账本（{MARKET_NAMES.get(mk, mk)}·"
+                     f"{dict(ACCOUNTS).get(acc.split(':')[-1], '')}）：")
+        except Exception:
+            pass
+
+        pnl_map = self._realized_pnls(acc)
         for rec in reversed(self._recs(acc)):
-            self._tree.insert("", "end", values=(
+            pnl = pnl_map.get(id(rec))
+            tags = ()
+            if pnl is not None and pnl > 0:
+                tags = ("win",)
+            elif pnl is not None and pnl < 0:
+                tags = ("loss",)
+            self._tree.insert("", "end", tags=tags, values=(
                 rec.get("date", ""),
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -504,6 +567,7 @@ class TradeLogPlugin(StockPlugin):
                 rec.get("price", ""),
                 rec.get("volume", ""),
                 rec.get("fee", ""),
+                "" if pnl is None else f"{pnl:+,.2f}",
             ))
 
         self._highlight_acc_btn()
@@ -568,18 +632,23 @@ class TradeLogPlugin(StockPlugin):
         total_sell = sum(r.get("volume", 0) * r.get("price", 0)
                          for r in recs if r.get("type") == "SELL")
         total_fee = sum(r.get("fee", 0) for r in recs)
+        realized = sum(self._realized_pnls(acc).values())
         text = (f"累计买入：{total_buy:.0f}元 | 累计卖出：{total_sell:.0f}元 | "
-                f"累计费用：{total_fee:.2f}元 | 记录 {len(recs)} 笔")
+                f"累计费用：{total_fee:.2f}元 | "
+                f"已实现盈亏：{realized:+,.2f}元 | 记录 {len(recs)} 笔")
         try:
             self._summary_label.config(text=text)
         except Exception:
             pass
 
     def _update_capital_label(self):
-        """本金/现金/市值/总资产显示（当前账本）。"""
+        """本金/现金/市值/总资产显示（当前账本；融资时带杠杆倍数与购买力）。"""
         acc = self._view_acc()
-        name = dict(ACCOUNTS).get(acc, acc)
+        name = self._acc_name(acc)
         capital = self._capital(acc)
+        lev = self._acc_leverage(acc)
+        lev_txt = (f"（融资{lev:g}×·购买力¥{capital * lev:,.0f}）"
+                   if lev > 1.0 else "")
         cash, positions = self._positions_detail(acc)
         try:
             if capital <= 0:
@@ -595,7 +664,7 @@ class TradeLogPlugin(StockPlugin):
             pnl = total - capital
             pct = pnl / capital * 100 if capital else 0.0
             self._cap_label.config(
-                text=f"{name} | 本金 ¥{capital:,.0f} | 现金 ¥{cash:,.0f} | "
+                text=f"{name} | 本金 ¥{capital:,.0f}{lev_txt} | 现金 ¥{cash:,.0f} | "
                      f"持仓市值 ¥{mv:,.0f} | 总资产 ¥{total:,.0f} "
                      f"({pnl:+,.0f}, {pct:+.2f}%)")
         except Exception:
@@ -604,7 +673,7 @@ class TradeLogPlugin(StockPlugin):
     def _set_capital(self):
         """设置当前账本本金。"""
         acc = self._view_acc()
-        name = dict(ACCOUNTS).get(acc, acc)
+        name = self._acc_name(acc)
         cur = self._capital(acc)
         val = simpledialog.askfloat(
             f"{name}本金",
@@ -832,11 +901,13 @@ class TradeLogPlugin(StockPlugin):
                  font=("Microsoft YaHei", 10, "bold")).grid(
                      row=0, column=0, columnspan=2, pady=(0, 8))
 
-        def _add(r, label, key, note=""):
+        def _add(r, label, key, note="", init=None):
             tk.Label(form, text=label, bg=c["DARK_BG"], fg=c["FG_MAIN"],
                      font=("Microsoft YaHei", 9)).grid(
                          row=r, column=0, sticky="e", pady=4)
-            var = tk.StringVar(value=str(self._settings.get(key, "")))
+            var = tk.StringVar(
+                value=str(self._settings.get(key, ""))
+                if init is None else str(init))
             tk.Entry(form, textvariable=var, width=20,
                      font=("Microsoft YaHei", 9)).grid(row=r, column=1,
                                                        pady=4)
@@ -859,6 +930,27 @@ class TradeLogPlugin(StockPlugin):
         cap_sim_var = _add(12, "模拟本金(元)：", "capital_sim",
                            f"（模拟盘默认 {DEFAULT_CAPITAL_SIM:,.0f}）")
 
+        # ---- 分市场融资杠杆（v7.5.14：每个市场各自倍数）----
+        tk.Label(form, text="— 分市场融资杠杆（账本购买力倍数）—",
+                 bg=c["DARK_BG"], fg=c["FG_MAIN"],
+                 font=("Microsoft YaHei", 10, "bold")).grid(
+                     row=15, column=0, columnspan=2, pady=(12, 4))
+        lev_vars = {}
+        _lev_dflt = {"cn": "1", "hk": "1", "us": "1",
+                     "futures": "10", "crypto": "5"}
+        for i, mk in enumerate(("cn", "hk", "us", "futures", "crypto")):
+            note = ("（1=不融资；宿主 设置→交易/融资 已设置时以宿主为准）"
+                    if mk == "cn" else "")
+            lev_vars[mk] = _add(16 + i, f"{MARKET_NAMES[mk]}杠杆倍数：",
+                                f"leverage_{mk}", note,
+                                init=self._settings.get(f"leverage_{mk}")
+                                or _lev_dflt[mk])
+        tk.Label(form, text="融资开启后买入校验按 本金×杠杆 算购买力；"
+                            "上限 20 倍（期货默认10、加密默认5）",
+                 bg=c["DARK_BG"], fg=c["AXIS_TXT"],
+                 font=("Microsoft YaHei", 8)).grid(
+                     row=21, column=0, columnspan=2, sticky="w")
+
         link_var = tk.BooleanVar(value=bool(
             self._settings.get("link_analysis", True)))
         tk.Checkbutton(form, text="参与信号联动（荐股/每日组合按实盘资金计算手数；"
@@ -868,7 +960,7 @@ class TradeLogPlugin(StockPlugin):
                        activeforeground=c["FG_MAIN"],
                        selectcolor=c["FIELD_BG"],
                        font=("Microsoft YaHei", 9)).grid(
-                           row=14, column=0, columnspan=2, sticky="w", pady=4)
+                           row=22, column=0, columnspan=2, sticky="w", pady=4)
 
         def on_save():
             try:
@@ -882,6 +974,9 @@ class TradeLogPlugin(StockPlugin):
                     0.0, float(cap_live_var.get() or 0))
                 self._settings["capital_sim"] = max(
                     0.0, float(cap_sim_var.get() or 0))
+                for mk, var in lev_vars.items():
+                    self._settings[f"leverage_{mk}"] = max(
+                        1.0, min(20.0, float(var.get() or 1)))
                 self._settings["link_analysis"] = bool(link_var.get())
                 self._save_data()
                 self._update_capital_label()
@@ -891,7 +986,7 @@ class TradeLogPlugin(StockPlugin):
                 messagebox.showwarning("提示", "请输入有效的数值", parent=win)
 
         btn_frame = tk.Frame(form, bg=c["DARK_BG"])
-        btn_frame.grid(row=15, column=0, columnspan=2, pady=(12, 0))
+        btn_frame.grid(row=23, column=0, columnspan=2, pady=(12, 0))
 
         tk.Button(btn_frame, text="保存", command=on_save,
                   bg=c["BTN_BG"], fg=c["BTN_FG"],
@@ -990,7 +1085,7 @@ class TradeLogPlugin(StockPlugin):
     def _show_equity_dialog(self):
         c = self.api.colors()
         acc = self._view_acc()
-        name = dict(ACCOUNTS).get(acc, acc)
+        name = self._acc_name(acc)
         win = tk.Toplevel(self._frame)
         win.title(f"账户收益曲线 · {name}")
         win.configure(bg=c["DARK_BG"])
@@ -1291,7 +1386,7 @@ class TradeLogPlugin(StockPlugin):
 
         def _build_prompt():
             acc = self._view_acc()
-            name = dict(ACCOUNTS).get(acc, acc)
+            name = self._acc_name(acc)
             _, positions = self._positions_detail(acc)
             pos_out = {}
             for code, p in positions.items():
