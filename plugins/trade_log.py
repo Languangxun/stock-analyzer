@@ -109,6 +109,25 @@ class TradeLogPlugin(StockPlugin):
                 self._settings["capital_sim"] = DEFAULT_CAPITAL_SIM
         except Exception:
             pass
+        # v7.5.15：入库市场纠偏——记录账本按**代码所属市场**重算
+        # （v7.0.1~v7.5.14 按录入时的宿主市场模式落账，A股股票在加密/
+        # 美股等模式下录入会被误记进其他市场账本，导致“数据不见了”）。
+        try:
+            fixed_n = 0
+            for r in self._records:
+                acc = str(r.get("account") or "cn:live")
+                mk = _code_market(str(r.get("code") or ""))
+                mode = acc.split(":")[-1] if ":" in acc else "live"
+                if mode not in ("live", "sim"):
+                    mode = "live"
+                fixed = f"{mk}:{mode}"
+                if acc != fixed:
+                    r["account"] = fixed
+                    fixed_n += 1
+            if fixed_n:
+                self._save_data()
+        except Exception:
+            pass
 
     def _save_data(self):
         try:
@@ -362,6 +381,11 @@ class TradeLogPlugin(StockPlugin):
                 "last_price": px or None,
                 "market_value": round(px * p["volume"], 2) if px else None,
                 "today_buy": int(p.get("today_vol", 0)),
+                # v7.5.15：浮动盈亏%（金额），AI/联动可直接读
+                "pnl": (round((px - p["avg_cost"]) * p["volume"], 2)
+                        if px else None),
+                "pnl_pct": (round((px / p["avg_cost"] - 1) * 100, 2)
+                            if px and p["avg_cost"] else None),
             }
             if px:
                 mv += px * p["volume"]
@@ -819,8 +843,13 @@ class TradeLogPlugin(StockPlugin):
                         parent=win)
                     return
 
-                acc = self._view_acc()
                 is_sell = typ == "SELL"
+                # v7.5.15：按**代码所属市场**落账（此前按录入时界面市场
+                # 模式，A股股票在加密/美股模式下录入会记错账本）；
+                # 实盘/模拟仍跟随面板当前切换。
+                acc = "{}:{}".format(
+                    _code_market(code),
+                    self._settings.get("view_mode", "live"))
                 fee = self._calc_fee(price, volume, is_sell, code)
                 rec = {"date": date, "code": code, "name": name,
                        "type": typ, "price": price, "volume": volume,

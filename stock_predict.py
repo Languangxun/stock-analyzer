@@ -133,7 +133,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.14"
+APP_VERSION = "7.5.15"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -18637,6 +18637,43 @@ def _ai_tool_rows_code(code, days, end=None):
     return rows[-days:]
 
 
+def _ai_tool_positions(ctx, args):
+    """持仓工具（v7.5.15）：读取交易记录插件实盘账户（本金/现金/持仓）。
+
+    插件 ``account_context()`` 经 ctx["account"] 回调取得；联动关闭/
+    未设本金时 available=False，按提示返回（不编造）。"""
+    get_acc = (ctx or {}).get("account")
+    acc = None
+    if callable(get_acc):
+        try:
+            acc = get_acc()
+        except Exception:
+            log.exception("读取账本持仓失败")
+    if not acc or not acc.get("available"):
+        return ("暂无可用持仓数据：交易记录插件未启用、联动已关闭或"
+                "实盘本金未设置（右侧栏账本→本金填写后可用）。")
+    lines = [f"账户 {acc.get('account')}（{acc.get('source')}）；"
+             f"本金 ¥{float(acc.get('capital') or 0):,.0f}，"
+             f"现金 ¥{float(acc.get('cash') or 0):,.2f}，"
+             f"市值 ¥{float(acc.get('market_value') or 0):,.2f}"]
+    positions = acc.get("positions") or {}
+    if not positions:
+        lines.append("当前无持仓。")
+    else:
+        lines.append("代码,名称,持仓,成本价,现价,市值,浮动盈亏,盈亏%,今日买入")
+        for code, p in positions.items():
+            lines.append(
+                f"{code},{p.get('name')},{p.get('volume')},"
+                f"{_ai_tool_f(p.get('avg_cost'), 3)},"
+                f"{_ai_tool_f(p.get('last_price'), 3)},"
+                f"{_ai_tool_f(p.get('market_value'), 2)},"
+                f"{_ai_tool_f(p.get('pnl'), 2)},"
+                f"{_ai_tool_f(p.get('pnl_pct'), 2)},"
+                f"{p.get('today_buy') or 0}")
+        lines.append("注：A股 T+1，今日买入(today_buy>0)次日才可卖出。")
+    return "\n".join(lines)
+
+
 def _ai_tool_kline(ctx, args):
     days = _ai_tool_int(args.get("days"), 60, 1, 240)
     code = str(args.get("code") or "").strip()
@@ -19187,6 +19224,7 @@ def _ai_tool_draw_lines(ctx, args):
 
 _AI_TOOL_FUNCS = {
     "get_kline": _ai_tool_kline,
+    "get_positions": _ai_tool_positions,
     "get_indicators": _ai_tool_indicators,
     "get_prediction": _ai_tool_prediction,
     "get_similar_samples": _ai_tool_samples,
@@ -19207,6 +19245,13 @@ _AI_TOOL_FUNCS = {
 def ai_tool_specs():
     """OpenAI 兼容工具定义：让模型按需取数，而不是首轮塞满上下文。"""
     return [
+        {"type": "function", "function": {
+            "name": "get_positions",
+            "description": "读取本地账本（交易记录插件）实盘账户：本金/现金/"
+                           "持仓明细（成本价/现价/市值/浮动盈亏/今日买入）。"
+                           "涉及仓位管理、加减仓建议、风险控制或“我现在持有什么”"
+                           "时调用。",
+            "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {
             "name": "get_kline",
             "description": "获取任意股票/ETF日K线（默认当前标的，可用 code "
