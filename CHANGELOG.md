@@ -5,6 +5,23 @@
 
 ## 版本历史
 
+> **v7.5.19：默认源分级——A股/港美期默认 quant 机、加密默认币安（2026-11-28）**：
+> ①**A股默认源**：「quant机」从链尾提到**链首**（tailnet 同源实时库，
+> 失效/无 tailnet 时自动按原链轮换 腾讯×6 → 通达信 → 新浪 → 同花顺 →
+> 东财，熔断器跳过冷却中的源；实测 `tries=['quant机','腾讯']` 降级
+> 正常）；存量源链配置一次性迁移提首（`kline_srcs_migrated=2026-11-28.2`，
+> 之后的停用/排序照常持久化）；
+> ②**加密默认币安**：新增 `_fetch_binance_daily`（免 key 公共
+> `/api/v3/klines`，1d UTC 自然日与工程口径一致，volume=base 币量；
+> api.binance.com 走代理优先，备 data-api.binance.vision 数据域；末根
+> 未完成 bar 由 `_keep` 过滤不入库）；多市场默认源分级改为——
+> **加密=币安 → quant机 → Yahoo；港/美/期=quant机 → TD(美股) → Yahoo**，
+> 备用源全保留、任一级失败自动落下一级；
+> ③**裸币修复**：`cryptobtc`（无报价币后缀）统一按 `BTCUSDT`/
+> `BTC/USDT` 处理（`_binance_symbol`/`_quant_code`；原样透传会被币安
+> 400）；
+> ④`APP_VERSION=7.5.19`，`stock_predict.py` 重新生成。
+
 > **v7.5.18：quant 机（Tailscale）统一行情源接入（2026-11-28）**：
 > ①**达标实测**：`quant.tail6a6cc8.ts.net` 下载中心/REST 全通——/health
 > ok、五市场日K全部新鲜至 11-27（crypto 按 UTC 已完成日口径，与本工程

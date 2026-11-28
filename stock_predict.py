@@ -177,7 +177,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.18"
+APP_VERSION = "7.5.19"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -2790,9 +2790,61 @@ def _fetch_tdx(full, count=600):
 _KLINE_KIND_LABELS = {"tx": "腾讯格式", "ths": "同花顺", "em": "东财",
                       "sina": "新浪", "163": "网易"}
 _KLINE_ORDER = []        # 启用的内置源名（顺序=优先级）；空=全部默认
-_KLINE_MIGRATE_TS = "2026-11-28"   # 新增内置源时递增（v7.5.17 quant机）
+_KLINE_MIGRATE_TS = "2026-11-28.2"  # 新增/调整内置源时递增（quant机→链首）
 _KLINE_CUSTOM = []       # [{"name","kind","url"}]，最多 10 个
 _KLINE_SRC_RUNTIME = []  # 运行时源链，配置变更时整体原子重建
+
+
+def _binance_symbol(full):
+    """cryptobtcusdt → 'BTCUSDT'；裸基础币 cryptobtc → 'BTCUSDT'；
+    成对代码 cryptoethbtc → 'ETHBTC' 保留。"""
+    body = full[6:].upper()
+    for q in ("USDT", "USD", "BTC", "ETH"):
+        if body.endswith(q) and len(body) > len(q):
+            return body             # 已含报价币：BTCUSDT / ETHBTC
+    return body + "USDT"            # 裸基础币：BTC → BTCUSDT
+
+
+_BINANCE_HOSTS = ("https://api.binance.com",
+                  "https://data-api.binance.vision")
+
+
+def _fetch_binance_daily(full, count=600):
+    """币安公共日K源（v7.5.18 加密默认）。
+
+    GET /api/v3/klines（免 key）：1d 线 UTC 自然日切（openTime=当日
+    00:00 UTC，与工程「已完成 UTC 日」口径一致；末根为未完成 bar，由
+    _get_daily_market 的 _keep 过滤），volume=base 币量。api.binance.com
+    国内直连常被墙——走 _http_get（非国内域名代理优先），备
+    data-api.binance.vision 公共数据域；全挂抛最后异常交回上层链。"""
+    sym = _binance_symbol(full)
+    n = max(30, min(1000, int(count or 600)))
+    last = None
+    for host in _BINANCE_HOSTS:
+        url = (host + "/api/v3/klines?symbol=" + urllib.parse.quote(sym)
+               + "&interval=1d&limit=" + str(n))
+        try:
+            arr = json.loads(_http_get(url, retries=2, timeout=15))
+        except Exception as e:      # noqa: BLE001 - 换下一个域名重试
+            last = e
+            continue
+        out = []
+        for k in arr:
+            try:
+                close = float(k[4])
+                if close <= 0:
+                    continue
+                out.append({"date": time.strftime(
+                                "%Y-%m-%d", time.gmtime(int(k[0]) / 1000)),
+                            "open": float(k[1]), "close": close,
+                            "high": float(k[2]), "low": float(k[3]),
+                            "vol": float(k[5])})
+            except (IndexError, TypeError, ValueError):
+                continue
+        if len(out) >= 5:
+            return out[-n:]
+        last = RuntimeError(f"币安返回K线不足 {sym}: {len(out)}")
+    raise last or RuntimeError(f"币安无数据 {sym}")
 
 
 def _quant_code(full):
@@ -2814,7 +2866,7 @@ def _quant_code(full):
         for q in ("USDT", "USD", "BTC", "ETH"):
             if body.endswith(q) and len(body) > len(q):
                 return "crypto:" + body[:-len(q)] + "/" + q
-        return "crypto:" + body
+        return "crypto:" + body + "/USDT"       # 裸基础币：BTC → BTC/USDT
     return None
 
 
@@ -2860,6 +2912,12 @@ def _kline_builtin_defs():
     """内置K线源定义（顺序=默认优先级）。名称是熔断器键，勿随意改动。"""
     tx = "appstock/app/fqkline/get"
     return [
+        # v7.5.18：quant 机提为 A 股默认首选源（tailnet 内网同源实时库，
+        # 口径与主库一致、无强制限频）；失效/无 tailnet 时按后续源轮换，
+        # 熔断器自动跳过冷却中的源。
+        ("quant机", "tailnet quant /api/kline（五市场同源实时库，"
+                    "A股+ETF；北交不覆盖；失效按后续源轮换）",
+         _fetch_quant),
         ("腾讯", "ini [data] kline_url 配置域（急救箱可自动切换）",
          lambda f, c: _fetch_tencent_mul(f, c)),
         ("腾讯代理", "proxy.finance.qq.com",
@@ -2885,9 +2943,6 @@ def _kline_builtin_defs():
          _fetch_ths),
         ("东财", "push2his 多host轮询",
          _fetch_eastmoney),
-        ("quant机", "tailnet quant /api/kline（五市场同源实时库，"
-                    "sm70x/global_daily 同源；北交不覆盖）",
-         _fetch_quant),
     ]
 
 
@@ -3007,8 +3062,9 @@ def _load_kline_src_cfg():
                if cp.has_section("data") else "")
         order = [s.strip() for s in raw.split(",") if s.strip()]
         order = [s for s in order if s in names]
-        # 内置源增补迁移（v7.5.17 quant机）：用户存过旧源链时把链里没有
-        # 的内置源追加到链尾并回写 ini——只跑一次（kline_srcs_migrated
+        # 内置源增补/排序迁移（v7.5.17 增补；v7.5.18 quant机提链首）：
+        # 用户存过旧源链时，把链里没有的内置源追加到链尾、并把 quant机
+        # 移到链首（默认首选源），回写 ini——只跑一次（kline_srcs_migrated
         # 标记），之后用户在设置里停用/排序照常持久化，不会再被顶回。
         _migrated = (cp.get("data", "kline_srcs_migrated", fallback="")
                      if cp.has_section("data") else "")
@@ -3017,7 +3073,10 @@ def _load_kline_src_cfg():
                        if d[0] not in order]
             if missing:
                 order = order + missing
-                flog.info("K线源链增补迁移（v7.5.17）: + %s", missing)
+                flog.info("K线源链增补迁移（v7.5.18）: + %s", missing)
+            if "quant机" in order:
+                order = ["quant机"] + [n for n in order if n != "quant机"]
+                flog.info("K线源链迁移：quant机 提为首选源（v7.5.18）")
             try:
                 cp.set("data", "kline_srcs", ",".join(order))
                 cp.set("data", "kline_srcs_migrated", _KLINE_MIGRATE_TS)
@@ -3122,7 +3181,9 @@ _reload_kline_srcs()
 
 def _fetch_remote_rows(full, count=600, info=None):
     """多源自动切换 + 熔断调度：源链来自 `_kline_sources()`
-    （默认 腾讯(配置域+固定域×5) → 新浪 → 同花顺(前复权口径) → 东财）。
+    （默认 quant机(tailnet 同源库，v7.5.18 链首) → 腾讯(配置域+固定域×5)
+    → 通达信 → 新浪 → 同花顺(前复权口径) → 东财；quant机失效/无 tailnet
+    时按后续源轮换，熔断器自动跳过冷却中的源）。
 
     v6.6.5：源链可在设置→数据源调整（启用/排序/自定义源，存 ini [data]）；
     「腾讯」源与固定变体当前域重复时已在链构建时去重。
@@ -7117,14 +7178,25 @@ def _td_quote(sym):
 
 
 def fetch_market_daily(full, count=None):
-    """多市场日K：quant 机（tailnet，与 sm70x/global_daily 同源实时库）
-    优先，美股 Twelve Data 次之，Yahoo 兜底。
+    """多市场日K默认源分级（v7.5.18）：加密=币安公共K线 → quant 机 →
+    Yahoo；港/美/期=quant 机 → TD(美股) → Yahoo。备用源全部保留。
 
-    v7.5.17 统一接入：quant /api/kline 五市场同构编码（hk:00700 /
-    us:AAPL / crypto:BTC/USDT / fut:RB0），无强制限频、延迟 ~0.1s，
-    失败自动回落原链。Yahoo 1d period=10y 一次拉足；TD 一次 5000 根，
-    同为拆股复权口径，上层照旧差量入库、整只替换。"""
+    - 币安 `_fetch_binance_daily`：免 key 公共 /api/v3/klines，1d UTC
+      自然日，与工程「已完成 UTC 日」口径一致；
+    - quant `_fetch_quant`：tailnet 内网，sm70x/global_daily 同源实时库
+      （hk:00700 / us:AAPL / fut:RB0 等同构编码），无强制限频；
+    - Yahoo 1d period=10y 一次拉足；TD 一次 5000 根，同为拆股复权口径，
+      上层照旧差量入库、整只替换。任一级失败自动落下一级。"""
     n = int(count or CFG.MAX_FETCH_BARS * 2)
+    mk = _market_of(full)
+    if mk == "crypto":
+        try:
+            rows = _fetch_binance_daily(full, n)
+            if rows:
+                _MKT_DAILY_SRC["src"] = "binance"
+                return rows[-n:] if n and len(rows) > n else rows
+        except Exception as e:
+            flog.info("币安日K回落 quant/yahoo %s: %s", full, e)
     if QUANT_URL:
         try:
             rows = _fetch_quant(full, n)
@@ -7133,7 +7205,7 @@ def fetch_market_daily(full, count=None):
                 return rows[-n:] if n and len(rows) > n else rows
         except Exception as e:
             flog.info("quant 日K回落 td/yahoo %s: %s", full, e)
-    if _market_of(full) == "us":
+    if mk == "us":
         try:
             rows = _td_daily(_market_yf_symbol(full), n)
             if rows:
