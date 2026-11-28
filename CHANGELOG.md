@@ -5,6 +5,20 @@
 
 ## 版本历史
 
+> **v7.5.17：Windows 桌面目录实测 + sm70x 模型目录可选（2026-11-28）**：
+> ①**Windows 优化**：桌面目录改走 `SHGetFolderPathW` 实测（OneDrive
+> 「桌面备份」把桌面重定向到 `~/OneDrive/Desktop|桌面` 时，原
+> `~/桌面`、`~/Desktop` 硬编码全部落空），OneDrive* 环境变量/桌面兜底
+> 一并探测——sm701/sm702 自动发现、global_daily.db 查找、报告导出/
+> 回测导出初始目录、品牌图与画线 PDF 查找共用该逻辑；
+> ②**sm70x 模型目录手动选择**：设置→外部策略 新增「sm701/sm702 模型
+> 目录」输入框 + 浏览…/清除（存 ini `[predict] sm701_dir/sm702_dir`，
+> 空=自动探测），保存即映射 `SM70_DIR/SM702_DIR` 并清适配层缓存
+> 立即生效（生成的 CLI 读同一 ini 同样生效）；同页显示 sm701 连接
+> 状态（目录/数据源/模型/可用市场）；③`check_open_source.py` Windows
+> GBK 控制台打 ✅ 崩 `UnicodeEncodeError`（退出码丢失）——stdout/stderr
+> 重配 UTF-8；④`APP_VERSION=7.5.17`，`stock_predict.py` 重新生成。
+
 > **v7.5.16：主图交易记录成本点（灰色 B/S）（2026-11-27）**：
 > K线主图把交易记录标在图上：记录日K线、成交价位置画灰色小圈+灰色
 > **B/S** 字母（买入B/卖出S），哪一日建的仓/成本多少一眼可见；与红绿

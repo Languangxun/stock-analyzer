@@ -22,6 +22,14 @@ import re
 import subprocess
 import sys
 
+# Windows GBK 控制台打 ✅/❌ 会 UnicodeEncodeError（扫描结果丢失退出码），
+# 统一重配 stdout/stderr 为 UTF-8（v7.5.17）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_SCAN = 4 * 1024 * 1024        # 每个文本文件最多读 4MB（模型头在开头）
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "dist", "_data",

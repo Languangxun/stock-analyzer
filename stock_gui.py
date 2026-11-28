@@ -64,6 +64,49 @@ DB_PATH = (os.environ.get("STOCK_DB") or "").strip() or os.path.join(
 INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stock_gui.ini")
 
+
+def desktop_dir():
+    """Windows 桌面真实目录（报告导出/品牌图/画线 PDF 查找共用）。
+
+    OneDrive「桌面备份」开启后真实桌面在 ~/OneDrive/Desktop（中文系统
+    常为 ~/OneDrive/桌面），expanduser("~") 拼 Desktop/桌面 都猜不中——
+    Windows 走 SHGetFolderPathW(CSIDL_DESKTOPDIRECTORY) 取实测值，再按
+    OneDrive 环境变量/~/Desktop/~/桌面 兜底；都不可用回退 ~。结果缓存。
+    """
+    cands = _DESKTOP_DIR_CACHE
+    if cands:
+        return cands[0]
+    if os.name == "nt":
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(
+                    None, 0x00, None, 0, buf) == 0 and buf.value:
+                cands.append(buf.value)
+        except Exception:
+            pass
+        for env in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            od = (os.environ.get(env) or "").strip()
+            if od:
+                cands.extend((os.path.join(od, "桌面"),
+                              os.path.join(od, "Desktop")))
+    home = os.path.expanduser("~")
+    cands.append(os.path.join(home, "Desktop"))
+    cands.append(os.path.join(home, "桌面"))
+    cands.append(home)
+    for p in cands:
+        try:
+            if p and os.path.isdir(p):
+                _DESKTOP_DIR_CACHE[:] = [p]
+                return p
+        except OSError:
+            continue
+    _DESKTOP_DIR_CACHE[:] = [home]
+    return home
+
+
+_DESKTOP_DIR_CACHE = []        # desktop_dir() 实测缓存（首个=已验证存在）
+
 # ---- 日志（#10）：文件 INFO+（滚动5MBx2），控制台 WARNING+ ----
 from logging.handlers import RotatingFileHandler  # noqa: E402
 
@@ -114,7 +157,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.16"
+APP_VERSION = "7.5.17"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -355,6 +398,12 @@ class CFG:
     SM702_MULT_SCALE = 10.0 # 胜率每超 0.5 一个百分点对应倍数
     SM702_MULT_MAX = 3.0
     SM702_MIN_RATE = 0.55
+    # v7.5.17：sm70x 模型目录手动指定（设置→外部策略「浏览…」选择；
+    # 空=自动探测桌面 sm70*）。存 ini [predict] sm701_dir/sm702_dir，
+    # 运行时经 _apply_sm70_env() 映射成 SM70_DIR/SM702_DIR 供
+    # external/sm701_ext.py 读取（生成的 CLI 读同一 ini 同样生效）。
+    SM701_DIR = ""
+    SM702_DIR = ""
     # ---- 分市场交易/融资配置（v7.5.7，ini [trade]）----
     # 回测与交易记录共用：finance=允许融资/杠杆做多，short=允许做空，
     # leverage=杠杆倍数（finance=0 时回测强制 1 倍）。默认全部关闭，
@@ -520,6 +569,27 @@ def ablation_risk_params():
             if m in ABLATION_MODES}
 
 
+# 启动时的原始 SM70_DIR/SM702_DIR（_apply_sm70_env 还原用；ini 清空时
+# 恢复用户自己的环境变量，而不是留下我们设置过的旧值）
+_SM70_ENV_ORIG = {k: os.environ.get(k) for k in ("SM70_DIR", "SM702_DIR")}
+
+
+def _apply_sm70_env():
+    """把 CFG 里的 sm70x 模型目录映射到 SM70_DIR/SM702_DIR 环境变量。
+
+    external/sm701_ext.py 只认环境变量（SM70_DIR/SM702_DIR 优先于自动
+    探测），这里让 ini [predict] sm701_dir/sm702_dir 的 GUI 选择对其
+    生效；清空设置则还原启动前的环境变量状态。"""
+    for attr, env in (("SM701_DIR", "SM70_DIR"), ("SM702_DIR", "SM702_DIR")):
+        v = (getattr(CFG, attr, "") or "").strip()
+        if v:
+            os.environ[env] = v
+        elif _SM70_ENV_ORIG.get(env) is None:
+            os.environ.pop(env, None)
+        else:
+            os.environ[env] = _SM70_ENV_ORIG[env]
+
+
 def _load_predict_cfg():
     """从 stock_gui.ini [predict] 读取用户调过的预测参数（带范围钳制）。
     必须在模块级别名 W_WINDOW/TOPK 赋值之前执行。"""
@@ -588,6 +658,12 @@ def _load_predict_cfg():
                                 CFG.SM702_MULT_MAX, 0.0, 20.0)
         CFG.SM702_MIN_RATE = gf("sm702_min_rate",
                                 CFG.SM702_MIN_RATE, 0.50, 0.99)
+        # v7.5.17：sm70x 模型目录（设置→外部策略浏览选择；空=自动探测；
+        # 读取后由 _apply_sm70_env() 映射成 SM70_DIR/SM702_DIR）
+        CFG.SM701_DIR = (cp.get("predict", "sm701_dir",
+                                fallback=CFG.SM701_DIR) or "").strip()
+        CFG.SM702_DIR = (cp.get("predict", "sm702_dir",
+                                fallback=CFG.SM702_DIR) or "").strip()
         # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
         CFG.LOCAL_ABLATION = bool(gi("local_ablation",
                                      1 if CFG.LOCAL_ABLATION else 0, 0, 1))
@@ -625,6 +701,9 @@ def _load_predict_cfg():
                                               _rp.get("cooldown", 5)), 0, 30)
     except Exception:
         log.exception("读取预测参数失败(使用默认)")
+    # sm70x 模型目录 → SM70_DIR/SM702_DIR（读取成败都要执行，
+    # 早于任何 sm701_paths()/sm702_dir() 调用）
+    _apply_sm70_env()
 
 
 def _load_studio_cfg():
@@ -19628,6 +19707,7 @@ def _load_sm_brand_logo(master, width=560):
     home = os.path.expanduser("~")
     paths = [
         os.path.join(here, "assets", "smlogo.png"),
+        os.path.join(desktop_dir(), "smlogo.png"),
         os.path.join(home, "桌面", "smlogo.png"),
         os.path.join(home, "Desktop", "smlogo.png"),
         os.path.join(home, "图片", "smlogo.png"),
@@ -27773,9 +27853,7 @@ class App:
     def export_report(self):
         if not self.res:
             return
-        desk = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.isdir(desk):
-            desk = os.path.expanduser("~")
+        desk = desktop_dir()
         fn = filedialog.asksaveasfilename(
             initialdir=desk,
             initialfile=f"预测_{self.res['full_code']}_{time.strftime('%Y%m%d')}.txt",
@@ -28768,9 +28846,7 @@ class App:
                 messagebox.showinfo("导出", "请先计算胜率/收益曲线",
                                     parent=win)
                 return
-            desk = os.path.join(os.path.expanduser("~"), "Desktop")
-            if not os.path.isdir(desk):
-                desk = os.path.expanduser("~")
+            desk = desktop_dir()
             r = self.res
             strat = r.get("strategy") or {}
             rows_ = bt.get("_rows") or r["disp_rows"]
@@ -30325,11 +30401,70 @@ class App:
         _sm702_d = sm702_dir() if CFG.SM702_ON else ""
         ttk.Label(
             frm,
-            text=("sm702 目录: " + (_sm702_d or "未检测到（~/桌面/sm702）")
+            text=("sm702 目录: " + (_sm702_d or "未检测到（桌面/sm702 或下方自选）")
                   + "\n模型/数据在仓库外，只读接入；参数保存后立即生效。"),
             foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
             justify="left", wraplength=620).grid(
                 row=_r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        _r += 1
+
+        # ---- v7.5.17：sm70x 模型目录手动指定（浏览选择；空=自动探测）----
+        # Windows OneDrive 桌面重定向/自装盘等场景自动探测可能落空，
+        # 这里允许直接选定模型文件夹（存 ini sm701_dir/sm702_dir）。
+        def _sm70x_status_text():
+            try:
+                st = sm701_status()
+            except Exception:
+                st = {"ok": False, "error": "检测失败"}
+            if not st.get("ok"):
+                return ("sm701 状态：未连接（%s）\n模型目录需含 "
+                        "lgbm_train_backtest.py 与 production/ 模型集"
+                        % str(st.get("error", ""))[:120])
+            mks = " ".join(k for k, v in (st.get("markets") or {}).items()
+                           if v)
+            return ("sm701 状态：已连接 %s\n数据源: %s · 模型: %s\n"
+                    "可用市场: %s" % (st.get("dir") or "-",
+                                      st.get("db") or "回退主库行情",
+                                      os.path.basename(
+                                          st.get("model") or "") or "-",
+                                      mks or "-"))
+
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=_r, column=0, columnspan=3, sticky="we", pady=(10, 6))
+        _r += 1
+        ttk.Label(frm, text="— sm70x 模型目录（留空=自动探测桌面 sm70*）—"
+                  ).grid(row=_r, column=0, columnspan=3, sticky="w")
+        _r += 1
+        sm701_dir_var = tk.StringVar(value=CFG.SM701_DIR)
+        sm702_dir_var = tk.StringVar(value=CFG.SM702_DIR)
+
+        def _pick_sm70x_dir(var):
+            d = filedialog.askdirectory(
+                title="选择 sm70x 模型文件夹（含 lgbm_train_backtest.py / "
+                      "production/）", parent=frm.winfo_toplevel())
+            if d:
+                var.set(os.path.normpath(d))
+
+        for _lab, _var in (("sm701 模型目录", sm701_dir_var),
+                           ("sm702 模型目录", sm702_dir_var)):
+            ttk.Label(frm, text=_lab).grid(row=_r, column=0, sticky="w",
+                                           pady=2)
+            ttk.Entry(frm, textvariable=_var, width=46).grid(
+                row=_r, column=1, sticky="we", pady=2)
+            _btns = ttk.Frame(frm)
+            _btns.grid(row=_r, column=2, sticky="w", pady=2)
+            ttk.Button(_btns, text="浏览…",
+                       command=lambda v=_var: _pick_sm70x_dir(v)).pack(
+                           side="left")
+            ttk.Button(_btns, text="清除",
+                       command=lambda v=_var: v.set("")).pack(
+                           side="left", padx=(4, 0))
+            _r += 1
+        sm70x_status_var = tk.StringVar(value=_sm70x_status_text())
+        ttk.Label(frm, textvariable=sm70x_status_var,
+                  foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
+                  justify="left", wraplength=620).grid(
+                      row=_r, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         def _studio_sel():
             cur = studio_lb.curselection()
@@ -30935,6 +31070,23 @@ class App:
                 pnotes.append(
                     f"sm702={'开' if CFG.SM702_ON else '关'}"
                     f"(q={CFG.SM702_Q:g},N={CFG.SM702_PERSIST})")
+                # v7.5.17：sm70x 模型目录（浏览选择；空=自动探测）。
+                # 映射 SM70_DIR/SM702_DIR 并清适配层缓存，立即生效。
+                CFG.SM701_DIR = (sm701_dir_var.get() or "").strip()
+                CFG.SM702_DIR = (sm702_dir_var.get() or "").strip()
+                cp.set("predict", "sm701_dir", CFG.SM701_DIR)
+                cp.set("predict", "sm702_dir", CFG.SM702_DIR)
+                _apply_sm70_env()
+                try:
+                    _sm701_ext.reset_cache()
+                except Exception:
+                    log.exception("sm70x 缓存重置失败(忽略)")
+                pnotes.append("sm701目录=" + (CFG.SM701_DIR or "自动探测"))
+                pnotes.append("sm702目录=" + (CFG.SM702_DIR or "自动探测"))
+                try:
+                    sm70x_status_var.set(_sm70x_status_text())
+                except Exception:
+                    pass
                 _av = ("all" if ablview_var.get() == "全部组合"
                        else "three")
                 CFG.ABLATION_VIEW = _av
@@ -31639,6 +31791,7 @@ atexit.register(_cleanup)
 # 来源：桌面《金融市场技术分析.pdf》（31 页）的 pdftotext 文字整理版；
 # 侧栏只读展示，图表请点面板右上角「打开原版PDF」查看。版权归原作者/整理者。
 DRAWING_GUIDE_PDF_CANDIDATES = (
+    os.path.join(desktop_dir(), "金融市场技术分析.pdf"),
     "~/桌面/金融市场技术分析.pdf",
     "~/Desktop/金融市场技术分析.pdf",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),

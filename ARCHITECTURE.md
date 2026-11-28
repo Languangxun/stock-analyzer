@@ -752,10 +752,17 @@ Treeview 展示 段/序号/买入日价/卖出日价/收益/原因，可按段�
   `score="sm701"` 概率分数 kind（`sm701_score_matrix()` 显式 overrides 研究仍可用）；
   组合档位 `TIER_CFG` 只剩稳定三档（旧 `_SM701_TEST` 删除，相关组合入口/CLI
   `--tier test` 退役）；`tier_default_names()` 返回稳定三档；
-  - **路径解析 `sm701_paths(market)`**：优先 `~/桌面/sm701 (副本)`，其次
-    `~/桌面/sm701`，再查仓库同级目录与桌面其它 `sm70*`（v7.4.0）；
+  - **路径解析 `sm701_paths(market)`**（v7.5.17 Windows 优化）：桌面目录
+    用 `_desktop_roots()` 实测——Windows 走 `SHGetFolderPathW`
+    （OneDrive「桌面备份」重定向后真实桌面在 `~/OneDrive/Desktop|桌面`，
+    硬编码 `~/桌面`、`~/Desktop` 会全部落空），OneDrive 环境变量与
+    `~/Desktop`/`~/桌面` 兜底；优先桌面 `sm701 (副本)`，其次 `sm701`，
+    再查仓库同级目录与桌面其它 `sm70*`（v7.4.0）；
     `SM70_DIR` / `SM70_DB` / `SM70_MODEL` / `SM70_PRED`（兼容 `SM701_*`）
-    可覆盖；只要求目录内有 `lgbm_train_backtest.py` + 该市场生产模型集
+    或 ini `[predict] sm701_dir`（设置→外部策略「浏览…」选择，宿主
+    `_apply_sm70_env()` 映射成 `SM70_DIR`，改后 `_sm701_ext.reset_cache()`
+    立即生效；生成的 CLI 读同一 ini 同样生效）可覆盖；只要求目录内有
+    `lgbm_train_backtest.py` + 该市场生产模型集
     （v7.4.0 起 `stock_cache.db` / 历史预测文件可缺失）；market=
     cn/hk/us/futures/**crypto** 按市场找 `prod_{mpre}h{1,5,10}_tech.txt`
     （无生产集时 `sm701_has_model()` 返回 False）；
@@ -1457,6 +1464,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.17**<br>（2026-11-28） | **Windows 桌面目录实测 + sm70x 模型目录可选**：①`external/sm701_ext.py` 桌面目录改 `_desktop_roots()`——Windows `SHGetFolderPathW(CSIDL_DESKTOPDIRECTORY)` 实测 + OneDrive 变体 + `~/Desktop`/`~/桌面` 兜底（OneDrive 桌面备份重定向后原硬编码全部落空），`_sm701_dirs`/`_sm701_pick_db`/`sm702_dir` 共用；GUI `desktop_dir()` 同口径用于报告/回测导出、品牌图、画线 PDF 查找；②设置→外部策略新增「sm701/sm702 模型目录」（浏览…/清除，ini `[predict] sm701_dir/sm702_dir`，空=自动探测；保存即 `_apply_sm70_env()` 映射 `SM70_DIR/SM702_DIR` + `reset_cache()` 生效）+ sm701 连接状态显示；③`check_open_source.py` GBK 控制台 `UnicodeEncodeError` 修复（stdout/stderr 重配 UTF-8）；④`APP_VERSION=7.5.17`，`stock_predict.py` 重新生成；3.7 节与 CHANGELOG 同步 |
 | **v7.5.12**<br>（2026-11-22） | **加密回撤平仓 + 回测现生成**：删除 v7.5.10 净值保本强平（会过早停手导致曲线平），改为仅 crypto 的最大回撤平仓——权益从峰值回撤达到 maxdd%（默认 50，ini `[trade] maxdd_crypto`）时平仓，`dd_count/dd_hit`，以平仓后权益为新峰值可继续开仓；A股/港美期不生效；工具→信号胜率回测改为后台 `get_daily` 现取日K、现算信号，不复用 `analyze` 的 `disp_rows/signals` 缓存（结果标「现生成」）；`APP_VERSION=7.5.12`，`stock_predict.py` 重新生成 |
 | **v7.5.11**<br>（2026-11-22） | **sm702 止损否决 + sm 设置外部策略页**：`external/sm701_ext.py` 只读 `~/桌面/sm702/outputs_crypto/predictions_wf.csv.gz`/`latest_signals.csv`，新增 `sm702_pred_map/sm702_mult/sm702_veto`；crypto BUY 连续 N 日 top-q 止损概率或胜率不足时标「【sm702否决】」（图空心 B否、回测跳过），有效信号按 sm702 胜率乘仓位倍数；设置→外部策略页新增 sm702 开关与 q/persist/mult_scale/mult_max/min_rate，sm701 开关与买/卖阈同页（ini `[predict] sm702_*`/`sm701_buy|sell`）；`APP_VERSION=7.5.11`，`stock_predict.py` 重新生成 |
 | **v7.5.10**<br>（2026-11-22） | **净值保本强平**：`_bt_simulate(breakeven=True)` 跟踪权益峰值，曾 >1 后回落到 1.0 时按净值=1 的价格强平并停止后续开仓（`be_count/be_halt`，明细「保本强平（净值1.0）」）；排在普通止损前，爆仓重置时峰值重置；设置→交易/融资新增开关（ini `[trade] breakeven`，默认开）；`APP_VERSION=7.5.10`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |

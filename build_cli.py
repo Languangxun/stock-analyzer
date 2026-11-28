@@ -51,14 +51,15 @@ K线源自动切换：腾讯(多域名容灾) -> 新浪 -> 同花顺 -> 东财�
 
 sm701 外接算法（v7.3.0；v7.4.0 兼容新克隆）：适配层在
              external/sm701_ext.py；sm701 目录（数据+模型）保存在仓库外，
-             git 不分发。默认自动查找 ~/桌面/sm701 (副本) 与原目录；也可用
-             SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）
-             覆盖。行情库兼容 sm701 原生表与桌面 global_daily.db；模型
-             CRLF/缺失预测文件均可自动降级。A 股作为候选参加单股消融
-             （ini [predict] sm701_ablation=0 可关）；hk/us/futures/crypto
-             由市场策略链直出买卖点（sm701_ext=0 则只看行情）。
-             crypto 日K/盘中缓存按 UTC 切日，副本库落后时自动用 Yahoo
-             补齐最新已完成段（v7.5.2）。
+             git 不分发。默认自动查找桌面 sm701 (副本) 与原目录（Windows
+             实测桌面/OneDrive 重定向均可）；也可用 SM70_DIR / SM70_DB /
+             SM70_MODEL / SM70_PRED（兼容 SM701_*）或 ini [predict]
+             sm701_dir 覆盖。行情库兼容 sm701 原生表与桌面
+             global_daily.db；模型 CRLF/缺失预测文件均可自动降级。A 股
+             作为候选参加单股消融（ini [predict] sm701_ablation=0 可关）；
+             hk/us/futures/crypto 由市场策略链直出买卖点（sm701_ext=0 则
+             只看行情）。crypto 日K/盘中缓存按 UTC 切日，副本库落后时
+             自动用 Yahoo 补齐最新已完成段（v7.5.2）。
 """
 
 '''

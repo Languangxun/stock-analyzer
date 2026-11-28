@@ -24,6 +24,14 @@ v7.5.2 加密 UTC 口径:
   - `sm70x_series()` 返回已连接的 sm701 / sm702 / 其它 sm70x 系列目录名，
     仅供关于页署名（开源仓库无模型时不显示任何 sm70x 标识）。
 
+v7.5.17 Windows 优化:
+  - 桌面目录改用 SHGetFolderPathW 实测（OneDrive 开启桌面备份后真实桌面
+    在 ~/OneDrive/Desktop 或 ~/OneDrive/桌面，原实现只猜 ~/桌面 ~/Desktop
+    会全部落空）；OneDrive*/桌面/Desktop 变体一并探测。
+  - 模型目录可在 设置→外部策略 手动选择（ini [predict] sm701_dir/
+    sm702_dir），宿主映射成 SM70_DIR/SM702_DIR 环境变量，本模块无需感知
+    ini；`reset_cache()` 供宿主改目录后立即生效。
+
 v7.4.0 兼容性增强:
   - 模型文件 CRLF 容错：sm701 仓库在 Windows 检出后 `production/prod_*.txt`
     可能被 git 转成 CRLF，LightGBM 直接报 Model format error；加载时统一
@@ -331,29 +339,85 @@ def sm701_market_pool(market):
     return [(c, names.get(c) or c) for c in sorted(codes)]
 
 
+def _win_known_desktop():
+    """Windows 真实「桌面」物理目录（SHGetFolderPathW；非 Windows/失败
+    返回空串）。
+
+    OneDrive「桌面备份」开启后，桌面被重定向到 ~/OneDrive/Desktop（中文
+    系统常为 ~/OneDrive/桌面），expanduser("~") 拼 Desktop/桌面 都猜不中；
+    走系统 API（CSIDL_DESKTOPDIRECTORY=0x00）取实测值最稳。结果缓存。
+    """
+    if os.name != "nt":
+        return ""
+    hit = _SM701_CACHE.get("win_desktop")
+    if hit is not None:
+        return hit
+    d = ""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(
+                None, 0x00, None, 0, buf) == 0:
+            d = buf.value or ""
+    except Exception:
+        d = ""
+    _SM701_CACHE["win_desktop"] = d
+    return d
+
+
+def _desktop_roots():
+    """候选桌面目录（去重、保序，只留真实存在的）：
+
+    Windows API 实测 > OneDrive 变体（环境变量 OneDrive*）> ~/Desktop >
+    ~/桌面。_sm701_dirs / _sm701_pick_db / sm702_dir 共用。
+    """
+    out = []
+    win = _win_known_desktop()
+    if win:
+        out.append(win)
+    for env in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        od = (os.environ.get(env) or "").strip()
+        if od:
+            out.append(os.path.join(od, "桌面"))
+            out.append(os.path.join(od, "Desktop"))
+    home = os.path.expanduser("~")
+    out.append(os.path.join(home, "Desktop"))
+    out.append(os.path.join(home, "桌面"))
+    seen, uniq = set(), []
+    for p in out:
+        try:
+            ap = os.path.abspath(p)
+        except OSError:
+            continue
+        if ap not in seen and os.path.isdir(ap):
+            seen.add(ap)
+            uniq.append(ap)
+    return uniq
+
+
 def _sm701_dirs():
     """sm70x 候选目录：环境变量 > sm701 副本 > sm701 > 桌面其它 sm70*。"""
-    home = os.path.expanduser("~")
     here = os.path.dirname(os.path.abspath(__file__))
     out = []
     env_dir = _env_first("SM70_DIR", "SM701_DIR")
     if env_dir:
         out.append(env_dir)
-    for base in (
-        os.path.join(home, "桌面", "sm701 (副本)"),
-        os.path.join(home, "Desktop", "sm701 (副本)"),
+    bases = []
+    for desk in _desktop_roots():
+        bases.append(os.path.join(desk, "sm701 (副本)"))
+        bases.append(os.path.join(desk, "sm701"))
+    bases.extend((
         os.path.join(here, "sm701 (副本)"),
-        os.path.join(os.path.dirname(here), "sm701 (副本)"),
-        os.path.join(home, "桌面", "sm701"),
-        os.path.join(home, "Desktop", "sm701"),
         os.path.join(here, "sm701"),
+        os.path.join(os.path.dirname(here), "sm701 (副本)"),
         os.path.join(os.path.dirname(here), "sm701"),
-    ):
-        if base and base not in out:
+    ))
+    for base in bases:
+        if base not in out:
             out.append(base)
     # v7.4.0：sm 系列兼容——桌面其它 sm70* 目录（如 sm702）按版本号降序兜底
     extra = []
-    for parent in (os.path.join(home, "桌面"), os.path.join(home, "Desktop")):
+    for parent in _desktop_roots():
         try:
             extra.extend(glob.glob(os.path.join(parent, "sm70*")))
         except OSError:
@@ -376,9 +440,8 @@ def _sm701_pick_db(base, mk, env_db=""):
         db = os.path.join(base, name)
         if _sm701_db_kind(db, mk)[0]:
             return db
-    home = os.path.expanduser("~")
-    roots = (os.path.join(home, "桌面"), os.path.join(home, "Desktop"),
-             os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    roots = tuple(_desktop_roots()) + (
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),)
     for parent in roots:
         for name in ("global_daily.db", "stock_cache.db"):
             db = os.path.join(parent, name)
@@ -1297,10 +1360,12 @@ _SM702_LOCK = threading.RLock()
 
 
 def sm702_dir():
-    """sm702 根目录（SM702_DIR 优先；桌面副本/原目录兜底）。"""
-    cands = [(os.environ.get("SM702_DIR") or "").strip(),
-             os.path.join(os.path.expanduser("~"), "桌面", "sm702"),
-             os.path.join(os.path.expanduser("~"), "sm702")]
+    """sm702 根目录（SM702_DIR 优先；桌面 sm702 兜底；v7.5.17 桌面目录
+    走 _desktop_roots()——OneDrive 重定向/中文系统都能找对）。"""
+    cands = [(os.environ.get("SM702_DIR") or "").strip()]
+    for desk in _desktop_roots():
+        cands.append(os.path.join(desk, "sm702"))
+    cands.append(os.path.join(os.path.expanduser("~"), "sm702"))
     for p in cands:
         if p and os.path.isdir(p):
             return p
@@ -1437,4 +1502,22 @@ def sm701_has_model(market, _cache={}):
 EXT_RISK = {"atr_mult": 2.5, "trail_trigger": 1.05,
             "trail_ratio": 0.90, "buy_th": 1, "cooldown": 1,
             "sell_cooldown": 1}
+
+
+def reset_cache():
+    """清空路径/数据缓存（v7.5.17）：宿主在设置里改 sm701_dir/sm702_dir
+    后调用，下一次 sm701_paths()/sm702_dir() 立即按新目录定位。
+
+    Booster 缓存按（路径 + mtime/size）自校验、行/列缓存按库绝对路径
+    作 key，都不必清；`sm701_has_model` 的 per-market 结果缓存需一并清。"""
+    with _SM701_LOCK:
+        _SM701_CACHE.clear()
+        _COLUMN_CACHE.clear()
+        _DB_LATEST_CACHE.clear()
+    with _SM702_LOCK:
+        _SM702_CACHE.clear()
+    try:
+        sm701_has_model.__defaults__[0].clear()
+    except (IndexError, AttributeError, TypeError):
+        pass
 
