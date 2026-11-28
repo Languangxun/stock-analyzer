@@ -11,8 +11,9 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
 
 - **多市场（v7.0.1，v7.3.0 外接算法化）——港股 / 美股 / 期货 / 加密 一键切换**：
   顶栏市场下拉，代码前缀 `hk00700 / usaapl / fugc / cryptobtcusdt`；
-  K线/分时/快照/预测与 A股同库同链路（日K/快照 Yahoo + sm701/global 库同源；
-  加密分时优先 Kraken 公共 OHLC，失败回落 Yahoo）；
+  K线/分时/快照/预测与 A股同库同链路（日K quant 机源优先（v7.5.18，
+  sm701/global 同源实时库）→ 美股 Twelve Data → Yahoo；加密分时优先
+  Kraken 公共 OHLC，失败回落 Yahoo）；
   **这些市场的买卖点由 sm70x 外接算法直出**（cn/hk/us/futures/crypto 各三周期；
   算法本体在 `external/sm701_ext.py`，ini `[predict] sm701_ext=0` 可断开——
   断开则只看行情）；
@@ -20,7 +21,7 @@ sm701 多市场模型直出 + 三档组合策略（A股）+ 全量回测。本�
   自选池、交易记录账本、指标参数均按市场独立（期货/加密支持杠杆与 T+0）；
   **加密按 UTC 切日**（v7.5.2）：日K只缓存已完成的 UTC 昨日，盘中实时
   T 日 bar 由 UTC 快照合成（7×24，显示「UTC 盘中」），不再套 A 股
-  9:30~15:00；sm70x 副本库落后时自动用 Yahoo 补齐最新段；
+  9:30~15:00；sm70x 副本库落后时自动用 quant 机源（同源）/ Yahoo 补齐最新段；
   网页面板含「多市场 sm701 信号概览」。
 - **分市场交易/融资（v7.5.7；v7.5.12 加密回撤平仓 + 置信度杠杆）**：设置→交易/融资
   按市场勾选「允许融资」「允许做空」并设杠杆倍数（1~20）；默认关闭/1倍。
@@ -1093,8 +1094,15 @@ python auto_lines.py --csv bars.csv --days 240
     折算，与新浪 hfq 因子逐值等价），**ETF 不再退回腾讯前复权**（份额折算
     也不再留 −67% 假跳空）；源链位置在腾讯 6 域之后、新浪之前，
     ini `[data] kline_srcs` 已加入，设置→数据源可停用/排序；
+    **v7.5.18 新增 quant 机源（链尾）**：Tailscale 内网 quant 机 REST
+    `/api/kline`（五市场同构编码，与 sm70x/global_daily 同一实时库，
+    A股+ETF 可用、北交不覆盖）；同轮起多市场日K（港/美/期/加密）也改
+    **quant → TD(美股) → Yahoo** 三级；地址可配 `ini [data] quant_url` /
+    环境变量 `QUANT_URL`（none/off/0 停用；无 tailnet 环境该源自动熔断
+    跳过，不影响其它源）；
   - **板块**：东财 clist → 腾讯行业榜 → akshare（可选依赖）；
   - **代理**：国内域名直连优先、代理兜底，被拒自动旁路 120s；
+    Tailscale 内网地址（`*.ts.net` / `100.x`）始终直连；
   - 急救箱：`python3 stock_firstaid.py --check`（全候选域体检）、`--ai`（AI 找源，
     实测验证后采用）。
 - **复权口径**：库内统一存真乘法后复权；`adjust(code, k)` 存显示缩放系数

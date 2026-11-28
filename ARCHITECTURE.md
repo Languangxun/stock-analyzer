@@ -126,6 +126,8 @@
 
 **通道策略 `_open_url()`**：`_PROXY_OPENER`（ini `[proxy]`，通常指向本地 VPN）不再是默认前置通道。
 按域名选路：**国内行情域名直连优先（失败再走代理），国外（AI 接口）代理优先（失败再直连）**；
+**Tailscale 内网地址强制直连（v7.5.17）**——`_is_tailnet_url()` 识别 `*.ts.net` 域名与
+`100.64.0.0/10` CGNAT IP，本地代理转发不了 100.x，此类 URL 不进代理通道；
 代理端口被拒（VPN 未开/重启中）自动旁路 120s，避免每次请求双倍超时。国内域名集合见
 `_DOMESTIC_SUFFIX`（eastmoney/gtimg/qq/sina/163/sse/szse/cninfo/csindex）。
 这修复了「VPN 一挂全部源报 `[Errno 111] Connection refused`」的全局故障。
@@ -185,12 +187,26 @@ hkHSCEI→`^HSCE`、hkHSTECH→`^HSTECH`）。
 （v6.6.5，JSONP 无需 cookie；个股/ETF/科创板/深证系列指数可用，上证指数无映射交回
 其他源；**完整前复权口径原样入库、绝不乘新浪因子**——除权日收益≈复权真实收益，
 但绝对水平与库内差时变因子（复权表黑盒），与库内不同时由 rebase 机制整段自洽替换）
-→ 东财 4 host 轮询（`push2his` / `92` / `93` / `97`）。
-**源链可配置（v6.6.5，设置→数据源）**：`_kline_sources()` 返回运行时链，内置 9 源
+→ 东财 4 host 轮询（`push2his` / `92` / `93` / `97`）→ **quant机 REST**
+（v7.5.17，链尾兜底；见下「quant 机统一行情源」）。
+**源链可配置（v6.6.5，设置→数据源）**：`_kline_sources()` 运行时链，内置 10 源
 可启用/停用/排序（ini `[data] kline_srcs`），自定义源（`custom_kline` JSON，类型
 腾讯格式/同花顺/东财/新浪/网易，最多 10 个）追加链尾、熔断键 `自定义:名称`；
 「腾讯」源域与固定变体 URL 相同时自动去重；全停用且无自定义保存时回默认链；
-急救箱切换 `kline_url` 后联动重建（`_reload_kline_srcs`）。
+急救箱切换 `kline_url` 后联动重建（`_reload_kline_srcs`）。**内置源增补迁移
+（v7.5.17）**：用户存过旧源链时，新版本把链里没有的内置源追加到链尾并回写
+ini（`kline_srcs_migrated` 时间戳只跑一次，之后的停用/排序照常持久化）。
+
+**quant 机统一行情源（v7.5.17，`_fetch_quant` / `_quant_code`）**：
+Tailscale 内网 quant 机（`quant.tail6a6cc8.ts.net`，达事实测五市场日K全新鲜、
+延迟 0.04~0.12s、无强制限频）提供 `/api/kline` REST——**五市场同构编码**
+`sh600519` / `hk:00700` / `us:AAPL` / `crypto:BTC/USDT` / `fut:RB0`，读的
+就是 sm70x/global_daily 同一实时库（口径与副本库/主库一致；加密按 UTC 已完成日，
+与本工程 v7.5.2 口径相同）；北交所（bj）不覆盖（软失败「空数据」，不触发自愈），
+`tail` 上限 800。接入位置：①A股源链链尾（「quant机」，走既有熔断/节流/软硬失败
+判定）；②多市场 `fetch_market_daily` 首选——**quant → TD(美股) → Yahoo**，
+同源实时库优先于公网。base 可配 `ini [data] quant_url` > 环境变量 `QUANT_URL`
+> 默认域名，`none/off/0` 显式停用；无 tailnet 的开源环境该源失败后自动熔断跳过。
 **2026-09-26 观测**：`web.ifzq.gtimg.cn` 曾对 hfq 请求返 **501**（腾讯反爬）而 qfq
 探测可通过（该域此后实测又恢复，属时段性），旧 `_probe_kline_url` 用 qfq 探测会把
 死域写进 ini；现探测改 **hfq + 连测2次**，且 501 纳入熔断（死源连续2次失败冷却
@@ -273,6 +289,9 @@ key 读取顺序：环境变量 `TWELVE_DATA_API_KEY` → `stock_gui.ini [data] 
 未配置）。免费层限频/额度由 `_td_acquire()` 令牌桶守卫（最小间隔 7.6s、日上限 700 次），
 不阻塞 UI；实际来源记入 `stock_fetch.log`（`多市场入库 … 源=twelvedata|yahoo`）。
 注意：sm701 副本库仍优先于 TD（同源训练口径不变），TD 替换的是原来的 Yahoo 兜底位置。
+**v7.5.17 起 `fetch_market_daily` 首选 quant 机 REST**（`_fetch_quant`，与 sm701/
+global_daily 同源实时库，hk/us/fut/crypto 全覆盖），TD 退居第二、Yahoo 兜底——
+即 **quant → TD(美股) → Yahoo** 三级（达实与接入细节见 2.1 节「quant 机统一行情源」）。
 
 ### 2.2 SQLite 缓存（`stock_cache.db`）
 
@@ -1464,6 +1483,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.18**<br>（2026-11-28） | **quant 机（Tailscale）统一行情源接入**：达标实测（/health ok、五市场日K全新鲜至 11-27、加密按 UTC 已完成日与工程口径一致、延迟 0.04~0.12s、Range 断点续传可用、bj 不覆盖）后统一接入——①新增 `_quant_code/_fetch_quant` REST 日K源（`/api/kline` 五市场同构编码 `sh600519`/`hk:00700`/`us:AAPL`/`crypto:BTC/USDT`/`fut:RB0`，读 sm70x/global_daily 同一实时库，tail≤800，无数据=软失败不触发自愈）；②A股源链链尾新增「quant机」内置源（既有熔断/节流复用）+ 内置源增补一次性迁移（`kline_srcs_migrated`，老配置自动补新源、后续停用照常持久化）；③多市场 `fetch_market_daily` 改 **quant → TD(美股) → Yahoo** 三级（同源实时库优先于公网）；④base 可配 `ini [data] quant_url`/环境变量 `QUANT_URL`（none/off/0 停用；无 tailnet 环境自动熔断跳过）；⑤`_is_tailnet_url`（*.ts.net / 100.64.0.0/10）强制直连（代理转发不了 100.x）；⑥`APP_VERSION=7.5.18`，`stock_predict.py` 重新生成；2.0/2.1 节与 README/CHANGELOG 同步 |
 | **v7.5.17**<br>（2026-11-28） | **Windows 桌面目录实测 + sm70x 模型目录可选**：①`external/sm701_ext.py` 桌面目录改 `_desktop_roots()`——Windows `SHGetFolderPathW(CSIDL_DESKTOPDIRECTORY)` 实测 + OneDrive 变体 + `~/Desktop`/`~/桌面` 兜底（OneDrive 桌面备份重定向后原硬编码全部落空），`_sm701_dirs`/`_sm701_pick_db`/`sm702_dir` 共用；GUI `desktop_dir()` 同口径用于报告/回测导出、品牌图、画线 PDF 查找；②设置→外部策略新增「sm701/sm702 模型目录」（浏览…/清除，ini `[predict] sm701_dir/sm702_dir`，空=自动探测；保存即 `_apply_sm70_env()` 映射 `SM70_DIR/SM702_DIR` + `reset_cache()` 生效）+ sm701 连接状态显示；③`check_open_source.py` GBK 控制台 `UnicodeEncodeError` 修复（stdout/stderr 重配 UTF-8）；④`APP_VERSION=7.5.17`，`stock_predict.py` 重新生成；3.7 节与 CHANGELOG 同步 |
 | **v7.5.12**<br>（2026-11-22） | **加密回撤平仓 + 回测现生成**：删除 v7.5.10 净值保本强平（会过早停手导致曲线平），改为仅 crypto 的最大回撤平仓——权益从峰值回撤达到 maxdd%（默认 50，ini `[trade] maxdd_crypto`）时平仓，`dd_count/dd_hit`，以平仓后权益为新峰值可继续开仓；A股/港美期不生效；工具→信号胜率回测改为后台 `get_daily` 现取日K、现算信号，不复用 `analyze` 的 `disp_rows/signals` 缓存（结果标「现生成」）；`APP_VERSION=7.5.12`，`stock_predict.py` 重新生成 |
 | **v7.5.11**<br>（2026-11-22） | **sm702 止损否决 + sm 设置外部策略页**：`external/sm701_ext.py` 只读 `~/桌面/sm702/outputs_crypto/predictions_wf.csv.gz`/`latest_signals.csv`，新增 `sm702_pred_map/sm702_mult/sm702_veto`；crypto BUY 连续 N 日 top-q 止损概率或胜率不足时标「【sm702否决】」（图空心 B否、回测跳过），有效信号按 sm702 胜率乘仓位倍数；设置→外部策略页新增 sm702 开关与 q/persist/mult_scale/mult_max/min_rate，sm701 开关与买/卖阈同页（ini `[predict] sm702_*`/`sm701_buy|sell`）；`APP_VERSION=7.5.11`，`stock_predict.py` 重新生成 |

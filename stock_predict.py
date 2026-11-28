@@ -177,7 +177,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.17"
+APP_VERSION = "7.5.18"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -228,6 +228,28 @@ try:
     _fa_url = _fa_cp.get("data", "kline_url", fallback="").strip()
     if _fa_url.startswith(("http://", "https://")):
         KLINE_URL = _fa_url
+except Exception:
+    pass
+
+# quant 机（Tailscale 内网）统一行情源（v7.5.17）：/api/kline 五市场同构
+# 编码（sh600519 / hk:00700 / us:AAPL / crypto:BTC/USDT / fut:RB0），读的
+# 就是 sm70x/global_daily 同一实时库，无强制限频。优先级：ini [data]
+# quant_url > 环境变量 QUANT_URL > 默认 Tailscale 域名；填 none/off/0
+# 显式停用（无 tailnet 的开源环境该源会自动熔断跳过，不碍事）。
+QUANT_URL = "https://quant.tail6a6cc8.ts.net"
+try:
+    import configparser as _cp_quant
+    _q_cp = _cp_quant.ConfigParser()
+    _q_cp.read(INI_PATH, encoding="utf-8")
+    if _q_cp.has_option("data", "quant_url"):
+        _q_url = _q_cp.get("data", "quant_url", fallback="").strip()
+    else:
+        _q_url = (os.environ.get("QUANT_URL") or "").strip()
+    if _q_url.lower() in ("none", "off", "0"):
+        QUANT_URL = ""                  # 显式停用
+    elif _q_url:
+        QUANT_URL = _q_url.rstrip("/")
+    del _q_url
 except Exception:
     pass
 UT = "fa5fd1943c7b386f172d6893dbfba10b"
@@ -1426,6 +1448,19 @@ def _is_domestic_url(url):
                for s in _DOMESTIC_SUFFIX)
 
 
+def _is_tailnet_url(url):
+    """Tailscale 内网地址（v7.5.17）：*.ts.net MagicDNS 域名或
+    100.64.0.0/10 CGNAT IP。本地代理转发不了 100.x，这类地址必须直连。"""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        return False
+    if host == "ts.net" or host.endswith(".ts.net"):
+        return True
+    m = re.match(r"^100\.(\d+)\.", host)
+    return bool(m and 64 <= int(m.group(1)) <= 127)
+
+
 def _proxy_dead():
     with _PROXY_LOCK:
         return time.time() < _PROXY_DEAD_UNTIL[0]
@@ -1442,7 +1477,9 @@ def _open_url(req, url, timeout):
 
     返回响应字节；两个通道都失败时抛最后一个异常。"""
     can_proxy = _PROXY_OPENER is not None and not _proxy_dead()
-    if not can_proxy:
+    if _is_tailnet_url(url):
+        order = [None]                 # tailnet 内网必须直连（代理到不了 100.x）
+    elif not can_proxy:
         order = [None]
     elif _is_domestic_url(url):
         order = [None, _PROXY_OPENER]      # 国内：直连失败再试代理
@@ -2753,8 +2790,70 @@ def _fetch_tdx(full, count=600):
 _KLINE_KIND_LABELS = {"tx": "腾讯格式", "ths": "同花顺", "em": "东财",
                       "sina": "新浪", "163": "网易"}
 _KLINE_ORDER = []        # 启用的内置源名（顺序=优先级）；空=全部默认
+_KLINE_MIGRATE_TS = "2026-11-28"   # 新增内置源时递增（v7.5.17 quant机）
 _KLINE_CUSTOM = []       # [{"name","kind","url"}]，最多 10 个
 _KLINE_SRC_RUNTIME = []  # 运行时源链，配置变更时整体原子重建
+
+
+def _quant_code(full):
+    """本项目代码 → quant REST code（同构映射，quant docs/API.md §4）：
+    sh600519 原样；hk00700→'hk:00700'、usaapl→'us:AAPL'、
+    cryptobtcusdt→'crypto:BTC/USDT'、fua0→'fut:A0'。
+    北交所（bj）quant 不覆盖返回 None。"""
+    mk = _market_of(full)
+    if mk == "cn":
+        return None if full.startswith("bj") else full
+    if mk == "hk":
+        return "hk:" + full[2:].zfill(5)
+    if mk == "us":
+        return "us:" + full[2:].upper()
+    if mk == "futures":
+        return "fut:" + full[2:].upper()
+    if mk == "crypto":
+        body = full[6:].upper()
+        for q in ("USDT", "USD", "BTC", "ETH"):
+            if body.endswith(q) and len(body) > len(q):
+                return "crypto:" + body[:-len(q)] + "/" + q
+        return "crypto:" + body
+    return None
+
+
+def _fetch_quant(full, count=600, base=""):
+    """quant 机 REST 日K源（v7.5.17 统一接入）。
+
+    GET /api/kline?code=<code>&period=day&tail=N → bars[{date,open,high,
+    low,close,vol}]，读 sm70x/global_daily 同一实时库（收盘后 cron 更新，
+    加密按 UTC 日），与副本库/主库口径一致、无强制限频；tail 上限 800。
+    无该标的返回 {"error":"no data"} —— 按「空数据」软失败处理（不触发
+    自愈/AI 找源），北交所等不覆盖市场同理。"""
+    base = (base or QUANT_URL).rstrip("/")
+    if not base:
+        raise RuntimeError("quant 源未配置(空数据)")
+    qc = _quant_code(full)
+    if not qc:
+        raise RuntimeError(f"quant 源不覆盖 {full}（空数据）")
+    n = max(30, min(800, int(count or 600)))
+    url = (base + "/api/kline?code=" + urllib.parse.quote(qc, safe=":")
+           + "&period=day&tail=" + str(n))
+    txt = _http_get(url, retries=2, timeout=15)
+    d = json.loads(txt)
+    if d.get("error"):
+        raise RuntimeError(f"quant 空数据 {qc}: {d.get('error')}")
+    out = []
+    for b in (d.get("bars") or []):
+        try:
+            close = float(b["close"])
+            if close <= 0:
+                continue
+            out.append({"date": str(b["date"]), "open": float(b["open"]),
+                        "close": close, "high": float(b["high"]),
+                        "low": float(b["low"]),
+                        "vol": float(b.get("vol") or 0)})
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(out) < 5:
+        raise RuntimeError(f"quant 返回K线不足 {qc}: {len(out)}")
+    return out[-n:]
 
 
 def _kline_builtin_defs():
@@ -2786,6 +2885,9 @@ def _kline_builtin_defs():
          _fetch_ths),
         ("东财", "push2his 多host轮询",
          _fetch_eastmoney),
+        ("quant机", "tailnet quant /api/kline（五市场同源实时库，"
+                    "sm70x/global_daily 同源；北交不覆盖）",
+         _fetch_quant),
     ]
 
 
@@ -2905,6 +3007,24 @@ def _load_kline_src_cfg():
                if cp.has_section("data") else "")
         order = [s.strip() for s in raw.split(",") if s.strip()]
         order = [s for s in order if s in names]
+        # 内置源增补迁移（v7.5.17 quant机）：用户存过旧源链时把链里没有
+        # 的内置源追加到链尾并回写 ini——只跑一次（kline_srcs_migrated
+        # 标记），之后用户在设置里停用/排序照常持久化，不会再被顶回。
+        _migrated = (cp.get("data", "kline_srcs_migrated", fallback="")
+                     if cp.has_section("data") else "")
+        if order and _migrated != _KLINE_MIGRATE_TS:
+            missing = [d[0] for d in _kline_builtin_defs()
+                       if d[0] not in order]
+            if missing:
+                order = order + missing
+                flog.info("K线源链增补迁移（v7.5.17）: + %s", missing)
+            try:
+                cp.set("data", "kline_srcs", ",".join(order))
+                cp.set("data", "kline_srcs_migrated", _KLINE_MIGRATE_TS)
+                with open(INI_PATH, "w", encoding="utf-8") as f:
+                    cp.write(f)
+            except Exception:
+                log.exception("K线源链迁移写回失败(忽略)")
         _KLINE_ORDER = order            # 空列表=全默认
         customs = []
         try:
@@ -6997,11 +7117,22 @@ def _td_quote(sym):
 
 
 def fetch_market_daily(full, count=None):
-    """多市场日K：美股配了 Twelve Data key 时优先 TD，其余/失败回落 Yahoo。
+    """多市场日K：quant 机（tailnet，与 sm70x/global_daily 同源实时库）
+    优先，美股 Twelve Data 次之，Yahoo 兜底。
 
-    Yahoo 1d period=10y 一次拉足；TD 一次 5000 根，同为拆股复权口径，
-    上层照旧差量入库、整只替换。"""
+    v7.5.17 统一接入：quant /api/kline 五市场同构编码（hk:00700 /
+    us:AAPL / crypto:BTC/USDT / fut:RB0），无强制限频、延迟 ~0.1s，
+    失败自动回落原链。Yahoo 1d period=10y 一次拉足；TD 一次 5000 根，
+    同为拆股复权口径，上层照旧差量入库、整只替换。"""
     n = int(count or CFG.MAX_FETCH_BARS * 2)
+    if QUANT_URL:
+        try:
+            rows = _fetch_quant(full, n)
+            if rows:
+                _MKT_DAILY_SRC["src"] = "quant"
+                return rows[-n:] if n and len(rows) > n else rows
+        except Exception as e:
+            flog.info("quant 日K回落 td/yahoo %s: %s", full, e)
     if _market_of(full) == "us":
         try:
             rows = _td_daily(_market_yf_symbol(full), n)
@@ -7111,22 +7242,24 @@ def _get_daily_market(full, tail=None):
     info = {}
     try:
         # v6.6.5 同源优先：hk/us/fut 直读 sm701 副本库（训练数据源，特征
-        # 口径与模型一致）；副本无该股/落后 → Yahoo 补齐。crypto 同日K
-        # 只取已完成 UTC 日（副本库较新时仍优先同源）。
+        # 口径与模型一致）；副本无该股/落后 → quant 机（v7.5.17，同源
+        # 实时库）→ Yahoo 补齐。crypto 同日K只取已完成 UTC 日（副本库
+        # 较新时仍优先同源）。
         remote = [r for r in _sm701_market_bars(full) if _keep(r)]
         if remote and remote[-1]["date"] < fresh:
             try:
                 yahoo = [r for r in fetch_market_daily(full) if _keep(r)]
             except Exception as e:
-                flog.info("多市场 Yahoo 补最新失败 %s: %s", full, e)
+                flog.info("多市场 quant/Yahoo 补最新失败 %s: %s", full, e)
                 yahoo = []
             if yahoo:
-                # 重叠日以 sm70x 同源数据为准，Yahoo 只补缺口/更新日。
+                # 重叠日以 sm70x 同源数据为准，quant/Yahoo 只补缺口/更新日。
                 merged = {r["date"]: r for r in remote}
                 for r in yahoo:
                     merged.setdefault(r["date"], r)
                 remote = [merged[d] for d in sorted(merged)]
-                info["src"] = "sm701副本库+yahoo"
+                info["src"] = ("sm701副本库+"
+                               + (_MKT_DAILY_SRC.get("src") or "yahoo"))
             else:
                 info["src"] = "sm701副本库"
         elif remote:

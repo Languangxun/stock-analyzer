@@ -5,6 +5,24 @@
 
 ## 版本历史
 
+> **v7.5.18：quant 机（Tailscale）统一行情源接入（2026-11-28）**：
+> ①**达标实测**：`quant.tail6a6cc8.ts.net` 下载中心/REST 全通——/health
+> ok、五市场日K全部新鲜至 11-27（crypto 按 UTC 已完成日口径，与本工程
+> 一致）、A 股非 watchlist（含 ETF）也新鲜、延迟 0.04~0.12s、
+> `Accept-Ranges` 支持断点续传；北交所（bj）不覆盖（08-26 停更）；
+> ②**统一接入**：新增 `_fetch_quant` REST 日K源——五市场同构编码
+> （sh600519 / hk:00700 / us:AAPL / crypto:BTC/USDT / fut:RB0），读
+> sm70x/global_daily 同一实时库（口径一致、无强制限频）；A 股源链链尾
+> 新增「quant机」源（走既有熔断/软失败机制，`tail≤800`），多市场
+> `fetch_market_daily` 改为 quant → TD(美股) → Yahoo 三级（同源优先于
+> 公网）；base 可配 `ini [data] quant_url` / 环境变量 `QUANT_URL`
+> （none/off/0 显式停用；无 tailnet 环境自动熔断跳过）；老用户源链
+> 一次性迁移自动补上新源（`kline_srcs_migrated` 标记，之后停用/排序
+> 照常持久化）；
+> ③**tailnet 直连**：`_is_tailnet_url`（*.ts.net / 100.64.0.0/10）强制
+> 直连——本地代理转发不了 100.x 内网，代理优先路由会白等一次超时；
+> ④`APP_VERSION=7.5.18`，`stock_predict.py` 重新生成。
+
 > **v7.5.17：Windows 桌面目录实测 + sm70x 模型目录可选（2026-11-28）**：
 > ①**Windows 优化**：桌面目录改走 `SHGetFolderPathW` 实测（OneDrive
 > 「桌面备份」把桌面重定向到 `~/OneDrive/Desktop|桌面` 时，原
