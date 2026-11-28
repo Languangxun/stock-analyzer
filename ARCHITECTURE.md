@@ -620,6 +620,19 @@ v7.5.7 多空拆分/杠杆改用 `_bt_simulate(mode=long/short/both)`（见下�
 高对比通用）；`run_bt` 结束 `yview_moveto(0)`，结果文本回到顶部直接展示全期/训练/验证；
 主图 MA 图例按 `cv.bbox` 实际字宽推进（HiDPI 不再重叠）。
 
+**结果与当前分析的绑定（v7.5.20）**：同股自动重分析会**替换 `res` 对象**（盘中跨快照
+`_tick_done` 重分析、应用 quant 消融策略后的 `_refresh_done`、15 分钟自动刷新），
+`run_bt` 的完成回调原先用对象身份 `self.res is res` 判等——同股结果被整批丢弃，
+面板永远停在「后台计算中…」（quant 批次重分析更频繁，命中率更高）。现改为：
+①丢弃条件只看**代码是否已切**（`full_code` 不同才丢）；②结果键=
+`(full_code, 策略签名)`，签名=算法/标签/档位/落库时间（`_strat_sig`）——签名未变
+照常渲染，签名已变（用户重选策略）自动按新策略重跑；③工具窗可在分析前打开：
+`run_bt` 无 `res` 时给出「请先分析预测」，`_loaded()` 调 `_maybe_refresh_tools_bt()`
+在分析完成后自动补算（同签名不重复算，避免重信号算法白跑）；④结果顶部标注
+「当前策略 + 回测窗口」；⑤副产物修复：`[ui] last` 改存**上一次成功分析**的正式代码
+（原存搜索框原文，半截搜索词会让下次启动 `normalize_code` 失败、模态「代码有误」
+卡住启动），启动时校验失败即清空。
+
 **多空拆分 / 杠杆（v7.5.7；v7.5.9 爆仓重置与置信度杠杆）**：设置→交易/融资 按市场配置
 `finance_市场`（允许融资/杠杆做多）、`short_市场`（允许做空）、
 `leverage_市场`（1~20，**上限**）、`adaptive_市场`（置信度自适应）、
@@ -1494,6 +1507,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.20**<br>（2026-11-28） | **工具→信号胜率「点了没结果」修复**：①根因——同股重分析替换 `res` 对象（tick 跨快照重分析 / 应用 quant 策略后重分析 / 15 分钟自动刷新），`run_bt` 完成回调按 `self.res is res` 判等，同股结果被整批丢弃、页面停在「后台计算中…」（quant 批次重分析更频繁更易命中）；②改按「代码 + 策略签名（`_strat_sig`：算法/标签/档位/落库时间）」比对，签名未变照常渲染、已变自动重跑；③分析前打开工具窗给提示，`_loaded()`→`_maybe_refresh_tools_bt()` 分析完成后自动补算（同签名不重复算）；④结果顶部标注「当前策略 + 回测窗口」；⑤`[ui] last` 改存上一次成功分析的正式代码（半截搜索词会让下次启动 `normalize_code` 失败、模态「代码有误」卡住启动），启动校验失败即清空；⑥`APP_VERSION=7.5.20`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.19**<br>（2026-11-28） | **默认源分级**：①A股默认源=quant机（提链首；失效/无 tailnet 按原链轮换 腾讯×6→通达信→新浪→同花顺→东财，实测 `tries=[quant机,腾讯]` 降级正常）；存量源链一次性迁移提首（`kline_srcs_migrated=2026-11-28.2`）；②加密默认=币安（新增 `_fetch_binance_daily`/`_binance_symbol`：免 key `/api/v3/klines` 1d UTC 日切，api.binance.com 代理优先 + data-api.binance.vision 备域，末根未完成 bar 由 `_keep` 过滤）；多市场分级=加密 币安→quant→Yahoo / 港美期 quant→TD→Yahoo，备用源全保留；③裸币修复：`cryptobtc`→`BTCUSDT`/`BTC/USDT`（`_binance_symbol`/`_quant_code`）；④`APP_VERSION=7.5.19`，`stock_predict.py` 重新生成；2.0/2.1 节与 README/CHANGELOG 同步 |
 | **v7.5.18**<br>（2026-11-28） | **quant 机（Tailscale）统一行情源接入**：达标实测（/health ok、五市场日K全新鲜至 11-27、加密按 UTC 已完成日与工程口径一致、延迟 0.04~0.12s、Range 断点续传可用、bj 不覆盖）后统一接入——①新增 `_quant_code/_fetch_quant` REST 日K源（`/api/kline` 五市场同构编码 `sh600519`/`hk:00700`/`us:AAPL`/`crypto:BTC/USDT`/`fut:RB0`，读 sm70x/global_daily 同一实时库，tail≤800，无数据=软失败不触发自愈）；②A股源链链尾新增「quant机」内置源（既有熔断/节流复用）+ 内置源增补一次性迁移（`kline_srcs_migrated`，老配置自动补新源、后续停用照常持久化）；③多市场 `fetch_market_daily` 改 **quant → TD(美股) → Yahoo** 三级（同源实时库优先于公网）；④base 可配 `ini [data] quant_url`/环境变量 `QUANT_URL`（none/off/0 停用；无 tailnet 环境自动熔断跳过）；⑤`_is_tailnet_url`（*.ts.net / 100.64.0.0/10）强制直连（代理转发不了 100.x）；⑥`APP_VERSION=7.5.18`，`stock_predict.py` 重新生成；2.0/2.1 节与 README/CHANGELOG 同步 |
 | **v7.5.17**<br>（2026-11-28） | **Windows 桌面目录实测 + sm70x 模型目录可选**：①`external/sm701_ext.py` 桌面目录改 `_desktop_roots()`——Windows `SHGetFolderPathW(CSIDL_DESKTOPDIRECTORY)` 实测 + OneDrive 变体 + `~/Desktop`/`~/桌面` 兜底（OneDrive 桌面备份重定向后原硬编码全部落空），`_sm701_dirs`/`_sm701_pick_db`/`sm702_dir` 共用；GUI `desktop_dir()` 同口径用于报告/回测导出、品牌图、画线 PDF 查找；②设置→外部策略新增「sm701/sm702 模型目录」（浏览…/清除，ini `[predict] sm701_dir/sm702_dir`，空=自动探测；保存即 `_apply_sm70_env()` 映射 `SM70_DIR/SM702_DIR` + `reset_cache()` 生效）+ sm701 连接状态显示；③`check_open_source.py` GBK 控制台 `UnicodeEncodeError` 修复（stdout/stderr 重配 UTF-8）；④`APP_VERSION=7.5.17`，`stock_predict.py` 重新生成；3.7 节与 CHANGELOG 同步 |

@@ -157,7 +157,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.19"
+APP_VERSION = "7.5.20"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -10101,6 +10101,20 @@ STRAT_TTL = 5 * 86400
 
 def _strat_key(full):
     return "strategy:" + full
+
+
+def _strat_sig(strat):
+    """策略签名字（v7.5.20）：判「工具→信号胜率」结果是否对应当前策略。
+
+    分析重跑会替换 res 对象（tick 跨快照自动重分析、应用 quant 策略后
+    重分析），旧逻辑用对象身份判等会把同股结果整批丢弃——改用策略签名
+    （算法/标签/档位/落库时间）比对，策略没变就照常渲染。"""
+    s = strat or {}
+    try:
+        ts = round(float(s.get("ts") or 0), 3)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return (s.get("algo"), s.get("label"), s.get("mode"), ts)
 
 
 def load_strategy(full, allow_stale=False):
@@ -20085,6 +20099,12 @@ class App:
         globals()["_AI_RESCUE_HOOK"] = self._ai_rescue_flow
         if getattr(self, "_last_code", ""):
             self.code_var.set(self._last_code)
+            try:
+                normalize_code(self._last_code)
+            except ValueError:
+                # 旧 ini 可能存了半截搜索词：清掉，避免启动即弹窗（v7.5.20）
+                self.code_var.set("")
+                self._last_code = ""
         self._build_body()
         self._apply_fold()              # 紧凑小屏默认折叠副图
         try:
@@ -24748,11 +24768,17 @@ class App:
         if self.res is not None and res["full_code"] != self.res["full_code"]:
             self._ai_msgs = []
         self.res = res
+        self._last_full = res["full_code"]   # 只持久化有效代码（v7.5.20）
         self._sync_user_lines()
         self.ai_text = ""
         self._save_ini()
         self._set_info()
         self._rerender()
+        # 工具窗开着时，策略变了/尚未算过 → 自动补算信号胜率（v7.5.20）
+        try:
+            self._maybe_refresh_tools_bt()
+        except Exception:
+            log.debug("工具窗信号胜率自动补算失败(忽略)", exc_info=True)
         # 盘口面板可见时，切股/分析完成后五档自动跟随新股票
         try:
             if getattr(self, "_rt_choice", "") == "盘口":
@@ -24764,6 +24790,32 @@ class App:
             self._ai_on_res_loaded(res)
         except Exception:
             log.exception("AI 侧栏绑定失败(忽略)")
+
+    def _maybe_refresh_tools_bt(self):
+        """工具窗「信号胜率」自动补算（v7.5.20）。
+
+        工具窗可在分析前打开、也可在切股/应用 quant 策略后继续开着：
+        分析完成（`_loaded`）时若该页还没算过、或策略签名已变，就重跑
+        一次；同一策略签名不重复计算（重信号算法冷缓存较慢）。"""
+        win = getattr(self, "_tools_win", None)
+        res = self.res
+        if not win or not res:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+            runner = getattr(win, "_bt_run", None)
+        except Exception:
+            return
+        if not callable(runner):
+            return
+        if getattr(win, "_bt_busy", False):
+            return
+        st = res.get("strategy") or {}
+        if (res.get("full_code"), _strat_sig(st)) == getattr(
+                win, "_bt_done_key", None):
+            return
+        runner()
 
     def _set_info(self, q=None):
         """顶栏信息行（盘前不显示过期今开，锚定提示在图表右下角）。
@@ -27724,7 +27776,16 @@ class App:
         cp.remove_option("watchlist", "codes")
         if not cp.has_section("ui"):
             cp.add_section("ui")
-        cp.set("ui", "last", self.code_var.get())
+        # v7.5.20：只持久化「上一次成功分析」的正式代码——搜索框是同一个
+        # 变量，用户可能停在半截搜索词（如「沪」），旧逻辑会把半截词写进
+        # ini，下次启动 normalize_code 失败弹「代码有误」把启动卡住。
+        _last_txt = getattr(self, "_last_full", "") or ""
+        if not _last_txt:
+            try:
+                _last_txt = normalize_code(self.code_var.get())
+            except ValueError:
+                _last_txt = ""
+        cp.set("ui", "last", _last_txt)
         cp.set("ui", "theme", self.settings["theme"])
         cp.set("ui", "updown", self.settings["updown"])
         # 指标线：颜色 / 粗细
@@ -28811,12 +28872,24 @@ class App:
             # 复算，冷缓存 ~110s）+ backtest_signals + _bt_segments，
             # 整个 UI 冻结数分钟（用户表现为"打开工具/点数据工具就卡死"）。
             # 现计算放后台线程，完成后回主线程渲染（懒加载同模式）。
-            if not self.res or not win.winfo_exists():
+            if not win.winfo_exists():
                 return
             if getattr(win, "_bt_busy", False):
                 return
             res = self.res
+            if not res:
+                # v7.5.20：工具窗可以在分析前打开——给出明确提示，
+                # 分析完成后 _maybe_refresh_tools_bt() 会自动补算。
+                win._bt_done_key = None
+                bt_result.config(state="normal")
+                bt_result.delete("1.0", "end")
+                bt_result.insert(
+                    "end", "\n  请先【分析预测】一只股票，再计算信号胜率。\n"
+                           "  （分析完成后本页会自动计算，无需重开工具窗）\n")
+                bt_result.config(state="disabled")
+                return
             strat = res.get("strategy") or {}
+            win._bt_req_key = (res.get("full_code"), _strat_sig(strat))
             rp = (strat.get("params")
                   or CFG.RISK_PARAMS.get(res.get("risk_mode"))
                   or CFG.risk_params())
@@ -28880,12 +28953,36 @@ class App:
                         self.progress_var.set("信号胜率计算失败（详见日志）")
                     except Exception:
                         pass
+                    try:
+                        bt_result.config(state="normal")
+                        bt_result.delete("1.0", "end")
+                        bt_result.insert(
+                            "end", f"\n  计算失败：{err}\n  详见 stock_gui.log")
+                        bt_result.config(state="disabled")
+                    except Exception:
+                        pass
                     return
-                if not (win.winfo_exists() and self.res is res):
+                cur = self.res
+                if not (win.winfo_exists() and cur
+                        and cur.get("full_code") == res.get("full_code")):
                     return          # 窗口已关/已切换股票，丢弃过期结果
+                # v7.5.20：重分析会替换 self.res 对象（tick 跨快照自动重分析、
+                # 应用 quant 策略后重分析）——旧逻辑按对象身份判等会把同股
+                # 结果整批丢弃，信号胜率永远停在「后台计算中…」。改按策略
+                # 签名比对：策略已变则按当前策略重算，未变照常渲染。
+                if (cur.get("full_code"),
+                        _strat_sig(cur.get("strategy") or {})) != win._bt_req_key:
+                    run_bt()
+                    return
                 _bt_last[0] = bt
                 bt_result.config(state="normal")
                 bt_result.delete("1.0", "end")
+                win._bt_done_key = win._bt_req_key
+                _lbl = strat.get("label") or strat.get("algo") or "默认"
+                _win = (f"{rows_bt[0]['date']} ~ {rows_bt[-1]['date']}"
+                        if rows_bt else "-")
+                bt_result.insert(
+                    "end", f"  当前策略：{_lbl}（{_win}，{len(rows_bt)} 根）\n")
                 if not bt:
                     bt_result.insert(
                         "end",
@@ -29209,6 +29306,8 @@ class App:
                   font=("Microsoft YaHei", 10, "bold")).pack(
                       side="left", padx=6, ipadx=10, ipady=4)
         # 打开即算一次，省得用户再点
+        win._bt_run = run_bt
+        win._bt_done_key = None
         self.root.after(80, run_bt)
 
         # ── 基本面（v6.2.1：历史财报关键数据 + 规则分析）──

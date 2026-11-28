@@ -177,7 +177,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.19"
+APP_VERSION = "7.5.20"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -10123,6 +10123,20 @@ STRAT_TTL = 5 * 86400
 
 def _strat_key(full):
     return "strategy:" + full
+
+
+def _strat_sig(strat):
+    """策略签名字（v7.5.20）：判「工具→信号胜率」结果是否对应当前策略。
+
+    分析重跑会替换 res 对象（tick 跨快照自动重分析、应用 quant 策略后
+    重分析），旧逻辑用对象身份判等会把同股结果整批丢弃——改用策略签名
+    （算法/标签/档位/落库时间）比对，策略没变就照常渲染。"""
+    s = strat or {}
+    try:
+        ts = round(float(s.get("ts") or 0), 3)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return (s.get("algo"), s.get("label"), s.get("mode"), ts)
 
 
 def load_strategy(full, allow_stale=False):
