@@ -98,6 +98,51 @@ def _env_first(*names):
     return ""
 
 
+# ---- sm701 云 API（v7.5.21，StockModel /platform）----
+# 本地无模型时的兜底：云端只发布「当前数据时点」概率，因此只补最新一日；
+# 历史信号/回测仍需本地模型（A股消融候选仍按 sm701_has_model 过滤）。
+def _cloud_module():
+    try:
+        from . import sm701_cloud as _c
+        return _c
+    except Exception:
+        try:
+            import sm701_cloud as _c     # 同目录脚本兜底
+            return _c
+        except Exception:
+            return None
+
+
+def sm701_cloud_ready():
+    """云 API 是否可用（Key 已配置且未停用）。"""
+    c = _cloud_module()
+    try:
+        return bool(c and c.enabled())
+    except Exception:
+        return False
+
+
+def _sm701_cloud_latest(full, latest):
+    """云 API 取最新一日概率；未配置/失败返回 None（不影响本地信号）。"""
+    if not latest:
+        return None
+    c = _cloud_module()
+    if c is None:
+        return None
+    try:
+        if not c.enabled():
+            return None
+        rec = c.prob_for(full, latest)
+        if rec and rec.get("prob") is not None:
+            _SM701_CACHE.setdefault("cloud_probs", {})[full] = dict(rec)
+            log.info("sm701 云概率 %s %s: %.3f (%s)",
+                     full, latest, rec["prob"], rec.get("model") or "-")
+            return float(rec["prob"])
+    except Exception as exc:            # 网络/限流/余额：只警告，不阻断分析
+        log.warning("sm701 云预测失败 %s: %s", full, str(exc)[:160])
+    return None
+
+
 def tier_load_panel():
     return _HOST["tier_load_panel"]()
 
@@ -1036,9 +1081,19 @@ def sm701_status(market="cn"):
                                   for h, v in prod["models"].items()}
             out["prod_n_feat"] = len(prod["features"])
         out["markets"] = {mk: sm701_has_model(mk) for mk in _SM701_MK}
-        return out
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        out = {"ok": False, "error": str(exc)}
+    # v7.5.21：云 API 状态（不联网；Key 只给掩码）
+    c = _cloud_module()
+    if c is not None:
+        try:
+            out["cloud"] = c.status()
+            out["cloud_ready"] = c.enabled()
+        except Exception:
+            out["cloud"] = {"configured": False, "ready": False,
+                            "url": "", "key": "", "source": ""}
+            out["cloud_ready"] = False
+    return out
 
 
 # 外接算法信号阈值：模型概率滞回映射
@@ -1204,16 +1259,25 @@ def sm701_prob_map(full, dates=None):
     mtime 缓存）；dates 中晚于历史末日的交易日走实时复算——cn 全市场口径
     （_sm701_live_predict），hk/us/fut/crypto 单股口径（_sm701_live_one）。
     v7.4.0：历史预测文件缺失时改走实时复算——A股复用 sm701_score_matrix
-    的一次全市场矩阵，非 cn 最多复算最近 250 个交易日（不再返回空）。"""
+    的一次全市场矩阵，非 cn 最多复算最近 250 个交易日（不再返回空）。
+    v7.5.21：本地没有该市场模型时，用云 API（StockModel）补**最新一日**
+    概率——云端只发布当前数据时点，历史回测仍需本地模型；有本地模型时
+    完全离线（不产生云端调用/费用）。"""
     if np is None:
-        return {}
+        # 无 numpy：本地实时复算不可用，云模式仍可给最新一日
+        latest = max([d for d in (dates or []) if d] or [""])
+        p = _sm701_cloud_latest(full, latest)
+        return {latest: p} if (latest and p is not None) else {}
     mk = _market_of(full)
     if mk not in _SM701_MK:
         return {}
     try:
         paths = sm701_paths(market=mk)
     except Exception:
-        return {}
+        # v7.5.21：本地没有该市场模型集 → 仍可用云 API 出最新一日
+        latest = max([d for d in (dates or []) if d] or [""])
+        p = _sm701_cloud_latest(full, latest)
+        return {latest: p} if (latest and p is not None) else {}
     sm_code = _sm701_code(full)
     try:
         pred_mt = os.path.getmtime(paths["pred"])
@@ -1266,14 +1330,24 @@ def sm701_prob_map(full, dates=None):
         cache[full] = (key, dict(out))
     if dates:
         uniq = list(dict.fromkeys(d for d in dates if d))
+        if not uniq:
+            return out
+        latest = max(uniq)
         hist_max = max(out) if out else ""
-        if hist_max:
-            missing = [d for d in uniq if d > hist_max]
-        else:
-            # 无历史预测文件：只复算最近窗口，避免把整段历史拖进
-            # 全市场实时复算（A股一次会读上百万行，旧实现会卡数十秒）
-            missing = sorted(uniq)[-_SM701_LIVE_MAX:]
+        try:
+            local_model = bool(sm701_has_model(mk))
+        except Exception:
+            local_model = False
+        missing = []
+        if local_model:
+            if hist_max:
+                missing = [d for d in uniq if d > hist_max]
+            else:
+                # 无历史预测文件：只复算最近窗口，避免把整段历史拖进
+                # 全市场实时复算（A股一次会读上百万行，旧实现会卡数十秒）
+                missing = sorted(uniq)[-_SM701_LIVE_MAX:]
         if missing:
+            # （v7.5.21：无本地模型时不再尝试本地实时复算——直接走云端）
             try:
                 if mk == "cn":
                     got = {} if hist_max else _sm701_cn_matrix_probs(full)
@@ -1290,6 +1364,12 @@ def sm701_prob_map(full, dates=None):
                     out.update(_sm701_live_one(full, missing))
             except Exception:
                 log.exception("sm701 单股实时概率复算失败")
+        # v7.5.21：本地无该市场模型（或该日仍缺）→ 云 API 补最新一日。
+        # 只在「无本地模型」时走云端，避免有模型的机器给整段历史刷云端账单。
+        if not local_model and out.get(latest) is None:
+            p = _sm701_cloud_latest(full, latest)
+            if p is not None:
+                out[latest] = p
     return out
 
 

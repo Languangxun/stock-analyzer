@@ -5,6 +5,28 @@
 
 ## 版本历史
 
+> **v7.5.21：sm701 云 API（StockModel /platform）接入 + Key 支持（2026-11-28）**：
+> ①**新增 `external/sm701_cloud.py`**：`POST /v1/predict` 批量概率预测
+> （≤50 标的，`Authorization: Bearer sk-sm-…`）、`GET /v1/balance`
+> （余额/限流）、`GET /health`（探活）；编码与本工程同构
+> （`sh600519` / `hk:00700` / `us:AAPL` / `crypto:BTC/USDT` / `fut:RB0`，
+> 加密小时 `BTCUSDT`）；内置 **2 秒节流** + **5 分钟结果缓存**
+> （`[predict] sm701_cloud_ttl` 可调），401/402/429/503 转中文提示且
+> **不打印 Key**（状态只显示掩码）；base URL 可配，空路径自动补
+> `/platform`，tailnet 地址复用宿主 `_open_url` 强制直连；
+> ②**用途=本地无模型兜底**：`sm701_prob_map` 在「该市场无本地模型」时用
+> 云端补**最新一日**概率（云端只发布当前数据时点，历史回测仍需本地
+> 模型；有本地模型时完全离线、零云端费用，A股消融候选仍按本地模型
+> 过滤）；非 cn 市场（港/美/期/加密）无本地模型时也能直出 sm701 买卖点，
+> 标签标注「仅最新一日；本地模型未装」；`_sm701_available()` 统一判定
+> 「本地模型 or 云 Key」；
+> ③**设置→外部策略**新增「sm701 云 API」：兜底开关（`[predict] sm701_cloud`）、
+> Key（密码框，ini `[predict] sm701_cloud_key`，环境变量 `SM701_API_KEY` 优先）、
+> 地址（`sm701_cloud_url`，空=默认）、「测试连接」（`/v1/balance` 显示
+> 余额/限流；未填 Key 时只探活 `/health`）、「清除」；保存即清缓存生效，
+> 状态行显示来源（env/ini）与掩码 Key；
+> ④`APP_VERSION=7.5.21`，`stock_predict.py` 重新生成。
+
 > **v7.5.20：工具→信号胜率「点了没结果」修复（2026-11-28）**：
 > ①**根因**：同股自动重分析会替换 `self.res` 对象（盘中跨快照 tick 重分析、
 > 应用 quant 消融策略后的重分析），回测线程完成后旧逻辑用对象身份

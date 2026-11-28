@@ -177,7 +177,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.20"
+APP_VERSION = "7.5.21"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -433,6 +433,11 @@ class CFG:
     # v7.5.11：sm701 信号滞回阈值（内调参；默认 0.55/0.50）
     SM701_SIG_BUY = 0.55
     SM701_SIG_SELL = 0.50
+    # v7.5.21：sm701 云 API（StockModel /platform）——本地无模型时用云端
+    # 最新一日概率（ini [predict] sm701_cloud_key/url；环境变量 SM701_API_KEY
+    # /SM701_API_URL 优先，避免明文落盘）
+    SM701_CLOUD_KEY = ""
+    SM701_CLOUD_URL = ""
     # v7.5.11：sm702 加密止损/否决模型（只读 sm702 outputs_crypto）
     SM702_ON = False
     SM702_Q = 0.30          # 止损概率 top-q 视为高风险
@@ -706,6 +711,14 @@ def _load_predict_cfg():
                                 fallback=CFG.SM701_DIR) or "").strip()
         CFG.SM702_DIR = (cp.get("predict", "sm702_dir",
                                 fallback=CFG.SM702_DIR) or "").strip()
+        # v7.5.21：sm701 云 API Key/地址（环境变量 SM701_API_KEY 优先，
+        # 由 external/sm701_cloud.py 统一解析；这里只给设置页回显 ini 值）
+        CFG.SM701_CLOUD_KEY = (cp.get("predict", "sm701_cloud_key",
+                                      fallback=CFG.SM701_CLOUD_KEY)
+                               or "").strip()
+        CFG.SM701_CLOUD_URL = (cp.get("predict", "sm701_cloud_url",
+                                      fallback=CFG.SM701_CLOUD_URL)
+                               or "").strip()
         # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
         CFG.LOCAL_ABLATION = bool(gi("local_ablation",
                                      1 if CFG.LOCAL_ABLATION else 0, 0, 1))
@@ -13560,9 +13573,19 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         if bound:
             strat = bound
         elif (CFG.SM701_EXT_ON and mk in _SM701_MK
-              and sm701_has_model(mk)):
-            _label = f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"
-            if mk == "crypto":
+              and _sm701_available(mk)):
+            _local = False
+            try:
+                _local = bool(sm701_has_model(mk))
+            except Exception:
+                _local = False
+            if _local:
+                _label = f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"
+            else:
+                # v7.5.21：无本地模型 → 云 API 最新一日概率（历史段无信号）
+                _label = (f"sm70x云端·{_MARKET_LABELS[mk]}"
+                          "（仅最新一日；本地模型未装）")
+            if _local and mk == "crypto":
                 try:
                     _hp = os.path.join(
                         sm701_paths(market="crypto").get("dir") or "",
@@ -15845,6 +15868,7 @@ _TIER_CACHE = {}
 # 路径可用 SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）覆盖；
 # 行情库兼容 sm701 原生表与桌面 global_daily.db（market 列统一表）。
 import external.sm701_ext as _sm701_ext
+import external.sm701_cloud as _sm701_cloud
 
 _sm701_ext.init_host(globals())
 from external.sm701_ext import (  # noqa: E402,F401
@@ -15859,16 +15883,35 @@ from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
 
+def _sm701_cloud_ready():
+    """云端 sm701 是否可用（Key 已配置；v7.5.21）。"""
+    try:
+        return bool(_sm701_cloud.enabled())
+    except Exception:
+        return False
+
+
+def _sm701_available(market):
+    """sm70x 是否有可用输出：本地模型优先，其次云 API（仅最新一日）。"""
+    try:
+        if sm701_has_model(market):
+            return True
+    except Exception:
+        pass
+    return _sm701_cloud_ready()
+
+
 def _sm701_strategy_usable(market):
-    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型存在。
+    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型/云存在。
 
     v7.3.5：用于忽略缓存里残留的 sm701 策略（旧版 sm701_ext=0 只影响
-    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。"""
+    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。
+    v7.5.21：云 API 已配置时也视为可用（云端只出最新一日信号）。"""
     if not CFG.SM701_EXT_ON:
         return False
     if market == "cn" and not CFG.SM701_JOIN_ABLATION:
         return False
-    return sm701_has_model(market)
+    return _sm701_available(market)
 
 
 def tier_segments(cal):

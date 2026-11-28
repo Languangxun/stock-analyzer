@@ -157,7 +157,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-11-06 升 7.0.2 盘口/备选AI）
-APP_VERSION = "7.5.20"
+APP_VERSION = "7.5.21"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -413,6 +413,11 @@ class CFG:
     # v7.5.11：sm701 信号滞回阈值（内调参；默认 0.55/0.50）
     SM701_SIG_BUY = 0.55
     SM701_SIG_SELL = 0.50
+    # v7.5.21：sm701 云 API（StockModel /platform）——本地无模型时用云端
+    # 最新一日概率（ini [predict] sm701_cloud_key/url；环境变量 SM701_API_KEY
+    # /SM701_API_URL 优先，避免明文落盘）
+    SM701_CLOUD_KEY = ""
+    SM701_CLOUD_URL = ""
     # v7.5.11：sm702 加密止损/否决模型（只读 sm702 outputs_crypto）
     SM702_ON = False
     SM702_Q = 0.30          # 止损概率 top-q 视为高风险
@@ -686,6 +691,14 @@ def _load_predict_cfg():
                                 fallback=CFG.SM701_DIR) or "").strip()
         CFG.SM702_DIR = (cp.get("predict", "sm702_dir",
                                 fallback=CFG.SM702_DIR) or "").strip()
+        # v7.5.21：sm701 云 API Key/地址（环境变量 SM701_API_KEY 优先，
+        # 由 external/sm701_cloud.py 统一解析；这里只给设置页回显 ini 值）
+        CFG.SM701_CLOUD_KEY = (cp.get("predict", "sm701_cloud_key",
+                                      fallback=CFG.SM701_CLOUD_KEY)
+                               or "").strip()
+        CFG.SM701_CLOUD_URL = (cp.get("predict", "sm701_cloud_url",
+                                      fallback=CFG.SM701_CLOUD_URL)
+                               or "").strip()
         # v7.4.1：本地消融开关（0=GUI 不跑 run_ablation，只用导入/旧策略）
         CFG.LOCAL_ABLATION = bool(gi("local_ablation",
                                      1 if CFG.LOCAL_ABLATION else 0, 0, 1))
@@ -13538,9 +13551,19 @@ def _analyze_body(full, progress=None, quick=False, defer_signals=False):
         if bound:
             strat = bound
         elif (CFG.SM701_EXT_ON and mk in _SM701_MK
-              and sm701_has_model(mk)):
-            _label = f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"
-            if mk == "crypto":
+              and _sm701_available(mk)):
+            _local = False
+            try:
+                _local = bool(sm701_has_model(mk))
+            except Exception:
+                _local = False
+            if _local:
+                _label = f"sm70x外接算法·{_MARKET_LABELS[mk]}（直出，不消融）"
+            else:
+                # v7.5.21：无本地模型 → 云 API 最新一日概率（历史段无信号）
+                _label = (f"sm70x云端·{_MARKET_LABELS[mk]}"
+                          "（仅最新一日；本地模型未装）")
+            if _local and mk == "crypto":
                 try:
                     _hp = os.path.join(
                         sm701_paths(market="crypto").get("dir") or "",
@@ -15823,6 +15846,7 @@ _TIER_CACHE = {}
 # 路径可用 SM70_DIR / SM70_DB / SM70_MODEL / SM70_PRED（兼容 SM701_*）覆盖；
 # 行情库兼容 sm701 原生表与桌面 global_daily.db（market 列统一表）。
 import external.sm701_ext as _sm701_ext
+import external.sm701_cloud as _sm701_cloud
 
 _sm701_ext.init_host(globals())
 from external.sm701_ext import (  # noqa: E402,F401
@@ -15837,16 +15861,35 @@ from external.sm701_ext import (  # noqa: E402,F401
     EXT_RISK as _SM701_EXT_RISK)
 
 
+def _sm701_cloud_ready():
+    """云端 sm701 是否可用（Key 已配置；v7.5.21）。"""
+    try:
+        return bool(_sm701_cloud.enabled())
+    except Exception:
+        return False
+
+
+def _sm701_available(market):
+    """sm70x 是否有可用输出：本地模型优先，其次云 API（仅最新一日）。"""
+    try:
+        if sm701_has_model(market):
+            return True
+    except Exception:
+        pass
+    return _sm701_cloud_ready()
+
+
 def _sm701_strategy_usable(market):
-    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型存在。
+    """当前配置下 sm701 策略是否可用：总开关 + A股消融开关 + 模型/云存在。
 
     v7.3.5：用于忽略缓存里残留的 sm701 策略（旧版 sm701_ext=0 只影响
-    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。"""
+    新一轮消融/多市场直出，已缓存策略仍会被 load_strategy 沿用）。
+    v7.5.21：云 API 已配置时也视为可用（云端只出最新一日信号）。"""
     if not CFG.SM701_EXT_ON:
         return False
     if market == "cn" and not CFG.SM701_JOIN_ABLATION:
         return False
-    return sm701_has_model(market)
+    return _sm701_available(market)
 
 
 def tier_segments(cal):
@@ -30254,13 +30297,21 @@ class App:
             base_now = base_var.get().strip()
 
             def done(res, err):
+                try:
+                    if not win.winfo_exists():
+                        return          # 设置窗已关闭/已保存销毁
+                except Exception:
+                    return
                 if err:
                     if not auto:
                         messagebox.showerror("获取模型", str(err), parent=win)
                     return
                 names = res or []
                 if names:
-                    cmb_model["values"] = names
+                    try:
+                        cmb_model["values"] = names
+                    except Exception:
+                        return          # 窗口刚销毁（保存/关闭）
                     if model_var.get() not in names:
                         model_var.set(names[0])
                     self.progress_var.set(
@@ -30720,18 +30771,21 @@ class App:
                 st = sm701_status()
             except Exception:
                 st = {"ok": False, "error": "检测失败"}
+            _c = st.get("cloud") or {}
+            _ctxt = ("云API: " + ("已配置 " + (_c.get("key") or "")
+                                  if _c.get("configured") else "未配置"))
             if not st.get("ok"):
-                return ("sm701 状态：未连接（%s）\n模型目录需含 "
+                return ("sm701 状态：未连接（%s）\n%s\n模型目录需含 "
                         "lgbm_train_backtest.py 与 production/ 模型集"
-                        % str(st.get("error", ""))[:120])
+                        % (str(st.get("error", ""))[:120], _ctxt))
             mks = " ".join(k for k, v in (st.get("markets") or {}).items()
                            if v)
             return ("sm701 状态：已连接 %s\n数据源: %s · 模型: %s\n"
-                    "可用市场: %s" % (st.get("dir") or "-",
+                    "可用市场: %s\n%s" % (st.get("dir") or "-",
                                       st.get("db") or "回退主库行情",
                                       os.path.basename(
                                           st.get("model") or "") or "-",
-                                      mks or "-"))
+                                      mks or "-", _ctxt))
 
         ttk.Separator(frm, orient="horizontal").grid(
             row=_r, column=0, columnspan=3, sticky="we", pady=(10, 6))
@@ -30769,6 +30823,124 @@ class App:
                   foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
                   justify="left", wraplength=620).grid(
                       row=_r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        _r += 1
+
+        # ---- v7.5.21：sm701 云 API（StockModel /platform）----
+        # 本地没有 sm70x 模型/数据时，用云端最新一日概率出买卖点
+        # （历史段仍需本地模型；云端 ¥0.10/次、失败不计费、2 秒/次）。
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=_r, column=0, columnspan=3, sticky="we", pady=(10, 6))
+        _r += 1
+        ttk.Label(
+            frm,
+            text="— sm701 云 API（StockModel /platform；本地无模型时用云端"
+                 "最新一日概率）—").grid(row=_r, column=0, columnspan=3,
+                                          sticky="w")
+        _r += 1
+        sm701_cloud_on_var = tk.BooleanVar(value=_sm701_cloud.flag_on())
+        ttk.Checkbutton(
+            frm, text="启用云 API 兜底（仅本地无该市场模型时调用；"
+                      "有本地模型则完全离线，不产生费用）",
+            variable=sm701_cloud_on_var).grid(
+                row=_r, column=0, columnspan=3, sticky="w")
+        _r += 1
+        sm701_cloud_key_var = tk.StringVar(value=CFG.SM701_CLOUD_KEY)
+        sm701_cloud_url_var = tk.StringVar(value=CFG.SM701_CLOUD_URL)
+
+        def _cloud_status_text(extra=""):
+            try:
+                st = _sm701_cloud.status()
+            except Exception:
+                st = {"key": "", "url": "", "source": "", "configured": False}
+            _src = st.get("source") or ""
+            _who = {"env": "环境变量 SM701_API_KEY（优先）",
+                    "ini": "本地 ini（stock_gui.ini 已忽略）"}.get(_src,
+                                                                  "未配置")
+            _off = "" if _sm701_cloud.flag_on() else "（兜底开关已关闭）"
+            _txt = ("云 API：%s · Key %s · 地址 %s%s\n"
+                    "仅本地缺该市场模型时调用（有本地模型则完全离线）；"
+                    "云端只提供最新数据时点概率，历史回测仍用本地模型；"
+                    "¥0.10/次、失败不计费、普通用户 2 秒/次。"
+                    % (_who, st.get("key") or "（未配置）",
+                       st.get("url") or "-", _off))
+            if extra:
+                _txt += "\n" + extra
+            return _txt
+
+        def _test_cloud():
+            _k = (sm701_cloud_key_var.get() or "").strip() or \
+                _sm701_cloud.api_key()
+            _u = (sm701_cloud_url_var.get() or "").strip()
+            if not _k:
+                sm701_cloud_status_var.set(
+                    "云 API：未填 Key —— 只测试服务可达性（GET /health）…")
+
+                def _w0():
+                    return _sm701_cloud.health(url=_u)
+
+                def _d0(r, e):
+                    try:
+                        if e:
+                            sm701_cloud_status_var.set(
+                                "云 API：不可达 · %s" % str(e)[:160])
+                        else:
+                            sm701_cloud_status_var.set(
+                                "云 API：服务可达（%s v%s，数据 %s）· "
+                                "未配置 Key，无法查询余额/预测"
+                                % (r.get("service") or "StockModel",
+                                   r.get("version") or "?",
+                                   r.get("data_ts") or "-"))
+                    except Exception:
+                        pass
+                self._run_bg(_w0, _d0)
+                return
+            sm701_cloud_status_var.set("云 API：测试中…（GET /v1/balance，免费）")
+
+            def _work():
+                return _sm701_cloud.balance(key=_k, url=_u)
+
+            def _done(r, e):
+                try:
+                    if e:
+                        sm701_cloud_status_var.set(
+                            "云 API：测试失败 · %s" % str(e)[:160])
+                        return
+                    sm701_cloud_status_var.set(
+                        "云 API：连接正常 · 余额 ¥%s · 限流 %s 秒/次 · "
+                        "¥%s/次（%s）" % (
+                            r.get("balance_yuan"), r.get("rate_limit_seconds"),
+                            r.get("price_per_call_yuan"),
+                            _sm701_cloud.api_url()))
+                except Exception:
+                    pass
+            self._run_bg(_work, _done)
+
+        ttk.Label(frm, text="云 API Key").grid(row=_r, column=0, sticky="w",
+                                               pady=2)
+        ttk.Entry(frm, textvariable=sm701_cloud_key_var, width=46,
+                  show="*").grid(row=_r, column=1, sticky="we", pady=2)
+        _cbtn = ttk.Frame(frm)
+        _cbtn.grid(row=_r, column=2, sticky="w", pady=2)
+        ttk.Button(_cbtn, text="测试连接", command=_test_cloud).pack(
+            side="left")
+        ttk.Button(_cbtn, text="清除",
+                   command=lambda: sm701_cloud_key_var.set("")).pack(
+                       side="left", padx=(4, 0))
+        _r += 1
+        ttk.Label(frm, text="云 API 地址").grid(row=_r, column=0, sticky="w",
+                                               pady=2)
+        ttk.Entry(frm, textvariable=sm701_cloud_url_var, width=46).grid(
+            row=_r, column=1, sticky="we", pady=2)
+        ttk.Label(frm, text="留空=默认 /platform；tailnet 需能直连",
+                  foreground=AXIS_TXT).grid(row=_r, column=2, sticky="w")
+        _r += 1
+        sm701_cloud_status_var = tk.StringVar(value=_cloud_status_text())
+        ttk.Label(frm, textvariable=sm701_cloud_status_var,
+                  foreground=AXIS_TXT, font=("Microsoft YaHei", 8),
+                  justify="left", wraplength=620).grid(
+                      row=_r, column=0, columnspan=3, sticky="w",
+                      pady=(4, 0))
+        _r += 1
 
         def _studio_sel():
             cur = studio_lb.curselection()
@@ -31387,6 +31559,26 @@ class App:
                     log.exception("sm70x 缓存重置失败(忽略)")
                 pnotes.append("sm701目录=" + (CFG.SM701_DIR or "自动探测"))
                 pnotes.append("sm702目录=" + (CFG.SM702_DIR or "自动探测"))
+                # v7.5.21：sm701 云 API Key/地址（环境变量优先；空=不启用）
+                _ck = (sm701_cloud_key_var.get() or "").strip()
+                _cu = (sm701_cloud_url_var.get() or "").strip()
+                CFG.SM701_CLOUD_KEY, CFG.SM701_CLOUD_URL = _ck, _cu
+                cp.set("predict", "sm701_cloud_key", _ck)
+                cp.set("predict", "sm701_cloud_url", _cu)
+                cp.set("predict", "sm701_cloud",
+                       "1" if sm701_cloud_on_var.get() else "0")
+                try:
+                    _sm701_cloud.reset_cache()
+                except Exception:
+                    log.exception("sm701 云缓存重置失败(忽略)")
+                _cst = _sm701_cloud.status()
+                pnotes.append("sm701云API=" + (
+                    "已配置(" + (_cst.get("source") or "") + ")"
+                    if _cst.get("configured") else "未配置"))
+                try:
+                    sm701_cloud_status_var.set(_cloud_status_text())
+                except Exception:
+                    pass
                 try:
                     sm70x_status_var.set(_sm70x_status_text())
                 except Exception:

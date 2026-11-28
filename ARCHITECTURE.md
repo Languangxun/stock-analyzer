@@ -41,7 +41,7 @@
 | `stock_predict.py` | CLI 生成物（`build_cli.py` 抽取拼装），**勿手改** |
 | `auto_lines.py` | **纯脚本自动画线**（v7.4.6）：读缓存日K，多尺度枢轴 + ATR/成交量加权 + 多轮精修输出支撑/压力/趋势/通道/箱体；CLI 可独立运行，GUI「自动画线」按钮复用 |
 | `studio_strategies/` | 从「股票策略工坊」导入的自定义策略 JSON 副本（v6.6.0；规则引擎读取，设置→外部策略维护） |
-| `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆；v7.5.2 兼容 sm702/UTC crypto）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号/`sm70x_series()` 关于页署名；缺库/缺预测文件自动降级；适配层代码入库，仅 sm70x/global 数据目录不入库 |
+| `external/` | **外接算法适配层**（v7.3.0；v7.4.0 兼容 sm701 新克隆；v7.5.2 兼容 sm702/UTC crypto；v7.5.21 云 API 兜底）：`sm701_ext.py` 为 sm70x 桌面库（数据+模型在仓库外，git 不分发）的唯一接入入口——模型定位（CRLF 容错/Booster 缓存）/行情库只读（sm701 原生表或 `global_daily.db` 统一表）/概率复算/买卖点信号/`sm70x_series()` 关于页署名；`sm701_cloud.py` 为 StockModel 云 API 客户端（`/v1/predict` 最新一日概率、`/v1/balance`、`/health`，节流+缓存，仅本地无模型时兜底）；缺库/缺预测文件自动降级；适配层代码入库，仅 sm70x/global 数据目录不入库 |
 | `assets/smlogo.png` | 关于页「Powered by」品牌图（v7.5.2；仅检测到外接 sm70x 时加载，不是模型/数据） |
 | `check_open_source.py` | **开源隔离自检**（v7.5.2）：扫描 git 跟踪 + 未忽略新文件，拦截 sm70x 目录/行情库/特征/模型/预测、改名 LightGBM 模型内容与 API Key |
 | `build_cli.py` | GUI → CLI 打包器；按锚点注释抽取「缓存块」「算法块」，并做 tkinter 残留 / 语法校验 |
@@ -553,6 +553,26 @@ sm701 改为**外接算法**接入（`external/sm701_ext.py`，`init_host(global
   消融候选与 CLI 导出共用 `strategy_signals_full` 同分支；
 - **兜底口径**：外接算法（sm701）/外部策略（工坊）不混入
   「近250日信号过少→多维评分」回退与「异动相似覆盖」，保证纯模型/纯规则直出。
+
+**sm701 云 API 兜底（v7.5.21，`external/sm701_cloud.py`）**：本地没有 sm70x
+模型/数据时，用 StockModel 云服务（`https://quant.tail6a6cc8.ts.net/platform`，
+官方文档 `/platform/docs`）的概率直出：
+- 接口：`POST /v1/predict`（`{"codes":[…]}`，≤50 标的，Bearer `sk-sm-…`，
+  ¥0.10/次、失败不计费、普通用户 2 秒/次）、`GET /v1/balance`（余额/限流）、
+  `GET /health`（探活）；编码与本工程同构（`sh600519`/`hk:00700`/`us:AAPL`/
+  `crypto:BTC/USDT`/`fut:RB0`，加密小时 `BTCUSDT`）。
+- 配置：环境变量 `SM701_API_KEY`/`SM701_API_URL` > ini `[predict]
+  sm701_cloud_key/sm701_cloud_url` > 默认地址；`sm701_cloud=0` 停用；
+  `sm701_cloud_ttl` 控制结果缓存（默认 300s）。base URL 空路径自动补
+  `/platform`，tailnet 复用宿主 `_open_url` 强制直连（`_is_tailnet_url`）。
+- 接入点：`sm701_prob_map()` 在「该市场无本地模型」时用云端补**最新一日**
+  概率（云端只发布当前数据时点，历史回测仍需本地模型；有本地模型时零
+  云端调用，A股消融候选仍按 `sm701_has_model("cn")` 过滤）；
+  `_sm701_available(market)` = 本地模型 or 云 Key，供多市场直出与缓存策略
+  可用性判定；非 cn 无本地模型时标签标「仅最新一日；本地模型未装」。
+- 可靠性：401/402/429/503 转中文提示（不回显 Key），429 按 `Retry-After`
+  重试一次，结果按标的缓存避免界面刷新重复扣费；设置→外部策略「测试连接」
+  调 `/v1/balance` 显示余额/限流，未填 Key 时只探活 `/health`。
 
 ### 3.5 筹码分布
 逐日按换手衰减历史筹码（换手率 ≈ 量/中位量 ×2%，限幅），当日筹码在 [low, high] 均匀摊到价格桶；
@@ -1507,6 +1527,7 @@ ai-quant 实盘候选默认按市值前 120 只扫描，与该结论一致；
 
 | 版本 | 主要变更 |
 |---|---|
+| **v7.5.21**<br>（2026-11-28） | **sm701 云 API 接入 + Key 支持**：新增 `external/sm701_cloud.py`——`POST /v1/predict`（≤50 标的、Bearer `sk-sm-…`、¥0.10/次、失败不计费、2 秒/次）、`GET /v1/balance`、`GET /health`；编码同构（sh600519/hk:00700/us:AAPL/crypto:BTC/USDT/fut:RB0/小时 BTCUSDT）；**仅作本地无模型兜底**——`sm701_prob_map` 在该市场无本地模型时补最新一日概率（历史回测仍需本地模型，有模型时零云端调用），非 cn 无模型也能直出并标注「仅最新一日」；`_sm701_available`=本地模型 or 云 Key；2 秒节流 + 5 分钟结果缓存（`sm701_cloud_ttl`）、429 按 Retry-After 重试、401/402/503 中文提示且不回显 Key；设置→外部策略新增云兜底开关/Key/地址/测试连接（`/v1/balance` 显示余额；无 Key 时探活 `/health`），环境变量 `SM701_API_KEY`/`SM701_API_URL` 优先；`APP_VERSION=7.5.21`，`stock_predict.py` 重新生成；3.4 节与 README/CHANGELOG 同步 |
 | **v7.5.20**<br>（2026-11-28） | **工具→信号胜率「点了没结果」修复**：①根因——同股重分析替换 `res` 对象（tick 跨快照重分析 / 应用 quant 策略后重分析 / 15 分钟自动刷新），`run_bt` 完成回调按 `self.res is res` 判等，同股结果被整批丢弃、页面停在「后台计算中…」（quant 批次重分析更频繁更易命中）；②改按「代码 + 策略签名（`_strat_sig`：算法/标签/档位/落库时间）」比对，签名未变照常渲染、已变自动重跑；③分析前打开工具窗给提示，`_loaded()`→`_maybe_refresh_tools_bt()` 分析完成后自动补算（同签名不重复算）；④结果顶部标注「当前策略 + 回测窗口」；⑤`[ui] last` 改存上一次成功分析的正式代码（半截搜索词会让下次启动 `normalize_code` 失败、模态「代码有误」卡住启动），启动校验失败即清空；⑥`APP_VERSION=7.5.20`，`stock_predict.py` 重新生成；3.6 节与 README/CHANGELOG 同步 |
 | **v7.5.19**<br>（2026-11-28） | **默认源分级**：①A股默认源=quant机（提链首；失效/无 tailnet 按原链轮换 腾讯×6→通达信→新浪→同花顺→东财，实测 `tries=[quant机,腾讯]` 降级正常）；存量源链一次性迁移提首（`kline_srcs_migrated=2026-11-28.2`）；②加密默认=币安（新增 `_fetch_binance_daily`/`_binance_symbol`：免 key `/api/v3/klines` 1d UTC 日切，api.binance.com 代理优先 + data-api.binance.vision 备域，末根未完成 bar 由 `_keep` 过滤）；多市场分级=加密 币安→quant→Yahoo / 港美期 quant→TD→Yahoo，备用源全保留；③裸币修复：`cryptobtc`→`BTCUSDT`/`BTC/USDT`（`_binance_symbol`/`_quant_code`）；④`APP_VERSION=7.5.19`，`stock_predict.py` 重新生成；2.0/2.1 节与 README/CHANGELOG 同步 |
 | **v7.5.18**<br>（2026-11-28） | **quant 机（Tailscale）统一行情源接入**：达标实测（/health ok、五市场日K全新鲜至 11-27、加密按 UTC 已完成日与工程口径一致、延迟 0.04~0.12s、Range 断点续传可用、bj 不覆盖）后统一接入——①新增 `_quant_code/_fetch_quant` REST 日K源（`/api/kline` 五市场同构编码 `sh600519`/`hk:00700`/`us:AAPL`/`crypto:BTC/USDT`/`fut:RB0`，读 sm70x/global_daily 同一实时库，tail≤800，无数据=软失败不触发自愈）；②A股源链链尾新增「quant机」内置源（既有熔断/节流复用）+ 内置源增补一次性迁移（`kline_srcs_migrated`，老配置自动补新源、后续停用照常持久化）；③多市场 `fetch_market_daily` 改 **quant → TD(美股) → Yahoo** 三级（同源实时库优先于公网）；④base 可配 `ini [data] quant_url`/环境变量 `QUANT_URL`（none/off/0 停用；无 tailnet 环境自动熔断跳过）；⑤`_is_tailnet_url`（*.ts.net / 100.64.0.0/10）强制直连（代理转发不了 100.x）；⑥`APP_VERSION=7.5.18`，`stock_predict.py` 重新生成；2.0/2.1 节与 README/CHANGELOG 同步 |
