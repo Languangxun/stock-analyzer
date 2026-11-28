@@ -30915,6 +30915,58 @@ class App:
                     pass
             self._run_bg(_work, _done)
 
+        def _try_predict():
+            """用当前股票的代码真调一次 /v1/predict（¥0.10/次），验证 Key。"""
+            _k = (sm701_cloud_key_var.get() or "").strip() or \
+                _sm701_cloud.api_key()
+            _u = (sm701_cloud_url_var.get() or "").strip()
+            if not _k:
+                sm701_cloud_status_var.set(
+                    "云 API：请先填 Key（控制台创建，形如 sk-sm-…）")
+                return
+            full = ""
+            try:
+                full = normalize_code(self.code_var.get().strip())
+            except ValueError:
+                full = (self.res or {}).get("full_code") or ""
+            if not full:
+                sm701_cloud_status_var.set(
+                    "云 API：请先输入/分析一只股票，再点「试算当前股票」")
+                return
+            code = _sm701_cloud.code_for(full)
+            if not code:
+                sm701_cloud_status_var.set(
+                    "云 API：%s 不在覆盖范围（如北交所）" % full)
+                return
+            sm701_cloud_status_var.set(
+                "云 API：试算 %s …（¥0.10/次，失败不计费）" % code)
+
+            def _w():
+                return _sm701_cloud.predict([code], key=_k, url=_u,
+                                            use_cache=False)
+
+            def _d(r, e):
+                try:
+                    if e:
+                        sm701_cloud_status_var.set(
+                            "云 API：试算失败 · %s" % str(e)[:160])
+                        return
+                    rec = (r or {}).get(code) or {}
+                    if not rec:
+                        sm701_cloud_status_var.set(
+                            "云 API：%s 无返回（云端未覆盖该标的）" % code)
+                        return
+                    sm701_cloud_status_var.set(
+                        "云 API 试算：%s 上涨概率 %.4f · 数据时点 %s · "
+                        "模型 %s · 阈值 %s" % (
+                            code, rec.get("prob") or 0.0,
+                            rec.get("ts") or "-", rec.get("model") or "-",
+                            rec.get("threshold") if rec.get("threshold")
+                            is not None else "-"))
+                except Exception:
+                    pass
+            self._run_bg(_w, _d)
+
         ttk.Label(frm, text="云 API Key").grid(row=_r, column=0, sticky="w",
                                                pady=2)
         ttk.Entry(frm, textvariable=sm701_cloud_key_var, width=46,
@@ -30923,6 +30975,8 @@ class App:
         _cbtn.grid(row=_r, column=2, sticky="w", pady=2)
         ttk.Button(_cbtn, text="测试连接", command=_test_cloud).pack(
             side="left")
+        ttk.Button(_cbtn, text="试算当前股票",
+                   command=_try_predict).pack(side="left", padx=(4, 0))
         ttk.Button(_cbtn, text="清除",
                    command=lambda: sm701_cloud_key_var.set("")).pack(
                        side="left", padx=(4, 0))
